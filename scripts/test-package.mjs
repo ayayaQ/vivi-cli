@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url'
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
-const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(tmpdir(), 'vivi-npm-cache')
+// This check prepares a fresh registry cache explicitly, then verifies an offline consumer.
+// npm ci's tarball cache alone may not contain packuments needed to install an archive.
+const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
 const coreVersion = '0.2.0'
 const coreIntegrity = 'sha512-4qxPGSjhKgJKx01fV18V4qvzlVQxkhyiXhPX+KpnbevDYFMilAlnlhx7JIPyWZENG6zUOYSRB6xnQkTT0K1usw=='
@@ -62,8 +64,17 @@ try {
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
   const tarball = join(temporary, packed.filename)
   await writeFile(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }))
-  // The bundled core is offline; OpenTUI dependencies use the populated npm cache, without install scripts.
-  run('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
+  // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
+  run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
+  const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
+  for (const name of ['@opentui/core', 'web-tree-sitter']) {
+    const path = `node_modules/${name}`
+    for (const field of ['version', 'resolved', 'integrity']) {
+      assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
+    }
+  }
+  await rm(join(temporary, 'node_modules'), { recursive: true, force: true })
+  run('npm', ['ci', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache], temporary)
   const installed = join(temporary, 'node_modules/@ayayaq/vivi-cli')
   const installedManifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'))
   assert.equal(installedManifest.name, '@ayayaq/vivi-cli')

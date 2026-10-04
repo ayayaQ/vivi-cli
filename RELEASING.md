@@ -61,9 +61,10 @@ embeds native assets, and writes dependency notices beside the local binary.
 The standard Ubuntu Bun CI lane uses native in-memory rendering and mock input;
 it makes no real provider calls and does not upload build artifacts. Windows/macOS
 need their own actual runtime and clean-consumer checks before platform claims or
-release targets are added. Packaging tests require the source-installed dependency
-cache for their offline isolated consumer, rather than claiming the archive alone
-is an offline distribution.
+release targets are added. Packaging tests prepare dependency metadata and bytes from the registry in a fresh
+cache, verify OpenTUI/parser resolution and integrity against the reviewed lock, then
+reinstall the isolated consumer offline from that cache. This requires registry access
+for preparation; the archive alone is not an offline distribution.
 
 A binary release is a separate action. Before distributing one, review the exact
 Bun release's MIT/linked-library licensing and LGPL relinking obligations, preserve

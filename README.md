@@ -114,7 +114,9 @@ npm run build:standalone       # Current-platform local executable in build/
 ```
 
 Checks use fake providers and temporary directories, without API keys or live model
-calls. Native UI tests use OpenTUI's official headless test renderer, not terminal UI
+calls. The package check explicitly prepares a fresh registry dependency cache, verifies
+OpenTUI/parser resolution and integrity against the lockfile, then reinstalls the isolated
+consumer offline from that prepared cache. Registry access is required for preparation. Native UI tests use OpenTUI's official headless test renderer, not terminal UI
 automation. CI retains Node 22/24 checks and adds a standard Ubuntu Bun job.
 Strict application typechecking remains enabled; dependency declaration checks are
 skipped because OpenTUI 0.5.14's KeyHandler declaration conflicts with Node typings.
