@@ -12,6 +12,8 @@ import { TerminalIO, runChatLoop } from '../dist/terminal.js';
 import { calculate, builtinTools } from '../dist/tools.js';
 import { main, parseArguments, providerForSession } from '../dist/main.js';
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi';
+import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai';
+import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter';
 
 const test = (name, fn) => nodeTest(name, { timeout: 4000 }, fn);
 const answer = (content = 'Done', toolCalls = [], extras = {}) => ({ content, toolCalls, ...extras });
@@ -74,6 +76,53 @@ test('CLI displays provider progress but only complete assistant output enters p
   assert.equal(saved.history.at(-1).content, 'Accepted canonical output');
   assert.ok(!JSON.stringify(saved).includes('provisional'));
 });
+
+for (const [providerName, factory] of [['openai', createOpenAIProvider], ['openrouter', createOpenRouterProvider]]) {
+  test(`CLI rejects ${providerName} streaming completion after a blocking progress callback without dispatching tools`, async (t) => {
+    const { store } = await fixture(t);
+    const frames = providerName === 'openai' ? [
+      { type: 'response.output_text.delta', delta: 'Unaccepted partial' },
+      { type: 'response.completed', response: { status: 'completed', output: [
+        { type: 'function_call', call_id: 'late_note', name: 'note_set',
+          arguments: JSON.stringify({ key: 'task', value: 'late mutation', expectedRevision: 0 }) },
+      ] } },
+    ] : [
+      { choices: [{ index: 0, delta: { role: 'assistant', content: 'Unaccepted partial' }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'late_note', type: 'function',
+        function: { name: 'note_set', arguments: JSON.stringify({ key: 'task', value: 'late mutation', expectedRevision: 0 }) } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+      '[DONE]',
+    ];
+    const body = frames.map((frame) => `data: ${typeof frame === 'string' ? frame : JSON.stringify(frame)}\n\n`).join('');
+    let elapsed = 0; let requests = 0; let approvals = 0;
+    // Advance monotonic time inside the callback, before a timer can run. The
+    // shared transport must check the deadline before accepting terminal tools.
+    t.mock.method(globalThis.performance, 'now', () => elapsed);
+    const events = [];
+    const provider = factory({ model: 'fake-model', apiKey: 'fake-key', timeoutMs: 1000, stream: true,
+      fetch: async () => { requests++; return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }); },
+    });
+    const host = await CliHost.create({ store, settings: { ...settings, provider: providerName }, provider,
+      enableNotes: true, approve: async () => { approvals++; return true; },
+      onEvent: (event) => { events.push(event.type); if (event.type === 'text_delta') elapsed = 1001; },
+    });
+    const result = await host.send('Try a late note');
+    assert.equal(approvals, 0);
+    assert.deepEqual(events, ['text_delta']);
+    assert.equal(result.status, 'error');
+    assert.equal(result.error.code, 'provider_error');
+    assert.match(result.error.message, /timed out/);
+    assert.equal(requests, 1);
+    assert.deepEqual(result.history, [{ kind: 'message', role: 'user', content: 'Try a late note' }]);
+    const saved = await store.load(host.session.id);
+    assert.deepEqual(saved.history, result.history);
+    assert.deepEqual(saved.notes, {});
+    assert.equal(saved.noteRevision, 0);
+    assert.deepEqual(saved.usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+    assert.ok(!JSON.stringify(saved).includes('Unaccepted partial'));
+    assert.ok(!JSON.stringify(saved).includes('late_note'));
+  });
+}
 
 test('calculator and time are bounded, read-only builtins; notes are absent by default', async (t) => {
   assert.equal(calculate('2 * (3 + 4) - .5'), 13.5);
