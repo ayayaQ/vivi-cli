@@ -35,6 +35,9 @@ transcript available through `/resume`.
 
 Enter sends; Shift+Enter or Alt+Enter adds a line. Tab completes slash commands.
 Escape or Ctrl+C cancels a running turn; Ctrl+C while idle exits.
+In `/models`, type to filter by ID, name or provider; words can be in any order.
+Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,
+Ctrl+R to refresh the catalog, and Escape to go back.
 
 Keys can be saved in an available OS credential store or used for this launch only.
 There is no plaintext key-storage fallback. Conversations are stored locally in

@@ -14,8 +14,10 @@ import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
 import type { ChatIO } from './terminal.js'
 import type { ApprovalRequest } from './tools.js'
+import { matchingChoiceIndices } from './picker.js'
+import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 
-export interface Choice<T> { name: string; description?: string; value: T }
+export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[] }
 
 export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: '#18181b',
@@ -43,14 +45,21 @@ const MAX_INPUT = 65536
 const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
+const MAX_QUERY = 200
 const HINTS = '/new /resume /settings /menu /help /exit · Tab complete · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
-type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice'
+type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
   armed: boolean
   finish(value: string | number | undefined, aborted?: boolean): void
 }
 interface DisplayEntry { label: string; content: string; markdown: boolean }
+interface SearchPicker {
+  choices: readonly Choice<unknown>[]
+  matches: number[]
+  query: string
+  refresh: boolean
+}
 
 /** Strip entire terminal commands, including incomplete commands at a stream boundary.
  * Text is never sent to the terminal directly. Keep only ordinary text, tabs and newlines.
@@ -119,6 +128,7 @@ export class OpenTuiIO implements ChatIO {
   private hintLine!: TextRenderable
   private pickerBox!: BoxRenderable
   private picker: SelectRenderable | undefined
+  private searchPicker: SearchPicker | undefined
   private partialBox: BoxRenderable | undefined
   private partial: MarkdownRenderable | undefined
   private entries: DisplayEntry[] = []
@@ -137,6 +147,10 @@ export class OpenTuiIO implements ChatIO {
 
   private readonly keyHandler = (key: KeyEvent): void => {
     try { this.handleKey(key) } catch (error) { this.errorHandler({ error }) }
+  }
+  private readonly resizeHandler = (): void => {
+    if (this.searchPicker) this.renderSearchPicker(false)
+    if (this.completions.length) this.renderCompletions()
   }
   private readonly pasteHandler = (event: PasteEvent): void => {
     try { this.handlePaste(event) } catch (error) { this.errorHandler({ error }) }
@@ -226,6 +240,7 @@ export class OpenTuiIO implements ChatIO {
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
       renderer.keyInput.on('paste', this.pasteHandler)
+      renderer.on(CliRenderEvents.RESIZE, this.resizeHandler)
       renderer.on(CliRenderEvents.RENDER_ERROR, this.errorHandler)
       renderer.on(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
       process.on('SIGINT', this.signalHandler)
@@ -306,14 +321,61 @@ export class OpenTuiIO implements ChatIO {
   private inputChanged(): void {
     if (this.closed || this.changingInput) return
     const raw = this.composer.plainText
-    const safe = this.safe(raw, MAX_INPUT).slice(0, MAX_INPUT)
+    const safe = this.pending?.kind === 'search'
+      ? this.safe(raw, MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
+      : this.safe(raw, MAX_INPUT).slice(0, MAX_INPUT)
     if (raw !== safe) {
       this.changingInput = true
       try { this.composer.setText(safe); this.composer.gotoBufferEnd() }
       finally { this.changingInput = false }
-      this.updateStatus(raw.length > MAX_INPUT ? 'Input limit: 65536 characters' : 'Control text or known credential removed from input')
+      const limit = this.pending?.kind === 'search' ? MAX_QUERY : MAX_INPUT
+      this.updateStatus(raw.length > limit ? `Input limit: ${limit} characters` : 'Control text or known credential removed from input')
     }
-    this.updateCompletions()
+    if (this.searchPicker) this.renderSearchPicker(this.composer.plainText !== this.searchPicker.query)
+    else this.updateCompletions()
+  }
+  private renderSearchPicker(queryChanged: boolean): void {
+    const search = this.searchPicker
+    if (!search || !this.picker || this.closed) return
+    const previous = search.matches[this.picker.getSelectedIndex()]
+    const query = this.composer.plainText
+    if (queryChanged || query !== search.query) {
+      search.query = query
+      search.matches = matchingChoiceIndices(search.choices, query)
+      this.picker.options = search.matches.length ? search.matches.map(index => {
+        const choice = search.choices[index]!
+        return { name: this.safe(choice.name, 1024), description: this.safe(choice.description ?? '', 2048), value: index }
+      }) : [{ name: query ? 'No matching models' : 'No models available',
+        description: 'Backspace or Ctrl+U clears search' + (search.refresh ? ' · Ctrl+R refreshes catalog' : ''), value: -1 }]
+      // A changed query starts at the best-ranked match, never an old row number.
+      this.picker.setSelectedIndex(0)
+    } else if (previous !== undefined) this.picker.setSelectedIndex(search.matches.indexOf(previous))
+    this.composerBox.title = `Search models · ${search.matches.length} / ${search.choices.length} results`
+    const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - 9, Math.max(1, search.matches.length) * 2 + 2))
+    this.pickerBox.height = height
+    this.picker.showDescription = height >= 4
+  }
+  private handleSearchKey(key: KeyEvent): boolean {
+    const search = this.searchPicker
+    if (!search || !this.picker) return false
+    // Native content-change notifications may be deferred until the next frame.
+    // Navigation/refresh must use the query typed in this input batch immediately.
+    if (this.composer.plainText !== search.query) this.inputChanged()
+    if (['return', 'kpenter', 'linefeed'].includes(key.name)) { this.consume(key); this.submit(); return true }
+    if (key.ctrl && key.name === 'u') { this.consume(key); this.composer.setText(''); return true }
+    if (key.ctrl && key.name === 'r' && search.refresh) { this.consume(key); this.pending?.finish(-1); return true }
+    if (key.name === 'tab') { this.consume(key); return true }
+    if (!key.ctrl && !key.meta && !key.super && !key.hyper && ['up', 'down', 'pageup', 'pagedown', 'home', 'end'].includes(key.name)) {
+      this.consume(key)
+      if (!search.matches.length) return true
+      const step = Math.max(1, Math.floor((Number(this.pickerBox.height) - 2) / (this.picker.showDescription ? 2 : 1)))
+      const current = this.picker.getSelectedIndex()
+      const next = key.name === 'home' ? 0 : key.name === 'end' ? search.matches.length - 1
+        : current + (key.name === 'up' ? -1 : key.name === 'down' ? 1 : key.name === 'pageup' ? -step : step)
+      this.picker.setSelectedIndex(Math.max(0, Math.min(search.matches.length - 1, next)))
+      return true
+    }
+    return false
   }
   private hideCompletions(): void {
     this.completions = []
@@ -407,13 +469,14 @@ export class OpenTuiIO implements ChatIO {
     if (key.eventType === 'release') { this.consume(key); return }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
       this.consume(key)
-      if (key.name === 'escape' && (this.pending?.kind === 'choice' || this.pending?.kind === 'text' || this.pending?.kind === 'secret')) {
+      if (key.name === 'escape' && (this.pending?.kind === 'choice' || this.pending?.kind === 'search' || this.pending?.kind === 'text' || this.pending?.kind === 'secret')) {
         this.pending.finish(undefined)
       } else if (key.name === 'escape' && this.pending?.kind === 'chat' && !this.cancelCallbacks.size) {
         this.clearInput()
       } else this.cancelOrClose(key.name === 'escape')
       return
     }
+    if (this.pending?.armed && this.pending.kind === 'search' && this.handleSearchKey(key)) return
     if (key.name === 'pageup' || key.name === 'pagedown' ||
       (key.ctrl && key.shift && (key.name === 'up' || key.name === 'down'))) {
       if (this.pending?.kind === 'choice') return
@@ -462,6 +525,12 @@ export class OpenTuiIO implements ChatIO {
   private submit(): void {
     const pending = this.pending
     if (!pending?.armed || pending.kind === 'choice' || this.closed) return
+    if (pending.kind === 'search') {
+      this.inputChanged()
+      const index = this.searchPicker?.matches[this.picker?.getSelectedIndex() ?? -1]
+      if (index !== undefined) pending.finish(index)
+      return
+    }
     if (pending.kind === 'secret') {
       const value = this.secretInput.join('')
       // Register before resolving, so immediate host/provider errors are already redacted.
@@ -507,6 +576,7 @@ export class OpenTuiIO implements ChatIO {
     this.composerBox.title = this.safe(title, 4096)
     this.hintLine.content = kind === 'chat' ? HINTS : kind === 'approval'
       ? 'Type allow or deny · Enter defaults to deny · Escape cancels · pasted approvals are ignored'
+      : kind === 'search' ? 'Type to search · ↑/↓ select · PgUp/PgDn · Home/End'
       : kind === 'choice' ? '↑/↓ select · Enter confirm · Escape back'
       : kind === 'secret' ? 'Input hidden · Enter confirm · Escape back · Ctrl+U clear'
       : 'Enter confirm · Shift/Alt+Enter newline · Escape back'
@@ -520,13 +590,16 @@ export class OpenTuiIO implements ChatIO {
         if (timer !== undefined) clearTimeout(timer)
         signal?.removeEventListener('abort', abort)
         this.disableComposer()
+        this.searchPicker = undefined
         this.clearInput()
         if (this.picker) { this.picker.destroyRecursively(); this.picker = undefined }
         this.pickerBox.visible = false
+        this.pickerBox.bottomTitle = undefined
         this.composerBox.visible = true
         this.composer.visible = true
         this.secretMask.visible = false
         this.composerBox.title = 'Message'
+        this.composerBox.bottomTitle = undefined
         this.hintLine.content = HINTS
         if (this.failure) reject(this.failure)
         else if (aborted && kind === 'chat') reject(new Error('Input cancelled'))
@@ -594,6 +667,39 @@ export class OpenTuiIO implements ChatIO {
     }
     const index = await selection
     return typeof index === 'number' ? choices[index]?.value : undefined
+  }
+  async chooseSearchable<T>(title: string, choices: readonly Choice<T>[], options: SearchableOptions = {}): Promise<SearchableSelection<T> | undefined> {
+    if (this.failure) throw this.failure
+    if (this.closed) return undefined
+    // Display is viewport-bounded, but every catalog entry remains reachable/searchable.
+    const query = this.safe(options.query ?? '', MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
+    const selection = this.openInput('search', 'Search models', query)
+    this.pickerBox.title = this.safe(title, 4096)
+    this.pickerBox.visible = true
+    this.pickerBox.bottomTitle = 'Enter choose · Esc back'
+    this.composerBox.bottomTitle = 'Ctrl+U clear' + (options.refresh ? ' · Ctrl+R refresh' : '')
+    try {
+      this.searchPicker = { choices, matches: [], query, refresh: options.refresh ?? false }
+      this.picker = new SelectRenderable(this.renderer, { id: 'vivi-picker', width: '100%', height: '100%',
+        options: [], showDescription: true, showScrollIndicator: true, wrapSelection: false,
+        backgroundColor: TUI_THEME.background, textColor: TUI_THEME.foreground,
+        selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
+        descriptionColor: '#a1a1aa', selectedDescriptionColor: TUI_THEME.lavender })
+      // This is a result view, not a second input target. Mouse autofocus must not
+      // redirect later query typing into SelectRenderable's own key handler.
+      this.picker.focusable = false
+      this.pickerBox.add(this.picker)
+      this.renderSearchPicker(true)
+      const initial = Number.isFinite(options.initialIndex) ? Math.trunc(options.initialIndex!) : 0
+      const selected = this.searchPicker.matches.indexOf(initial)
+      // A persisted query uses relevance ranking rather than restoring a hidden selection.
+      this.picker.setSelectedIndex(query ? 0 : Math.max(0, selected))
+    } catch (error) { this.pending?.finish(undefined); throw error }
+    // Keep the editable query focused; list navigation is handled without focus changes.
+    const search = this.searchPicker!
+    const index = await selection
+    return typeof index !== 'number' ? undefined : index === -1 ? { kind: 'refresh', query: search.query }
+      : choices[index] ? { kind: 'selected', value: choices[index]!.value, query: search.query } : undefined
   }
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
@@ -791,6 +897,7 @@ export class OpenTuiIO implements ChatIO {
     this.cancelCallbacks.clear()
     this.renderer.keyInput.off('keypress', this.keyHandler)
     this.renderer.keyInput.off('paste', this.pasteHandler)
+    this.renderer.off(CliRenderEvents.RESIZE, this.resizeHandler)
     this.renderer.off(CliRenderEvents.RENDER_ERROR, this.errorHandler)
     this.renderer.off(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
     process.off('SIGINT', this.signalHandler)

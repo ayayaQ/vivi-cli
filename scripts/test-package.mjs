@@ -50,7 +50,7 @@ try {
   const paths = new Set(packed.files.map((file) => file.path))
   for (const path of ['LICENSE', 'NOTICE', 'README.md', 'RELEASING.md', 'package.json', 'tsconfig.json',
     'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
-    'src/models.ts', 'src/credentials.ts', 'dist/models.js', 'dist/credentials.js',
+    'src/models.ts', 'src/picker.ts', 'src/credentials.ts', 'dist/models.js', 'dist/picker.js', 'dist/picker.d.ts', 'dist/credentials.js',
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts']) assert(paths.has(path), `Missing ${path}`)
@@ -176,13 +176,19 @@ try {
   await setup.renderOnce()
   assert(setup.captureCharFrame().includes('Packed Markdown works'))
   assert(!setup.captureCharFrame().includes('## Packed heading'))
-  io.close()
+  const models = Array.from({ length: 1500 }, (_, index) => ({ name: 'vendor/model-' + index,
+    searchTerms: ['Packed Provider'], value: 'vendor/model-' + index }))
+  const selecting = io.chooseSearchable('Packed models', models, { refresh: true })
   assert.equal(await reading, undefined)
+  await setup.mockInput.typeText('PROVIDER model 1499')
+  setup.mockInput.pressEnter()
+  assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
+  io.close()
 } finally { io.close(); setup.renderer.destroy() }
 `)
     run(process.env.VIVI_TEST_BUN, [join(installed, 'tui-consumer.ts')], temporary)
     assert.match(run(process.env.VIVI_TEST_BUN, [join(temporary, 'node_modules/.bin/vivi'), '--help'], temporary), /--provider/)
-    console.log('Packed OpenTUI native renderer and Bun CLI entrypoint passed')
+    console.log('Packed native renderer, model search and Bun CLI entrypoint passed')
   }
   const bytes = await readFile(tarball)
   console.log(`Installed CLI bin, shared-provider runtime and TypeScript declarations passed (${packed.filename})`)

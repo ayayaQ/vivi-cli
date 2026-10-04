@@ -4,8 +4,11 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createTestRenderer } from '@opentui/core/testing'
+import { TextareaRenderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
-import type { CliSession } from '../src/session.js'
+import type { CliProviderName, CliSession } from '../src/session.js'
+import type { Catalog, ModelEntry } from '../src/models.js'
+import type { TuiPreferences } from '../src/preferences.js'
 import { main } from '../src/main.js'
 import { PreferenceStore } from '../src/preferences.js'
 import { FileSessionStore } from '../src/session.js'
@@ -241,8 +244,6 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
     expect(setup.captureCharFrame()).toContain('•')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Models · openai') && frame.includes('gpt-5.1'))
-    setup.mockInput.pressArrow('down')
-    setup.mockInput.pressArrow('down')
     const afterModel = ready.nextComposer()
     setup.mockInput.pressEnter()
     await afterModel
@@ -277,3 +278,201 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
     expect(JSON.parse(await readFile(join(directory, 'preferences.json'), 'utf8')).reasoning).toBe('high')
   } finally { io.close(); await running; setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
 }, 15000)
+
+function nativeCatalogModel(id: string, name = id): ModelEntry {
+  return { id, name, conversation: 'supported', tools: 'unsupported', streaming: 'supported',
+    reasoning: 'unsupported', efforts: [], reasoningMandatory: false, source: 'Native fake catalog' }
+}
+
+/** Synthetic metadata and providers keep these native integration tests entirely offline. */
+async function nativeCatalogApplication(provider: CliProviderName, catalog: Catalog) {
+  const directory = await mkdtemp(join(tmpdir(), `vivi-native-${provider}-catalog-`))
+  const setup = await createTestRenderer({ width: 110, height: 32, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer)
+  const ready = observeUI(io)
+  const preferences = new PreferenceStore(directory)
+  const defaults: TuiPreferences = { schemaVersion: 1, provider, model: 'saved-default-model', reasoning: 'default',
+    reasoningCapabilities: [], enableTools: false, enableNotes: false, stream: true, maxRounds: 25 }
+  await preferences.save(defaults)
+  let current: CliSession | undefined
+  const setSession = io.setSession.bind(io)
+  io.setSession = session => { current = structuredClone(session); setSession(session) }
+  const sessions: { id: string; provider: CliProviderName; model: string }[] = []
+  const requests: { sessionId: string; model: string; prompt: unknown }[] = []
+  const running = main([], { VIVI_SESSION_DIR: directory }, { tuiIO: io, catalog,
+    credentials: { status: async () => ({ available: false, label: 'Fake vault' }), load: async () => undefined,
+      save: async () => { throw new Error('Catalog tests must not save credentials') } },
+    providerFactory: (session, _options, env) => {
+      expect(env.OPENAI_API_KEY).toBeUndefined()
+      expect(env.OPENROUTER_API_KEY).toBeUndefined()
+      sessions.push({ id: session.id, provider: session.provider, model: session.model })
+      return { generate: async input => {
+        expect(input.tools).toEqual([])
+        requests.push({ sessionId: session.id, model: session.model, prompt: input.messages.at(-1)?.content })
+        return { content: 'Native catalog answer', toolCalls: [] }
+      } }
+    }
+  })
+  const composer = (): TextareaRenderable => setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  const session = (): CliSession => {
+    if (!current) throw new Error('Native catalog application has not opened its session')
+    return current
+  }
+  const openModels = async (): Promise<void> => {
+    await setup.mockInput.typeText('/models')
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame(frame => frame.includes(`Models · ${provider}`) && frame.includes('Type to search'))
+  }
+  const chat = async (text: string): Promise<void> => {
+    expect(composer().plainText).toBe('')
+    const afterSend = ready.nextComposer()
+    await setup.mockInput.typeText(text)
+    setup.mockInput.pressEnter()
+    await afterSend
+    await setup.waitForFrame(frame => frame.includes('Native catalog answer') && frame.includes('Enter send'))
+    expect(requests.at(-1)?.prompt).toBe(text)
+    expect(composer().plainText).toBe('')
+  }
+  const close = async (): Promise<void> => {
+    io.close()
+    try { expect(await running).toBe(0) }
+    finally { setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+  }
+  try {
+    await ready(state => state.kind === 'composer')
+    await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('Enter send'))
+  } catch (error) { await close(); throw error }
+  return { directory, setup, io, ready, preferences, defaults, sessions, requests, running, composer, session, openModels, chat, close }
+}
+
+for (const provider of ['openai', 'openrouter'] as const) {
+  test(`native ${provider} live catalog search selects exact IDs by identifier, display name and provider beyond 250 rows`, async () => {
+    const byId = nativeCatalogModel('zz-lab/aurora-4096:preview', 'Orchid Identifier Match')
+    const byName = nativeCatalogModel('zz-lab/quartz-4097:preview', 'Cobalt Semantic Search')
+    const byProvider = nativeCatalogModel('zz-lab/zircon-4098:preview', 'Copper Gateway Search')
+    const models = [nativeCatalogModel('saved-default-model'),
+      ...Array.from({ length: 4096 }, (_, index) => nativeCatalogModel(`fixture-model-${String(index).padStart(4, '0')}`)),
+      byId, byName, byProvider]
+    let catalogCalls = 0
+    const app = await nativeCatalogApplication(provider, { list: async (actualProvider, key) => {
+      expect(actualProvider).toBe(provider)
+      expect(key).toBeUndefined()
+      catalogCalls++
+      return { state: 'fresh', models }
+    } })
+    try {
+      expect(models.indexOf(byId)).toBeGreaterThan(4000)
+      const selections = [
+        { query: 'ZZ LAB AURORA 4096 PREVIEW', model: byId },
+        { query: 'COBALT / SEMANTIC', model: byName },
+        { query: `${provider.toUpperCase()} COPPER`, model: byProvider }
+      ]
+      for (const [index, { query, model }] of selections.entries()) {
+        const previousId = app.session().id
+        await app.openModels()
+        expect(app.composer().plainText).toBe('')
+        if (index === 0) expect(app.setup.captureCharFrame()).not.toContain(byId.id)
+        if (index === 2) {
+          const wrongProvider = provider === 'openai' ? 'openrouter' : 'openai'
+          await app.setup.mockInput.typeText(`${wrongProvider} COPPER`)
+          await app.setup.waitForFrame(frame => frame.includes('No matching models'))
+          app.setup.mockInput.pressEnter()
+          await app.setup.renderOnce()
+          expect(app.session().id).toBe(previousId)
+          expect(app.composer().plainText).toBe(`${wrongProvider} COPPER`)
+          app.setup.mockInput.pressKey('u', { ctrl: true })
+          expect(app.composer().plainText).toBe('')
+        }
+        await app.setup.mockInput.typeText(query)
+        await app.setup.waitForFrame(frame => frame.includes(model.id))
+        expect(app.composer().plainText).toBe(query)
+        const afterModel = app.ready.nextComposer()
+        app.setup.mockInput.pressEnter()
+        await afterModel
+        await app.setup.waitForFrame(frame => frame.includes(`${provider} / ${model.id}`) && !frame.includes('Models ·'))
+        expect(app.session().id).not.toBe(previousId)
+        expect(app.session().model).toBe(model.id)
+        expect(app.session().history).toEqual([])
+        expect(await app.preferences.load()).toEqual({ ...app.defaults, model: model.id })
+        expect(app.composer().plainText).toBe('')
+        expect(app.setup.renderer.root.findDescendantById('vivi-completions')!.visible).toBe(false)
+        await app.chat(`clean chat after ${index + 1}`)
+        expect(app.requests.at(-1)).toEqual({ sessionId: app.session().id, model: model.id, prompt: `clean chat after ${index + 1}` })
+      }
+      expect(catalogCalls).toBe(3)
+      expect(app.sessions.map(session => session.model)).toEqual(['saved-default-model', byId.id, byName.id, byProvider.id])
+      await app.setup.mockInput.typeText('/exit')
+      app.setup.mockInput.pressEnter()
+      expect(await app.running).toBe(0)
+    } finally { await app.close() }
+  }, 20000)
+
+  test(`native ${provider} search cancellation preserves session/defaults and refresh preserves the live query`, async () => {
+    const fillers = Array.from({ length: 3072 }, (_, index) => nativeCatalogModel(`fixture-model-${String(index).padStart(4, '0')}`))
+    const original = nativeCatalogModel('zz-lab/cedar-3072:preview', 'Original Cedar Catalog')
+    const refreshed = nativeCatalogModel('zz-lab/aurora-3073:latest', 'Refreshed Aurora Catalog')
+    const calls: { provider: CliProviderName; refresh: boolean }[] = []
+    const app = await nativeCatalogApplication(provider, { list: async (actualProvider, key, _signal, refresh = false) => {
+      expect(actualProvider).toBe(provider)
+      expect(key).toBeUndefined()
+      calls.push({ provider: actualProvider, refresh })
+      return { state: refresh ? 'fresh' : 'cached', models: [nativeCatalogModel('saved-default-model'), ...fillers,
+        refresh ? refreshed : original] }
+    } })
+    try {
+      await app.chat('before cancelled model search')
+      const originalSession = structuredClone(app.session())
+      for (const query of ['CEDAR ORIGINAL', 'catalog-that-does-not-exist']) {
+        await app.openModels()
+        await app.setup.mockInput.typeText(query)
+        await app.setup.renderOnce()
+        const afterCancel = app.ready.nextComposer()
+        app.setup.mockInput.pressEscape()
+        await afterCancel
+        await app.setup.waitForFrame(frame => frame.includes('Enter send') && !frame.includes('Models ·'))
+        expect(app.session()).toEqual(originalSession)
+        expect(await app.preferences.load()).toEqual(app.defaults)
+        expect(await new FileSessionStore(app.directory).load(originalSession.id)).toEqual(originalSession)
+        expect(app.sessions).toHaveLength(1)
+        expect(app.composer().plainText).toBe('')
+      }
+      await app.chat('clean chat after cancellation')
+      expect(app.session().id).toBe(originalSession.id)
+      expect(app.session().history.map(message => message.content)).toEqual([
+        'before cancelled model search', 'Native catalog answer', 'clean chat after cancellation', 'Native catalog answer'
+      ])
+      await app.openModels()
+      const query = 'REFRESHED AURORA'
+      await app.setup.mockInput.typeText(query)
+      await app.setup.waitForFrame(frame => frame.includes('No matching models'))
+      app.setup.mockInput.pressKey('r', { ctrl: true })
+      await app.setup.waitForFrame(frame => frame.includes('Models ·') && frame.includes(refreshed.id))
+      expect(app.composer().plainText).toBe(query)
+      expect(app.session().id).toBe(originalSession.id)
+      expect(await app.preferences.load()).toEqual(app.defaults)
+      expect(calls).toEqual([
+        { provider, refresh: false }, { provider, refresh: false }, { provider, refresh: false }, { provider, refresh: true }
+      ])
+      const afterModel = app.ready.nextComposer()
+      app.setup.mockInput.pressEnter()
+      await afterModel
+      await app.setup.waitForFrame(frame => frame.includes(`${provider} / ${refreshed.id}`) && !frame.includes('Models ·'))
+      expect(app.session().id).not.toBe(originalSession.id)
+      expect(app.session().model).toBe(refreshed.id)
+      expect(await app.preferences.load()).toEqual({ ...app.defaults, model: refreshed.id })
+      expect(app.composer().plainText).toBe('')
+      await app.chat('clean chat after refresh')
+      expect(app.requests.at(-1)).toEqual({ sessionId: app.session().id, model: refreshed.id, prompt: 'clean chat after refresh' })
+      const preserved = await new FileSessionStore(app.directory).load(originalSession.id)
+      expect(preserved.model).toBe('saved-default-model')
+      expect(preserved.history.map(message => message.content)).toEqual([
+        'before cancelled model search', 'Native catalog answer', 'clean chat after cancellation', 'Native catalog answer'
+      ])
+      await app.setup.mockInput.typeText('/exit')
+      app.setup.mockInput.pressEnter()
+      expect(await app.running).toBe(0)
+      expect((await readdir(app.directory)).some(name => name.endsWith('.lock'))).toBe(false)
+    } finally { await app.close() }
+  }, 20000)
+}

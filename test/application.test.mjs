@@ -12,7 +12,7 @@ import { parseModelCatalog, unknownModel } from '../dist/models.js'
 const answer = content => ({ content, toolCalls: [] })
 const defaultFactory = () => ({ generate: async () => answer('Done') })
 function fakeIO(choices = [], texts = [], lines = [], secretInputs = []) {
-  return { output: '', sessions: [], events: [], results: [], closed: false, choices: [], secretTitles: [], protected: [],
+  return { output: '', sessions: [], events: [], results: [], closed: false, choices: [], searches: [], secretTitles: [], protected: [],
     get isClosed() { return this.closed },
     async choose(title, values, initial) {
       this.choices.push({ title, values: structuredClone(values), initial })
@@ -20,6 +20,16 @@ function fakeIO(choices = [], texts = [], lines = [], secretInputs = []) {
       if (value === undefined) return
       assert(values.some(choice => choice.value === value), `Choice ${String(value)} is absent from ${title}`)
       return value
+    },
+    async chooseSearchable(title, values, options = {}) {
+      this.choices.push({ title, values: structuredClone(values), initial: options.initialIndex })
+      this.searches.push({ title, values: structuredClone(values), options: structuredClone(options) })
+      const selection = choices.shift()
+      if (selection === undefined) return
+      if (selection?.kind === 'refresh') { assert.equal(options.refresh, true); return selection }
+      const value = selection?.kind === 'selected' ? selection.value : selection
+      assert(values.some(choice => choice.value === value), `Choice ${String(value)} is absent from ${title}`)
+      return { kind: 'selected', value, query: selection?.query ?? options.query ?? '' }
     },
     async askText() { return texts.shift() }, async readLine() { return lines.shift() },
     async askSecret(title) { this.secretTitles.push(title); return secretInputs.shift() },
@@ -134,13 +144,28 @@ test('catalog failure keeps saved selection explicit and downgrades unknown capa
   assert.equal(await run(directory, io, services, (_s, options) => { seen.push(options.enableTools); return defaultFactory() }), 0)
   assert.deepEqual(seen, [true, false]); assert.match(io.output, /Catalog offline/)
 })
-test('model search is partial-name filtering, refresh is explicit and cancelled search returns to picker', async t => {
+test('live model picker gets the full catalog and retains the query across explicit refresh', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'alpha' }, { id: 'beta' }])
-  const io = fakeIO(['__search', '__search', '__refresh', 'beta'], [undefined, 'bet'], ['/models', '/exit'])
+  const io = fakeIO([{ kind: 'refresh', query: 'OPENAI bet' }, 'beta'], [], ['/models', '/exit'])
   assert.equal(await run(directory, io, services, defaultFactory, [], { OPENAI_API_KEY: 'fake' }), 0)
   assert.equal(services.catalogCalls.length, 2); assert.equal(services.catalogCalls[1].refresh, true)
   assert.equal(JSON.parse(await readFile(join(directory, 'preferences.json'))).model, 'beta')
-  assert.equal(io.choices.at(-1).values.some(v => v.value === 'alpha'), false)
+  assert.equal(io.searches.length, 2)
+  assert.deepEqual(io.searches[1].options, { query: 'OPENAI bet', initialIndex: 0, refresh: true })
+  assert.deepEqual(io.searches[1].values.map(choice => choice.value), ['alpha', 'beta'])
+  assert.deepEqual(io.searches[1].values[1].searchTerms, ['beta', 'openai'])
+})
+test('model picker reaches saved and selected IDs beyond the old 250-row cutoff without sentinel collisions', async t => {
+  const directory = await fixture(t)
+  const ids = ['__refresh', '__search', ...Array.from({ length: 2000 }, (_, index) => `vendor/model-${String(index).padStart(4, '0')}`)]
+  const services = fakeServices(ids.map(id => ({ id })))
+  await new PreferenceStore(directory).save({ ...base, provider: 'openrouter', model: ids.at(-1) })
+  const io = fakeIO(['__refresh'], [], ['/models', '/exit'])
+  assert.equal(await run(directory, io, services), 0)
+  assert.equal(io.searches[0].values.length, 2002)
+  assert.equal(io.searches[0].values[io.searches[0].options.initialIndex].value, ids.at(-1))
+  assert.equal(services.catalogCalls.length, 1)
+  assert.equal(JSON.parse(await readFile(join(directory, 'preferences.json'))).model, '__refresh')
 })
 test('settings affect future sessions while explicit new resets transcripts and retains nonsecret setup', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'new-model' }])
@@ -225,7 +250,7 @@ test('authenticated catalog refresh denial exits picker without offering the pre
   services.catalog = new ModelCatalog(async () => deny ? new Response('secret-body', { status: 401 }) : new Response(JSON.stringify({ data: [{ id: 'saved-model' }] })))
   await new PreferenceStore(directory).save(base)
   const io = fakeIO([], [], ['/models', '/exit'])
-  io.choose = async (title, choices) => { io.choices.push({ title, values: choices }); deny = true; return '__refresh' }
+  io.chooseSearchable = async (title, choices) => { io.choices.push({ title, values: choices }); deny = true; return { kind: 'refresh', query: 'saved' } }
   assert.equal(await run(directory, io, services, defaultFactory, [], { OPENAI_API_KEY: 'fake-key' }), 0)
   assert.equal(io.choices.length, 1); assert.match(io.output, /access was denied/)
   assert(!io.output.includes('secret-body'))
