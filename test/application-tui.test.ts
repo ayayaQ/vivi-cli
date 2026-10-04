@@ -132,3 +132,65 @@ test('closing native UI during startup cannot start a one-shot provider request'
     expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false)
   } finally { io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
 })
+
+for (const event of ['RENDER_ERROR', 'HANDLER_ERROR'] as const) {
+  test(`one-shot native ${event} reports a safe fatal error after restoration instead of cancellation`, async () => {
+    const { CliRenderEvents } = await import('@opentui/core')
+    const directory = await mkdtemp(join(tmpdir(), 'vivi-native-prompt-failure-'))
+    const setup = await createTestRenderer({ width: 80, height: 24, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+    const io = new OpenTuiIO(setup.renderer, { secrets: ['known-secret'] })
+    const originalWrite = process.stderr.write
+    let errors = ''
+    let outputAfterRestoration = true
+    let aborted = false
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      outputAfterRestoration &&= setup.renderer.isDestroyed
+      errors += chunk.toString()
+      return true
+    }) as typeof process.stderr.write
+    try {
+      const code = await main(['--model', 'fake', '--tui', '--prompt', 'hello'],
+        { VIVI_SESSION_DIR: directory, OPENAI_API_KEY: 'known-secret' }, {
+          tuiIO: io, providerFactory: () => ({ generate: async (_input, signal) => {
+            setup.renderer.emit(CliRenderEvents[event], { error: new Error('\x1b[31mSynthetic known-secret failure\x1b[0m') })
+            aborted = signal.aborted
+            return { content: 'Must not be accepted', toolCalls: [] }
+          } })
+        })
+      expect(code).toBe(1)
+      expect(aborted).toBe(true)
+      expect(io.failed).toBe(true)
+      expect(setup.renderer.isDestroyed).toBe(true)
+      expect(outputAfterRestoration).toBe(true)
+      expect(errors).toContain('OpenTUI renderer failed: Synthetic [REDACTED] failure')
+      expect(errors).not.toContain('known-secret')
+      expect(errors).not.toContain('\x1b')
+      expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false)
+    } finally { process.stderr.write = originalWrite; io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+  })
+}
+
+test('one-shot native user cancellation remains status 130 without a fatal diagnostic', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-prompt-cancel-'))
+  const setup = await createTestRenderer({ width: 80, height: 24, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer)
+  const originalWrite = process.stderr.write
+  let errors = ''
+  let aborted = false
+  process.stderr.write = ((chunk: string | Uint8Array) => { errors += chunk.toString(); return true }) as typeof process.stderr.write
+  try {
+    const code = await main(['--model', 'fake', '--tui', '--prompt', 'hello'], { VIVI_SESSION_DIR: directory }, {
+      tuiIO: io, providerFactory: () => ({ generate: async (_input, signal) => {
+        setup.mockInput.pressCtrlC()
+        aborted = signal.aborted
+        return { content: 'Must not be accepted', toolCalls: [] }
+      } })
+    })
+    expect(code).toBe(130)
+    expect(aborted).toBe(true)
+    expect(io.failed).toBe(false)
+    expect(setup.renderer.isDestroyed).toBe(true)
+    expect(errors).toBe('')
+    expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false)
+  } finally { process.stderr.write = originalWrite; io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+})

@@ -205,7 +205,13 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (io.isClosed) continue
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
-        try { const result = await host.send(options.prompt, controller.signal); io.result(result); return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0 }
+        try {
+          const result = await host.send(options.prompt, controller.signal)
+          // Renderer failure cancels the host too, but must retain its safe fatal diagnostic.
+          if (io.failed) await io.readLine('')
+          io.result(result)
+          return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0
+        }
         finally { dispose() }
       }
       let line = await io.readLine('Message')
