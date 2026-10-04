@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliRenderer, KeyEvent, PasteEvent, Renderable } from '@opentui/core'
 import type { AgentEvent, AgentResult, HistoryMessage, Usage } from '@ayayaq/vivi'
-import type { CliSession } from './session.js'
+import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
 import type { ChatIO } from './terminal.js'
 import type { ApprovalRequest } from './tools.js'
@@ -18,11 +18,33 @@ import type { ApprovalRequest } from './tools.js'
 export interface Choice<T> { name: string; description?: string; value: T }
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[] }
 
+export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: '#18181b',
+  foreground: '#e4e4e7', selectedBackground: '#3d2946' } as const
+export const SLASH_COMMANDS = [
+  { command: '/provider', description: 'Choose a provider' },
+  { command: '/models', description: 'Choose a model' },
+  { command: '/effort', description: 'Choose reasoning effort' },
+  { command: '/new', description: 'Start a new session' },
+  { command: '/resume', description: 'Resume a saved session' },
+  { command: '/settings', description: 'Change session settings' },
+  { command: '/menu', description: 'Open the menu' },
+  { command: '/help', description: 'Show commands and shortcuts' },
+  { command: '/session', description: 'Show the current session' },
+  { command: '/exit', description: 'Exit vivi' }
+] as const
+export type SlashCommand = typeof SLASH_COMMANDS[number]
+
+/** Complete only the whole, first slash token. Ordinary text and arguments are untouched. */
+export function getSlashCommandCompletions(input: string): readonly SlashCommand[] {
+  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input)) : []
+}
+
 const MAX_INPUT = 65536
+const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
-const HINTS = '/new /resume /settings /menu /help /exit · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
-type InputKind = 'chat' | 'text' | 'approval' | 'choice'
+const HINTS = '/new /resume /settings /menu /help /exit · Tab complete · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
+type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice'
 interface PendingInput {
   kind: InputKind
   armed: boolean
@@ -73,7 +95,7 @@ function stripControls(text: string): string {
 
 /** Imperative OpenTUI surface. Only the host's history is an accepted transcript. */
 export class OpenTuiIO implements ChatIO {
-  private readonly secrets: readonly string[]
+  private secrets: readonly string[]
   private readonly stream: boolean
   private style: SyntaxStyle | undefined
   private parser: TreeSitterClient | undefined
@@ -84,6 +106,16 @@ export class OpenTuiIO implements ChatIO {
   private statusLine!: TextRenderable
   private composerBox!: BoxRenderable
   private composer!: TextareaRenderable
+  private secretMask!: TextRenderable
+  // Secret characters never enter an editable/renderable buffer or its undo history.
+  private secretInput: string[] = []
+  private secretCursor = 0
+  private completionBox!: BoxRenderable
+  private completionList!: TextRenderable
+  private completions: readonly SlashCommand[] = []
+  private completionIndex = 0
+  private completionInput = ''
+  private acceptedCompletion: string | undefined
   private hintLine!: TextRenderable
   private pickerBox!: BoxRenderable
   private picker: SelectRenderable | undefined
@@ -97,18 +129,26 @@ export class OpenTuiIO implements ChatIO {
   private changingInput = false
   private cancelCallbacks = new Set<() => void>()
   private status = 'Ready'
-  private sessionTitle = 'vivi · choose a session'
+  private sessionTitle = 'vivi · fresh conversation'
   private sessionId: string | undefined
   private usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
   private streamed = ''
   private streamOverflow = false
 
-  private readonly keyHandler = (key: KeyEvent): void => this.handleKey(key)
-  private readonly pasteHandler = (event: PasteEvent): void => this.handlePaste(event)
+  private readonly keyHandler = (key: KeyEvent): void => {
+    try { this.handleKey(key) } catch (error) { this.errorHandler({ error }) }
+  }
+  private readonly pasteHandler = (event: PasteEvent): void => {
+    try { this.handlePaste(event) } catch (error) { this.errorHandler({ error }) }
+  }
   private readonly signalHandler = (): void => this.cancelOrClose()
   private readonly exitHandler = (): void => this.close()
   private readonly errorHandler = (event: { error?: unknown }): void => {
-    this.failure = new Error(`OpenTUI renderer failed: ${this.safe(event.error instanceof Error ? event.error.message : 'native render or input handler error', 1024)}`)
+    // Hidden-input failures can contain only part of the entered key. Suppress their
+    // diagnostics entirely rather than trying to match one currently complete value.
+    const message = this.pending?.kind === 'secret' ? 'failure while reading hidden input'
+      : event.error instanceof Error ? event.error.message : 'native render or input handler error'
+    this.failure = new Error(`OpenTUI renderer failed: ${this.safe(message, 1024)}`)
     this.close()
   }
   private readonly destroyHandler = (): void => {
@@ -139,17 +179,17 @@ export class OpenTuiIO implements ChatIO {
     renderer.once(CliRenderEvents.DESTROY, this.destroyHandler)
     try {
       this.style = SyntaxStyle.fromStyles({
-        default: { fg: '#e4e4e7' }, 'markup.heading': { fg: '#a5b4fc', bold: true },
+        default: { fg: TUI_THEME.foreground }, 'markup.heading': { fg: TUI_THEME.lavender, bold: true },
         'markup.strong': { bold: true }, 'markup.italic': { italic: true },
-        'markup.raw': { fg: '#67e8f9' }, 'markup.link': { fg: '#93c5fd', underline: true },
-        'markup.list': { fg: '#a5b4fc' }, 'markup.quote': { fg: '#a1a1aa', italic: true },
+        'markup.raw': { fg: TUI_THEME.pink }, 'markup.link': { fg: TUI_THEME.lavender, underline: true },
+        'markup.list': { fg: TUI_THEME.lavender }, 'markup.quote': { fg: '#a1a1aa', italic: true },
         conceal: { fg: '#71717a' }
       })
       this.shell = new BoxRenderable(renderer, { id: 'vivi-root', width: '100%', height: '100%',
         flexDirection: 'column', backgroundColor: '#18181b' })
       renderer.root.add(this.shell)
       this.header = new TextRenderable(renderer, { id: 'vivi-header', height: 2, flexShrink: 0,
-        content: this.sessionTitle, fg: '#a5b4fc', wrapMode: 'word' })
+        content: this.sessionTitle, fg: TUI_THEME.pink, wrapMode: 'word' })
       this.transcript = new ScrollBoxRenderable(renderer, { id: 'vivi-transcript', flexGrow: 1,
         minHeight: 1, width: '100%', scrollX: false, scrollY: true, stickyScroll: true,
         stickyStart: 'bottom', contentOptions: { flexDirection: 'column', paddingX: 1 },
@@ -157,21 +197,32 @@ export class OpenTuiIO implements ChatIO {
       this.statusLine = new TextRenderable(renderer, { id: 'vivi-status', height: 1, flexShrink: 0,
         fg: '#a1a1aa', content: this.status })
       this.composerBox = new BoxRenderable(renderer, { id: 'vivi-composer-box', height: 4,
-        flexShrink: 0, border: true, borderColor: '#52525b', title: 'Message', paddingX: 1 })
+        flexShrink: 0, border: true, borderColor: TUI_THEME.pink, titleColor: TUI_THEME.pink,
+        title: 'Message', paddingX: 1 })
       this.composer = new TextareaRenderable(renderer, { id: 'vivi-composer', width: '100%', height: 2,
         wrapMode: 'word', placeholder: 'Enter a message or /menu', backgroundColor: '#18181b',
-        textColor: '#e4e4e7', focusedBackgroundColor: '#27272a', cursorColor: '#a5b4fc',
+        textColor: '#e4e4e7', focusedBackgroundColor: '#27272a', cursorColor: TUI_THEME.lavender,
         keyBindings: ['return', 'kpenter', 'linefeed'].flatMap((name) => [
           { name, action: 'submit' as const }, { name, shift: true, action: 'newline' as const },
           { name, meta: true, action: 'newline' as const }
         ]), onSubmit: () => this.submit(), onContentChange: () => this.inputChanged() })
       this.composerBox.add(this.composer)
+      this.secretMask = new TextRenderable(renderer, { id: 'vivi-secret-mask', width: '100%', height: 2,
+        visible: false, content: '', fg: TUI_THEME.lavender, wrapMode: 'none' })
+      this.composerBox.add(this.secretMask)
+      this.completionBox = new BoxRenderable(renderer, { id: 'vivi-completions', visible: false,
+        flexDirection: 'column', height: 6, flexShrink: 0, border: true, borderColor: TUI_THEME.lavender,
+        titleColor: TUI_THEME.lavender, title: 'Commands · ↑/↓ choose · Tab complete', paddingX: 1 })
+      this.completionList = new TextRenderable(renderer, { id: 'vivi-completion-list', width: '100%',
+        height: '100%', fg: TUI_THEME.lavender, wrapMode: 'none' })
+      this.completionBox.add(this.completionList)
       this.hintLine = new TextRenderable(renderer, { id: 'vivi-hints', height: 1, flexShrink: 0,
         fg: '#71717a', content: HINTS, wrapMode: 'none' })
       this.pickerBox = new BoxRenderable(renderer, { id: 'vivi-picker-box', visible: false,
-        height: 8, flexShrink: 0, border: true, borderColor: '#a5b4fc', paddingX: 1 })
-      for (const child of [this.header, this.transcript, this.statusLine, this.composerBox,
-        this.pickerBox, this.hintLine]) this.shell.add(child)
+        height: 8, flexShrink: 0, border: true, borderColor: TUI_THEME.lavender,
+        titleColor: TUI_THEME.lavender, paddingX: 1 })
+      for (const child of [this.header, this.transcript, this.statusLine, this.pickerBox,
+        this.completionBox, this.composerBox, this.hintLine]) this.shell.add(child)
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
       renderer.keyInput.on('paste', this.pasteHandler)
@@ -184,8 +235,9 @@ export class OpenTuiIO implements ChatIO {
     } catch (error) {
       // Construction can fail before a widget is attached to the renderer's root.
       // Destroy detached widgets too; renderer.destroy only owns attached children.
-      for (const widget of [this.composer, this.header, this.transcript, this.statusLine,
-        this.composerBox, this.pickerBox, this.hintLine, this.shell]) {
+      for (const widget of [this.composer, this.secretMask, this.completionList, this.header,
+        this.transcript, this.statusLine, this.composerBox, this.completionBox,
+        this.pickerBox, this.hintLine, this.shell]) {
         if (widget && !widget.parent && !widget.isDestroyed) {
           try { widget.destroyRecursively() } catch { /* Still release the renderer and hooks below. */ }
         }
@@ -208,6 +260,25 @@ export class OpenTuiIO implements ChatIO {
   get failed(): boolean { return this.failure !== undefined }
   get isClosed(): boolean { return this.closed }
 
+  /** Register credentials before any provider output can reach the surface. */
+  addSecrets(secrets: readonly string[]): void {
+    this.secrets = [...new Set([...this.secrets, ...secrets])].filter(Boolean).sort((a, b) => b.length - a.length)
+    if (this.closed) return
+    const redactEntry = (entry: DisplayEntry): DisplayEntry => ({ ...entry,
+      label: this.safe(entry.label, 4096), content: this.safe(entry.content) })
+    this.entries = this.entries.map(redactEntry)
+    this.resultNotices = this.resultNotices.map(redactEntry)
+    this.sessionTitle = this.safe(this.sessionTitle, 4096)
+    this.header.content = this.sessionTitle
+    this.composerBox.title = this.safe(this.composerBox.title ?? '', 4096)
+    this.pickerBox.title = this.safe(this.pickerBox.title ?? '', 4096)
+    if (this.picker) this.picker.options = this.picker.options.map((option) => ({ ...option,
+      name: this.safe(option.name, 1024), description: this.safe(option.description, 2048) }))
+    this.inputChanged()
+    this.rebuild()
+    this.updateStatus()
+  }
+
   private safe(text: string, limit = MAX_DISPLAY): string {
     const safe = redactSecrets(stripControls(text), this.secrets)
     return safe.length > limit ? `${safe.slice(0, limit)}\n[display truncated]` : safe
@@ -225,6 +296,9 @@ export class OpenTuiIO implements ChatIO {
     }
   }
   private clearInput(): void {
+    this.clearSecret()
+    this.acceptedCompletion = undefined
+    this.hideCompletions()
     if (!this.composer || this.composer.isDestroyed) return
     this.changingInput = true
     try { this.composer.setText('') } finally { this.changingInput = false }
@@ -233,11 +307,84 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || this.changingInput) return
     const raw = this.composer.plainText
     const safe = this.safe(raw, MAX_INPUT).slice(0, MAX_INPUT)
-    if (raw === safe) return
-    this.changingInput = true
-    try { this.composer.setText(safe); this.composer.gotoBufferEnd() }
-    finally { this.changingInput = false }
-    this.updateStatus(raw.length > MAX_INPUT ? 'Input limit: 65536 characters' : 'Control text or known credential removed from input')
+    if (raw !== safe) {
+      this.changingInput = true
+      try { this.composer.setText(safe); this.composer.gotoBufferEnd() }
+      finally { this.changingInput = false }
+      this.updateStatus(raw.length > MAX_INPUT ? 'Input limit: 65536 characters' : 'Control text or known credential removed from input')
+    }
+    this.updateCompletions()
+  }
+  private hideCompletions(): void {
+    this.completions = []
+    this.completionIndex = 0
+    this.completionInput = ''
+    if (this.completionBox) this.completionBox.visible = false
+    if (this.completionList && !this.completionList.isDestroyed) this.completionList.content = ''
+  }
+  private updateCompletions(): void {
+    const input = this.composer.plainText
+    if (input !== this.acceptedCompletion) this.acceptedCompletion = undefined
+    if (this.pending?.kind !== 'chat' || !this.pending.armed || this.cancelCallbacks.size ||
+      input === this.acceptedCompletion) { this.hideCompletions(); return }
+    this.completions = getSlashCommandCompletions(input)
+    if (!this.completions.length) { this.hideCompletions(); return }
+    if (input !== this.completionInput) this.completionIndex = 0
+    this.completionInput = input
+    this.renderCompletions()
+  }
+  private renderCompletions(): void {
+    const rows = Math.max(1, Math.min(4, this.completions.length, this.renderer.terminalHeight - 11))
+    const first = Math.min(Math.max(0, this.completionIndex - rows + 1), this.completions.length - rows)
+    this.completionList.content = this.completions.slice(first, first + rows).map((item, offset) =>
+      `${first + offset === this.completionIndex ? '›' : ' '} ${item.command}  ${item.description}`).join('\n')
+    this.completionBox.height = rows + 2
+    this.completionBox.visible = true
+  }
+  private clearSecret(): void {
+    this.secretInput.fill('')
+    this.secretInput = []
+    this.secretCursor = 0
+    if (this.secretMask && !this.secretMask.isDestroyed) this.secretMask.content = ''
+  }
+  private renderSecret(): void {
+    // Limit the mask to one terminal row without disclosing any entered characters.
+    const capacity = Math.max(1, this.renderer.terminalWidth - 10)
+    const start = Math.max(0, this.secretCursor - capacity)
+    const end = Math.min(this.secretInput.length, start + capacity)
+    this.secretMask.content = `${start ? '…' : ''}${'•'.repeat(this.secretCursor - start)}│${'•'.repeat(end - this.secretCursor)}${end < this.secretInput.length ? '…' : ''}`
+  }
+  private insertSecret(text: string): void {
+    if (/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/.test(text) ||
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)) {
+      this.updateStatus('API key input rejected: controls, line breaks or invalid Unicode are not allowed')
+      return
+    }
+    if (text.length > MAX_SECRET - this.secretInput.reduce((length, character) => length + character.length, 0)) {
+      this.updateStatus('API key input limit: 4096 characters')
+      return
+    }
+    const characters = [...text]
+    this.secretInput.splice(this.secretCursor, 0, ...characters)
+    this.secretCursor += characters.length
+    this.renderSecret()
+  }
+  private handleSecretKey(key: KeyEvent): void {
+    this.consume(key)
+    if (['return', 'kpenter', 'linefeed'].includes(key.name)) { this.submit(); return }
+    if (key.ctrl && key.name === 'u') { this.clearSecret(); this.renderSecret(); return }
+    if (key.name === 'backspace') {
+      if (this.secretCursor) this.secretInput.splice(--this.secretCursor, 1)
+    } else if (key.name === 'delete') this.secretInput.splice(this.secretCursor, 1)
+    else if (key.name === 'left') this.secretCursor = Math.max(0, this.secretCursor - 1)
+    else if (key.name === 'right') this.secretCursor = Math.min(this.secretInput.length, this.secretCursor + 1)
+    else if (key.name === 'home' || (key.ctrl && key.name === 'a')) this.secretCursor = 0
+    else if (key.name === 'end' || (key.ctrl && key.name === 'e')) this.secretCursor = this.secretInput.length
+    else if (!key.ctrl && !key.meta && !key.super && !key.hyper) {
+      this.insertSecret(key.name === 'space' ? ' ' : key.sequence)
+      return
+    }
+    this.renderSecret()
   }
   private consume(key: KeyEvent | PasteEvent): void { key.preventDefault(); key.stopPropagation() }
   private handlePaste(event: PasteEvent): void {
@@ -249,6 +396,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus('Approval requires typing allow or deny; pasted text ignored')
       return
     }
+    if (this.pending.kind === 'secret') { this.insertSecret(decodePasteBytes(event.bytes)); return }
     const text = this.safe(decodePasteBytes(event.bytes), MAX_INPUT)
     const remaining = MAX_INPUT - this.composer.plainText.length
     if (text.length > remaining) { this.updateStatus('Paste ignored: input limit is 65536 characters'); return }
@@ -259,7 +407,7 @@ export class OpenTuiIO implements ChatIO {
     if (key.eventType === 'release') { this.consume(key); return }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
       this.consume(key)
-      if (key.name === 'escape' && (this.pending?.kind === 'choice' || this.pending?.kind === 'text')) {
+      if (key.name === 'escape' && (this.pending?.kind === 'choice' || this.pending?.kind === 'text' || this.pending?.kind === 'secret')) {
         this.pending.finish(undefined)
       } else if (key.name === 'escape' && this.pending?.kind === 'chat' && !this.cancelCallbacks.size) {
         this.clearInput()
@@ -277,6 +425,23 @@ export class OpenTuiIO implements ChatIO {
     const pending = this.pending
     if (!pending?.armed) { this.consume(key); return }
     if (this.cancelCallbacks.size && pending.kind !== 'approval') { this.consume(key); return }
+    if (pending.kind === 'secret') { this.handleSecretKey(key); return }
+    if (pending.kind === 'chat' && this.completions.length && !key.ctrl && !key.meta && !key.super && !key.hyper) {
+      if (key.name === 'up' || key.name === 'down') {
+        this.consume(key)
+        this.completionIndex = (this.completionIndex + (key.name === 'up' ? -1 : 1) + this.completions.length) % this.completions.length
+        this.renderCompletions()
+        return
+      }
+      if (key.name === 'tab') {
+        this.consume(key)
+        this.acceptedCompletion = this.completions[this.completionIndex]!.command
+        this.composer.setText(this.acceptedCompletion)
+        this.composer.gotoBufferEnd()
+        this.hideCompletions()
+        return
+      }
+    }
     if (pending.kind === 'chat' && key.ctrl && ['n', 'r', 'p'].includes(key.name)) {
       this.consume(key)
       if (!this.cancelCallbacks.size && !this.composer.plainText) {
@@ -297,6 +462,13 @@ export class OpenTuiIO implements ChatIO {
   private submit(): void {
     const pending = this.pending
     if (!pending?.armed || pending.kind === 'choice' || this.closed) return
+    if (pending.kind === 'secret') {
+      const value = this.secretInput.join('')
+      // Register before resolving, so immediate host/provider errors are already redacted.
+      if (value) this.addSecrets([value])
+      pending.finish(value)
+      return
+    }
     const text = this.composer.plainText
     if (pending.kind === 'approval') {
       const reply = text.trim().toLowerCase()
@@ -319,12 +491,26 @@ export class OpenTuiIO implements ChatIO {
     this.pending?.finish(undefined)
     this.clearInput()
     this.disableComposer()
+    if (kind === 'secret') {
+      // OpenTUI 0.5.14 captures raw stdin before global key/paste handlers. Its public
+      // API has no per-input logging switch, so fail closed rather than expose a key.
+      const capture = this.renderer as unknown as { readonly stdinLogPath?: string; readonly _debugModeEnabled?: boolean }
+      const debugRequested = ['true', '1', 'on', 'yes'].includes((process.env.OTUI_DEBUG ?? '').toLowerCase())
+      if (process.env.OTUI_STDIN_LOG || debugRequested || capture.stdinLogPath || capture._debugModeEnabled) {
+        this.updateStatus('API key entry blocked: raw input capture is enabled')
+        throw new Error('Disable OTUI_STDIN_LOG and OTUI_DEBUG, then restart vivi before entering an API key')
+      }
+    }
     this.composerBox.visible = kind !== 'choice'
+    this.composer.visible = kind !== 'secret'
+    this.secretMask.visible = kind === 'secret'
     this.composerBox.title = this.safe(title, 4096)
     this.hintLine.content = kind === 'chat' ? HINTS : kind === 'approval'
       ? 'Type allow or deny · Enter defaults to deny · Escape cancels · pasted approvals are ignored'
-      : kind === 'choice' ? '↑/↓ select · Enter confirm · Escape back' : 'Enter confirm · Shift/Alt+Enter newline · Escape back'
-    if (kind !== 'choice') this.composer.setText(this.safe(initial, MAX_INPUT).slice(0, MAX_INPUT))
+      : kind === 'choice' ? '↑/↓ select · Enter confirm · Escape back'
+      : kind === 'secret' ? 'Input hidden · Enter confirm · Escape back · Ctrl+U clear'
+      : 'Enter confirm · Shift/Alt+Enter newline · Escape back'
+    if (kind !== 'choice' && kind !== 'secret') this.composer.setText(this.safe(initial, MAX_INPUT).slice(0, MAX_INPUT))
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const abort = (): void => pending.finish(undefined, true)
@@ -338,6 +524,8 @@ export class OpenTuiIO implements ChatIO {
         if (this.picker) { this.picker.destroyRecursively(); this.picker = undefined }
         this.pickerBox.visible = false
         this.composerBox.visible = true
+        this.composer.visible = true
+        this.secretMask.visible = false
         this.composerBox.title = 'Message'
         this.hintLine.content = HINTS
         if (this.failure) reject(this.failure)
@@ -358,11 +546,13 @@ export class OpenTuiIO implements ChatIO {
           this.composer.showCursor = true
           this.composer.focus()
         }, 0)
-      } else if (kind !== 'choice') {
+      } else if (kind === 'secret') this.renderSecret()
+      else if (kind !== 'choice') {
         this.composer.traits = {}
         this.composer.showCursor = true
         this.composer.focus()
         this.composer.gotoBufferEnd()
+        this.updateCompletions()
       }
     })
   }
@@ -372,6 +562,10 @@ export class OpenTuiIO implements ChatIO {
   }
   async askText(title: string, initial = ''): Promise<string | undefined> {
     const value = await this.openInput('text', title, initial)
+    return typeof value === 'string' ? value : undefined
+  }
+  async askSecret(title: string): Promise<string | undefined> {
+    const value = await this.openInput('secret', title)
     return typeof value === 'string' ? value : undefined
   }
   async choose<T>(title: string, choices: readonly Choice<T>[], initialIndex = 0): Promise<T | undefined> {
@@ -388,8 +582,9 @@ export class OpenTuiIO implements ChatIO {
           description: this.safe(choice.description ?? '', 2048), value: index })),
         selectedIndex: Math.max(0, Math.min(choices.length - 1, Number.isFinite(initialIndex) ? Math.trunc(initialIndex) : 0)),
         showDescription: true, showScrollIndicator: true, wrapSelection: true,
-        backgroundColor: '#18181b', textColor: '#e4e4e7', selectedBackgroundColor: '#312e81',
-        selectedTextColor: '#ffffff', descriptionColor: '#a1a1aa' })
+        backgroundColor: TUI_THEME.background, textColor: TUI_THEME.foreground,
+        selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
+        descriptionColor: '#a1a1aa', selectedDescriptionColor: TUI_THEME.lavender })
       this.picker.on(SelectRenderableEvents.ITEM_SELECTED, (index: number) => this.pending?.finish(index))
       this.pickerBox.add(this.picker)
       this.picker.focus()
@@ -428,7 +623,7 @@ export class OpenTuiIO implements ChatIO {
       // Plain fenced code is readable offline and does not fetch language grammars.
       renderNode: (token, context) => {
         if (token.type === 'code') return new TextRenderable(this.renderer, {
-          content: token.text, fg: '#67e8f9', width: '100%', wrapMode: 'word', flexShrink: 0 })
+          content: token.text, fg: TUI_THEME.pink, width: '100%', wrapMode: 'word', flexShrink: 0 })
         const rendered = context.defaultRender()
         const readable = (node: Renderable): void => {
           if (node instanceof CodeRenderable) node.drawUnstyledText = true
@@ -440,7 +635,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private addEntry(entry: DisplayEntry): Renderable {
     const box = new BoxRenderable(this.renderer, { flexDirection: 'column', flexShrink: 0, width: '100%', marginBottom: 1 })
-    box.add(new TextRenderable(this.renderer, { content: entry.label, fg: '#a5b4fc', flexShrink: 0, wrapMode: 'word' }))
+    box.add(new TextRenderable(this.renderer, { content: entry.label, fg: TUI_THEME.pink, flexShrink: 0, wrapMode: 'word' }))
     if (entry.content) box.add(entry.markdown ? this.markdown(entry.content) : new TextRenderable(this.renderer,
       { content: entry.content, fg: '#e4e4e7', width: '100%', wrapMode: 'word', flexShrink: 0 }))
     this.transcript.add(box)
@@ -484,6 +679,18 @@ export class OpenTuiIO implements ChatIO {
     if (entries.length < history.length) entries.unshift({ label: 'Display limit',
       content: 'Earlier transcript is omitted from this bounded view; saved history is unchanged', markdown: false })
     return entries
+  }
+  setDraft(provider: CliProviderName): void {
+    if (this.closed) return
+    this.sessionId = undefined
+    this.sessionTitle = `vivi · fresh conversation · ${provider} · choose a model with /models`
+    this.header.content = this.sessionTitle
+    this.clearStream()
+    this.entries = []
+    this.resultNotices = []
+    this.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+    this.rebuild()
+    this.updateStatus('Ready')
   }
   setSession(session: CliSession): void {
     if (this.closed) return
@@ -592,6 +799,8 @@ export class OpenTuiIO implements ChatIO {
     process.off('exit', this.exitHandler)
     this.streamed = ''
     this.entries = []
+    this.clearSecret()
+    this.secrets = []
     if (destroyRenderer && !this.renderer.isDestroyed) this.renderer.destroy()
   }
   close(): void { this.dispose(true) }

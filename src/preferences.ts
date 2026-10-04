@@ -64,7 +64,7 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
   }
   check(fields.schemaVersion === 1, 'unsupported schema version')
   check(fields.provider === 'openai' || fields.provider === 'openrouter', 'unsupported provider')
-  check(typeof fields.model === 'string' && fields.model.length > 0 && fields.model.length <= 200 &&
+  check(typeof fields.model === 'string' && fields.model.length <= 200 &&
     fields.model.trim() === fields.model && !/[\u0000-\u001f\u007f-\u009f]/.test(fields.model), 'invalid model')
   check(typeof fields.reasoning === 'string' &&
     (fields.reasoning === 'default' || efforts.includes(fields.reasoning as ReasoningEffort)), 'invalid reasoning')
@@ -87,6 +87,8 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
   check(typeof fields.stream === 'boolean' && typeof fields.enableTools === 'boolean' &&
     typeof fields.enableNotes === 'boolean', 'invalid toggle')
   check(!fields.enableNotes || fields.enableTools, 'notes require explicitly enabled tools')
+  check(fields.model !== '' || (fields.reasoning === 'default' && supported.length === 0 && !fields.enableTools && !fields.enableNotes),
+    'unselected model cannot declare capabilities')
   check(Number.isSafeInteger(fields.maxRounds) && Number(fields.maxRounds) >= 1 && Number(fields.maxRounds) <= 100,
     'maxRounds must be an integer from 1 to 100')
   const preferences: TuiPreferences = {
@@ -125,11 +127,12 @@ function privateFile(info: Stats): boolean {
 /** Private, bounded JSON; writes use a unique 0600 temporary file and durable atomic rename. */
 export class PreferenceStore {
   readonly directory: string
-  private readonly secrets: readonly string[]
+  private readonly secrets: string[]
   constructor(directory: string, secrets: readonly string[] = []) {
     this.directory = resolve(directory)
     this.secrets = [...secrets]
   }
+  addSecrets(secrets: readonly string[]): void { this.secrets.push(...secrets.filter(secret => secret && !this.secrets.includes(secret))) }
   async load(): Promise<TuiPreferences | undefined> {
     const directory = await privateDirectory(this.directory)
     if (!directory) return undefined

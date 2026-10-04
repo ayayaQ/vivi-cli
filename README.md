@@ -17,7 +17,7 @@ npm run build
 bun dist/launcher.js
 ```
 
-The development package pins `@ayayaq/vivi@0.2.0`, `@opentui/core@0.5.14` and
+The development package pins `@ayayaq/vivi@0.2.1`, `@opentui/core@0.5.14` and
 `web-tree-sitter@0.25.10`. npm on Node 22/24 can warn about OpenTUI's newer Node
 engine requirement; this application loads the native UI only under Bun. It does
 not use Node's experimental FFI. Native dependencies must not be omitted for TUI use.
@@ -37,35 +37,72 @@ archives or copied provider implementations are committed to this repository.
 
 ## Interactive conversations
 
-Set `OPENAI_API_KEY` or `OPENROUTER_API_KEY` in your own environment, then launch
-`vivi` without arguments. The welcome screen lets you start or resume a conversation.
-First-time setup selects provider, exact model identifier, reasoning capabilities and
-tool support. Nonsecret defaults are saved atomically as private settings alongside
-sessions. Credentials are never requested in the UI or saved in settings.
+Launch `vivi` without arguments to enter a fresh conversation immediately. The interface uses
+pink `#f87ea2` and lavender `#b08bfc` accents inspired by kikirara vivi. There is no welcome
+menu and no automatic resume; `/resume` explicitly selects an older conversation.
+Nonsecret defaults and provider setup carry over to the next launch.
 
-Model IDs are entered manually; there is no downloaded or guessed model catalog.
-Reasoning defaults to the provider's behavior. Only explicitly declared, verified
-reasoning efforts appear as choices. Default does not mean reasoning disabled.
-Tool support defaults to chat only; declare checked support to enable the bounded
-calculator/time tools, then optionally enable approval-gated session notes.
-Declarations belong to a provider/model pair and are cleared when that pair changes.
+Use `/provider` to choose OpenAI or OpenRouter and enter a key in a masked modal.
+An environment key takes precedence over a saved key. Secure persistence is offered only
+when the platform's credential service is available; otherwise choose “this launch only”.
+There is no plaintext fallback, and a failed save needs an explicit session-only choice.
+Keys never enter the composer, transcript, settings, command arguments or helper diagnostics.
+OpenTUI raw-stdin logging/debug capture must be disabled before masked key entry is allowed.
+
+Native storage uses Windows Credential Manager (the current user's local-machine vault),
+macOS Keychain or Linux Secret Service via `secret-tool`. Windows uses the installed system
+PowerShell helper without a profile or execution-policy changes; no extra credential package
+is required. A disabled/constrained helper, locked vault or missing Secret Service is reported
+explicitly. Save success requires an exact in-memory read-back. Native vault integration is
+fake-tested here; no real Windows/macOS/Linux vault calls have been validated on this Linux host.
+Windows credential blobs are limited to 2,560 UTF-8 bytes; macOS helper framing has a smaller
+limit than the 4,096-character input bound. Oversized native writes fail before helper execution.
+
+`/models` loads provider model IDs into a picker. Search accepts partial names, and Refresh
+reloads the catalog. OpenAI uses the authenticated Models API; OpenRouter uses its authenticated
+account-filtered model catalog when a key is available. A global unauthenticated catalog does
+not establish account eligibility. Model discovery is bounded, cancellable and cached in memory
+for up to 15 minutes. Offline/stale results are labelled; authentication denial never reuses
+cached results. With no catalog, an existing saved model can be retained explicitly with unknown
+capabilities. The routine setup flow never asks you to type an exact model identifier.
+
+`/effort` offers provider default and only this model's verified supported efforts.
+OpenRouter reasoning metadata drives the options dynamically, including mandatory reasoning
+which hides disabled/none. OpenAI's Models API does not publish capability metadata, so exact
+Responses-model IDs use a small official-documentation registry. Known embedding, audio-only,
+image-only and other incompatible endpoint models are excluded. Unknown IDs are visibly
+unverified and require a separate compatibility choice, with tools disabled and default reasoning. Provider default always means omitting an effort override.
+Calculator/time tools are enabled automatically only for verified model capabilities; session
+notes remain opt-in and each write requires approval. Known nonstreaming OpenAI models use
+accepted complete messages instead of streaming. Capability claims are scoped to provider/model. OpenRouter requests that use tools or an
+explicit reasoning override require routes supporting all supplied parameters, through the
+published `@ayayaq/vivi@0.2.1` provider contract. If no suitable route is available, the gateway
+returns an error instead of silently ignoring those capabilities. Chat-only requests omit tool
+fields, and default reasoning remains an omitted override.
+
+Metadata contracts: [OpenAI Models API](https://developers.openai.com/api/reference/resources/models/methods/list),
+[OpenAI model documentation](https://developers.openai.com/api/docs/models),
+[OpenRouter model reasoning metadata](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#discovering-per-model-reasoning-options).
 
 The full-screen interface includes a multiline composer, scrollable Markdown chat,
 streaming preview, tool activity, usage and session status. Enter sends;
 Shift+Enter or Alt+Enter adds a line, depending on terminal keyboard support.
-PageUp/PageDown scroll while keeping the composer intact. `/menu` opens actions;
-Ctrl+P opens the same menu, Ctrl+N starts a new conversation, and Ctrl+R selects a
-session when the composer is empty. `/help` shows shortcuts.
+PageUp/PageDown scroll while keeping the composer intact. Slash-command suggestions appear
+above the composer; Up/Down selects a suggestion and Tab accepts it without sending.
+Ordinary input and command arguments do not trigger completion.
+`/menu` or Ctrl+P opens actions, Ctrl+N starts fresh, and Ctrl+R selects a session
+when the composer is empty. `/help` shows shortcuts.
 
-- `/new` starts with the saved defaults
-- `/settings` changes provider/model/reasoning/tool defaults for future sessions
-- `/resume` selects an unlocked, validated local session
-- `/session` displays the current UUID; `/exit` quits
+- `/provider` configures the provider and key, then opens the model picker
+- `/models` selects a model; `/effort` selects its supported reasoning effort
+- Provider/model/effort changes start a fresh conversation and preserve the old transcript
+- `/new` starts with saved defaults; `/settings` changes defaults for future conversations
+- `/resume` selects an unlocked validated session; `/session` displays the current UUID; `/exit` quits
 
 An existing session retains its provider/model/reasoning. Changing defaults does not
 rewrite that session. The picker reads metadata only, scanning at most 1,000 directory
 entries and showing up to 100 valid sessions, newest first within that bounded scan.
-Locked sessions are excluded. A resumed nondefault effort without matching saved
+Locked sessions are excluded. A resumed nondefault effort without matching saved or documented
 capabilities requires a fresh explicit declaration before provider construction.
 
 Escape or Ctrl+C cancels a running turn or approval; Ctrl+C while idle exits.
@@ -99,8 +136,8 @@ vivi --provider openai --model YOUR_MODEL --reasoning high --reasoning-capabilit
 vivi --provider openrouter --model PROVIDER/MODEL --reasoning disabled --reasoning-capabilities none
 ```
 
-No arbitrary endpoint, credential flag, automatic provider retry, key storage,
-unrestricted filesystem tool or shell tool is provided.
+No arbitrary endpoint, credential flag, automatic provider retry, plaintext key storage,
+unrestricted filesystem tool or shell tool is provided. Line mode continues to accept environment keys.
 
 ## Development checks and local standalone builds
 
@@ -113,8 +150,8 @@ npm run build:standalone       # Current-platform local executable in build/
 ./build/vivi --help
 ```
 
-Checks use fake providers and temporary directories, without API keys or live model
-calls. The package check explicitly prepares a fresh registry dependency cache, verifies
+Checks use fake providers, fake keys, mocked OS credential helpers and temporary directories,
+without real API keys, native vault mutations or live model calls. The package check explicitly prepares a fresh registry dependency cache, verifies
 OpenTUI/parser resolution and integrity against the lockfile, then reinstalls the isolated
 consumer offline from that prepared cache. Registry access is required for preparation. Native UI tests use OpenTUI's official headless test renderer, not terminal UI
 automation. CI retains Node 22/24 checks and adds a standard Ubuntu Bun job.
@@ -136,7 +173,7 @@ Use the displayed UUID with `--resume UUID`. Provider/model/reasoning remain tho
 session; use a new session to change them. For nondefault reasoning, repeat the checked
 `--reasoning-capabilities` declaration when resuming. `--session-dir DIRECTORY` chooses the CLI's own
 storage location. Session files contain canonical history, optional native continuation state,
-usage and opt-in notes, so treat them as private conversation data. Known environment credentials
+usage and opt-in notes, so treat them as private conversation data. Known environment and configured credentials
 are rejected in outgoing prompts and redacted from persisted/displayed data; this is defense in
 depth, not a general secret scanner. Do not type secrets into conversations.
 

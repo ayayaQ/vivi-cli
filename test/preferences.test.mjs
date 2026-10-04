@@ -62,7 +62,7 @@ test('preferences reject unsupported, credential, extra and out-of-bounds settin
   const missing = preferences(); delete missing.stream;
   const invalid = [null, [], {}, missing, { ...preferences(), schemaVersion: 2 },
     { ...preferences(), apiKey: 'a-credential' }, { ...preferences(), history: [] },
-    { ...preferences(), provider: 'arbitrary-provider' }, { ...preferences(), model: '' },
+    { ...preferences(), provider: 'arbitrary-provider' }, { ...preferences(), model: '', enableTools: true },
     { ...preferences(), model: ' padded' }, { ...preferences(), model: 'x'.repeat(201) },
     { ...preferences(), model: 'model\u001b[31m' }, { ...preferences(), reasoning: 'disabled' },
     { ...preferences(), reasoning: 'high' }, { ...preferences(), reasoningCapabilities: ['default'] },
@@ -321,4 +321,9 @@ test('session picker tolerates absent directories and refuses public directories
     await chmod(directory, 0o755);
     await assert.rejects(listSessions(new FileSessionStore(directory)), /0700/);
   }
+});
+
+test('provider setup can be saved before selecting a model, without any capability claims', () => {
+  assert.equal(validatePreferences({ ...preferences(), model: '' }).model, '');
+  assert.throws(() => validatePreferences({ ...preferences(), model: '', reasoning: 'high', reasoningCapabilities: ['high'] }));
 });
