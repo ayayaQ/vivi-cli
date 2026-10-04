@@ -14,8 +14,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.2.0'
-const coreIntegrity = 'sha512-4qxPGSjhKgJKx01fV18V4qvzlVQxkhyiXhPX+KpnbevDYFMilAlnlhx7JIPyWZENG6zUOYSRB6xnQkTT0K1usw=='
+const coreVersion = '0.2.1'
+const coreIntegrity = 'sha512-iMuY7HbBfRljH9yTMS0unR98WctuNjYVUYrXOOuLYbwlscydW2TKwVKhw9ec6SVjtqFwjPQdn7tLkoYi4pUkmA=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -38,7 +38,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.2.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.2.1 release bytes')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -50,6 +50,7 @@ try {
   const paths = new Set(packed.files.map((file) => file.path))
   for (const path of ['LICENSE', 'NOTICE', 'README.md', 'RELEASING.md', 'package.json', 'tsconfig.json',
     'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
+    'src/models.ts', 'src/credentials.ts', 'dist/models.js', 'dist/credentials.js',
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts']) assert(paths.has(path), `Missing ${path}`)

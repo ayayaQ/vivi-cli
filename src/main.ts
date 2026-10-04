@@ -14,6 +14,8 @@ import type { CliProviderName, CliSession } from './session.js'
 import { TerminalIO, runChatLoop } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
+import type { Catalog } from './models.js'
+import type { CredentialStore } from './credentials.js'
 
 export interface CliOptions {
   provider?: CliProviderName
@@ -52,7 +54,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
   --help                      Show this help
 
-Credentials: OPENAI_API_KEY or OPENROUTER_API_KEY environment variables only.
+Credentials: environment variables, or masked /provider setup in the full-screen UI.
 Full-screen UI requires Bun >=1.3.0; Node >=22 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id.
 Streaming is display-only. Notes never access other files; piped approval is denied.
@@ -152,12 +154,14 @@ export function providerForSession(session: CliSession, options: CliOptions, env
   if (!apiKey) throw new Error(session.provider === 'openai' ? 'Set OPENAI_API_KEY in your environment' : 'Set OPENROUTER_API_KEY in your environment')
   const common = { model: session.model, apiKey, reasoning: reasoningPolicy(session.reasoning),
     supportedReasoningEfforts: options.reasoningCapabilities, stream: options.stream }
-  return session.provider === 'openai' ? createOpenAIProvider(common) : createOpenRouterProvider(common)
+  return session.provider === 'openai' ? createOpenAIProvider(common) : createOpenRouterProvider({ ...common,
+    requireSupportedParameters: options.enableTools || (session.reasoning !== undefined && session.reasoning !== 'default') })
 }
 
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
-  dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession } = {}): Promise<number> {
+  dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
+    credentials?: CredentialStore; catalog?: Catalog } = {}): Promise<number> {
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
   const secrets = environmentSecrets(env)
@@ -173,6 +177,9 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets })
       io = tui
       return await runApplication({ io: tui, options, args, env, secrets,
+        ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
+        ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
+        registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
         providerFactory: dependencies.providerFactory ?? providerForSession })
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })

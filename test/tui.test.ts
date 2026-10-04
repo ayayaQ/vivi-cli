@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, expect, test } from 'bun:test'
-import { CliRenderEvents, CodeRenderable } from '@opentui/core'
+import { afterEach, expect, spyOn, test } from 'bun:test'
+import { BoxRenderable, CliRenderEvents, CodeRenderable, RGBA, SelectRenderable,
+  TextareaRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import type { TestRendererSetup } from '@opentui/core/testing'
 import type { AgentResult, HistoryMessage } from '@ayayaq/vivi'
-import { OpenTuiIO } from '../src/tui.js'
+import { getSlashCommandCompletions, OpenTuiIO, SLASH_COMMANDS, TUI_THEME } from '../src/tui.js'
 import { newSession } from '../src/session.js'
 
 const fixtures: { io: OpenTuiIO; setup: TestRendererSetup }[] = []
@@ -36,6 +37,369 @@ const result = (content: string, status: AgentResult['status'] = 'completed'): A
 })
 const request = { call: { id: 'note-1', name: 'note_set', arguments: { key: 'topic', value: 'test', expectedRevision: 4 } },
   description: 'Set session note topic to test', currentRevision: 4 }
+const renderedText = (node: Renderable): string => [
+  node instanceof TextRenderable || node instanceof TextareaRenderable ? node.plainText : '',
+  node instanceof BoxRenderable ? `${node.title ?? ''} ${node.bottomTitle ?? ''}` : '',
+  node instanceof SelectRenderable ? JSON.stringify(node.options) : '',
+  ...node.getChildren().map(renderedText)
+].join('\n')
+
+test('slash command helpers match only the sole starting token', () => {
+  expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
+    '/provider', '/models', '/effort', '/new', '/resume', '/settings', '/menu', '/help', '/session', '/exit'
+  ])
+  expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
+  expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/menu'])
+  expect(getSlashCommandCompletions('/provider').map(({ command }) => command)).toEqual(['/provider'])
+  for (const input of ['', 'message', ' /m', 'message /m', '/m ', '/models argument', '/m\n', '/unknown']) {
+    expect(getSlashCommandCompletions(input)).toEqual([])
+  }
+})
+
+test('autocomplete renders above composer, arrows cycle and Tab accepts without submitting', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const line = io.readLine('Message')
+  let submitted = false
+  void line.then(() => { submitted = true })
+  await input.typeText('/m')
+  const display = await frame()
+  expect(display).toContain('› /models')
+  expect(display).toContain('/menu')
+  const completions = setup.renderer.root.findDescendantById('vivi-completions')!
+  const composerBox = setup.renderer.root.findDescendantById('vivi-composer-box')!
+  expect(completions.y + completions.height).toBeLessThanOrEqual(composerBox.y)
+  input.pressArrow('up') // Wrap from the first match to the last.
+  expect(await frame()).toContain('› /menu')
+  input.pressArrow('down')
+  expect(await frame()).toContain('› /models')
+  input.pressArrow('down')
+  input.pressTab()
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  expect(composer.plainText).toBe('/menu')
+  expect(completions.visible).toBe(false)
+  await Promise.resolve()
+  expect(submitted).toBe(false)
+  input.pressEnter()
+  expect(await line).toBe('/menu')
+})
+
+test('autocomplete leaves ordinary text, arguments, unknown commands and askText alone', async () => {
+  const { io, setup, input, frame } = await fixture()
+  for (const text of ['ordinary /m', '/models argument', '/unknown']) {
+    const line = io.readLine('Message')
+    await input.typeText(text)
+    await frame()
+    const completions = setup.renderer.root.findDescendantById('vivi-completions')!
+    expect(completions.visible).toBe(false)
+    input.pressArrow('left')
+    input.pressArrow('right')
+    input.pressTab()
+    input.pressEnter()
+    expect(await line).toBe(text)
+  }
+  const text = io.askText('Model identifier')
+  await input.typeText('/m')
+  expect(setup.renderer.root.findDescendantById('vivi-completions')!.visible).toBe(false)
+  input.pressTab()
+  input.pressEnter()
+  expect(await text).toBe('/m')
+})
+
+test('autocomplete keeps the composer visible in a compact native terminal', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 40, height: 12 })
+  const line = io.readLine('Message')
+  await input.typeText('/')
+  expect(await frame()).toContain('› /provider')
+  const completions = setup.renderer.root.findDescendantById('vivi-completions')!
+  const composer = setup.renderer.root.findDescendantById('vivi-composer-box')!
+  expect(completions.y + completions.height).toBeLessThanOrEqual(composer.y)
+  expect(composer.y + composer.height).toBeLessThanOrEqual(12)
+  io.close()
+  expect(await line).toBeUndefined()
+})
+
+test('autocomplete clears on Escape, aborted input and running-turn cancellation', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const controller = new AbortController()
+  const line = io.readLine('Message', controller.signal)
+  const rejected = line.catch((error: Error) => error.message)
+  await input.typeText('/s')
+  expect(await frame()).toContain('› /settings')
+  input.pressEscape()
+  expect(setup.renderer.root.findDescendantById('vivi-completions')!.visible).toBe(false)
+  expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
+  await input.typeText('/p')
+  controller.abort()
+  expect(await rejected).toBe('Input cancelled')
+  expect(setup.renderer.root.findDescendantById('vivi-completions')!.visible).toBe(false)
+  const next = io.readLine('Message')
+  await input.typeText('/m')
+  let cancellations = 0
+  const dispose = io.onCancel(() => { cancellations++ })
+  input.pressTab()
+  input.pressEscape()
+  expect(cancellations).toBe(1)
+  expect(setup.renderer.root.findDescendantById('vivi-completions')!.visible).toBe(false)
+  dispose()
+  io.close()
+  expect(await next).toBeUndefined()
+})
+
+test('API key typing is bullet-only in frames, widgets and logs, then immediately redacted', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const secret = 'sk-live-never-render-me'
+  const logs: string[] = []
+  const spies = ['log', 'warn', 'error'].map((method) => spyOn(console, method as 'log')
+    .mockImplementation((...values: unknown[]) => { logs.push(values.map(String).join(' ')) }))
+  try {
+    const answer = io.askSecret('OpenAI API key')
+    for (let index = 0; index < secret.length; index++) {
+      await input.typeText(secret[index]!)
+      const display = await frame()
+      expect(display).toContain('•')
+      if (index >= 2) {
+        const prefix = secret.slice(0, index + 1)
+        expect(display).not.toContain(prefix)
+        expect(renderedText(setup.renderer.root)).not.toContain(prefix)
+        expect(JSON.stringify(setup.captureSpans())).not.toContain(prefix)
+      }
+      expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
+    }
+    input.pressEnter()
+    expect(await answer).toBe(secret)
+    expect((setup.renderer.root.findDescendantById('vivi-secret-mask') as TextRenderable).plainText).toBe('')
+    io.write(`Provider rejected ${secret}`)
+    io.event({ type: 'tool_started', call: { id: 'key', name: secret, arguments: {} } })
+    const session = newSession({ provider: 'openai', model: secret })
+    session.history = history(`Response echoed ${secret}`)
+    io.setSession(session)
+    const display = await frame()
+    expect(display).toContain('[REDACTED]')
+    expect(display).not.toContain(secret)
+    expect(renderedText(setup.renderer.root)).not.toContain(secret)
+    expect(logs.join('\n')).not.toContain(secret)
+    expect(setup.externalOutput.takeText()).not.toContain(secret)
+  } finally { for (const spy of spies) spy.mockRestore() }
+})
+
+test('API key paste and editing use only the password model and never render pasted text', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const secret = 'pasted-api-key-123'
+  const answer = io.askSecret('Paste API key')
+  await input.pasteBracketedText(secret)
+  expect(await frame()).not.toContain(secret)
+  expect(renderedText(setup.renderer.root)).not.toContain(secret)
+  expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
+  input.pressArrow('left')
+  input.pressBackspace()
+  await input.typeText('X')
+  input.pressKey('HOME')
+  await input.typeText('!')
+  input.pressKey('END')
+  input.pressEnter()
+  expect(await answer).toBe('!pasted-api-key-1X3')
+  expect(await frame()).not.toContain('pasted-api-key')
+  const pastedKnown = io.askSecret('Enter the same saved key again')
+  await input.pasteBracketedText('!pasted-api-key-1X3')
+  input.pressEnter()
+  expect(await pastedKnown).toBe('!pasted-api-key-1X3')
+})
+
+test('API key cancellation, replacement, clear and repeated prompts cannot carry stale characters', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const first = io.askSecret('First API key')
+  await input.typeText('discard-on-cancel')
+  input.pressEscape()
+  expect(await first).toBeUndefined()
+  const mask = setup.renderer.root.findDescendantById('vivi-secret-mask') as TextRenderable
+  expect(mask.plainText).toBe('')
+  const second = io.askSecret('Second API key')
+  input.pressEnter()
+  expect(await second).toBe('')
+  const replaced = io.askSecret('Replace this key')
+  await input.typeText('discard-on-replace')
+  const replacement = io.askSecret('Replacement API key')
+  expect(await replaced).toBeUndefined()
+  await input.typeText('clear-this-key')
+  input.pressKey('u', { ctrl: true })
+  await input.typeText('fresh-secret')
+  input.pressEnter()
+  expect(await replacement).toBe('fresh-secret')
+  const line = io.readLine('Message')
+  input.pressKey('-', { ctrl: true }) // The ordinary editor has no password undo history.
+  expect(await frame()).not.toContain('fresh-secret')
+  expect(renderedText(setup.renderer.root)).not.toContain('discard-on-')
+  input.pressEnter()
+  expect(await line).toBe('')
+})
+
+test('API key close and renderer failures clear the model and redact the active credential', async () => {
+  for (const action of ['close', 'escape', 'ctrl-c', 'destroy', 'error'] as const) {
+    const { io, setup, input, frame } = await fixture()
+    const secret = 'active-secret-never-printed'
+    const answer = io.askSecret('API key')
+    const outcome = answer.catch((error: Error) => error.message)
+    await input.typeText(secret)
+    expect(await frame()).not.toContain(secret)
+    const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+    const mask = setup.renderer.root.findDescendantById('vivi-secret-mask') as TextRenderable
+    expect(composer.plainText).toBe('')
+    if (action === 'error') setup.renderer.emit(CliRenderEvents.HANDLER_ERROR,
+      { error: new Error(`Failure ${secret.slice(0, 10)}\x1b[31m${secret.slice(10)}\x1b[0m`) })
+    else if (action === 'close') io.close()
+    else if (action === 'destroy') setup.renderer.destroy()
+    else if (action === 'escape') input.pressEscape()
+    else input.pressCtrlC()
+    expect(await outcome).toBe(action === 'error' ? 'OpenTUI renderer failed: failure while reading hidden input' : undefined)
+    expect((io as unknown as { secretInput: string[] }).secretInput).toEqual([])
+    if (!mask.isDestroyed) expect(mask.plainText).toBe('')
+    expect(setup.externalOutput.takeText()).not.toContain(secret)
+  }
+})
+
+test('password input handler failures are redacted before OpenTUI can log them', async () => {
+  for (const handler of ['handleKey', 'handlePaste'] as const) {
+    const { io, input } = await fixture()
+    const secret = 'secret-only-in-password-model'
+    const answer = io.askSecret('API key')
+    const outcome = answer.catch((error: Error) => error.message)
+    await input.typeText(secret)
+    const logs: string[] = []
+    const logger = spyOn(console, 'error').mockImplementation((...values: unknown[]) => {
+      logs.push(values.map(String).join(' '))
+    })
+    try {
+      Object.assign(io, { [handler]: () => { throw new Error(`Input handler failure ${secret.slice(0, 7)}`) } })
+      if (handler === 'handleKey') input.pressKey('F1')
+      else await input.pasteBracketedText('irrelevant')
+      expect(await outcome).toBe('OpenTUI renderer failed: failure while reading hidden input')
+      expect(logs.join('\n')).not.toContain(secret)
+      expect(logs.join('\n')).not.toContain(secret.slice(0, 7))
+      expect(io.isClosed).toBe(true)
+      expect((io as unknown as { secretInput: string[] }).secretInput).toEqual([])
+    } finally { logger.mockRestore() }
+  }
+})
+
+test('API key entry fails closed when OpenTUI raw input logging or debug capture is enabled', async () => {
+  for (const capture of [{ stdinLogPath: '/unused-test-capture.log' }, { _debugModeEnabled: true }]) {
+    const { io, setup, input, frame } = await fixture()
+    const earlier = io.readLine('Message')
+    await input.typeText('ordinary draft')
+    Object.assign(setup.renderer, capture)
+    await expect(io.askSecret('API key')).rejects.toThrow('Disable OTUI_STDIN_LOG and OTUI_DEBUG')
+    expect(await earlier).toBeUndefined()
+    expect(await frame()).toContain('API key entry blocked')
+    expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
+    expect((io as unknown as { secretInput: string[] }).secretInput).toEqual([])
+    Object.assign(setup.renderer, { stdinLogPath: '', _debugModeEnabled: false })
+    const safe = io.askSecret('API key')
+    await input.typeText('safe-now')
+    input.pressEnter()
+    expect(await safe).toBe('safe-now')
+  }
+})
+
+test('API key entry also refuses publicly opted-in raw input capture', async () => {
+  const original = { log: process.env.OTUI_STDIN_LOG, debug: process.env.OTUI_DEBUG }
+  try {
+    for (const capture of [{ OTUI_STDIN_LOG: '/unused-test-capture.log', OTUI_DEBUG: 'false' },
+      { OTUI_STDIN_LOG: '', OTUI_DEBUG: 'true' }]) {
+      const { io, frame } = await fixture()
+      Object.assign(process.env, capture)
+      await expect(io.askSecret('API key')).rejects.toThrow('Disable OTUI_STDIN_LOG and OTUI_DEBUG')
+      expect(await frame()).toContain('API key entry blocked')
+      expect((io as unknown as { secretInput: string[] }).secretInput).toEqual([])
+      process.env.OTUI_STDIN_LOG = ''
+      process.env.OTUI_DEBUG = 'false'
+    }
+  } finally {
+    if (original.log === undefined) delete process.env.OTUI_STDIN_LOG
+    else process.env.OTUI_STDIN_LOG = original.log
+    if (original.debug === undefined) delete process.env.OTUI_DEBUG
+    else process.env.OTUI_DEBUG = original.debug
+  }
+})
+
+test('API key input rejects an oversized paste without storing or displaying it', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const answer = io.askSecret('API key')
+  await input.typeText('short-key')
+  await input.pasteBracketedText('oversized-secret'.repeat(400))
+  expect(await frame()).toContain('API key input limit: 4096 characters')
+  expect(renderedText(setup.renderer.root)).not.toContain('oversized-secret')
+  input.pressEnter()
+  expect(await answer).toBe('short-key')
+})
+
+test('API key input rejects malformed paste whole instead of silently changing the credential', async () => {
+  const { io, setup, input, frame } = await fixture()
+  for (const malformed of ['rejected-secret\n', 'rejected\tsecret', 'rejected\rsecret',
+    'rejected\x1b[31msecret', 'rejected\u202esecret', 'rejected\u200fsecret',
+    'rejected\u2066secret', 'rejected\u2028secret', 'rejected\x00secret']) {
+    const answer = io.askSecret('API key')
+    await input.pasteBracketedText('prior-key')
+    await input.pasteBracketedText(malformed)
+    expect(await frame()).toContain('API key input rejected')
+    expect(renderedText(setup.renderer.root)).not.toContain('rejected-secret')
+    input.pressEnter()
+    expect(await answer).toBe('prior-key')
+  }
+  const typed = io.askSecret('API key')
+  await input.typeText('exact-key')
+  await input.typeText('\u202e')
+  expect(await frame()).toContain('API key input rejected')
+  input.pressEnter()
+  expect(await typed).toBe('exact-key')
+})
+
+test('API key input length is bounded in UTF-16 code units without altering valid Unicode', async () => {
+  const { io, input, frame } = await fixture()
+  const answer = io.askSecret('API key')
+  await input.pasteBracketedText('🔑'.repeat(2049))
+  expect(await frame()).toContain('API key input limit: 4096 characters')
+  await input.pasteBracketedText('🔑'.repeat(2048))
+  input.pressEnter()
+  expect(await answer).toBe('🔑'.repeat(2048))
+})
+
+test('newly registered secrets redact prior surfaces and split streaming fragments', async () => {
+  const { io, input, frame } = await fixture()
+  const secret = 'dynamically-added-credential'
+  io.write(`Prior diagnostic ${secret}`)
+  io.addSecrets([secret, secret, ''])
+  expect(await frame()).not.toContain(secret)
+  for (const text of ['Reply dynamically-', 'added-', 'credential and more output'.repeat(3)]) {
+    io.event({ type: 'text_delta', text })
+    const display = await frame()
+    expect(display).not.toContain(secret)
+    expect(display).not.toContain('dynamically-')
+  }
+  const line = io.readLine('Message')
+  await input.pasteBracketedText(`ordinary ${secret}`)
+  input.pressEnter()
+  expect(await line).toBe('ordinary [REDACTED]')
+})
+
+test('pink and lavender colors are configured and present in native frame spans', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const line = io.readLine('Message')
+  await input.typeText('/m')
+  await frame()
+  const header = setup.renderer.root.findDescendantById('vivi-header') as TextRenderable
+  const composerBox = setup.renderer.root.findDescendantById('vivi-composer-box') as BoxRenderable
+  const completions = setup.renderer.root.findDescendantById('vivi-completions') as BoxRenderable
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  expect(header.fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
+  expect(composerBox.borderColor.equals(RGBA.fromHex('#f87ea2'))).toBe(true)
+  expect(completions.borderColor.equals(RGBA.fromHex('#b08bfc'))).toBe(true)
+  expect(composer.cursorColor.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
+  const colors = setup.captureSpans().lines.flatMap((row) => row.spans.map((span) => span.fg.toInts().slice(0, 3)))
+  expect(colors).toContainEqual([248, 126, 162])
+  expect(colors).toContainEqual([176, 139, 252])
+  io.close()
+  expect(await line).toBeUndefined()
+})
 
 test('renders session header, canonical roles, tools, usage and command hints', async () => {
   const { io, frame } = await fixture()

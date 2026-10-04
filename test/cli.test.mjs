@@ -613,3 +613,27 @@ test('nonstreaming renderer emits accepted content only and cleans up its SIGINT
   assert.equal(process.listenerCount('SIGINT'), before);
   input.destroy(); output.destroy();
 });
+
+test('CLI OpenRouter provider uses typed strict routing for tools or explicit effort, omits tool fields in chat-only mode', async t => {
+  const bodies = [];
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Fake reply' } }] }),
+      { headers: { 'Content-Type': 'application/json' } });
+  });
+  for (const [toolsEnabled, reasoning] of [[true, 'default'], [false, 'high'], [false, 'none'], [false, 'default']]) {
+    const session = newSession({ provider: 'openrouter', model: 'vendor/fake', reasoning });
+    const args = ['--provider', 'openrouter', '--model', 'vendor/fake', '--no-stream', toolsEnabled ? '--tools' : '--no-tools'];
+    if (reasoning !== 'default') args.push('--reasoning', reasoning, '--reasoning-capabilities', reasoning);
+    const options = parseArguments(args, {});
+    const provider = providerForSession(session, options, { OPENROUTER_API_KEY: 'fake-only-no-network' });
+    assert.equal((await provider.generate({ messages: [{ kind: 'message', role: 'user', content: 'Hello' }],
+      tools: toolsEnabled ? builtinTools() : [] }, new AbortController().signal)).content, 'Fake reply');
+    const body = bodies.at(-1);
+    if (toolsEnabled || reasoning !== 'default') assert.deepEqual(body.provider, { require_parameters: true });
+    else assert(!Object.hasOwn(body, 'provider'));
+    assert.equal(Object.hasOwn(body, 'tools'), toolsEnabled);
+    assert(!Object.hasOwn(body, 'tool_choice'));
+    assert.equal(Object.hasOwn(body, 'reasoning'), reasoning !== 'default');
+  }
+});
