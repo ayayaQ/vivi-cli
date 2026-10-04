@@ -1,0 +1,33 @@
+{
+  "name": "@ayayaq/vivi-cli",
+  "version": "0.1.0-dev.0",
+  "private": true,
+  "description": "A small terminal application for the shared vivi agent loop and providers",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "ayayaQ",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ayayaQ/vivi-cli.git"
+  },
+  "engines": { "node": ">=22" },
+  "bin": { "vivi": "./dist/main.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src", "scripts", "tsconfig.json", "vendor", "LICENSE", "NOTICE", "README.md", "RELEASING.md"],
+  "scripts": {
+    "build": "node scripts/clean-build.mjs && tsc -p tsconfig.json && node scripts/finish-build.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:package": "npm run build && node scripts/test-package.mjs",
+    "check": "npm test && npm run test:package"
+  },
+  "dependencies": { "@ayayaq/vivi": "file:vendor/ayayaq-vivi-0.2.0-dev.0.tgz" },
+  "bundledDependencies": ["@ayayaq/vivi"],
+  "devDependencies": { "typescript": "6.0.3", "@types/node": "26.2.0" }
+}
