@@ -12,6 +12,8 @@ export interface CliHostOptions {
   store: SessionPersistence
   session: CliSession
   enableNotes?: boolean
+  /** A host can omit tools when the selected model's tool support is undeclared. */
+  enableTools?: boolean
   secrets?: readonly string[]
   maxRounds?: number
   approve?(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
@@ -88,7 +90,7 @@ export class CliHost {
       await this.save()
       const result = await runAgent({
         provider: this.options.provider, messages: this.current.history,
-        tools: builtinTools(this.options.enableNotes), signal: controller.signal,
+        tools: this.options.enableTools === false ? [] : builtinTools(this.options.enableNotes), signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: (call, context) => executeBuiltin(call, context.signal, {
           enableNotes: this.options.enableNotes ?? false,

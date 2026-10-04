@@ -2,7 +2,7 @@
   "name": "@ayayaq/vivi-cli",
   "version": "0.1.0-dev.0",
   "private": true,
-  "description": "A small terminal application for the shared vivi agent loop and providers",
+  "description": "A standalone conversational terminal application for the shared vivi agent loop and providers",
   "type": "module",
   "license": "Apache-2.0",
   "author": "ayayaQ",
@@ -10,8 +10,12 @@
     "type": "git",
     "url": "git+https://github.com/ayayaQ/vivi-cli.git"
   },
-  "engines": { "node": ">=22" },
-  "bin": { "vivi": "./dist/main.js" },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "vivi": "./dist/launcher.js"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -20,14 +24,35 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src", "scripts", "tsconfig.json", "LICENSE", "NOTICE", "README.md", "RELEASING.md"],
+  "files": [
+    "dist",
+    "src",
+    "scripts",
+    "tsconfig.json",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "RELEASING.md"
+  ],
   "scripts": {
     "build": "node scripts/clean-build.mjs && tsc -p tsconfig.json && node scripts/finish-build.mjs",
     "test": "npm run build && node --test test/*.test.mjs",
     "test:package": "npm run build && node scripts/test-package.mjs",
-    "check": "npm test && npm run test:package"
+    "check": "npm test && npm run test:package",
+    "test:tui": "npm run build && bun test test/*.test.ts",
+    "build:standalone": "npm run build && bun scripts/build-standalone.ts",
+    "test:standalone": "bun scripts/test-standalone.ts"
   },
-  "dependencies": { "@ayayaq/vivi": "0.2.0" },
-  "bundledDependencies": ["@ayayaq/vivi"],
-  "devDependencies": { "typescript": "6.0.3", "@types/node": "26.2.0" }
+  "dependencies": {
+    "@ayayaq/vivi": "0.2.0",
+    "@opentui/core": "0.5.14",
+    "web-tree-sitter": "0.25.10"
+  },
+  "bundledDependencies": [
+    "@ayayaq/vivi"
+  ],
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "typescript": "6.0.3"
+  }
 }
