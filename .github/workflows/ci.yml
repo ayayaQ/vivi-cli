@@ -21,3 +21,23 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
+
+  tui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - run: npm run test:tui
+      - run: npm run test:package
+        env:
+          VIVI_TEST_BUN: bun
+      - run: npm run test:standalone
+      - run: npm run build:standalone
+      - run: ./build/vivi --help

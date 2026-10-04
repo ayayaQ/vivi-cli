@@ -13,6 +13,7 @@ import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSe
 import type { CliProviderName, CliSession } from './session.js'
 import { TerminalIO, runChatLoop } from './terminal.js'
 import type { ChatIO } from './terminal.js'
+import type { InteractiveIO } from './application.js'
 
 export interface CliOptions {
   provider?: CliProviderName
@@ -24,14 +25,17 @@ export interface CliOptions {
   stream: boolean
   tui: boolean
   enableNotes: boolean
+  enableTools: boolean
+  startNew: boolean
   maxRounds: number
   prompt?: string
   help: boolean
 }
-export const HELP = `vivi - a thin shared-agent CLI
+export const HELP = `vivi - a shared-agent terminal application
 
 Usage: vivi --provider openai|openrouter --model MODEL [options]
        vivi --resume SESSION_ID [options]
+       vivi                       Interactive setup and saved defaults (Bun)
 
   --provider NAME             openai (default) or openrouter
   --model MODEL               Required for a new session
@@ -42,20 +46,23 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
-  --tui / --no-tui            Terminal UI (default on a TTY)
+  --tui / --no-tui            OpenTUI full-screen / accessible line mode
+  --tools / --no-tools        Declare tool support / use chat only
   --enable-notes              Enable session-only revisioned notes with allow/deny prompts
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
   --help                      Show this help
 
 Credentials: OPENAI_API_KEY or OPENROUTER_API_KEY environment variables only.
+Full-screen UI requires Bun >=1.3.0; Node >=22 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id.
 Streaming is display-only. Notes never access other files; piped approval is denied.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
-export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv = process.env): CliOptions {
+export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv = process.env,
+  interactiveSetup = false): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    stream: true, tui: true, enableNotes: false, maxRounds: 25, help: false
+    stream: true, tui: true, enableNotes: false, enableTools: true, startNew: false, maxRounds: 25, help: false
   }
   let explicitlyNew = false
   for (let index = 0; index < args.length; index++) {
@@ -88,11 +95,13 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--resume': options.resume = value(); break
       case '--session-dir': options.sessionDirectory = value(); break
       case '--prompt': options.prompt = value(); break
-      case '--new': explicitlyNew = true; break
+      case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
       case '--tui': options.tui = true; break
       case '--no-tui': options.tui = false; break
       case '--enable-notes': options.enableNotes = true; break
+      case '--tools': options.enableTools = true; break
+      case '--no-tools': options.enableTools = false; break
       case '--max-rounds': {
         const count = Number(value())
         if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('max-rounds must be an integer from 1 to 100')
@@ -107,7 +116,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   if (options.resume && (options.provider !== undefined || options.model !== undefined || options.reasoning !== undefined)) {
     throw new Error('Resumed sessions retain their provider, model and reasoning; omit selection flags')
   }
-  if (!options.resume && (!options.model || options.model.length > 200 || options.model.trim() !== options.model)) {
+  if (!options.resume && ((!options.model && !interactiveSetup) || (options.model !== undefined &&
+    (!options.model || options.model.length > 200 || options.model.trim() !== options.model)))) {
     throw new Error('A new session requires --model with a bounded model identifier')
   }
   if (options.reasoning !== undefined && options.reasoning !== 'default' &&
@@ -116,6 +126,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
     !options.reasoningCapabilities.includes(options.reasoning as ReasoningEffort)) {
     throw new Error('Selected reasoning requires explicit --reasoning-capabilities from your model’s supported efforts')
   }
+  if (options.enableNotes && !options.enableTools) throw new Error('Session notes require declared tool support; omit --enable-notes or --no-tools')
   // Never echo a rejected value. Credential-bearing flags are refused before provider construction.
   const secrets = environmentSecrets(env)
   for (const argument of args) {
@@ -131,6 +142,11 @@ export function reasoningPolicy(level?: string): ReasoningSelection {
   return { mode: 'effort', effort: level as Exclude<ReasoningEffort, 'none'> }
 }
 
+export function supportsBunTui(version: string | undefined = process.versions.bun): boolean {
+  const match = version?.match(/^(\d+)\.(\d+)\.(\d+)/)
+  return Boolean(match && (Number(match[1]) > 1 || Number(match[1]) === 1 && Number(match[2]) >= 3))
+}
+
 export function providerForSession(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider {
   const apiKey = session.provider === 'openai' ? env.OPENAI_API_KEY : env.OPENROUTER_API_KEY
   if (!apiKey) throw new Error(session.provider === 'openai' ? 'Set OPENAI_API_KEY in your environment' : 'Set OPENROUTER_API_KEY in your environment')
@@ -141,13 +157,25 @@ export function providerForSession(session: CliSession, options: CliOptions, env
 
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
-  dependencies: { io?: ChatIO; providerFactory?: typeof providerForSession } = {}): Promise<number> {
+  dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession } = {}): Promise<number> {
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
   const secrets = environmentSecrets(env)
   try {
-    const options = parseArguments(args, env)
-    io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: options.tui, secrets })
+    const interactive = dependencies.tuiIO !== undefined || (!dependencies.io && Boolean(process.stdin.isTTY && process.stdout.isTTY) &&
+      !args.includes('--no-tui') && (!args.includes('--prompt') || args.includes('--tui')) && !args.includes('--help') && !args.includes('-h'))
+    if (interactive && !dependencies.tuiIO && !supportsBunTui()) {
+      throw new Error('The full-screen UI requires Bun >=1.3.0. Install Bun from https://bun.sh, then run bun dist/main.js. Use --no-tui --model MODEL for Node line mode.')
+    }
+    const options = parseArguments(args, env, interactive)
+    if (interactive) {
+      const { runApplication } = await import('./application.js')
+      const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets })
+      io = tui
+      return await runApplication({ io: tui, options, args, env, secrets,
+        providerFactory: dependencies.providerFactory ?? providerForSession })
+    }
+    io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const fresh = options.resume ? undefined : newSession({
@@ -158,6 +186,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const session = options.resume ? await store.load(options.resume) : fresh!
     const provider = (dependencies.providerFactory ?? providerForSession)(session, options, env)
     const host = new CliHost({ provider, store, session, secrets, enableNotes: options.enableNotes,
+      enableTools: options.enableTools,
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
     await store.save(host.session)
@@ -166,7 +195,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {
     const message = redactSecrets(error instanceof Error ? error.message : 'CLI failed', secrets)
-    if (io) io.write(`${message}\n`)
+    if (io && !io.failed) io.write(`${message}\n`)
     else process.stderr.write(`${message}\n`)
     return 1
   } finally {

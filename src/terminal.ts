@@ -8,6 +8,9 @@ import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
 
 export interface ChatIO {
+  /** Fatal native UI failure means output should go to stderr after terminal restoration. */
+  readonly failed?: boolean
+  readonly isClosed?: boolean
   readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined>
   write(text: string): void
   event(event: AgentEvent): void

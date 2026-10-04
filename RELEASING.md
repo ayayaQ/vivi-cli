@@ -7,8 +7,8 @@ The current package remains private and versioned `0.1.0-dev.0`. It depends on
 the exact immutable npm release `@ayayaq/vivi@0.2.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
-dependency, including its source, LICENSE, NOTICE and attribution records, so npm can
-install the CLI artifact offline without a separate registry request.
+dependency, including its source, LICENSE, NOTICE and attribution records, so the shared core needs no separate registry request. OpenTUI and its native platform
+dependencies remain registry dependencies; offline installs need a populated npm cache.
 
 ## Shared registry dependency
 
@@ -26,11 +26,16 @@ unchanged unless a separate CLI release is requested.
 
 ## Check the checkout
 
-Use Node.js 22 or newer:
+Use Node.js 22 or newer for the baseline; install Bun >=1.3.0 for native UI checks:
 
 ```sh
 npm ci --ignore-scripts
 npm run check
+npm run test:tui
+VIVI_TEST_BUN=bun npm run test:package
+npm run test:standalone
+npm run build:standalone
+./build/vivi --help
 ```
 
 Checks use fake providers and local streams. They make no real model calls and need
@@ -45,3 +50,26 @@ A future public CLI npm release requires a separate decision to remove `private:
 and select its release version. Regenerate the lockfile, rerun the full checks and
 review the packed files for that release. This shared dependency transition does not
 publish or release the CLI. No release workflow is enabled in this repository.
+
+## UI runtime and standalone artifacts
+
+OpenTUI 0.5.14 is loaded lazily under Bun only. The Node 22/24 line route and public
+host exports must never import native TUI modules. Check both installed entrypoints,
+not just source imports. The standalone build targets the current platform only,
+embeds native assets, and writes dependency notices beside the local binary.
+
+The standard Ubuntu Bun CI lane uses native in-memory rendering and mock input;
+it makes no real provider calls and does not upload build artifacts. Windows/macOS
+need their own actual runtime and clean-consumer checks before platform claims or
+release targets are added. Packaging tests require the source-installed dependency
+cache for their offline isolated consumer, rather than claiming the archive alone
+is an offline distribution.
+
+A binary release is a separate action. Before distributing one, review the exact
+Bun release's MIT/linked-library licensing and LGPL relinking obligations, preserve
+all runtime/native dependency notices, supply the required corresponding materials,
+and check clean-machine startup on each advertised platform. The local build's
+notice collection is an aid, not a substitute for that release review. No binaries
+or native archives are vendored into Git, and no executable publishing workflow is
+enabled. npm publication, GitHub publication and binary release remain separately
+authorized operations.

@@ -48,7 +48,8 @@ try {
   const paths = new Set(packed.files.map((file) => file.path))
   for (const path of ['LICENSE', 'NOTICE', 'README.md', 'RELEASING.md', 'package.json', 'tsconfig.json',
     'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
-    'src/tools.ts', 'src/terminal.ts', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
+    'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
+    'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
@@ -61,7 +62,7 @@ try {
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
   const tarball = join(temporary, packed.filename)
   await writeFile(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }))
-  // The installed artifact must use its bundled registry dependency offline and without custom install scripts.
+  // The bundled core is offline; OpenTUI dependencies use the populated npm cache, without install scripts.
   run('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const installed = join(temporary, 'node_modules/@ayayaq/vivi-cli')
   const installedManifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'))
@@ -140,6 +141,37 @@ void result; void io
   const typeRoots = join(root, 'node_modules/@types')
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',
     '--target', 'ES2022', '--lib', 'ES2022,DOM', '--types', 'node', '--typeRoots', typeRoots, join(installed, 'consumer.ts')], temporary)
+  if (process.env.VIVI_TEST_BUN) {
+    await writeFile(join(installed, 'tui-consumer.ts'), `
+import assert from 'node:assert/strict'
+import { createTestRenderer } from '@opentui/core/testing'
+import { CodeRenderable } from '@opentui/core'
+import { OpenTuiIO } from './dist/tui.js'
+import { newSession } from './dist/session.js'
+const setup = await createTestRenderer({ width: 80, height: 24 })
+const io = new OpenTuiIO(setup.renderer, { stream: true })
+try {
+  const session = newSession({ provider: 'openai', model: 'packed-headless-model' })
+  session.history = [{ kind: 'assistant', content: '## Packed heading' + String.fromCharCode(10, 10) + 'Packed Markdown works', toolCalls: [] }]
+  io.setSession(session)
+  const reading = io.readLine('Message')
+  await setup.renderOnce()
+  assert(setup.captureCharFrame().includes('packed-headless-model'))
+  const codeNodes = node => [...(node instanceof CodeRenderable ? [node] : []), ...node.getChildren().flatMap(codeNodes)]
+  const blocks = codeNodes(setup.renderer.root)
+  assert(blocks.length > 0)
+  await Promise.all(blocks.map(block => block.highlightingDone))
+  await setup.renderOnce()
+  assert(setup.captureCharFrame().includes('Packed Markdown works'))
+  assert(!setup.captureCharFrame().includes('## Packed heading'))
+  io.close()
+  assert.equal(await reading, undefined)
+} finally { io.close(); setup.renderer.destroy() }
+`)
+    run(process.env.VIVI_TEST_BUN, [join(installed, 'tui-consumer.ts')], temporary)
+    assert.match(run(process.env.VIVI_TEST_BUN, [join(temporary, 'node_modules/.bin/vivi'), '--help'], temporary), /--provider/)
+    console.log('Packed OpenTUI native renderer and Bun CLI entrypoint passed')
+  }
   const bytes = await readFile(tarball)
   console.log(`Installed CLI bin, shared-provider runtime and TypeScript declarations passed (${packed.filename})`)
   console.log(`sha256 ${createHash('sha256').update(bytes).digest('hex')}`)
