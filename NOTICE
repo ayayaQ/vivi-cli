@@ -2,5 +2,5 @@ vivi CLI
 Copyright 2026 ayayaQ
 
 This project is licensed under the Apache License, Version 2.0.
-It uses @ayayaq/vivi as a separately licensed dependency. The bundled development
-archive contains that dependency's own LICENSE, NOTICE and attribution records.
+It uses @ayayaq/vivi as a separately licensed dependency. The bundled shared
+dependency contains its own source, LICENSE, NOTICE and attribution records.

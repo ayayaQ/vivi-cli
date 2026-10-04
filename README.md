@@ -15,14 +15,17 @@ npm run check
 node dist/main.js --help
 ```
 
-The private `@ayayaq/vivi-cli@0.1.0-dev.0` development package uses the deterministic
-checked-in `vendor/ayayaq-vivi-0.2.0-dev.0.tgz` archive. Published shared vivi `0.1.0`
-does not contain the required provider/history APIs. See [RELEASING.md](RELEASING.md)
-for archive validation and future-release requirements. No API key is needed for checks.
+The private `@ayayaq/vivi-cli@0.1.0-dev.0` development package pins the compatible
+shared npm release `@ayayaq/vivi@0.2.0`. Its registry artifact was verified against the
+reviewed release bytes; the immutable registry URL and SHA-512 integrity are recorded
+in the lockfile. Shared vivi `0.1.0` does not contain the required provider/history
+APIs. See [RELEASING.md](RELEASING.md) for validation and future-release requirements.
+No API key is needed for checks.
 
 `npm pack` includes the installed shared dependency as a bundled dependency, so the
 CLI archive can be installed offline with `npm install ./ayayaq-vivi-cli-0.1.0-dev.0.tgz`.
-The source checkout still installs the exact vendored archive recorded in the lockfile.
+The source checkout requires the exact registry artifact recorded in the lockfile;
+`npm run test:package` rejects a local archive dependency or a stale installed core.
 
 In the commands below, replace `vivi` with `node dist/main.js` when running from the checkout.
 

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,8 +11,10 @@ const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(tmpdir(), 'vivi-npm-cache')
-const vendorName = 'ayayaq-vivi-0.2.0-dev.0.tgz'
-const provenanceName = 'ayayaq-vivi-0.2.0-dev.0.provenance.json'
+const coreName = '@ayayaq/vivi'
+const coreVersion = '0.2.0'
+const coreIntegrity = 'sha512-4qxPGSjhKgJKx01fV18V4qvzlVQxkhyiXhPX+KpnbevDYFMilAlnlhx7JIPyWZENG6zUOYSRB6xnQkTT0K1usw=='
+const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: 120000,
@@ -24,22 +26,42 @@ function run(command, args, cwd = root) {
 }
 
 try {
-  const provenance = JSON.parse(await readFile(join(root, 'vendor', provenanceName), 'utf8'))
-  const vendorBytes = await readFile(join(root, 'vendor', vendorName))
   const lock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'))
-  assert.equal(createHash('sha256').update(vendorBytes).digest('hex'), provenance.sha256, 'Vendor archive provenance mismatch')
-  assert.equal(lock.packages['node_modules/@ayayaq/vivi'].integrity, provenance.integrity, 'Vendor lock integrity mismatch')
+  const installedLock = JSON.parse(await readFile(join(root, 'node_modules/.package-lock.json'), 'utf8'))
+  const coreLock = lock.packages[corePath]
+  assert.equal(manifest.dependencies[coreName], coreVersion, 'Shared core must use an exact registry version')
+  assert.equal(lock.packages[''].dependencies[coreName], coreVersion, 'Root lock dependency mismatch')
+  assert.equal(coreLock.version, coreVersion, 'Shared core lock version mismatch')
+  const resolved = new URL(coreLock.resolved)
+  assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
+  assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
+  assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.2.0 release bytes')
+  for (const field of ['version', 'resolved', 'integrity']) {
+    assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
+  }
+  const coreManifest = JSON.parse(await readFile(join(root, corePath, 'package.json'), 'utf8'))
+  assert.equal(coreManifest.name, coreName)
+  assert.equal(coreManifest.version, coreVersion)
+  assert.equal(coreManifest.license, 'Apache-2.0')
   const [packed] = JSON.parse(run('npm', ['pack', '--json', '--pack-destination', temporary, '--cache', cache]))
   const paths = new Set(packed.files.map((file) => file.path))
   for (const path of ['LICENSE', 'NOTICE', 'README.md', 'RELEASING.md', 'package.json', 'tsconfig.json',
-    `vendor/${vendorName}`, `vendor/${provenanceName}`, 'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
+    'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
     'src/tools.ts', 'src/terminal.ts', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts']) assert(paths.has(path), `Missing ${path}`)
+  for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
+    'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
+    'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
+    assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
+  }
+  assert.deepEqual(packed.bundled, [coreName], 'Shared core must remain bundled')
+  assert([...paths].every((path) => !path.startsWith('vendor/')), 'Obsolete vendor snapshots must not be packed')
   assert(!paths.has('src/run-agent.ts') && !paths.has('src/providers/openai.ts'), 'CLI must not copy core or provider implementations')
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
   const tarball = join(temporary, packed.filename)
   await writeFile(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }))
-  // Installed artifact must resolve its vendored dependency without registry access or custom install scripts.
+  // The installed artifact must use its bundled registry dependency offline and without custom install scripts.
   run('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const installed = join(temporary, 'node_modules/@ayayaq/vivi-cli')
   const installedManifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'))
@@ -47,10 +69,25 @@ try {
   assert.equal(installedManifest.version, manifest.version)
   assert.equal(installedManifest.private, true)
   assert.equal(installedManifest.license, 'Apache-2.0')
-  assert.equal(installedManifest.dependencies['@ayayaq/vivi'], `file:vendor/${vendorName}`)
+  assert.equal(installedManifest.dependencies[coreName], coreVersion)
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(await readFile(join(installed, 'LICENSE')), await readFile(join(root, 'LICENSE')))
-  assert.deepEqual(await readFile(join(installed, 'vendor', vendorName)), await readFile(join(root, 'vendor', vendorName)))
+  const bundledCore = join(installed, corePath)
+  async function compareDirectory(relative = '') {
+    const entries = await readdir(join(root, corePath, relative), { withFileTypes: true })
+    assert.deepEqual((await readdir(join(bundledCore, relative))).sort(), entries.map(entry => entry.name).sort(),
+      `Bundled shared core directory mismatch: ${relative}`)
+    for (const entry of entries) {
+      const path = join(relative, entry.name)
+      if (entry.isDirectory()) await compareDirectory(path)
+      else {
+        assert(entry.isFile(), `Unexpected shared core file type: ${path}`)
+        assert.deepEqual(await readFile(join(bundledCore, path)), await readFile(join(root, corePath, path)),
+          `Bundled shared core bytes mismatch: ${path}`)
+      }
+    }
+  }
+  await compareDirectory()
   assert.match(run(process.execPath, [join(temporary, 'node_modules/.bin/vivi'), '--help'], temporary), /--provider/)
   // Anchor runtime/type consumers beside the installed package: its bundled core is an
   // implementation dependency, not a promise that npm hoists that package for other consumers.
