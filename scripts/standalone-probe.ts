@@ -6,6 +6,13 @@ import { CodeRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
 import { newSession } from '../src/session.js'
+import { parseModelCatalog, documentedOpenAIModel } from '../src/models.js'
+
+const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
+  reasoning: { mandatory: false, supports_max_tokens: true } }] })[0]!
+assert.deepEqual(budget.efforts, ['none'])
+assert.equal(documentedOpenAIModel('gpt-6.1-sol').tools, 'supported')
+assert.equal(documentedOpenAIModel('o3-pro').streaming, 'unsupported')
 
 const setup = await createTestRenderer({ width: 80, height: 24 })
 const io = new OpenTuiIO(setup.renderer)

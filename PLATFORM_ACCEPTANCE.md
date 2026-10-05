@@ -1,12 +1,16 @@
 # Platform acceptance preparation
 
-The shared extension API and cache-usage integration are current in the CLI.
+The shared extension API, cache usage and endpoint-aware model normalization are current in the CLI.
 CLI-05 is incomplete until that final integrated CLI artifact is verified on the
 platforms selected for distribution. Windows x64 with npm installation is the chosen
 first release target; that target decision is not a completed acceptance or release
 claim. macOS and Linux remain unverified for real vault and interactive terminal
 behavior. Keep Linux headless compatibility checks running. Additional platform
 support requires their real runtime/vault checks, rather than an application rewrite.
+
+Acceptance evidence is tied to the exact archive hash. A successful manual check of an
+earlier candidate does not cover a later dependency or model-behavior change. Recheck
+the final candidate's model/effort/default/disable flows before a public CLI release.
 
 ## Windows npm runtime requirements
 

@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.3.0'
-const coreIntegrity = 'sha512-9Evt8vBmwyGQEQG5eowb3R1onJCyEru4pqqVwzGA4TX9sgaWE2p7AdcDAtVTt6wDERFiM0yXNUwQAVPK2TSz3A=='
+const coreVersion = '0.4.0'
+const coreIntegrity = 'sha512-dejKuQcP5YxHuiqL16Vbg7h36mNkruZhEOyyt4ErjOAKxL/Cr9DXjvr+rPDvcjcASWYJ0/jzRpWCbt/eeQkglg=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -54,7 +54,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.3.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.4.0 release bytes')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -90,6 +90,9 @@ try {
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
     'dist/cjs/extensions.js', 'dist/cjs/extensions/calculator.js',
+    'CAPABILITIES.md', 'examples/model-capabilities.mjs', 'src/providers/models.ts',
+    'dist/providers/models.js', 'dist/providers/models.d.ts',
+    'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
@@ -145,6 +148,7 @@ try {
   // implementation dependency, not a promise that npm hoists that package for other consumers.
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -154,7 +158,25 @@ import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
+import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
+import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
+const cjsModels = createRequire(import.meta.url)('@ayayaq/vivi/providers/models')
+const budgetModel = { id: 'vendor/budget-only', supported_parameters: ['reasoning'],
+  reasoning: { mandatory: false, supports_max_tokens: true } }
+const budget = normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: budgetModel })
+assert.deepEqual(cjsModels.normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: budgetModel }), budget)
+assert.equal(budget.reasoning.disable, 'supported')
+assert.deepEqual(budget.reasoning.efforts, [])
+assert.equal(reasoningSelectionSupport(budget, { mode: 'disabled' }), 'supported')
+assert.equal(reasoningSelectionSupport(budget, { mode: 'effort', effort: 'high' }), 'unsupported')
+assert.deepEqual(parseModelCatalog('openrouter', { data: [budgetModel] })[0].efforts, ['none'])
+assert.equal(documentedOpenAIModel('gpt-6.1-sol').tools, 'supported', 'Unseeded documented host facts must remain available')
+assert.equal(documentedOpenAIModel('gpt-4.1').reasoning, 'unsupported')
+assert.equal(documentedOpenAIModel('o3-pro').streaming, 'unsupported')
+assert.equal(documentedOpenAIModel('o3-pro').reasoning, 'supported')
+assert.deepEqual(documentedOpenAIModel('o3-pro').efforts, [])
+assert.equal(documentedOpenAIModel('gpt-image-2').conversation, 'unsupported')
 assert.equal(calculate('3 * (4 + 2)'), 18)
 assert.equal(calculate, sharedCalculate, 'CLI must re-export the shared calculator, not a duplicate parser')
 assert.deepEqual(builtinTools().map(tool => tool.name), ['calculate', 'current_time'])
@@ -205,6 +227,9 @@ import { CliHost, FileSessionStore, TerminalIO, newSession, createBuiltinToolset
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
+import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabilities, type Capability } from '@ayayaq/vivi/providers/models'
+const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
+const selection: Capability = reasoningSelectionSupport(capabilities, { mode: 'disabled' })
 const provider: ModelProvider = createOpenAIProvider({ model: 'fake', apiKey: 'fake' })
 const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
 session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
@@ -216,7 +241,7 @@ const options: CliHostOptions = { provider, session, store, extensions: [extensi
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
-void result; void io; void usageText; void createBuiltinToolset(false, [extension])
+void result; void io; void usageText; void selection; void createBuiltinToolset(false, [extension])
 `)
   const typeRoots = join(root, 'node_modules/@types')
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',

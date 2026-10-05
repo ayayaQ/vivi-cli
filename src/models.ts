@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
+import { normalizeModelCapabilities } from '@ayayaq/vivi/providers/models'
+import type { ModelCapabilities } from '@ayayaq/vivi/providers/models'
 import type { CliProviderName } from './session.js'
 import { createHash } from 'node:crypto'
 
@@ -19,7 +21,6 @@ export interface CatalogResult { models: ModelEntry[]; state: 'fresh' | 'cached'
 export interface Catalog {
   list(provider: CliProviderName, apiKey?: string, signal?: AbortSignal, refresh?: boolean): Promise<CatalogResult>
 }
-const efforts: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const MAX_BYTES = 4 * 1024 * 1024
 const MAX_MODELS = 5000
 class ModelCatalogError extends Error {}
@@ -75,57 +76,74 @@ documented(['o3-pro', 'o3-pro-2025-06-10'], [], 'unsupported')
 documented(['gpt-4.1', 'gpt-4.1-2025-04-14', 'gpt-4.1-mini', 'gpt-4.1-mini-2025-04-14', 'gpt-4.1-nano', 'gpt-4.1-nano-2025-04-14',
   'gpt-4o', 'gpt-4o-2024-05-13', 'gpt-4o-2024-08-06', 'gpt-4o-2024-11-20', 'gpt-4o-mini', 'gpt-4o-mini-2024-07-18'], [])
 
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
-const identifier = (value: unknown): value is string => typeof value === 'string' && /^[^\s\u0000-\u001f\u007f-\u009f]{1,200}$/.test(value)
+const object = (value: unknown): value is Record<string, unknown> => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype: unknown = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+// Catalog entries are data. Never invoke an accessor while reading untrusted fields.
+const field = (value: unknown, key: string): unknown => {
+  if (!object(value)) return undefined
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined
+}
+const identifier = (value: unknown): value is string => typeof value === 'string' && /^[^\s\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]{1,200}$/.test(value)
 const label = (value: unknown, fallback: string): string => typeof value === 'string' && value.length <= 300 &&
   !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(value) ? value : fallback
 export function unknownModel(id: string): ModelEntry {
   return { id, name: id, tools: 'unknown', conversation: 'unknown', streaming: 'unknown', efforts: [], reasoning: 'unknown', reasoningMandatory: false, source: 'Capability metadata unavailable' }
 }
+function applyCapabilities(model: ModelEntry, shared: ModelCapabilities): void {
+  if (shared.tools !== 'unknown') model.tools = shared.tools
+  if (shared.chat !== 'unknown') model.conversation = shared.chat
+  if (shared.stream !== 'unknown') model.streaming = shared.stream
+  if (shared.reasoning.support !== 'unknown') model.reasoning = shared.reasoning.support
+  if (shared.reasoning.requirement !== 'unknown') model.reasoningMandatory = shared.reasoning.requirement === 'required'
+  // The existing factory/UI uses none as its explicit-disable sentinel. Named
+  // efforts alone cannot describe optional token-budget reasoning without a selector.
+  const disable = shared.reasoning.disable === 'supported' ||
+    shared.reasoning.disable === 'unknown' && model.efforts.includes('none')
+  const named = shared.reasoning.effortSelection === 'unknown' ? model.efforts :
+    shared.reasoning.effortSelection === 'supported' ? shared.reasoning.efforts : []
+  model.efforts = named.filter(effort => effort !== 'none')
+  if (disable && !model.reasoningMandatory) model.efforts.unshift('none')
+}
 export function documentedOpenAIModel(id: string): ModelEntry {
   const model = unknownModel(id)
+  if (!identifier(id)) return model
   const verified = openaiCapabilities[id]
-  if (nonConversationOpenAI.has(id)) model.conversation = 'unsupported'
+  if (nonConversationOpenAI.has(id)) {
+    model.conversation = 'unsupported'
+    return model
+  }
   if (verified) Object.assign(model, { tools: 'supported', conversation: 'supported', streaming: verified.streaming,
     reasoning: verified.efforts.length ? 'supported' : 'unknown', efforts: [...verified.efforts],
     reasoningMandatory: verified.efforts.length > 0 && !verified.efforts.includes('none'), source: 'Official OpenAI Responses model documentation' })
+  // The shared seed enriches these exact host facts; unknown shared fields never
+  // replace the CLI's broader documented registry or task-specific exclusions.
+  const shared = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id } })
+  applyCapabilities(model, shared)
+  if (shared.sources.length) model.source = 'Official OpenAI Responses model documentation'
   return model
 }
 export function parseModelCatalog(provider: CliProviderName, input: unknown): ModelEntry[] {
-  if (!object(input) || !Array.isArray(input.data) || input.data.length > MAX_MODELS) throw new ModelCatalogError('Model catalog has an unsupported format or size')
+  const data = field(input, 'data')
+  if (!Array.isArray(data) || data.length > MAX_MODELS) throw new ModelCatalogError('Model catalog has an unsupported format or size')
   const models = new Map<string, ModelEntry>()
-  for (const raw of input.data) {
-    if (!object(raw) || !identifier(raw.id)) continue
-    const model = unknownModel(raw.id)
-    model.name = label(raw.name, raw.id)
+  for (let index = 0; index < data.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(data, String(index))
+    const raw: unknown = descriptor && 'value' in descriptor ? descriptor.value : undefined
+    const id = field(raw, 'id')
+    if (!identifier(id)) continue
+    const model = unknownModel(id)
+    model.name = label(field(raw, 'name'), id)
     if (provider === 'openai') {
-      Object.assign(model, documentedOpenAIModel(raw.id))
+      Object.assign(model, documentedOpenAIModel(id))
     } else {
       // OpenRouter model metadata describes its Chat Completions gateway. Never
       // infer capabilities from model names. Unknown/future efforts are omitted.
-      if (Array.isArray(raw.supported_parameters) && raw.supported_parameters.every(value => typeof value === 'string')) {
-        model.tools = raw.supported_parameters.includes('tools') ? 'supported' : 'unsupported'
-      }
-      if (object(raw.reasoning)) {
-        model.reasoningMandatory = raw.reasoning.mandatory === true
-        const supported = raw.reasoning.supported_efforts
-        if (supported === null) { model.reasoning = 'supported'; model.efforts = [...efforts] }
-        else if (Array.isArray(supported) && supported.every(value => typeof value === 'string')) {
-          model.reasoning = 'supported'
-          model.efforts = efforts.filter(value => supported.includes(value))
-        } else model.reasoning = 'unknown'
-        if (model.reasoningMandatory) model.efforts = model.efforts.filter(value => value !== 'none')
-      } else if (Array.isArray(raw.supported_parameters)) {
-        model.reasoning = 'unsupported'
-      }
+      applyCapabilities(model, normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: raw }))
       model.source = 'OpenRouter model catalog metadata'
-      if (object(raw.architecture)) {
-        const input = raw.architecture.input_modalities
-        const output = raw.architecture.output_modalities
-        const valid = (value: unknown): value is string[] => Array.isArray(value) && value.every(modality => typeof modality === 'string')
-        if (valid(input) && !input.includes('text') || valid(output) && !output.includes('text')) model.conversation = 'unsupported'
-        else if (valid(input) && input.includes('text') && valid(output) && output.includes('text')) model.conversation = 'supported'
-      }
     }
     if (model.conversation === 'unsupported') continue
     models.set(model.id, model)
