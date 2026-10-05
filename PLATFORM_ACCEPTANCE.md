@@ -1,6 +1,7 @@
 # Platform acceptance preparation
 
-CLI-05 is incomplete until the final integrated CLI artifact is verified on the
+The shared extension API and cache-usage integration are current in the CLI.
+CLI-05 is incomplete until that final integrated CLI artifact is verified on the
 platforms selected for distribution. Windows x64 with npm installation is the chosen
 first release target; that target decision is not a completed acceptance or release
 claim. macOS and Linux remain unverified for real vault and interactive terminal
@@ -30,7 +31,7 @@ and its licensing/startup checks remain a separate future gate.
 
 ## Automated, fake/headless evidence
 
-The existing Linux CI and exploratory Windows workflow verify installed Node
+The Linux CI and Windows acceptance workflow verify installed Node
 entrypoints, fake provider/application paths, fake native credential protocols,
 headless Bun rendering and current-platform compiled probes. They do not use real
 API keys, call a model service or invoke an actual native credential store.
@@ -42,46 +43,76 @@ npm cache. Preparation needs registry access. The tarball alone is not an offlin
 distribution. Windows uses npm's JS entrypoint instead of spawning a `.cmd` shim
 with `shell: false`.
 
-Set `VIVI_TEST_ACCEPTANCE_REPORT` to a local JSON filename to retain the exact
-tarball SHA-256, npm integrity, byte size, runtime and observed OS. The report is
-written only after package checks pass. Optional `VIVI_TEST_BUN=bun` adds installed
-headless renderer evidence. Every native/interactive stage remains `not-run` in
-this report. A Linux report cannot be relabeled as Windows/macOS acceptance.
+The Windows acceptance workflow first builds and checks one canonical private npm
+archive on Ubuntu with Node 26.4.0 and Bun 1.4.2. Only after all package and installed
+native/headless consumer checks pass does `VIVI_TEST_CANDIDATE_DIR` expose a new
+directory containing the exact `.tgz`, `candidate.json` and `package-evidence.json`.
+The metadata preserves actual npm pack metadata, byte size, SHA-256 and SHA-512.
+The artifact upload includes only those three files, with no standalone binaries,
+credentials or sessions. The npm package remains `private: true` and unpublished.
+This CI test artifact is not a release. The repository is public, and artifact
+access follows its existing permissions.
 
-For example, in PowerShell from a clean checkout:
+Both Windows x64 Node jobs (26.4.0 and latest 26) download that same artifact. Set
+`VIVI_TEST_PACKAGE_ARCHIVE` and `VIVI_TEST_PACKAGE_METADATA` together to test it
+without repacking. The check validates the expected package name/version/filename,
+byte size, both digests and npm integrity/shasum, then asks npm to inspect the actual
+archive's complete pack metadata before installation. Missing, altered or mismatched
+inputs fail before an acceptance report. Imports cannot be re-exported as a new
+candidate, and an existing export directory is never reused.
+
+Set `VIVI_TEST_ACCEPTANCE_REPORT` to a local JSON filename to retain the exact
+archive SHA-256, npm integrity, byte size, runtime and observed OS. The report is
+written only after package checks pass. Optional `VIVI_TEST_BUN=bun` adds installed
+headless renderer evidence. One archive gets separate Linux and Windows reports;
+each report records its actual OS. Every native-vault/interactive stage remains
+`not-run`. A Linux report cannot be relabeled as Windows/macOS acceptance.
+
+For example, in PowerShell from a clean checkout, with the canonical candidate
+downloaded into `C:\vivi-candidate`:
 
 ```powershell
 npm ci --ignore-scripts --engine-strict
 $env:VIVI_TEST_BUN = 'bun'
+$env:VIVI_TEST_PACKAGE_ARCHIVE = 'C:\vivi-candidate\ayayaq-vivi-cli-0.1.0-dev.0.tgz'
+$env:VIVI_TEST_PACKAGE_METADATA = 'C:\vivi-candidate\candidate.json'
 $env:VIVI_TEST_ACCEPTANCE_REPORT = 'windows-package-evidence.json'
 npm run test:package
 ```
 
-This checks the current source artifact, not a future integrated CLI-02 build.
-Rerun it after the published extension API is integrated. Keep the exact final
-archive or executable and its SHA-256 with the manual results. Do not substitute
-a build made from another commit, runtime or platform.
+Keep that exact archive and its SHA-256 with the manual results. Do not substitute
+a platform-local repack or a build from another commit. Only the CLI root LICENSE
+comparison normalizes Windows checkout CRLF to LF; its legal text must otherwise
+match. Every bundled published core file, including its legal notices, remains
+byte-exact.
 
 ## Manual Windows acceptance still required
 
-Use a real Windows machine and terminal, with the final artifact and a dedicated
-local test account that has no existing Vivi credential records. The current
-vault implementation uses fixed targets `vivi-cli/openai` and
-`vivi-cli/openrouter`; saving a fake value in an everyday account could overwrite
-an existing key. Nothing in the automated workflow performs these saves.
+Use a real Windows machine and terminal with the same final canonical npm archive.
+The safe offline native probe must default to read-only availability and record
+presence checks. It must never display existing record values. The current vault
+implementation uses fixed targets `vivi-cli/openai` and `vivi-cli/openrouter`;
+saving a fake value could overwrite an existing key. Refuse every save if either
+target already has a Vivi record, or if safe absence cannot be established.
+No account creation, security-setting change or deletion is required. Nothing in
+the automated workflow invokes the real vault or performs these saves.
 
 Use a deliberately fake, nonworking marker only. Do not enter a live API key,
 send chat or fetch a provider catalog during vault-only validation. A scoped
 manual probe must exercise `NativeCredentialStore` directly and stay offline.
-Running such a probe and creating/removing its test records requires the user's
-specific approval. This checklist does not authorize those actions.
+The separate manual harness is not part of this CI artifact. These are intended
+safe steps, not a claim that native execution occurred. Running a write-mode probe
+and creating any fake records requires the user's specific approval after the
+read-only preflight. This checklist does not authorize those actions. Leave
+existing records untouched; unavailable or unsafe steps must be reported as such.
 
 - Record Windows edition/build, architecture, terminal/version, Node/Bun versions,
   CLI commit, exact artifact SHA-256 and whether package or executable is tested
 - Install into a fresh consumer with no repository dependency fallback; run the
   installed bin's help and Node line-mode route without importing native TUI modules
-- In the dedicated account, verify the read-only availability probe, missing record,
-  fake save and exact-byte read-back separately for both fixed provider targets
+- Verify read-only availability and presence/absence for both fixed provider targets
+- Only after explicit write approval and confirmed absence of both records, verify
+  fake save and exact-byte read-back separately; recheck absence before any save
 - Restart the process and verify the saved fake value is still readable; check
   shell arguments, diagnostics, preferences and sessions contain no marker
 - Check missing/unavailable helper and restricted or unavailable vault session
@@ -93,8 +124,8 @@ specific approval. This checklist does not authorize those actions.
   persisted history, no late success, and a usable subsequent turn
 - Exit normally and via idle Ctrl+C and termination; verify cursor, echo, raw-mode
   state and alternate screen are restored in the real terminal
-- Remove test records only with authorization; report passes, failures and stages
-  that could not safely be exercised separately
+- Report passes, failures and stages that could not safely be exercised separately;
+  deletion is optional and requires separate authorization if cleanup is desired
 
 On Windows, "locked/unavailable" is the actual unsupported/restricted credential
 session or helper failure path. Do not manufacture that condition by changing

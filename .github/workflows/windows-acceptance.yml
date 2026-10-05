@@ -11,8 +11,38 @@ env:
   npm_config_engine_strict: 'true'
 
 jobs:
+  candidate:
+    # Produce one private npm archive. Both Windows runtimes consume these exact bytes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run test:tui
+      - run: npm run test:package
+        env:
+          VIVI_TEST_BUN: bun
+          VIVI_TEST_CANDIDATE_DIR: ${{ runner.temp }}/canonical-npm-candidate
+      # Explicit allowlist: private test archive and nonsecret metadata/evidence only.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canonical-private-npm-candidate
+          path: |
+            ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+            ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+            ${{ runner.temp }}/canonical-npm-candidate/package-evidence.json
+          if-no-files-found: error
+
   headless:
     # Windows x64 headless evidence. Real native vault/TTY acceptance remains pending.
+    needs: candidate
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -28,20 +58,26 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: canonical-private-npm-candidate
+          path: ${{ runner.temp }}/canonical-npm-candidate
       - run: npm ci --ignore-scripts
       - run: npm run build
       # Fake runners only: no native credential store, live keys, model calls or TTY automation.
-      - run: node --test test/credentials.test.mjs test/models.test.mjs test/picker.test.mjs test/application.test.mjs test/platform-acceptance.test.mjs test/extensions.test.mjs test/usage-pure.test.mjs test/usage-host.test.mjs
+      - run: node --test test/credentials.test.mjs test/models.test.mjs test/picker.test.mjs test/application.test.mjs test/platform-acceptance.test.mjs test/package-candidate.test.mjs test/extensions.test.mjs test/usage-pure.test.mjs test/usage-host.test.mjs
       # Windows npm scripts do not expand the shell wildcard used by test:tui.
       - run: bun test ./test/tui.test.ts ./test/application-tui.test.ts
       - run: npm run test:package
         env:
           VIVI_TEST_BUN: bun
+          VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+          VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
           VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-package-evidence.json
       - run: npm run test:standalone
       - run: npm run build:standalone
       - run: .\build\vivi.exe --help
-      # Retain only nonsecret evidence. Never upload credentials, sessions, archives or executables.
+      # Separate observed Windows reports only. No credentials, sessions or executables.
       - uses: actions/upload-artifact@v4
         with:
           name: windows-node-${{ matrix.node }}-headless-evidence

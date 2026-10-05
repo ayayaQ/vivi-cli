@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { npmInvocation, packageAcceptanceEvidence, supportsCliNode } from './platform-acceptance.mjs'
+import { candidateOptions, createCandidate, exportCandidate, normalizeLicense, readCandidate,
+  requireNewCandidateDirectory, verifyNpmMetadata } from './package-candidate.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+const candidateInput = candidateOptions()
+await requireNewCandidateDirectory(candidateInput.directory)
 const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // This check prepares a fresh registry cache explicitly, then verifies an offline consumer.
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
@@ -59,10 +62,24 @@ try {
   assert.equal(coreManifest.name, coreName)
   assert.equal(coreManifest.version, coreVersion)
   assert.equal(coreManifest.license, 'Apache-2.0')
-  const [packed] = JSON.parse(runNpm(['pack', '--json', '--pack-destination', temporary, '--cache', cache]))
+  let bytes, candidate
+  if (candidateInput.archive) {
+    ;({ bytes, candidate } = await readCandidate(candidateInput.archive, candidateInput.metadata, manifest))
+    // Install an immutable temporary copy of the bytes just validated, not a mutable input path.
+    await writeFile(join(temporary, candidate.artifact.filename), bytes, { flag: 'wx' })
+  } else {
+    const packedOutput = JSON.parse(runNpm(['pack', '--json', '--pack-destination', temporary, '--cache', cache]))
+    assert(Array.isArray(packedOutput) && packedOutput.length === 1, 'Expected exactly one packed CLI archive')
+    bytes = await readFile(join(temporary, packedOutput[0].filename))
+    candidate = createCandidate(packedOutput[0], bytes, manifest)
+  }
+  const packed = candidate.npm
+  const tarball = join(temporary, packed.filename)
+  // npm inspects the archive itself: file metadata must agree before any consumer installation.
+  verifyNpmMetadata(candidate, JSON.parse(runNpm(['pack', '--dry-run', '--json', '--ignore-scripts', tarball])))
   const paths = new Set(packed.files.map((file) => file.path))
   for (const path of ['LICENSE', 'NOTICE', 'README.md', 'RELEASING.md', 'package.json', 'tsconfig.json',
-    'scripts/platform-acceptance.mjs', 'scripts/no-tui-loader.mjs',
+    'scripts/platform-acceptance.mjs', 'scripts/package-candidate.mjs', 'scripts/no-tui-loader.mjs',
     'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
     'src/models.ts', 'src/picker.ts', 'src/credentials.ts', 'dist/models.js', 'dist/picker.js', 'dist/picker.d.ts', 'dist/credentials.js',
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
@@ -81,7 +98,6 @@ try {
   assert([...paths].every((path) => !path.startsWith('vendor/')), 'Obsolete vendor snapshots must not be packed')
   assert(!paths.has('src/run-agent.ts') && !paths.has('src/providers/openai.ts'), 'CLI must not copy core or provider implementations')
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
-  const tarball = join(temporary, packed.filename)
   await writeFile(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }))
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
@@ -103,7 +119,8 @@ try {
   assert.equal(installedManifest.license, 'Apache-2.0')
   assert.equal(installedManifest.dependencies[coreName], coreVersion)
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
-  assert.deepEqual(await readFile(join(installed, 'LICENSE')), await readFile(join(root, 'LICENSE')))
+  assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
+    normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
   const bundledCore = join(installed, corePath)
   async function compareDirectory(relative = '') {
     const entries = await readdir(join(root, corePath, relative), { withFileTypes: true })
@@ -244,14 +261,16 @@ try {
     assert.match(run(process.env.VIVI_TEST_BUN, [launcher, '--help'], temporary), /--provider/)
     console.log('Packed native renderer, model search and Bun CLI entrypoint passed')
   }
-  const bytes = await readFile(tarball)
-  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  const sha256 = candidate.artifact.sha256
+  const bun = process.env.VIVI_TEST_BUN ? run(process.env.VIVI_TEST_BUN, ['--version']).trim() : undefined
+  const evidence = packageAcceptanceEvidence({ filename: packed.filename, sha256,
+    integrity: packed.integrity, size: bytes.length, cliVersion: manifest.version, bun })
   if (process.env.VIVI_TEST_ACCEPTANCE_REPORT) {
-    const bun = process.env.VIVI_TEST_BUN ? run(process.env.VIVI_TEST_BUN, ['--version']).trim() : undefined
-    await writeFile(process.env.VIVI_TEST_ACCEPTANCE_REPORT, JSON.stringify(packageAcceptanceEvidence({
-      filename: packed.filename, sha256, integrity: packed.integrity, size: bytes.length,
-      cliVersion: manifest.version, bun
-    }), null, 2) + '\n')
+    await writeFile(process.env.VIVI_TEST_ACCEPTANCE_REPORT, JSON.stringify(evidence, null, 2) + '\n')
+  }
+  if (candidateInput.directory) {
+    await exportCandidate(candidateInput.directory, { bytes, candidate, evidence, manifest })
+    console.log(`Canonical private npm candidate exported to ${candidateInput.directory}`)
   }
   console.log(`Installed CLI bin, shared-provider runtime and TypeScript declarations passed (${packed.filename})`)
   console.log(`sha256 ${sha256}`)
