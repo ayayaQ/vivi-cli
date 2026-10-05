@@ -1,0 +1,45 @@
+name: Windows acceptance preparation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  headless:
+    # Exploratory Windows evidence only. This does not advertise Windows support.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      # Fake runners only: no native credential store, live keys, model calls or TTY automation.
+      - run: node --test test/credentials.test.mjs test/models.test.mjs test/picker.test.mjs test/application.test.mjs test/platform-acceptance.test.mjs
+      # Windows npm scripts do not expand the shell wildcard used by test:tui.
+      - run: bun test ./test/tui.test.ts ./test/application-tui.test.ts
+      - run: npm run test:package
+        env:
+          VIVI_TEST_BUN: bun
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-package-evidence.json
+      - run: npm run test:standalone
+      - run: npm run build:standalone
+      - run: .\build\vivi.exe --help
+      # Retain only nonsecret evidence. Never upload credentials, sessions, archives or executables.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-node-${{ matrix.node }}-headless-evidence
+          path: ${{ runner.temp }}/windows-package-evidence.json
+          if-no-files-found: error

@@ -6,6 +6,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { npmInvocation, packageAcceptanceEvidence } from './platform-acceptance.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
@@ -27,6 +28,13 @@ function run(command, args, cwd = root) {
   return result.stdout
 }
 
+function runNpm(args, cwd = root) {
+  const invocation = npmInvocation(args)
+  return run(invocation.command, invocation.args, cwd)
+}
+
+const nodeGuard = ['--experimental-loader', new URL('./no-tui-loader.mjs', import.meta.url).href]
+
 try {
   const lock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'))
   const installedLock = JSON.parse(await readFile(join(root, 'node_modules/.package-lock.json'), 'utf8'))
@@ -46,9 +54,10 @@ try {
   assert.equal(coreManifest.name, coreName)
   assert.equal(coreManifest.version, coreVersion)
   assert.equal(coreManifest.license, 'Apache-2.0')
-  const [packed] = JSON.parse(run('npm', ['pack', '--json', '--pack-destination', temporary, '--cache', cache]))
+  const [packed] = JSON.parse(runNpm(['pack', '--json', '--pack-destination', temporary, '--cache', cache]))
   const paths = new Set(packed.files.map((file) => file.path))
   for (const path of ['LICENSE', 'NOTICE', 'README.md', 'RELEASING.md', 'package.json', 'tsconfig.json',
+    'scripts/platform-acceptance.mjs', 'scripts/no-tui-loader.mjs',
     'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
     'src/models.ts', 'src/picker.ts', 'src/credentials.ts', 'dist/models.js', 'dist/picker.js', 'dist/picker.d.ts', 'dist/credentials.js',
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
@@ -66,7 +75,7 @@ try {
   const tarball = join(temporary, packed.filename)
   await writeFile(join(temporary, 'package.json'), JSON.stringify({ private: true, type: 'module' }))
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
-  run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
+  runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
   for (const name of ['@opentui/core', 'web-tree-sitter']) {
     const path = `node_modules/${name}`
@@ -75,7 +84,7 @@ try {
     }
   }
   await rm(join(temporary, 'node_modules'), { recursive: true, force: true })
-  run('npm', ['ci', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache], temporary)
+  runNpm(['ci', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache], temporary)
   const installed = join(temporary, 'node_modules/@ayayaq/vivi-cli')
   const installedManifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'))
   assert.equal(installedManifest.name, '@ayayaq/vivi-cli')
@@ -101,7 +110,10 @@ try {
     }
   }
   await compareDirectory()
-  assert.match(run(process.execPath, [join(temporary, 'node_modules/.bin/vivi'), '--help'], temporary), /--provider/)
+  // npm exec resolves the platform's installed bin shim, including vivi.cmd on Windows.
+  assert.match(runNpm(['exec', '--offline', '--', 'vivi', '--help'], temporary), /--provider/)
+  const launcher = join(installed, installedManifest.bin.vivi)
+  assert.match(run(process.execPath, [...nodeGuard, launcher, '--no-tui', '--help'], temporary), /--provider/)
   // Anchor runtime/type consumers beside the installed package: its bundled core is an
   // implementation dependency, not a promise that npm hoists that package for other consumers.
   await writeFile(join(installed, 'consumer.mjs'), `
@@ -113,6 +125,7 @@ import { CliHost, FileSessionStore, calculate, builtinTools } from '@ayayaq/vivi
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
+globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
 assert.equal(calculate('3 * (4 + 2)'), 18)
 assert.deepEqual(builtinTools().map(tool => tool.name), ['calculate', 'current_time'])
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
@@ -134,7 +147,7 @@ try {
   assert.equal((await router.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenRouter shared')
 } finally { await rm(directory, { recursive: true, force: true }) }
 `)
-  run(process.execPath, [join(installed, 'consumer.mjs')], temporary)
+  run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
 import { CliHost, FileSessionStore, TerminalIO, newSession, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
@@ -187,11 +200,19 @@ try {
 } finally { io.close(); setup.renderer.destroy() }
 `)
     run(process.env.VIVI_TEST_BUN, [join(installed, 'tui-consumer.ts')], temporary)
-    assert.match(run(process.env.VIVI_TEST_BUN, [join(temporary, 'node_modules/.bin/vivi'), '--help'], temporary), /--provider/)
+    assert.match(run(process.env.VIVI_TEST_BUN, [launcher, '--help'], temporary), /--provider/)
     console.log('Packed native renderer, model search and Bun CLI entrypoint passed')
   }
   const bytes = await readFile(tarball)
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
+  if (process.env.VIVI_TEST_ACCEPTANCE_REPORT) {
+    const bun = process.env.VIVI_TEST_BUN ? run(process.env.VIVI_TEST_BUN, ['--version']).trim() : undefined
+    await writeFile(process.env.VIVI_TEST_ACCEPTANCE_REPORT, JSON.stringify(packageAcceptanceEvidence({
+      filename: packed.filename, sha256, integrity: packed.integrity, size: bytes.length,
+      cliVersion: manifest.version, bun
+    }), null, 2) + '\n')
+  }
   console.log(`Installed CLI bin, shared-provider runtime and TypeScript declarations passed (${packed.filename})`)
-  console.log(`sha256 ${createHash('sha256').update(bytes).digest('hex')}`)
+  console.log(`sha256 ${sha256}`)
   console.log(`integrity ${packed.integrity}`)
 } finally { await rm(temporary, { recursive: true, force: true }) }
