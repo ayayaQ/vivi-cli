@@ -27,7 +27,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       # Fake runners only: no native credential store, live keys, model calls or TTY automation.
-      - run: node --test test/credentials.test.mjs test/models.test.mjs test/picker.test.mjs test/application.test.mjs test/platform-acceptance.test.mjs
+      - run: node --test test/credentials.test.mjs test/models.test.mjs test/picker.test.mjs test/application.test.mjs test/platform-acceptance.test.mjs test/extensions.test.mjs
       # Windows npm scripts do not expand the shell wildcard used by test:tui.
       - run: bun test ./test/tui.test.ts ./test/application-tui.test.ts
       - run: npm run test:package

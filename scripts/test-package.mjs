@@ -15,8 +15,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.2.1'
-const coreIntegrity = 'sha512-iMuY7HbBfRljH9yTMS0unR98WctuNjYVUYrXOOuLYbwlscydW2TKwVKhw9ec6SVjtqFwjPQdn7tLkoYi4pUkmA=='
+const coreVersion = '0.3.0'
+const coreIntegrity = 'sha512-9Evt8vBmwyGQEQG5eowb3R1onJCyEru4pqqVwzGA4TX9sgaWE2p7AdcDAtVTt6wDERFiM0yXNUwQAVPK2TSz3A=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -46,7 +46,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.2.1 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.3.0 release bytes')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -64,6 +64,9 @@ try {
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
+    'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
+    'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
+    'dist/cjs/extensions.js', 'dist/cjs/extensions/calculator.js',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
@@ -121,13 +124,21 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, calculate, builtinTools } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, calculate, builtinTools, createBuiltinToolset } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
+import { createToolRegistry } from '@ayayaq/vivi/extensions'
+import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
 assert.equal(calculate('3 * (4 + 2)'), 18)
+assert.equal(calculate, sharedCalculate, 'CLI must re-export the shared calculator, not a duplicate parser')
 assert.deepEqual(builtinTools().map(tool => tool.name), ['calculate', 'current_time'])
+assert.deepEqual(createBuiltinToolset().tools[0], createToolRegistry([calculatorExtension]).tools[0])
+const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
+  definition: { name: 'packed_fixture', description: 'Packed extension', parameters: { type: 'object' } },
+  validateArguments() {}, execute() { return { content: 'packed extension works' } }
+}] }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
 try {
   const host = await CliHost.create({ store: new FileSessionStore(directory),
@@ -137,6 +148,16 @@ try {
   assert.equal(result.status, 'completed')
   validateHistory(result.history)
   assert.deepEqual(closeInterruptedHistory(result.history), result.history)
+  let extensionRounds = 0
+  const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
+    settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
+    provider: { generate: async () => ++extensionRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-call', name: 'packed_fixture', arguments: {} }] }
+      : { content: 'Packed extension accepted', toolCalls: [] } } })
+  const extensionResult = await extensionHost.send('Test the installed extension')
+  assert.equal(extensionResult.status, 'completed')
+  assert.equal(extensionResult.history[2].content, 'packed extension works')
+  assert.deepEqual((await new FileSessionStore(directory).load(extensionHost.session.id)).history, extensionResult.history)
   const openai = createOpenAIProvider({ model: 'fake', apiKey: 'fake', fetch: async () => new Response(JSON.stringify({
     status: 'completed', output: [{ type: 'message', id: 'fake-message', role: 'assistant', content: [{ type: 'output_text', text: 'OpenAI shared', annotations: [] }] }]
   })) })
@@ -149,19 +170,21 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, TerminalIO, newSession, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, TerminalIO, newSession, createBuiltinToolset, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
+import type { ToolExtension } from '@ayayaq/vivi/extensions'
 const provider: ModelProvider = createOpenAIProvider({ model: 'fake', apiKey: 'fake' })
 const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
 const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
-const options: CliHostOptions = { provider, session, store, onEvent(event: AgentEvent) { void event },
+const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
+const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
-void result; void io
+void result; void io; void createBuiltinToolset(false, [extension])
 `)
   const typeRoots = join(root, 'node_modules/@types')
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',

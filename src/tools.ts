@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
+import { createToolRegistry, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
+import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
+export { calculate }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
 export interface ApprovalRequest {
@@ -17,10 +20,8 @@ export interface ToolHost {
 const objectSchema = (properties: Record<string, unknown>, required: string[]): ToolDefinition['parameters'] =>
   ({ type: 'object', properties, required, additionalProperties: false }) as ToolDefinition['parameters']
 
-export function builtinTools(enableNotes = false): ToolDefinition[] {
+function hostTools(enableNotes = false): ToolDefinition[] {
   const tools: ToolDefinition[] = [
-    { name: 'calculate', description: 'Evaluate bounded arithmetic (+ - * / % and parentheses). No code execution.',
-      parameters: objectSchema({ expression: { type: 'string', maxLength: 256 } }, ['expression']) },
     { name: 'current_time', description: 'Return the current time in a requested IANA timezone, default UTC.',
       parameters: objectSchema({ timezone: { type: 'string', maxLength: 100 } }, []) }
   ]
@@ -34,53 +35,26 @@ export function builtinTools(enableNotes = false): ToolDefinition[] {
   return tools
 }
 
-/** A small parser, deliberately excluding JavaScript, functions, assignments and exponents. */
-export function calculate(expression: string): number {
-  if (expression.length === 0 || expression.length > 256) throw new Error('Expression must contain 1..256 characters')
-  const tokens = expression.match(/(?:\d+(?:\.\d*)?|\.\d+)|[()+\-*/%]|\S/g) ?? []
-  if (tokens.length > 128) throw new Error('Expression has too many tokens')
-  let index = 0
-  let depth = 0
-  const checked = (value: number): number => {
-    if (!Number.isFinite(value) || Math.abs(value) > 1e100) throw new Error('Arithmetic result is out of range')
-    return value
+/** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = []): {
+  tools: ToolDefinition[]
+  executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
+} {
+  const registry = createToolRegistry([calculatorExtension, ...extensions], {
+    reservedNames: ['current_time', 'note_read', 'note_set']
+  })
+  return {
+    tools: [...registry.tools, ...hostTools(enableNotes)],
+    executeTool: (call, signal, host) => executeHostTool(call, signal, host, registry)
   }
-  const atom = (): number => {
-    if (++depth > 24) throw new Error('Expression is too deeply nested')
-    try {
-      const token = tokens[index++]
-      if (token === '+' || token === '-') return checked((token === '-' ? -1 : 1) * atom())
-      if (token === '(') {
-        const value = sum()
-        if (tokens[index++] !== ')') throw new Error('Expected closing parenthesis')
-        return value
-      }
-      if (!token || !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(token)) throw new Error('Expected a number or parenthesis')
-      return checked(Number(token))
-    } finally { depth-- }
-  }
-  const product = (): number => {
-    let value = atom()
-    while (['*', '/', '%'].includes(tokens[index] ?? '')) {
-      const operation = tokens[index++]
-      const right = atom()
-      if ((operation === '/' || operation === '%') && right === 0) throw new Error('Division by zero')
-      value = checked(operation === '*' ? value * right : operation === '/' ? value / right : value % right)
-    }
-    return value
-  }
-  const sum = (): number => {
-    let value = product()
-    while (tokens[index] === '+' || tokens[index] === '-') {
-      const operation = tokens[index++]
-      const right = product()
-      value = checked(operation === '+' ? value + right : value - right)
-    }
-    return value
-  }
-  const result = sum()
-  if (index !== tokens.length) throw new Error('Unexpected arithmetic token')
-  return result
+}
+
+export function builtinTools(enableNotes = false): ToolDefinition[] {
+  return structuredClone(createBuiltinToolset(enableNotes).tools)
+}
+
+export function executeBuiltin(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult> {
+  return createBuiltinToolset(host.enableNotes).executeTool(call, signal, host)
 }
 
 function error(code: string, message: string): ToolResult {
@@ -89,14 +63,10 @@ function error(code: string, message: string): ToolResult {
 function exactArguments(call: ToolCall, allowed: string[]): void {
   if (Object.keys(call.arguments).some((key) => !allowed.includes(key))) throw new Error('Unexpected argument')
 }
-export async function executeBuiltin(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult> {
+async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHost, registry: ToolRegistry): Promise<ToolResult> {
   try {
     if (signal.aborted) return error('cancelled', 'Cancelled before tool execution')
-    if (call.name === 'calculate') {
-      exactArguments(call, ['expression'])
-      if (typeof call.arguments.expression !== 'string') throw new Error('expression must be a string')
-      return { content: JSON.stringify({ result: calculate(call.arguments.expression) }) }
-    }
+    if (registry.has(call.name)) return await registry.executeTool(call, { signal })
     if (call.name === 'current_time') {
       exactArguments(call, ['timezone'])
       const timezone = call.arguments.timezone ?? 'UTC'

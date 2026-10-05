@@ -15,6 +15,12 @@ launcher delegates to Bun and explains the line-mode fallback if Bun is absent.
 Node line mode and `--help` must work without resolving the native TUI. Native Bun
 UI startup on a real Windows terminal is still a release gate.
 
+OpenTUI 0.5.14 declares Node >=26.4.0 and Bun >=1.3.0 in its package metadata.
+Default npm installation on our tested Windows Node 22/24 runners succeeds with
+an engine warning; the guarded Node line-mode and Bun paths pass their checks.
+An engine-strict npm installation is not established by those results and needs
+an explicit packaging decision before public installation requirements are finalized.
+
 The CLI remains private and unpublished. Do not advertise a public npm installation
 command before its separately approved release. Test the final local tarball in a
 fresh npm consumer first; install runtime/parser/native dependencies from the registry
