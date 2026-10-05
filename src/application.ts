@@ -12,9 +12,11 @@ import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } 
 import type { Catalog, ModelEntry } from './models.js'
 import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
+import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
+  chooseSearchable<T>(title: string, choices: readonly Choice<T>[], options?: SearchableOptions): Promise<SearchableSelection<T> | undefined>
   askText(title: string, initial?: string): Promise<string | undefined>
   askSecret?(title: string): Promise<string | undefined>
   addSecrets?(secrets: readonly string[]): void
@@ -188,22 +190,14 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     else if (result.state === 'cached') io.write('Using the cached model catalog (up to 15 minutes old)\n')
     let search = ''
     for (;;) {
-      const matches = result.models.filter(model => `${model.id} ${model.name}`.toLowerCase().includes(search.toLowerCase()))
-      const shown = matches.slice(0, 250)
-      const choices = [
-        { name: 'Search models', description: matches.length > 250 ? `${matches.length} matches; showing first 250` : `${matches.length} models${search ? ` matching “${search}”` : ''}`, value: '__search' },
-        { name: 'Refresh catalog', description: 'Reload from the provider', value: '__refresh' },
-        ...shown.map(model => ({ name: model.id, description: `${model.name} · conversation ${model.conversation} · tools ${model.tools} · reasoning ${model.reasoning}`, value: model.id }))
-      ]
-      const id = await io.choose(`Models · ${base.provider} · ${result.state}`, choices,
-        Math.max(0, choices.findIndex(choice => choice.value === base.model)))
-      if (id === undefined) return
-      if (id === '__search') {
-        const query = await io.askText('Filter model names (partial names are fine)', search)
-        if (query === undefined) continue
-        search = query.slice(0, 200); continue
-      }
-      if (id === '__refresh') {
+      const choices = result.models.map(model => ({ name: model.id,
+        description: `${model.name} · conversation ${model.conversation} · tools ${model.tools} · reasoning ${model.reasoning}`,
+        searchTerms: [model.name, base.provider], value: model.id }))
+      const selection = await io.chooseSearchable(`Models · ${base.provider} · ${result.state}`, choices,
+        { query: search, initialIndex: Math.max(0, choices.findIndex(choice => choice.value === base.model)), refresh: true })
+      if (selection === undefined) return
+      search = selection.query
+      if (selection.kind === 'refresh') {
         const refreshController = new AbortController()
         const cleanup = io.onCancel(() => refreshController.abort())
         try {
@@ -216,7 +210,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (io.isClosed || refreshController.signal.aborted) return
         continue
       }
-      const model = shown.find(model => model.id === id)
+      const model = result.models.find(model => model.id === selection.value)
       if (!model) continue
       if (model.conversation === 'unknown') {
         const use = await io.choose(`Text conversation compatibility is unverified · ${model.id}`, [

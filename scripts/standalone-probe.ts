@@ -26,7 +26,13 @@ try {
   await setup.mockInput.typeText('Embedded input works')
   await setup.mockInput.pressEnter()
   assert.equal(await reading, 'Embedded input works')
+  const models = Array.from({ length: 1500 }, (_, index) => ({ name: `vendor/model-${index}`,
+    searchTerms: ['Embedded Provider'], value: `vendor/model-${index}` }))
+  const selecting = io.chooseSearchable('Embedded models', models, { refresh: true })
+  await setup.mockInput.typeText('PROVIDER model 1499')
+  setup.mockInput.pressEnter()
+  assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown and input passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input and model search passed')
 } finally { io.close(); setup.renderer.destroy() }

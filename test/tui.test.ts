@@ -455,6 +455,354 @@ test('pickers dismiss with Escape and work repeatedly with typed values intact',
   expect(await frame()).not.toContain('Initial selection')
 })
 
+const searchableWidgets = (setup: TestRendererSetup) => ({
+  composer: setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable,
+  composerBox: setup.renderer.root.findDescendantById('vivi-composer-box') as BoxRenderable,
+  pickerBox: setup.renderer.root.findDescendantById('vivi-picker-box') as BoxRenderable,
+  picker: setup.renderer.root.findDescendantById('vivi-picker') as SelectRenderable
+})
+
+test('searchable picker filters thousands of exact values live by normalized ID, name and provider tokens', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const target = { id: 'vendor.one/Exact-ID.v2', nested: { preserve: true } }
+  const sibling = { id: 'other/Zephyr.v1' }
+  const choices = [
+    ...Array.from({ length: 3200 }, (_, index) => ({ name: `filler/model-${index.toString().padStart(4, '0')}`,
+      description: 'conversation supported · tools supported', searchTerms: ['ordinary', 'openai'], value: { id: index } })),
+    { name: target.id, description: 'Zephyr Friendly Name · tools supported', searchTerms: ['Zephyr Friendly Name', 'openrouter'], value: target },
+    { name: sibling.id, description: 'Zephyr Friendly Name', searchTerms: ['Zephyr Friendly Name', 'openai'], value: sibling }
+  ]
+  const answer = io.chooseSearchable('Models', choices, { refresh: true })
+  let settled = false
+  void answer.then(() => { settled = true })
+  expect(await frame()).toContain('3202')
+  let widgets = searchableWidgets(setup)
+  expect(widgets.composer.focused).toBe(true)
+  expect(widgets.picker.focused).toBe(false)
+  expect(widgets.composerBox.visible).toBe(true)
+  await input.typeText('zephyr')
+  await frame()
+  widgets = searchableWidgets(setup)
+  expect(widgets.picker.options.map(option => option.name).sort()).toEqual([target.id, sibling.id].sort())
+  expect(widgets.composerBox.title).toMatch(/2\D+3202/)
+  await input.typeText('x')
+  expect((await frame()).toLowerCase()).toMatch(/no (matching|results|matches|models)/)
+  expect(widgets.composerBox.title).toMatch(/0\D+3202/)
+  input.pressEnter()
+  await Promise.resolve()
+  expect(settled).toBe(false)
+  input.pressBackspace()
+  await frame()
+  expect(widgets.picker.options.map(option => option.name).sort()).toEqual([target.id, sibling.id].sort())
+  input.pressKey('u', { ctrl: true })
+  await input.typeText('OPENROUTER vEnDoR.ONE zEpHyR v2')
+  await frame()
+  expect(widgets.picker.options.map(option => option.name)).toEqual([target.id])
+  expect(widgets.composer.plainText).toBe('OPENROUTER vEnDoR.ONE zEpHyR v2')
+  expect(widgets.composer.focused).toBe(true)
+  expect(setup.renderer.root.findDescendantById('vivi-completions')!.visible).toBe(false)
+  input.pressEnter()
+  const selected = await answer
+  expect(selected?.kind).toBe('selected')
+  if (selected?.kind !== 'selected') throw new Error('Expected a selected model')
+  expect(selected.value).toBe(target)
+  expect(selected.query).toBe('OPENROUTER vEnDoR.ONE zEpHyR v2')
+  expect(searchableWidgets(setup).composer.plainText).toBe('')
+  expect(searchableWidgets(setup).pickerBox.visible).toBe(false)
+})
+
+test('searchable navigation keeps search focus and query intact while moving through all results', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const choices = Array.from({ length: 30 }, (_, index) => ({ name: `batch/model-${index.toString().padStart(2, '0')}`,
+    searchTerms: ['batch'], value: { id: `original-${index}` } }))
+  const answer = io.chooseSearchable('Navigate models', choices, { initialIndex: 8 })
+  await frame()
+  const { composer, picker } = searchableWidgets(setup)
+  expect(picker.getSelectedIndex()).toBe(8)
+  input.pressArrow('up')
+  expect(picker.getSelectedIndex()).toBe(7)
+  input.pressArrow('down')
+  expect(picker.getSelectedIndex()).toBe(8)
+  input.pressKey('\x1b[6~')
+  expect(picker.getSelectedIndex()).toBeGreaterThan(8)
+  input.pressKey('HOME')
+  expect(picker.getSelectedIndex()).toBe(0)
+  input.pressKey('END')
+  expect(picker.getSelectedIndex()).toBe(29)
+  input.pressKey('\x1b[5~')
+  expect(picker.getSelectedIndex()).toBeLessThan(29)
+  expect(composer.focused).toBe(true)
+  expect(picker.focused).toBe(false)
+  expect(composer.plainText).toBe('')
+  await input.typeText('batch 29')
+  await frame()
+  expect(picker.options.map(option => option.name)).toEqual(['batch/model-29'])
+  expect(picker.getSelectedIndex()).toBe(0)
+  input.pressArrow('up')
+  input.pressArrow('down')
+  input.pressKey('HOME')
+  input.pressKey('END')
+  expect(composer.plainText).toBe('batch 29')
+  expect(composer.focused).toBe(true)
+  input.pressEnter()
+  const selected = await answer
+  expect(selected?.kind).toBe('selected')
+  if (selected?.kind !== 'selected') throw new Error('Expected a selected model')
+  expect(selected.value).toBe(choices[29]!.value)
+  expect(selected.query).toBe('batch 29')
+})
+
+test('clicking searchable results before and after resize keeps query typing focused and selects the latest exact value', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const target = { id: 'beta-two', preserve: true }
+  const answer = io.chooseSearchable('Mouse-safe models', [
+    { name: 'alpha', value: { id: 'alpha' } },
+    { name: 'beta-one', value: { id: 'beta-one' } },
+    { name: target.id, value: target }
+  ])
+  await frame()
+  let widgets = searchableWidgets(setup)
+  await setup.mockMouse.click(widgets.picker.x + 5, widgets.picker.y)
+  expect(widgets.composer.focused).toBe(true)
+  expect(widgets.picker.focused).toBe(false)
+  await input.typeText('beta')
+  await frame()
+  expect(widgets.composer.plainText).toBe('beta')
+  expect(widgets.picker.options.map(option => option.name)).toEqual(['beta-one', 'beta-two'])
+  setup.resize(40, 12)
+  await frame()
+  widgets = searchableWidgets(setup)
+  await setup.mockMouse.click(widgets.picker.x + 5, widgets.picker.y)
+  expect(widgets.composer.focused).toBe(true)
+  expect(widgets.picker.focused).toBe(false)
+  await input.typeText('-two')
+  await frame()
+  expect(widgets.composer.plainText).toBe('beta-two')
+  expect(widgets.picker.options.map(option => option.name)).toEqual(['beta-two'])
+  input.pressEnter()
+  const selected = await answer
+  expect(selected?.kind).toBe('selected')
+  if (selected?.kind !== 'selected') throw new Error('Expected a selected model')
+  expect(selected.value).toBe(target)
+  expect(selected.query).toBe('beta-two')
+})
+
+test('searchable paste filters without submitting, leaves capability text out of search and Ctrl+U restores all models', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const values = [{ name: 'openai/gpt-5-mini', description: 'tools supported', searchTerms: ['GPT 5 Mini', 'openai'], value: 'openai/gpt-5-mini' },
+    { name: 'vendor/other', description: 'GPT 5 Mini · tools supported', searchTerms: ['other', 'openrouter'], value: 'vendor/other' }]
+  const answer = io.chooseSearchable('Paste search', values)
+  let settled = false
+  void answer.then(() => { settled = true })
+  await input.pasteBracketedText('  GPT/5.MINI  ')
+  await frame()
+  const { composer, picker, composerBox } = searchableWidgets(setup)
+  expect(picker.options.map(option => option.name)).toEqual(['openai/gpt-5-mini'])
+  expect(settled).toBe(false)
+  expect(composer.focused).toBe(true)
+  input.pressKey('u', { ctrl: true })
+  await frame()
+  expect(composer.plainText).toBe('')
+  expect(picker.options.map(option => option.name)).toEqual(values.map(value => value.name))
+  expect(composerBox.title).toMatch(/2\D+2/)
+  await input.typeText('supported')
+  expect((await frame()).toLowerCase()).toMatch(/no (matching|results|matches|models)/)
+  input.pressEnter()
+  await Promise.resolve()
+  expect(settled).toBe(false)
+  input.pressKey('u', { ctrl: true })
+  await input.pasteBracketedText('openai gpt 5 mini')
+  input.pressEnter()
+  expect(await answer).toEqual({ kind: 'selected', value: 'openai/gpt-5-mini', query: 'openai gpt 5 mini' })
+})
+
+test('searchable text editing, Unicode and multiline paste keep the current query live through Enter', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const exact = { id: 'openai/gpt-5-mini' }
+  const choices = [{ name: 'openai/gpt-5-mini-longer', searchTerms: ['OpenAI GPT 5 Mini'], value: { id: 'longer' } },
+    { name: exact.id, searchTerms: ['OpenAI GPT 5 Mini'], value: exact }]
+  const pasted = io.chooseSearchable('Unicode search', choices)
+  let settled = false
+  void pasted.then(() => { settled = true })
+  await input.pasteBracketedText('ＯＰＥＮＡＩ\nＧＰＴ\t５／ＭＩＮＩ')
+  await frame()
+  const { composer, picker } = searchableWidgets(setup)
+  expect(composer.plainText).toBe('ＯＰＥＮＡＩ ＧＰＴ ５／ＭＩＮＩ')
+  expect(composer.plainText).not.toContain('\n')
+  expect(settled).toBe(false)
+  expect(picker.getSelectedOption()?.name).toBe(exact.id)
+  input.pressArrow('left')
+  input.pressBackspace()
+  await input.typeText('Ｎ')
+  input.pressArrow('right')
+  expect(composer.plainText).toBe('ＯＰＥＮＡＩ ＧＰＴ ５／ＭＩＮＩ')
+  expect(composer.focused).toBe(true)
+  input.pressEnter()
+  const selected = await pasted
+  expect(selected?.kind).toBe('selected')
+  if (selected?.kind !== 'selected') throw new Error('Expected a selected model')
+  expect(selected.value).toBe(exact)
+  expect(selected.query).toBe('ＯＰＥＮＡＩ ＧＰＴ ５／ＭＩＮＩ')
+  const immediate = io.chooseSearchable('Immediate search', [{ name: 'alpha', value: 'exact-alpha' },
+    { name: 'beta', value: 'exact-beta' }], { query: 'alpha' })
+  input.pressKey('u', { ctrl: true })
+  await input.typeText('betax')
+  input.pressBackspace()
+  input.pressEnter() // No frame between the last edit and submission.
+  expect(await immediate).toEqual({ kind: 'selected', value: 'exact-beta', query: 'beta' })
+})
+
+test('searchable input stays bounded and Ctrl+R only refreshes when the caller enabled it', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const answer = io.chooseSearchable('Bounded search', [{ name: 'beta', value: 'exact-beta' }])
+  let settled = false
+  void answer.then(() => { settled = true })
+  await input.pasteBracketedText('x'.repeat(4000))
+  await frame()
+  expect(searchableWidgets(setup).composer.plainText).toHaveLength(200)
+  expect(await frame()).toContain('Input limit: 200 characters')
+  expect((await frame()).toLowerCase()).toMatch(/no (matching|results|matches|models)/)
+  input.pressKey('u', { ctrl: true })
+  await input.typeText('beta')
+  input.pressKey('r', { ctrl: true })
+  await Promise.resolve()
+  expect(settled).toBe(false)
+  expect(searchableWidgets(setup).composer.plainText).toBe('beta')
+  input.pressEnter()
+  expect(await answer).toEqual({ kind: 'selected', value: 'exact-beta', query: 'beta' })
+})
+
+test('same native input batch uses the newest query for Enter, navigation and refresh', async () => {
+  const { io, setup, frame } = await fixture()
+  const choices = [{ name: 'alpha', value: 'exact-alpha' }, { name: 'beta', value: 'exact-beta' },
+    { name: 'beta-longer', value: 'exact-longer' }]
+  const selected = io.chooseSearchable('Same-batch Enter', choices, { query: 'alpha' })
+  await frame()
+  setup.renderer.stdin.emit('data', Buffer.from('\x15beta\r'))
+  expect(await selected).toEqual({ kind: 'selected', value: 'exact-beta', query: 'beta' })
+  const navigated = io.chooseSearchable('Same-batch navigation', choices, { query: 'alpha' })
+  await frame()
+  setup.renderer.stdin.emit('data', Buffer.from('\x15beta\x1b[B\r'))
+  expect(await navigated).toEqual({ kind: 'selected', value: 'exact-longer', query: 'beta' })
+  const refresh = io.chooseSearchable('Same-batch refresh', choices, { query: 'alpha', refresh: true })
+  await frame()
+  setup.renderer.stdin.emit('data', Buffer.from('\x15beta\x12'))
+  expect(await refresh).toEqual({ kind: 'refresh', query: 'beta' })
+})
+
+test('searchable refresh returns the live query and repeated opening starts clean unless a query is supplied', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const choices = [{ name: 'alpha', value: 'exact-alpha' }, { name: 'beta', value: 'exact-beta' }]
+  const refresh = io.chooseSearchable('First models', choices, { refresh: true })
+  await input.typeText('bet')
+  input.pressKey('r', { ctrl: true })
+  expect(await refresh).toEqual({ kind: 'refresh', query: 'bet' })
+  expect(searchableWidgets(setup).composer.plainText).toBe('')
+  expect(searchableWidgets(setup).pickerBox.visible).toBe(false)
+  const reopened = io.chooseSearchable('Refreshed models', choices, { query: 'bet', refresh: true })
+  await frame()
+  expect(searchableWidgets(setup).composer.plainText).toBe('bet')
+  expect(searchableWidgets(setup).picker.options.map(option => option.name)).toEqual(['beta'])
+  input.pressEnter()
+  expect(await reopened).toEqual({ kind: 'selected', value: 'exact-beta', query: 'bet' })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cancelled = io.chooseSearchable('Cancel models', choices)
+    await frame()
+    expect(searchableWidgets(setup).composer.plainText).toBe('')
+    expect(searchableWidgets(setup).picker.options.map(option => option.name)).toEqual(['alpha', 'beta'])
+    await input.typeText('discard')
+    input.pressEscape()
+    expect(await cancelled).toBeUndefined()
+    expect(searchableWidgets(setup).composer.plainText).toBe('')
+  }
+  const line = io.readLine('Message')
+  await input.typeText('/m')
+  expect(await frame()).toContain('› /models')
+  input.pressTab()
+  input.pressEnter()
+  expect(await line).toBe('/models')
+})
+
+test('empty searchable catalogs stay dismissible and refreshable without Enter selecting a placeholder', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const answer = io.chooseSearchable('Empty models', [], { refresh: true })
+  let settled = false
+  void answer.then(() => { settled = true })
+  expect((await frame()).toLowerCase()).toMatch(/no (matching|results|matches|models)/)
+  expect(searchableWidgets(setup).composerBox.title).toMatch(/0\D+0/)
+  expect(searchableWidgets(setup).composer.focused).toBe(true)
+  input.pressArrow('down')
+  input.pressKey('END')
+  input.pressEnter()
+  await Promise.resolve()
+  expect(settled).toBe(false)
+  input.pressKey('r', { ctrl: true })
+  expect(await answer).toEqual({ kind: 'refresh', query: '' })
+  const again = io.chooseSearchable('Empty again', [])
+  input.pressEscape()
+  expect(await again).toBeUndefined()
+})
+
+test('searchable picker survives native resize and keeps both the search editor and matched values visible', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 110, height: 32 })
+  const choices = Array.from({ length: 600 }, (_, index) => ({ name: `catalog/model-${index}`, value: `exact-${index}` }))
+  const answer = io.chooseSearchable('Resize models', choices, { refresh: true })
+  await input.typeText('599')
+  for (const [width, height] of [[40, 12], [70, 20], [110, 32]] as const) {
+    setup.resize(width, height)
+    const display = await frame()
+    const { composer, composerBox, pickerBox, picker } = searchableWidgets(setup)
+    expect(display).toContain('model-599')
+    expect(display).toContain('Ctrl+R refresh')
+    expect(display).toContain('Enter choose')
+    expect(display).toContain('Esc back')
+    expect(composerBox.visible).toBe(true)
+    expect(pickerBox.visible).toBe(true)
+    expect(composerBox.y + composerBox.height).toBeLessThanOrEqual(height)
+    expect(pickerBox.y + pickerBox.height).toBeLessThanOrEqual(composerBox.y)
+    expect(composer.plainText).toBe('599')
+    expect(composer.focused).toBe(true)
+    expect(picker.options.map(option => option.name)).toEqual(['catalog/model-599'])
+  }
+  input.pressEnter()
+  expect(await answer).toEqual({ kind: 'selected', value: 'exact-599', query: '599' })
+})
+
+test('searchable replacement and native termination settle once and cannot leak a stale query into later input', async () => {
+  const { io, setup, input, frame } = await fixture()
+  const choices = [{ name: 'alpha', value: { exact: 'alpha' } }, { name: 'beta', value: { exact: 'beta' } }]
+  const first = io.chooseSearchable('Old search', choices)
+  await input.typeText('alpha')
+  const replacement = io.chooseSearchable('New search', choices, { query: 'bet' })
+  expect(await first).toBeUndefined()
+  await frame()
+  expect(searchableWidgets(setup).composer.plainText).toBe('bet')
+  input.pressEnter()
+  const selected = await replacement
+  expect(selected?.kind).toBe('selected')
+  if (selected?.kind !== 'selected') throw new Error('Expected a selected model')
+  expect(selected.value).toBe(choices[1]!.value)
+  const replacedByText = io.chooseSearchable('Discard this search', choices)
+  await input.typeText('discard')
+  const text = io.askText('Ordinary text', 'fresh')
+  expect(await replacedByText).toBeUndefined()
+  input.pressEnter()
+  expect(await text).toBe('fresh')
+  for (const action of ['close', 'ctrl-c', 'destroy', 'error'] as const) {
+    const fixtureValue = await fixture()
+    const pending = fixtureValue.io.chooseSearchable('Interrupted search', choices)
+    const outcome = pending.catch((error: Error) => error.message)
+    await fixtureValue.input.typeText('unfinished-query')
+    if (action === 'close') fixtureValue.io.close()
+    else if (action === 'ctrl-c') fixtureValue.input.pressCtrlC()
+    else if (action === 'destroy') fixtureValue.setup.renderer.destroy()
+    else fixtureValue.setup.renderer.emit(CliRenderEvents.HANDLER_ERROR, { error: new Error('search failed') })
+    expect(await outcome).toBe(action === 'error' ? 'OpenTUI renderer failed: search failed' : undefined)
+    expect(fixtureValue.io.isClosed).toBe(true)
+    expect(fixtureValue.setup.renderer.isDestroyed).toBe(true)
+  }
+})
+
 test('askText starts with its initial value and dismisses without stale input', async () => {
   const { io, input } = await fixture()
   const first = io.askText('Model identifier', 'mock-model')
