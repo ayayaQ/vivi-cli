@@ -25,6 +25,15 @@ This does not add package discovery, a loader, installation, sandboxing or new t
 permissions. The private CLI remains a consuming package; publishing core does not
 publish the CLI.
 
+Schema-1 sessions accept optional complete-session cache input read/write counts.
+Old sessions retain missing fields. A cache aggregate is reported only when every
+accepted provider round reports that field, including an explicit zero. Cache counts
+are already included in provider input and total counts, which are never recomputed
+from the cache breakdown. Assistant checkpoints omit cache aggregates until round
+telemetry is saved; final cancellation/error reconciliation counts accepted usage once.
+Round, turn and session displays label their scope and distinguish unreported from zero.
+No cache policy, pricing or estimated savings is added.
+
 For a future shared dependency update, publish and verify the compatible shared npm
 release first, then change the exact dependency and regenerate the lockfile. Review
 the diff and preserve every other dependency's locked version, resolution, integrity

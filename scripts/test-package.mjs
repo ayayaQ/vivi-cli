@@ -67,7 +67,8 @@ try {
     'src/models.ts', 'src/picker.ts', 'src/credentials.ts', 'dist/models.js', 'dist/picker.js', 'dist/picker.d.ts', 'dist/credentials.js',
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
-    'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts']) assert(paths.has(path), `Missing ${path}`)
+    'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts',
+    'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
@@ -130,7 +131,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, calculate, builtinTools, createBuiltinToolset } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
@@ -149,11 +150,17 @@ const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
 try {
   const host = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' },
-    provider: { generate: async () => ({ content: 'Packed host works', toolCalls: [] }) } })
+    provider: { generate: async () => ({ content: 'Packed host works', toolCalls: [],
+      usage: { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 } }) } })
   const result = await host.send('Test the installed host')
   assert.equal(result.status, 'completed')
   validateHistory(result.history)
   assert.deepEqual(closeInterruptedHistory(result.history), result.history)
+  assert.deepEqual(result.usage, { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 })
+  assert.deepEqual((await new FileSessionStore(directory).load(host.session.id)).usage, result.usage)
+  assert.deepEqual(aggregateUsage([result.usage, result.usage]),
+    { inputTokens: 6, outputTokens: 4, totalTokens: 14, cachedInputTokens: 0 })
+  assert.match(formatUsage(result.usage), /Cache input: read 0 \\/ write unreported/)
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
@@ -176,13 +183,15 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, TerminalIO, newSession, createBuiltinToolset, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
 const provider: ModelProvider = createOpenAIProvider({ model: 'fake', apiKey: 'fake' })
 const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
+session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
+const usageText: string = formatUsage(aggregateUsage([session.usage, undefined]))
 const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
 const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
@@ -190,7 +199,7 @@ const options: CliHostOptions = { provider, session, store, extensions: [extensi
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
-void result; void io; void createBuiltinToolset(false, [extension])
+void result; void io; void usageText; void createBuiltinToolset(false, [extension])
 `)
   const typeRoots = join(root, 'node_modules/@types')
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',
@@ -206,11 +215,14 @@ const setup = await createTestRenderer({ width: 80, height: 24 })
 const io = new OpenTuiIO(setup.renderer, { stream: true })
 try {
   const session = newSession({ provider: 'openai', model: 'packed-headless-model' })
+  session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
   session.history = [{ kind: 'assistant', content: '## Packed heading' + String.fromCharCode(10, 10) + 'Packed Markdown works', toolCalls: [] }]
   io.setSession(session)
   const reading = io.readLine('Message')
   await setup.renderOnce()
   assert(setup.captureCharFrame().includes('packed-headless-model'))
+  assert(setup.captureCharFrame().includes('Session tokens: 3 in / 2 out / 7 total'))
+  assert(setup.captureCharFrame().includes('Cache input: read 0 / write unreported'))
   const codeNodes = node => [...(node instanceof CodeRenderable ? [node] : []), ...node.getChildren().flatMap(codeNodes)]
   const blocks = codeNodes(setup.renderer.root)
   assert(blocks.length > 0)

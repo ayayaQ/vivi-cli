@@ -26,7 +26,7 @@ then choose a model.
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/settings` — change defaults for future conversations
-- `/session` — show the current session ID
+- `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
 
@@ -65,3 +65,12 @@ npm run test:tui
 
 See [RELEASING.md](RELEASING.md) for packaging and release checks.
 Licensed under [Apache-2.0](LICENSE).
+
+## Usage counts
+
+Round and turn displays show provider-reported token counts. `/session` shows the
+saved session aggregate. Cache read/write counts are input-token subsets already
+included in input and total counts. A missing cache count is shown as `unreported`,
+while an explicitly reported zero is shown as `0`. Each session cache count is
+complete only if every accepted provider round reported that field. Old sessions
+keep missing metrics unreported; no cache policy, price or savings is inferred.

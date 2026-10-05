@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { runAgent } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
-import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
+import type { AgentEvent, AgentResult, ModelProvider, Usage } from '@ayayaq/vivi'
 import { createBuiltinToolset } from './tools.js'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { newSession, redactSecrets, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
+import { aggregateUsage } from './usage.js'
 
 export interface CliHostOptions {
   provider: ModelProvider
@@ -91,11 +92,24 @@ export class CliHost {
     signal?.addEventListener('abort', abort, { once: true })
     if (signal?.aborted) controller.abort()
     const baseUsage = structuredClone(this.current.usage)
+    // An empty new session has no prior rounds. Historical assistant rounds with
+    // omitted cache fields must remain unknown, including old schema-1 sessions.
+    const priorUsage = this.current.history.some((message) => message.kind === 'assistant') ||
+      Object.values(baseUsage).some((count) => count !== 0) ||
+      Object.hasOwn(baseUsage, 'cachedInputTokens') || Object.hasOwn(baseUsage, 'cacheWriteInputTokens')
+      ? [baseUsage] : []
+    const roundUsage: (Usage | undefined)[] = []
     try {
       this.current.history.push({ kind: 'message', role: 'user', content })
       await this.save()
+      const generate = this.options.provider.generate.bind(this.options.provider)
       const result = await runAgent({
-        provider: this.options.provider, messages: this.current.history,
+        provider: { generate: async (input, signal, options) => {
+          const output = await generate(input, signal, options)
+          // Reject session-wide overflow before this response enters canonical history.
+          aggregateUsage([...priorUsage, ...roundUsage, output.usage])
+          return output
+        } }, messages: this.current.history,
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: (call, context) => toolset.executeTool(call, context.signal, {
@@ -107,14 +121,17 @@ export class CliHost {
         onEvent: async (event) => {
           if (event.type === 'assistant') {
             this.current.history.push(structuredClone(event.message))
+            // This checkpoint precedes round telemetry. A crash here cannot leave
+            // a stale cache sum looking like a complete aggregate of the new history.
+            delete this.current.usage.cachedInputTokens
+            delete this.current.usage.cacheWriteInputTokens
             await this.save()
           } else if (event.type === 'tool_completed') {
             this.current.history.push(structuredClone(event.message))
             await this.save()
-          } else if (event.type === 'round_completed' && event.usage) {
-            for (const key of ['inputTokens', 'outputTokens', 'totalTokens'] as const) {
-              this.current.usage[key] += event.usage[key]
-            }
+          } else if (event.type === 'round_completed') {
+            roundUsage.push(event.usage)
+            this.current.usage = aggregateUsage([...priorUsage, ...roundUsage])
             await this.save()
           }
           if (!controller.signal.aborted) await this.options.onEvent?.(event)
@@ -124,9 +141,9 @@ export class CliHost {
       await this.persistence
       // Core abort cleanup intentionally skips callbacks. Always use its final canonical transcript.
       this.current.history = structuredClone(result.history)
-      for (const key of ['inputTokens', 'outputTokens', 'totalTokens'] as const) {
-        this.current.usage[key] = baseUsage[key] + result.usage[key]
-      }
+      // Reconcile from the original baseline, never add final usage to event sums.
+      // A cancelled/unaccepted response contributes no round and preserves prior metrics.
+      this.current.usage = aggregateUsage([...priorUsage, ...(result.rounds > 0 ? [result.usage] : [])])
       await this.save()
       return result
     } finally {

@@ -6,6 +6,7 @@ import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
 import type { CliHost } from './host.js'
 import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
+import { aggregateUsage, formatUsage } from './usage.js'
 
 export interface ChatIO {
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
@@ -97,12 +98,17 @@ export class TerminalIO implements ChatIO {
     if (!this.tui) return
     const columns = Math.max(20, Math.min(this.output.columns ?? 80, 200))
     const rows = Math.max(6, Math.min(this.output.rows ?? 24, 100))
-    const body = this.display.split('\n').flatMap((line) => {
+    const wrap = (text: string): string[] => text.split('\n').flatMap((line) => {
       const chunks: string[] = []
       for (let index = 0; index < Math.max(1, line.length); index += columns) chunks.push(line.slice(index, index + columns))
       return chunks
-    }).slice(-(rows - 4))
-    this.output.write(`\x1b[2J\x1b[H${'vivi | Ctrl-C / Escape cancels'.slice(0, columns)}\n${body.join('\n')}\n${'-'.repeat(columns)}\n${this.status.slice(0, columns)}\n`)
+    })
+    const status = wrap(this.status).slice(0, rows - 3)
+    const bodyRows = rows - 3 - status.length
+    const body = bodyRows > 0 ? wrap(this.display).slice(-bodyRows) : []
+    this.output.write(`\x1b[2J\x1b[H${[
+      'vivi | Ctrl-C / Escape cancels'.slice(0, columns), ...body, '-'.repeat(columns), ...status
+    ].join('\n')}\n`)
     if (this.waiting) this.readline.prompt(true)
   }
   write(text: string): void {
@@ -182,8 +188,8 @@ export class TerminalIO implements ChatIO {
       this.write(`[tool ${event.call.name}]\n`)
     } else if (event.type === 'tool_completed') {
       this.write(`[tool ${event.message.name}: ${event.message.isError ? 'error' : 'done'}] ${event.message.content}\n`)
-    } else if (event.type === 'round_completed' && event.usage) {
-      this.status = `Tokens: ${event.usage.inputTokens} in / ${event.usage.outputTokens} out / ${event.usage.totalTokens} total`
+    } else if (event.type === 'round_completed') {
+      this.status = `Round tokens: ${formatUsage(aggregateUsage([event.usage]))}`
       this.render()
     }
   }
@@ -195,8 +201,7 @@ export class TerminalIO implements ChatIO {
     this.streamed = ''
     this.streamedOffset = 0
     this.streamOverflow = false
-    const usage = result.usage
-    this.status = `${result.status} | ${usage.inputTokens} in / ${usage.outputTokens} out / ${usage.totalTokens} total`
+    this.status = `${result.status} | Turn tokens: ${formatUsage(result.usage)}`
     this.write(`[${this.status}]${result.error ? ` ${result.error.message}` : ''}\n`)
   }
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
@@ -237,7 +242,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
-    if (line.trim() === '/session') { io.write(`Session: ${host.session.id}\n`); continue }
+    if (line.trim() === '/session') {
+      const session = host.session
+      io.write(`Session: ${session.id}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      continue
+    }
     if (!line.trim()) continue
     const dispose = io.onCancel(() => host.cancel())
     try { io.result(await host.send(line)) }

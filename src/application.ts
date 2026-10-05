@@ -5,6 +5,7 @@ import type { CliOptions } from './main.js'
 import { CliHost } from './host.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
+import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
@@ -60,7 +61,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
 const COMMAND_HELP = `Enter submits; Shift/Alt+Enter adds a line. Tab completes slash commands above the composer.
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
-/menu opens actions; /session shows the current ID; /exit quits.
+/menu opens actions; /session shows the current ID and usage; /exit quits.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
 Keys are masked and saved only in an available OS credential store, or used for this launch after your choice.
@@ -353,7 +354,12 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready\n'); continue }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
-        if (command === '/session') { io.write(host ? `Session: ${host.session.id}\n` : 'Fresh conversation has no saved session until a model is selected\n'); continue }
+        if (command === '/session') {
+          const session = host?.session
+          io.write(session ? `Session: ${session.id}\nSession tokens: ${formatUsage(session.usage)}\n`
+            : 'Fresh conversation has no saved session until a model is selected\n')
+          continue
+        }
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }
         if (!line.trim()) continue
         if (!host) { io.write('Use /provider and /models before sending a message\n'); continue }
