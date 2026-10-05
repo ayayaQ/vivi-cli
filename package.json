@@ -44,7 +44,7 @@
     "test:standalone": "bun scripts/test-standalone.ts"
   },
   "dependencies": {
-    "@ayayaq/vivi": "0.3.0",
+    "@ayayaq/vivi": "0.4.0",
     "@opentui/core": "0.5.14",
     "web-tree-sitter": "0.25.10"
   },

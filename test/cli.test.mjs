@@ -14,6 +14,7 @@ import { main, parseArguments, providerForSession } from '../dist/main.js';
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi';
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai';
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter';
+import { documentedOpenAIModel, parseModelCatalog } from '../dist/models.js';
 
 const test = (name, fn) => nodeTest(name, { timeout: 4000 }, fn);
 const answer = (content = 'Done', toolCalls = [], extras = {}) => ({ content, toolCalls, ...extras });
@@ -636,4 +637,43 @@ test('CLI OpenRouter provider uses typed strict routing for tools or explicit ef
     assert(!Object.hasOwn(body, 'tool_choice'));
     assert.equal(Object.hasOwn(body, 'reasoning'), reasoning !== 'default');
   }
+});
+
+test('normalized disable choices retain provider-specific wire meaning and provider default omits an override', async t => {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    requests.push({ url: String(url), body: JSON.parse(init.body) });
+    return new Response(JSON.stringify(String(url).includes('openrouter')
+      ? { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Offline fixture' } }] }
+      : { status: 'completed', output: [{ type: 'message', id: 'fake-response', role: 'assistant',
+        content: [{ type: 'output_text', text: 'Offline fixture', annotations: [] }] }] }));
+  });
+  const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/budget',
+    supported_parameters: ['reasoning'], reasoning: { mandatory: false, supports_max_tokens: true } }] })[0];
+  for (const [providerName, model] of [['openai', documentedOpenAIModel('gpt-5.1')], ['openrouter', budget]]) {
+    for (const reasoning of ['default', 'none']) {
+      const session = newSession({ provider: providerName, model: model.id, reasoning });
+      const options = { ...parseArguments(['--provider', providerName, '--model', model.id, '--no-stream', '--no-tools'], {}),
+        reasoningCapabilities: model.efforts };
+      const provider = providerForSession(session, options, {
+        OPENAI_API_KEY: 'fake-only-no-network', OPENROUTER_API_KEY: 'fake-only-no-network'
+      });
+      assert.equal((await provider.generate({ messages: [{ kind: 'message', role: 'user', content: 'Hello' }], tools: [] },
+        new AbortController().signal)).content, 'Offline fixture');
+      const { url, body } = requests.at(-1);
+      assert.equal(url, providerName === 'openai' ? 'https://api.openai.com/v1/responses' : 'https://openrouter.ai/api/v1/chat/completions');
+      assert.equal(body.stream, false);
+      if (reasoning === 'default') assert(!Object.hasOwn(body, 'reasoning'));
+      else assert.deepEqual(body.reasoning, providerName === 'openai' ? { effort: 'none' } : { enabled: false });
+      assert(!Object.hasOwn(body, 'tools'));
+    }
+  }
+  const mandatory = parseModelCatalog('openrouter', { data: [{ id: 'vendor/mandatory',
+    reasoning: { mandatory: true, supported_efforts: ['none', 'high'] } }] })[0];
+  const options = { ...parseArguments(['--provider', 'openrouter', '--model', mandatory.id, '--no-tools'], {}),
+    reasoningCapabilities: mandatory.efforts };
+  const count = requests.length;
+  assert.throws(() => providerForSession(newSession({ provider: 'openrouter', model: mandatory.id, reasoning: 'none' }),
+    options, { OPENROUTER_API_KEY: 'fake-only-no-network' }), /requires explicit model capability support/);
+  assert.equal(requests.length, count);
 });

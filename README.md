@@ -39,6 +39,14 @@ In `/models`, type to filter by ID, name or provider; words can be in any order.
 Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,
 Ctrl+R to refresh the catalog, and Escape to go back.
 
+Model capabilities use the shared endpoint-aware normalizer with the CLI's existing
+documented OpenAI Responses facts. OpenRouter metadata describes its Chat Completions
+gateway. Unknown models remain unverified; catalog visibility does not prove a request
+will succeed. Provider default sends no reasoning override. The explicit disable choice
+is offered only when supported, including optional OpenRouter token-budget models that
+have no named effort choices. A documented non-streaming model uses complete responses;
+unknown streaming keeps your selected stream setting.
+
 Keys can be saved in an available OS credential store or used for this launch only.
 There is no plaintext key-storage fallback. Conversations are stored locally in
 `~/.vivi/sessions`; keep secrets out of chat and command arguments.

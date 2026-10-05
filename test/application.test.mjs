@@ -324,3 +324,68 @@ test('resuming another model does not borrow notes opt-in from future defaults',
     assert.equal(options.enableNotes, true); return defaultFactory()
   }, ['--resume', original.id, '--enable-notes']), 0)
 })
+
+test('optional OpenRouter token-budget reasoning offers explicit disable and preserves its saved none sentinel', async t => {
+  const directory = await fixture(t)
+  const services = fakeServices([{ id: 'vendor/budget-only', supported_parameters: ['reasoning'],
+    architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+    reasoning: { mandatory: false, supports_max_tokens: true } }])
+  const io = fakeIO(['openrouter', 'temporary', 'vendor/budget-only', 'none'], [],
+    ['/provider', '/effort', 'Hello', '/exit'], ['fake-budget-key'])
+  const seen = []
+  assert.equal(await run(directory, io, services, (session, options) => {
+    seen.push(session.reasoning)
+    assert.deepEqual(options.reasoningCapabilities, ['none'])
+    assert.equal(options.enableTools, false)
+    return defaultFactory()
+  }), 0)
+  assert.deepEqual(seen, ['default', 'none'])
+  assert.deepEqual(io.choices.find(choice => choice.title.startsWith('Reasoning effort')).values.map(value => value.value), ['default', 'none'])
+  assert.equal((await new PreferenceStore(directory).load()).reasoning, 'none')
+  const saved = io.sessions.at(-1)
+  assert.equal((await new FileSessionStore(directory).load(saved.id)).reasoning, 'none')
+  const next = fakeIO([], [], ['Again', '/exit'])
+  assert.equal(await run(directory, next, services, (session, options) => {
+    assert.equal(session.reasoning, 'none')
+    assert.deepEqual(options.reasoningCapabilities, ['none'])
+    return defaultFactory()
+  }), 0)
+  assert.equal(next.choices.length, 0)
+})
+
+test('known non-reasoning and unknown reasoning overrides fall back to default without offering an unverified choice', async t => {
+  for (const model of ['gpt-4.1', 'o3-pro']) {
+    const directory = await fixture(t)
+    await new PreferenceStore(directory).save({ ...base, model, reasoning: 'high', reasoningCapabilities: ['high'] })
+    const io = fakeIO(['default'], [], ['/effort', '/exit'])
+    assert.equal(await run(directory, io, fakeServices(), (session, options) => {
+      assert.equal(session.reasoning, 'default')
+      assert.deepEqual(options.reasoningCapabilities, [])
+      if (model === 'o3-pro') assert.equal(options.stream, false)
+      return defaultFactory()
+    }), 0)
+    assert.deepEqual(io.choices[0].values.map(value => value.value), ['default'])
+    assert.match(io.output, /no longer verified/)
+  }
+})
+
+test('unknown streaming retains the user toggle while documented unsupported streaming remains effective-only', async t => {
+  for (const stream of [true, false]) {
+    const directory = await fixture(t)
+    await new PreferenceStore(directory).save({ ...base, model: 'future-text-model', stream })
+    assert.equal(await run(directory, fakeIO([], [], ['/exit']), fakeServices(), (_session, options) => {
+      assert.equal(options.stream, stream)
+      assert.equal(options.enableTools, false)
+      assert.deepEqual(options.reasoningCapabilities, [])
+      return defaultFactory()
+    }), 0)
+    const saved = newSession({ provider: 'openai', model: 'o3-pro', reasoning: 'default' })
+    await new FileSessionStore(directory).save(saved)
+    assert.equal(await run(directory, fakeIO([], [], ['/exit']), fakeServices(), (_session, options) => {
+      assert.equal(options.stream, false)
+      assert.deepEqual(options.reasoningCapabilities, [])
+      return defaultFactory()
+    }, ['--resume', saved.id]), 0)
+    assert.equal((await new PreferenceStore(directory).load()).stream, stream)
+  }
+})
