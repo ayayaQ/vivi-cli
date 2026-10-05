@@ -2,7 +2,8 @@
 import { runAgent } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
-import { builtinTools, executeBuiltin } from './tools.js'
+import { createBuiltinToolset } from './tools.js'
+import type { ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { newSession, redactSecrets, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
@@ -12,6 +13,8 @@ export interface CliHostOptions {
   store: SessionPersistence
   session: CliSession
   enableNotes?: boolean
+  /** Trusted, explicitly imported tool packs. Registration is captured once per turn. */
+  extensions?: readonly ToolExtension[]
   /** A host can omit tools when the selected model's tool support is undeclared. */
   enableTools?: boolean
   secrets?: readonly string[]
@@ -79,6 +82,9 @@ export class CliHost {
     if (secrets.some((secret) => secret.length > 0 && content.includes(secret))) {
       throw new Error('Message contains an environment credential; remove it before sending')
     }
+    const enableNotes = this.options.enableNotes ?? false
+    const enableTools = this.options.enableTools !== false
+    const toolset = createBuiltinToolset(enableNotes, this.options.extensions)
     const controller = new AbortController()
     this.controller = controller
     const abort = (): void => controller.abort()
@@ -90,10 +96,10 @@ export class CliHost {
       await this.save()
       const result = await runAgent({
         provider: this.options.provider, messages: this.current.history,
-        tools: this.options.enableTools === false ? [] : builtinTools(this.options.enableNotes), signal: controller.signal,
+        tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
-        executeTool: (call, context) => executeBuiltin(call, context.signal, {
-          enableNotes: this.options.enableNotes ?? false,
+        executeTool: (call, context) => toolset.executeTool(call, context.signal, {
+          enableNotes,
           readNotes: () => this.notes(),
           commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
           approve: this.options.approve ?? (async () => false)
