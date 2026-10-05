@@ -34,7 +34,7 @@ unchanged unless a separate CLI release is requested.
 
 ## Check the checkout
 
-Use Node.js 22 or newer for the baseline; install Bun >=1.3.0 for native UI checks:
+Use Node.js 26.4 or newer for the CLI; install Bun >=1.3.0 for native UI checks:
 
 ```sh
 npm ci --ignore-scripts
@@ -61,15 +61,18 @@ publish or release the CLI. No release workflow is enabled in this repository.
 
 ## UI runtime and standalone artifacts
 
-OpenTUI 0.5.14 is loaded lazily under Bun only. The Node 22/24 line route and public
+OpenTUI 0.5.14 is loaded lazily under Bun only. The Node 26.4+ line route and public
 host exports must never import native TUI modules. Check both installed entrypoints,
 not just source imports. The standalone build targets the current platform only,
 embeds native assets, and writes dependency notices beside the local binary.
 
 The standard Ubuntu Bun CI lane uses native in-memory rendering and mock input;
-it makes no real provider calls and does not upload build artifacts. Windows/macOS
-need their own actual runtime and clean-consumer checks before platform claims or
-release targets are added. Packaging tests prepare dependency metadata and bytes from the registry in a fresh
+it makes no real provider calls and does not upload build artifacts. Windows x64 is
+the selected npm release target; real vault and interactive-terminal acceptance is
+still pending. macOS/Linux need those checks before additional platform claims.
+CI tests the minimum Node 26.4.0 and latest Node 26 with engine-strict npm; packed
+consumer checks also reject engine warnings. This changes the CLI requirement,
+not the shared core's Node 22+ support. Packaging tests prepare dependency metadata and bytes from the registry in a fresh
 cache, verify OpenTUI/parser resolution and integrity against the reviewed lock, then
 reinstall the isolated consumer offline from that cache. This requires registry access
 for preparation; the archive alone is not an offline distribution.

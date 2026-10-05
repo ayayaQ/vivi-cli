@@ -6,7 +6,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { npmInvocation, packageAcceptanceEvidence } from './platform-acceptance.mjs'
+import { npmInvocation, packageAcceptanceEvidence, supportsCliNode } from './platform-acceptance.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
@@ -21,10 +21,11 @@ const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: 120000,
-    env: { ...process.env, npm_config_cache: cache, npm_config_update_notifier: 'false' } })
+    env: { ...process.env, npm_config_cache: cache, npm_config_update_notifier: 'false', npm_config_engine_strict: 'true' } })
   if (result.error || result.status !== 0) {
     throw new Error(`${command} failed: ${result.error?.message ?? ''}\n${result.stdout}\n${result.stderr}`)
   }
+  assert.doesNotMatch(result.stderr, /EBADENGINE/, 'Supported package checks must not produce npm engine warnings')
   return result.stdout
 }
 
@@ -36,9 +37,13 @@ function runNpm(args, cwd = root) {
 const nodeGuard = ['--experimental-loader', new URL('./no-tui-loader.mjs', import.meta.url).href]
 
 try {
+  assert(supportsCliNode(process.versions.node), 'CLI package acceptance requires supported Node >=26.4.0')
+  assert.equal(manifest.engines.node, '>=26.4.0', 'CLI npm requirement must match its native dependency metadata')
   const lock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'))
   const installedLock = JSON.parse(await readFile(join(root, 'node_modules/.package-lock.json'), 'utf8'))
   const coreLock = lock.packages[corePath]
+  assert.equal(lock.packages[''].engines.node, manifest.engines.node, 'CLI lock engine mismatch')
+  assert.equal(coreLock.engines.node, '>=22', 'Shared core runtime support must remain unchanged')
   assert.equal(manifest.dependencies[coreName], coreVersion, 'Shared core must use an exact registry version')
   assert.equal(lock.packages[''].dependencies[coreName], coreVersion, 'Root lock dependency mismatch')
   assert.equal(coreLock.version, coreVersion, 'Shared core lock version mismatch')
@@ -93,6 +98,7 @@ try {
   assert.equal(installedManifest.name, '@ayayaq/vivi-cli')
   assert.equal(installedManifest.version, manifest.version)
   assert.equal(installedManifest.private, true)
+  assert.equal(installedManifest.engines.node, manifest.engines.node)
   assert.equal(installedManifest.license, 'Apache-2.0')
   assert.equal(installedManifest.dependencies[coreName], coreVersion)
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)

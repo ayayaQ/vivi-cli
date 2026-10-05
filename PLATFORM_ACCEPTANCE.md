@@ -1,7 +1,7 @@
 # Platform acceptance preparation
 
 CLI-05 is incomplete until the final integrated CLI artifact is verified on the
-platforms selected for distribution. Windows with npm installation is the chosen
+platforms selected for distribution. Windows x64 with npm installation is the chosen
 first release target; that target decision is not a completed acceptance or release
 claim. macOS and Linux remain unverified for real vault and interactive terminal
 behavior. Keep Linux headless compatibility checks running. Additional platform
@@ -9,17 +9,18 @@ support requires their real runtime/vault checks, rather than an application rew
 
 ## Windows npm runtime requirements
 
-The npm package requires Node.js 22+ for line mode and Bun >=1.3.0 for the full-screen
+The npm package requires Node.js 26.4+ for line mode and Bun >=1.3.0 for the full-screen
 interface. Installing the npm package does not install Bun. Node's interactive
 launcher delegates to Bun and explains the line-mode fallback if Bun is absent.
 Node line mode and `--help` must work without resolving the native TUI. Native Bun
 UI startup on a real Windows terminal is still a release gate.
 
 OpenTUI 0.5.14 declares Node >=26.4.0 and Bun >=1.3.0 in its package metadata.
-Default npm installation on our tested Windows Node 22/24 runners succeeds with
-an engine warning; the guarded Node line-mode and Bun paths pass their checks.
-An engine-strict npm installation is not established by those results and needs
-an explicit packaging decision before public installation requirements are finalized.
+The selected Node 26.4+ npm installation requirement matches that metadata.
+Both clean checkout and packed-consumer checks use engine-strict npm and reject
+engine warnings. Node 22/24 installation is no longer a supported CLI path; the
+shared core package retains its own separate Node 22+ requirement.
+Windows ARM64 requires Bun >=1.4.0, but is not part of the initial validated target.
 
 The CLI remains private and unpublished. Do not advertise a public npm installation
 command before its separately approved release. Test the final local tarball in a
@@ -50,7 +51,7 @@ this report. A Linux report cannot be relabeled as Windows/macOS acceptance.
 For example, in PowerShell from a clean checkout:
 
 ```powershell
-npm ci --ignore-scripts
+npm ci --ignore-scripts --engine-strict
 $env:VIVI_TEST_BUN = 'bun'
 $env:VIVI_TEST_ACCEPTANCE_REPORT = 'windows-package-evidence.json'
 npm run test:package
