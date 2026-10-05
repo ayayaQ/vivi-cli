@@ -29,7 +29,8 @@ test('observed headless evidence never marks real vault, TTY or platform accepta
       assert.equal(report.automated.bunHeadlessRenderer, bun ? 'passed' : 'not-run')
       assert.ok(Object.values(report.manual).every(value => value === 'not-run'))
       assert.equal(report.platformAcceptance, 'pending-manual-validation')
-      assert.equal(report.distributionDecision, 'not-recorded')
+      assert.equal(report.distributionDecision, 'windows-npm-selected')
+      assert.deepEqual(report.releaseTarget, { platform: 'win32', distribution: 'npm' })
       assert.equal(Object.hasOwn(report.observed, 'bun'), Boolean(bun))
       assert.deepEqual(report.artifact, artifactWithoutRuntime())
     }

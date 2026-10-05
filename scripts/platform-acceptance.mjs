@@ -38,6 +38,7 @@ export function packageAcceptanceEvidence({ filename, sha256, integrity, size, c
       terminalRestoration: 'not-run', binaryReleaseLicenseReview: 'not-run'
     },
     platformAcceptance: 'pending-manual-validation',
-    distributionDecision: 'not-recorded'
+    releaseTarget: { platform: 'win32', distribution: 'npm' },
+    distributionDecision: 'windows-npm-selected'
   }
 }

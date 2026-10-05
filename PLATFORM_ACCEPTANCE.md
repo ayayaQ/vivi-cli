@@ -1,10 +1,25 @@
 # Platform acceptance preparation
 
 CLI-05 is incomplete until the final integrated CLI artifact is verified on the
-platforms selected for distribution. Windows is the first acceptance priority;
-this is not an advertised support promise. macOS and Linux also remain unverified
-for real vault and interactive terminal behavior. Selecting supported platforms
-and npm package versus standalone binary distribution is a separate product decision.
+platforms selected for distribution. Windows with npm installation is the chosen
+first release target; that target decision is not a completed acceptance or release
+claim. macOS and Linux remain unverified for real vault and interactive terminal
+behavior. Keep Linux headless compatibility checks running. Additional platform
+support requires their real runtime/vault checks, rather than an application rewrite.
+
+## Windows npm runtime requirements
+
+The npm package requires Node.js 22+ for line mode and Bun >=1.3.0 for the full-screen
+interface. Installing the npm package does not install Bun. Node's interactive
+launcher delegates to Bun and explains the line-mode fallback if Bun is absent.
+Node line mode and `--help` must work without resolving the native TUI. Native Bun
+UI startup on a real Windows terminal is still a release gate.
+
+The CLI remains private and unpublished. Do not advertise a public npm installation
+command before its separately approved release. Test the final local tarball in a
+fresh npm consumer first; install runtime/parser/native dependencies from the registry
+or an explicitly populated cache. A compiled `.exe` is not the selected distribution
+and its licensing/startup checks remain a separate future gate.
 
 ## Automated, fake/headless evidence
 
@@ -79,7 +94,7 @@ session or helper failure path. Do not manufacture that condition by changing
 security settings. Fake protocol errors are useful automated coverage, not proof
 that the native failure path worked.
 
-## macOS/Linux and distribution gates
+## macOS/Linux and later binary gates
 
 If selected as support targets, macOS needs actual Keychain save/load and locked/
 unavailable/session-only checks plus native Bun startup and terminal restoration.
