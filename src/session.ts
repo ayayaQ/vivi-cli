@@ -18,6 +18,7 @@ export interface CliSession {
   createdAt: string
   updatedAt: string
   history: HistoryMessage[]
+  /** Cache subsets are optional complete-session totals; omission means unreported. */
   usage: Usage
   noteRevision: number
   notes: Record<string, string>
@@ -89,9 +90,11 @@ export function validateSession(value: unknown): CliSession {
       Number.isFinite(Date.parse(value[field])), 'invalid timestamp')
   }
   check(object(value.usage), 'invalid usage')
-  keys(value.usage, ['inputTokens', 'outputTokens', 'totalTokens'])
-  for (const field of ['inputTokens', 'outputTokens', 'totalTokens']) {
-    check(Number.isSafeInteger(value.usage[field]) && Number(value.usage[field]) >= 0, 'invalid usage')
+  const usage = value.usage
+  keys(usage, ['inputTokens', 'outputTokens', 'totalTokens', 'cachedInputTokens', 'cacheWriteInputTokens'])
+  for (const field of ['inputTokens', 'outputTokens', 'totalTokens',
+    ...['cachedInputTokens', 'cacheWriteInputTokens'].filter((field) => field in usage)]) {
+    check(Number.isSafeInteger(usage[field]) && Number(usage[field]) >= 0, 'invalid usage')
   }
   check(Number.isSafeInteger(value.noteRevision) && Number(value.noteRevision) >= 0, 'invalid note revision')
   check(object(value.notes) && Object.keys(value.notes).length <= 64, 'invalid notes')

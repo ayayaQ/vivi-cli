@@ -8,3 +8,4 @@ export { calculate, builtinTools, executeBuiltin, createBuiltinToolset } from '.
 export type { ApprovalRequest, NoteSnapshot, ToolHost } from './tools.js'
 export { TerminalIO, runChatLoop } from './terminal.js'
 export type { ChatIO, TerminalOptions } from './terminal.js'
+export { aggregateUsage, formatUsage } from './usage.js'

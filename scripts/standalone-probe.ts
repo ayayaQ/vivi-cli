@@ -11,6 +11,7 @@ const setup = await createTestRenderer({ width: 80, height: 24 })
 const io = new OpenTuiIO(setup.renderer)
 try {
   const session = newSession({ provider: 'openai', model: 'embedded-headless-model' })
+  session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
   session.history = [{ kind: 'assistant', content: '# Embedded renderer\n\nNative Markdown works\n\n```ts\nconst embedded = true\n```', toolCalls: [] }]
   io.setSession(session)
   const reading = io.readLine('Message')
@@ -22,6 +23,8 @@ try {
   assert(blocks.length > 0, 'Markdown parser blocks were not created')
   await Promise.all(blocks.map(block => block.highlightingDone))
   await setup.renderOnce()
+  assert(setup.captureCharFrame().includes('Session tokens: 3 in / 2 out / 7 total'))
+  assert(setup.captureCharFrame().includes('Cache input: read 0 / write unreported'))
   assert(!setup.captureCharFrame().includes('# Embedded renderer'), 'Embedded Markdown grammar did not conceal markup')
   await setup.mockInput.typeText('Embedded input works')
   await setup.mockInput.pressEnter()
@@ -34,5 +37,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input and model search passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

@@ -16,6 +16,7 @@ import type { ChatIO } from './terminal.js'
 import type { ApprovalRequest } from './tools.js'
 import { matchingChoiceIndices } from './picker.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
+import { aggregateUsage, formatUsage } from './usage.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[] }
@@ -142,6 +143,7 @@ export class OpenTuiIO implements ChatIO {
   private sessionTitle = 'vivi · fresh conversation'
   private sessionId: string | undefined
   private usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  private usageScope: 'Session' | 'Round' | 'Turn' = 'Session'
   private streamed = ''
   private streamOverflow = false
 
@@ -208,8 +210,8 @@ export class OpenTuiIO implements ChatIO {
         minHeight: 1, width: '100%', scrollX: false, scrollY: true, stickyScroll: true,
         stickyStart: 'bottom', contentOptions: { flexDirection: 'column', paddingX: 1 },
         viewportCulling: true })
-      this.statusLine = new TextRenderable(renderer, { id: 'vivi-status', height: 1, flexShrink: 0,
-        fg: '#a1a1aa', content: this.status })
+      this.statusLine = new TextRenderable(renderer, { id: 'vivi-status', width: '100%', flexShrink: 0,
+        fg: '#a1a1aa', wrapMode: 'word', content: this.status })
       this.composerBox = new BoxRenderable(renderer, { id: 'vivi-composer-box', height: 4,
         flexShrink: 0, border: true, borderColor: TUI_THEME.pink, titleColor: TUI_THEME.pink,
         title: 'Message', paddingX: 1 })
@@ -301,7 +303,7 @@ export class OpenTuiIO implements ChatIO {
   private updateStatus(status = this.status): void {
     if (this.closed) return
     this.status = this.safe(status, 1024)
-    this.statusLine.content = `${this.status} · ${this.usage.inputTokens} in / ${this.usage.outputTokens} out / ${this.usage.totalTokens} total`
+    this.statusLine.content = `${this.status}\n${this.usageScope} tokens: ${formatUsage(this.usage)}`
   }
   private disableComposer(): void {
     this.composer?.blur()
@@ -795,6 +797,7 @@ export class OpenTuiIO implements ChatIO {
     this.entries = []
     this.resultNotices = []
     this.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+    this.usageScope = 'Session'
     this.rebuild()
     this.updateStatus('Ready')
   }
@@ -809,6 +812,7 @@ export class OpenTuiIO implements ChatIO {
     this.sessionTitle = this.safe(`vivi · ${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}\nSession ${session.id}`, 4096)
     this.header.content = this.sessionTitle
     this.usage = { ...session.usage }
+    this.usageScope = 'Session'
     this.entries = [...this.historyEntries(session.history), ...this.resultNotices]
     this.rebuild()
     this.updateStatus()
@@ -867,8 +871,9 @@ export class OpenTuiIO implements ChatIO {
     } else if (event.type === 'tool_completed') {
       this.appendEntry({ label: `Tool ${event.message.name} · ${event.message.isError ? 'error' : 'done'}`,
         content: event.message.content, markdown: false })
-    } else if (event.type === 'round_completed' && event.usage) {
-      this.usage = { ...event.usage }
+    } else if (event.type === 'round_completed') {
+      this.usage = aggregateUsage([event.usage])
+      this.usageScope = 'Round'
       this.updateStatus('Round completed')
     }
   }
@@ -884,6 +889,7 @@ export class OpenTuiIO implements ChatIO {
     this.entries.push(...this.resultNotices)
     this.rebuild()
     this.usage = { ...result.usage }
+    this.usageScope = 'Turn'
     this.updateStatus(result.status === 'completed' ? 'Completed' : result.status === 'cancelled' ? 'Cancelled' : 'Error')
   }
   private dispose(destroyRenderer: boolean): void {

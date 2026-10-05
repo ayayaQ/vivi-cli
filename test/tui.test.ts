@@ -420,6 +420,44 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   expect(output).toContain('/new /resume /settings /menu /help /exit')
 })
 
+test('native status labels round, turn and session cache telemetry without inventing zero', async () => {
+  const { io, frame } = await fixture({ width: 80, height: 24 })
+  const session = newSession({ provider: 'openai', model: 'fake-cache-model' })
+  session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
+  io.setSession(session)
+  expect(await frame()).toContain('Session tokens: 3 in / 2 out / 7 total')
+  expect(await frame()).toContain('Cache input: read 0 / write unreported')
+  io.event({ type: 'round_completed', usage: {
+    inputTokens: 1, outputTokens: 2, totalTokens: 5, cacheWriteInputTokens: 0
+  } })
+  expect(await frame()).toContain('Round tokens: 1 in / 2 out / 5 total')
+  expect(await frame()).toContain('Cache input: read unreported / write 0')
+  io.event({ type: 'round_completed' })
+  expect(await frame()).toContain('Round tokens: 0 in / 0 out / 0 total')
+  expect(await frame()).toContain('Cache input: read unreported / write unreported')
+  io.result({ ...result('Accepted'), usage: {
+    inputTokens: 4, outputTokens: 4, totalTokens: 12, cachedInputTokens: 0, cacheWriteInputTokens: 0
+  } })
+  expect(await frame()).toContain('Turn tokens: 4 in / 4 out / 12 total')
+  expect(await frame()).toContain('Cache input: read 0 / write 0')
+  io.setSession(session)
+  expect(await frame()).toContain('Session tokens: 3 in / 2 out / 7 total')
+  expect(await frame()).toContain('Cache input: read 0 / write unreported')
+})
+
+test('compact native cache telemetry remains visible and fresh chats clear the prior counts', async () => {
+  const { io, frame } = await fixture({ width: 40, height: 20 })
+  const session = newSession({ provider: 'openai', model: 'compact-cache' })
+  session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
+  io.setSession(session)
+  expect(await frame()).toContain('Cache input: read 0 / write 0')
+  io.setDraft('openrouter')
+  const output = await frame()
+  expect(output).toContain('Session tokens: 0 in / 0 out / 0 total')
+  expect(output).toContain('Cache input: read unreported / write')
+  expect(output.match(/unreported/g)?.length).toBe(2)
+})
+
 test('Enter submits; Shift and Alt Enter compose multiline with preserved draft', async () => {
   const { io, input, frame } = await fixture()
   const line = io.readLine('Message')
