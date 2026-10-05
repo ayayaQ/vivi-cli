@@ -11,7 +11,7 @@
     "url": "git+https://github.com/ayayaQ/vivi-cli.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=26.4.0"
   },
   "bin": {
     "vivi": "./dist/launcher.js"

@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { npmInvocation, packageAcceptanceEvidence } from '../scripts/platform-acceptance.mjs'
+import { npmInvocation, packageAcceptanceEvidence, supportsCliNode } from '../scripts/platform-acceptance.mjs'
 import { resolve } from '../scripts/no-tui-loader.mjs'
 
 const artifact = { filename: 'ayayaq-vivi-cli-0.1.0-dev.0.tgz', sha256: 'a'.repeat(64),
-  integrity: 'sha512-Ynl0ZXM=', size: 1234, cliVersion: '0.1.0-dev.0', arch: 'x64', node: 'v22.21.0' }
+  integrity: 'sha512-Ynl0ZXM=', size: 1234, cliVersion: '0.1.0-dev.0', arch: 'x64', node: 'v26.4.0' }
+
+test('CLI npm support starts at stable Node26.4 independently of the core requirement', () => {
+  for (const version of ['26.4.0', 'v26.4.0', '26.10.0', '27.0.0']) assert.equal(supportsCliNode(version), true)
+  for (const version of [undefined, '', 'invalid', '22.23.3', '24.19.0', '26.3.99',
+    '26.4.0-rc.1', '26.4', '9999999999999999999999.4.0']) assert.equal(supportsCliNode(version), false)
+})
 
 test('npm runs through Node with no shell or .cmd shim on Windows', () => {
   const args = ['pack', '--json', 'C:\\Users\\A B\\archive.tgz']
@@ -30,7 +36,9 @@ test('observed headless evidence never marks real vault, TTY or platform accepta
       assert.ok(Object.values(report.manual).every(value => value === 'not-run'))
       assert.equal(report.platformAcceptance, 'pending-manual-validation')
       assert.equal(report.distributionDecision, 'windows-npm-selected')
-      assert.deepEqual(report.releaseTarget, { platform: 'win32', distribution: 'npm' })
+      assert.deepEqual(report.releaseTarget, { platform: 'win32', arch: 'x64', distribution: 'npm',
+        node: '>=26.4.0', bun: '>=1.3.0' })
+      assert.equal(report.automated.strictNpmEngines, 'passed')
       assert.equal(Object.hasOwn(report.observed, 'bun'), Boolean(bun))
       assert.deepEqual(report.artifact, artifactWithoutRuntime())
     }
@@ -45,7 +53,7 @@ function artifactWithoutRuntime() {
 test('invalid or path-bearing artifact identifiers cannot become evidence', () => {
   for (const override of [{ filename: '../artifact.tgz' }, { filename: 'C:\\artifact.tgz' },
     { sha256: 'wrong' }, { integrity: 'sha1-old' }, { size: 0 }, { size: 1.5 },
-    { platform: 'freebsd' }, { cliVersion: '' }, { bun: 142 }]) {
+    { platform: 'freebsd' }, { cliVersion: '' }, { bun: 142 }, { node: 'v24.19.0' }]) {
     assert.throws(() => packageAcceptanceEvidence({ ...artifact, platform: 'win32', ...override }), /Invalid/)
   }
 })

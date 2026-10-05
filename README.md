@@ -4,7 +4,7 @@ Chat with OpenAI or OpenRouter from your terminal.
 
 ## Run from source
 
-Requires Node.js 22+ and [Bun](https://bun.sh) 1.3+ for the full-screen interface.
+Requires Node.js 26.4+ and [Bun](https://bun.sh) 1.3+ for the full-screen interface.
 The CLI is not yet published to npm.
 
 ```sh
@@ -45,7 +45,7 @@ There is no plaintext key-storage fallback. Conversations are stored locally in
 
 ## Line mode
 
-Node.js 22+ supports line mode without Bun. Set `OPENAI_API_KEY` or
+Node.js 26.4+ supports line mode without Bun. Set `OPENAI_API_KEY` or
 `OPENROUTER_API_KEY` in your environment, then supply a model ID:
 
 ```sh

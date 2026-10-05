@@ -7,19 +7,23 @@ on:
 permissions:
   contents: read
 
+env:
+  npm_config_engine_strict: 'true'
+
 jobs:
   headless:
-    # Exploratory Windows evidence only. This does not advertise Windows support.
+    # Windows x64 headless evidence. Real native vault/TTY acceptance remains pending.
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        node: [22, 24]
+        node: ['26.4.0', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          architecture: x64
           cache: npm
       - uses: oven-sh/setup-bun@v2
         with:

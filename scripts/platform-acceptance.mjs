@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { basename } from 'node:path'
 
+export function supportsCliNode(version) {
+  const match = typeof version === 'string' && /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version)
+  if (!match) return false
+  const [major, minor, patch] = match.slice(1).map(Number)
+  return [major, minor, patch].every(Number.isSafeInteger) && (major > 26 || major === 26 && minor >= 4)
+}
+
 /** Invoke npm's JS entrypoint rather than a .cmd shim with shell:false on Windows. */
 export function npmInvocation(args, { npmPath = process.env.npm_execpath,
   node = process.execPath, platform = process.platform } = {}) {
@@ -16,7 +23,7 @@ export function packageAcceptanceEvidence({ filename, sha256, integrity, size, c
     !/^[a-f0-9]{64}$/.test(sha256) || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(integrity) ||
     !Number.isSafeInteger(size) || size < 1 || typeof cliVersion !== 'string' || !cliVersion ||
     !['win32', 'darwin', 'linux'].includes(platform) || typeof arch !== 'string' ||
-    typeof node !== 'string' || (bun !== undefined && typeof bun !== 'string')) {
+    !supportsCliNode(node) || (bun !== undefined && typeof bun !== 'string')) {
     throw new Error('Invalid package acceptance evidence')
   }
   return {
@@ -28,7 +35,7 @@ export function packageAcceptanceEvidence({ filename, sha256, integrity, size, c
       installedCliBin: 'passed', nodeLauncherWithoutTui: 'passed',
       installedHostWithoutTui: 'passed', fakeProviderRuntime: 'passed',
       installedTypeDeclarations: 'passed', bundledCoreBytesAndNotices: 'passed',
-      dependencyCacheReinstall: 'passed',
+      dependencyCacheReinstall: 'passed', strictNpmEngines: 'passed',
       bunHeadlessRenderer: bun === undefined ? 'not-run' : 'passed'
     },
     manual: {
@@ -38,7 +45,7 @@ export function packageAcceptanceEvidence({ filename, sha256, integrity, size, c
       terminalRestoration: 'not-run', binaryReleaseLicenseReview: 'not-run'
     },
     platformAcceptance: 'pending-manual-validation',
-    releaseTarget: { platform: 'win32', distribution: 'npm' },
+    releaseTarget: { platform: 'win32', arch: 'x64', distribution: 'npm', node: '>=26.4.0', bun: '>=1.3.0' },
     distributionDecision: 'windows-npm-selected'
   }
 }

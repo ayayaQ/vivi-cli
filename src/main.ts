@@ -55,7 +55,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --help                      Show this help
 
 Credentials: environment variables, or masked /provider setup in the full-screen UI.
-Full-screen UI requires Bun >=1.3.0; Node >=22 supports line/piped mode.
+Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id.
 Streaming is display-only. Notes never access other files; piped approval is denied.
 `
