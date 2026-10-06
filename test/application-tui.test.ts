@@ -204,6 +204,51 @@ test('fatal native failure exits nonzero and prints a redacted error after termi
   } finally { process.stderr.write = originalWrite; io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
 })
 
+for (const oneShot of [false, true]) {
+  test(`native ${oneShot ? 'one-shot success' : '/exit'} reports cleanup failure instead of a successful exit`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'vivi-native-cleanup-failure-'))
+    const setup = await createTestRenderer({ width: 80, height: 24, kittyKeyboard: true,
+      exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+    const io = new OpenTuiIO(setup.renderer)
+    const ready = observeUI(io)
+    ;(io as unknown as { windowsInput: { close(): void } }).windowsInput = {
+      close() { throw new Error('fake-output-detail-must-not-be-copied') }
+    }
+    const originalWrite = process.stderr.write
+    let errors = ''
+    let restoredBeforeDiagnostic = true
+    let calls = 0
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      restoredBeforeDiagnostic &&= setup.renderer.isDestroyed
+      errors += chunk.toString()
+      return true
+    }) as typeof process.stderr.write
+    try {
+      const running = main(oneShot ? ['--model', 'fake', '--tui', '--prompt', 'hello'] : [],
+        { VIVI_SESSION_DIR: directory, OPENAI_API_KEY: 'known-secret' }, {
+          tuiIO: io, credentials: { status: async () => ({ available: false, label: 'Fake vault' }),
+            load: async () => undefined, save: async () => { throw new Error('Fake storage unavailable') } },
+          providerFactory: () => ({ generate: async () => { calls++; return { content: 'Fake completed response', toolCalls: [] } } })
+        })
+      if (!oneShot) {
+        await ready(state => state.kind === 'composer')
+        await setup.mockInput.typeText('/exit')
+        setup.mockInput.pressEnter()
+      }
+      expect(await running).toBe(1)
+      expect(calls).toBe(oneShot ? 1 : 0)
+      expect(io.failed).toBe(true)
+      expect(setup.renderer.isDestroyed).toBe(true)
+      expect(restoredBeforeDiagnostic).toBe(true)
+      expect(errors).toBe('vivi: terminal cleanup failed. Close this terminal window or tab before restarting vivi.\n')
+      expect(errors).not.toContain('fake-output-detail')
+      expect(errors).not.toContain('known-secret')
+      expect(errors).not.toContain('\x1b')
+      expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false)
+    } finally { process.stderr.write = originalWrite; io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+  })
+}
+
 test('closing native UI during startup cannot start a one-shot provider request', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-native-startup-cancel-'))
   const setup = await createTestRenderer({ width: 80, height: 24, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })

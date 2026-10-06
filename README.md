@@ -34,7 +34,15 @@ then choose a model.
 Changing provider, model or effort starts a new conversation and keeps the old
 transcript available through `/resume`.
 
-Enter sends; Shift+Enter or Alt+Enter adds a line. Tab completes slash commands.
+Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
+terminal reports those modifiers. Tab completes slash commands.
+Some terminals send the same input for Enter and Shift+Enter, so the application
+cannot distinguish them from that byte alone. For a native Windows TTY, vivi
+requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
+to preserve Shift+Enter, including on Windows Terminal 1.24. It restores the prior
+reporting mode when the UI closes. Other terminals use the supported Kitty keyboard
+protocol automatically, or Ctrl+J when modifiers are unavailable. Alt+Enter may be
+intercepted by the terminal's own fullscreen shortcut.
 Escape or Ctrl+C cancels a running turn; Ctrl+C while idle exits.
 In `/models`, type to filter by ID, name or provider; words can be in any order.
 Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,

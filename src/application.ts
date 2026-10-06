@@ -61,7 +61,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
   })), Math.max(0, levels.indexOf(base.reasoning)))
   return selected === undefined ? undefined : { ...base, reasoning: selected }
 }
-const COMMAND_HELP = `Enter submits; Shift/Alt+Enter adds a line. Tab completes slash commands above the composer.
+const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.

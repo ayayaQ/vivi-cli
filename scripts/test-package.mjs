@@ -88,7 +88,8 @@ try {
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
-    'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts']) assert(paths.has(path), `Missing ${path}`)
+    'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
+    'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
@@ -309,6 +310,7 @@ import assert from 'node:assert/strict'
 import { createTestRenderer } from '@opentui/core/testing'
 import { CodeRenderable } from '@opentui/core'
 import { OpenTuiIO } from './dist/tui.js'
+import { WindowsInputDecoder } from './dist/windows-input.js'
 import { newSession } from './dist/session.js'
 const setup = await createTestRenderer({ width: 80, height: 24 })
 const io = new OpenTuiIO(setup.renderer, { stream: true })
@@ -329,10 +331,17 @@ try {
   await setup.renderOnce()
   assert(setup.captureCharFrame().includes('Packed Markdown works'))
   assert(!setup.captureCharFrame().includes('## Packed heading'))
+  await setup.mockInput.typeText('Packed input')
+  const windowsInput = new WindowsInputDecoder()
+  await setup.mockInput.pressKeys([windowsInput.write(String.fromCharCode(27) + '[13;28;13;1;16;1_')])
+  await setup.mockInput.typeText('second')
+  setup.mockInput.pressKey('j', { ctrl: true })
+  await setup.mockInput.typeText('third')
+  setup.mockInput.pressEnter()
+  assert.equal(await reading, 'Packed input\\nsecond\\nthird')
   const models = Array.from({ length: 1500 }, (_, index) => ({ name: 'vendor/model-' + index,
     searchTerms: ['Packed Provider'], value: 'vendor/model-' + index }))
   const selecting = io.chooseSearchable('Packed models', models, { refresh: true })
-  assert.equal(await reading, undefined)
   await setup.mockInput.typeText('PROVIDER model 1499')
   setup.mockInput.pressEnter()
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
