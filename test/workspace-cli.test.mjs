@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, parse, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { main, parseArguments, HELP } from '../dist/main.js'
 import { CliHost } from '../dist/host.js'
 import { FileSessionStore } from '../dist/session.js'
@@ -187,7 +187,7 @@ test('real Node launcher uses child launch cwd outside the install path and igno
     ? {url:new URL('./fake-provider.mjs',import.meta.url).href,shortCircuit:true} : next(specifier,context) }`)
   await writeFile(register, `import { register } from 'node:module'; register(new URL('./hooks.mjs',import.meta.url))`)
   const launcher = fileURLToPath(new URL('../dist/launcher.js', import.meta.url))
-  const result = await runChild(process.execPath, ['--import', register, launcher, '--no-tui', '--model', 'gpt-5.1', '--prompt', 'Read fixture'], {
+  const result = await runChild(process.execPath, ['--import', pathToFileURL(register).href, launcher, '--no-tui', '--model', 'gpt-5.1', '--prompt', 'Read fixture'], {
     cwd: project, env: { PATH: process.env.PATH, VIVI_SESSION_DIR: state, OPENAI_API_KEY: 'fixture-only-key', PWD: directory }
   })
   assert.equal(result.code, 0, result.stderr + result.stdout)
@@ -198,14 +198,14 @@ test('real Node launcher uses child launch cwd outside the install path and igno
 test('cwd is captured before async TUI credential setup and remains fixed after child chdir', async t => {
   const { project, other, state } = await fixture(t)
   const module = new URL('../dist/main.js', import.meta.url).href
-  const script = `import assert from 'node:assert/strict'; import {main} from ${JSON.stringify(module)};
-    const launch=process.cwd(); let captured; const lines=['Hello','/exit']; const io={closed:false, get isClosed(){return this.closed},
-    readLine:async()=>lines.shift(),write(){},event(){},result(){},approve:async()=>false,onCancel:()=>()=>{},close(){this.closed=true},
-    setSession(){},setDraft(){},setWorkspace(value){assert.equal(value,launch)},choose:async()=>undefined,chooseSearchable:async()=>undefined,askText:async()=>undefined};
+  const script = `import assert from 'node:assert/strict'; import {realpath} from 'node:fs/promises'; import {main} from ${JSON.stringify(module)};
+    const launch=process.cwd(),canonical=await realpath(launch); let captured,output=''; const lines=['Hello','/exit']; const io={closed:false, get isClosed(){return this.closed},
+    readLine:async()=>lines.shift(),write(text){output+=text},event(){},result(){},approve:async()=>false,onCancel:()=>()=>{},close(){this.closed=true},
+    setSession(){},setDraft(){},setWorkspace(value){assert.equal(value,canonical)},choose:async()=>undefined,chooseSearchable:async()=>undefined,askText:async()=>undefined};
     const code=await main(['--model','fixture','--tools'], {VIVI_SESSION_DIR:${JSON.stringify(state)}}, {tuiIO:io,
       credentials:{status:async()=>({available:false,label:'fixture'}),load:async()=>{process.chdir(${JSON.stringify(other)});return undefined}},
       providerFactory:(_session,options)=>{captured=options.workspace;return {generate:async()=>({content:'Done',toolCalls:[]})}}});
-    assert.equal(code,0);assert.equal(captured,launch);console.log('Captured launch cwd passed')`
+    assert.equal(code,0,output);assert.equal(captured,launch);console.log('Captured launch cwd passed')`
   const result = await runChild(process.execPath, ['--input-type=module', '-e', script], { cwd: project, env: { PATH: process.env.PATH } })
   assert.equal(result.code, 0, result.stderr + result.stdout); assert.match(result.stdout, /Captured launch cwd passed/)
 })
