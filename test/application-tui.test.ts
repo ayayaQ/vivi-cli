@@ -90,7 +90,7 @@ test('native memory manager reviews repeated writes, refreshes conflicts and mak
     const phase = await next(); expect(phase.kind).toBe('approval')
     await setup.renderOnce(); await new Promise(resolve => setTimeout(resolve, 2))
     await beforeReply?.()
-    if (allow) await setup.mockInput.typeText('allow')
+    if (allow) setup.mockInput.pressArrow('right')
     setup.mockInput.pressEnter()
   }
   let running: Promise<number> | undefined

@@ -65,6 +65,7 @@ const COMMAND_HELP = `Enter submits; Shift/Alt+Enter adds a line. Tab completes 
 /new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
+Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
 Keys are masked and saved only in an available OS credential store, or used for this launch after your choice.

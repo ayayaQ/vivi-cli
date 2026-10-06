@@ -40,6 +40,30 @@ In `/models`, type to filter by ID, name or provider; words can be in any order.
 Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,
 Ctrl+R to refresh the catalog, and Escape to go back.
 
+### Mouse controls
+
+The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
+Effort, Memory or Settings above the transcript to open an action when the draft
+is empty. Click a picker row to choose its exact value; the wheel moves through
+picker options or scrolls the transcript. Clicking a slash-command suggestion
+fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
+and, where available, Refresh buttons. Smaller terminals hide optional action
+bars to preserve space; the same commands, Enter and Escape still work.
+
+Approval prompts show separate Deny and Approve buttons. Deny starts selected.
+Use arrows or Tab to select, then Enter to confirm, or click the desired button.
+Typing or pasting `allow` cannot approve in the full-screen UI. Escape, abort and
+close deny. A click must start and finish on the same displayed request and
+button without dragging; rapid repeated approval clicks cannot accept the next
+request. Line mode continues to require its fresh typed `allow` response.
+
+Mouse reporting varies by terminal and multiplexer. [Windows Terminal supports
+VT mouse input](https://learn.microsoft.com/en-us/windows/terminal/selection);
+this implementation still needs interactive validation on your actual terminal.
+In Windows Terminal, hold Shift to select text using the terminal instead of
+sending mouse input to the application. Clipboard behavior and the OS pointer
+are controlled by your terminal, not vivi. All actions remain keyboard-accessible.
+
 Model capabilities use the shared endpoint-aware normalizer with the CLI's existing
 documented OpenAI Responses facts. OpenRouter metadata describes its Chat Completions
 gateway. Unknown models remain unverified; catalog visibility does not prove a request
@@ -72,7 +96,8 @@ launch default in `/settings` in the full-screen UI. `--disable-memory` override
 an enabled saved default. `/memories` enables or disables the current launch and
 lets you list, add, edit and delete records. Back, Escape and Cancel never submit
 a change. Each create, edit and delete shows the exact proposal and requires a
-fresh interactive `allow` response; piped input cannot approve writes.
+fresh interactive approval: select Approve in the full-screen UI, or type `allow`
+in line mode. Piped input cannot approve writes.
 
 Memories are stored as plaintext in `memories.json` alongside the CLI’s private
 session files, normally `~/.vivi/sessions`. When enabled, saved context is sent to

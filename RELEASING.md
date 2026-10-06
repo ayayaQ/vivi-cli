@@ -62,11 +62,22 @@ canonical session history, so edits/deletes do not leave obsolete saved snapshot
 The shared `extensions/memory` API supplies v1 codecs, limits, revisions, prepared
 mutations and static tools. The CLI owns fresh disk loads, an app-wide commit lease,
 backup/evidence recovery, atomic durability, explicit review and shutdown draining.
-Every create/edit/delete requires a fresh human approval; pipe, EOF and cancellation
+Every create/edit/delete requires a fresh human approval (select Approve in the
+full-screen UI, or type allow in line mode); pipe, EOF and cancellation
 default to denial. Memory context remains available in chat-only mode, but memory
 tools are omitted when tools are disabled or their support is unverified. Records
 are retained when the feature is disabled. No notes migration, embeddings or
 automatic summarization is added.
+
+Full-screen mouse regression tests send SGR sequences through the real OpenTUI
+0.5.14 parser and native hit grid. They cover approval default-deny, stale/repeated
+press-release gestures, query/resize boundaries, picker rows, wheel scrolling,
+modal actions, keyboard paths and composer focus. Picker cell mapping is an
+explicit adapter for the pinned Select's default-font, zero-spacing layout;
+revalidate it before changing OpenTUI or picker geometry. Mouse reporting is
+terminal-dependent; OS pointer styling and native clipboard integration are not
+added. Windows Terminal VT mouse support is documented by Microsoft, but offline
+native tests are not interactive Windows-terminal acceptance.
 
 Offline regression tests and native in-memory TUI tests do not claim real-device,
 interactive-terminal, OS-vault or live-provider acceptance.

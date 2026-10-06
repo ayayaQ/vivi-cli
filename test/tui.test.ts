@@ -601,7 +601,7 @@ test('clicking searchable results before and after resize keeps query typing foc
   ])
   await frame()
   let widgets = searchableWidgets(setup)
-  await setup.mockMouse.click(widgets.picker.x + 5, widgets.picker.y)
+  await setup.mockMouse.click(widgets.pickerBox.x, widgets.pickerBox.y)
   expect(widgets.composer.focused).toBe(true)
   expect(widgets.picker.focused).toBe(false)
   await input.typeText('beta')
@@ -611,7 +611,7 @@ test('clicking searchable results before and after resize keeps query typing foc
   setup.resize(40, 12)
   await frame()
   widgets = searchableWidgets(setup)
-  await setup.mockMouse.click(widgets.picker.x + 5, widgets.picker.y)
+  await setup.mockMouse.click(widgets.pickerBox.x, widgets.pickerBox.y)
   expect(widgets.composer.focused).toBe(true)
   expect(widgets.picker.focused).toBe(false)
   await input.typeText('-two')
@@ -888,7 +888,7 @@ test('running turn blocks queued typing and commands; Escape and Ctrl+C cancel',
   expect(await line).toBe('')
 })
 
-test('approval clears pretyped input and queued Return, requires fresh typed allow', async () => {
+test('approval clears pretyped input and queued Return, requires fresh selected Approve', async () => {
   const { io, input, frame } = await fixture()
   const draft = io.askText('An earlier input')
   await input.typeText('allow')
@@ -906,20 +906,20 @@ test('approval clears pretyped input and queued Return, requires fresh typed all
   void approval.then(() => { settled = true })
   await Promise.resolve()
   expect(settled).toBe(false)
-  await input.typeText('allow')
+  input.pressArrow('right')
   input.pressEnter()
   expect(await approval).toBe(true)
 })
 
 test('pasted approval cannot allow; blank, deny, abort, dismissal and close deny', async () => {
-  const { io, input } = await fixture()
+  const { io, input, frame } = await fixture()
   const pasted = io.approve(request, new AbortController().signal)
-  await tick()
+  await tick(); await frame()
   await input.pasteBracketedText('allow\n')
   input.pressEnter()
   expect(await pasted).toBe(false)
   const denied = io.approve(request, new AbortController().signal)
-  await tick()
+  await tick(); await frame()
   await input.typeText('deny')
   input.pressEnter()
   expect(await denied).toBe(false)
@@ -936,9 +936,9 @@ test('pasted approval cannot allow; blank, deny, abort, dismissal and close deny
 })
 
 test('invalid approval text cannot carry forward into a later approval', async () => {
-  const { io, input } = await fixture()
+  const { io, input, frame } = await fixture()
   const first = io.approve(request, new AbortController().signal)
-  await tick()
+  await tick(); await frame()
   await input.typeText('allowed')
   input.pressEnter()
   input.pressEnter()
@@ -946,7 +946,7 @@ test('invalid approval text cannot carry forward into a later approval', async (
   await input.typeText('allow')
   input.pressEnter() // No pending input, so this cannot grant a future request.
   const second = io.approve(request, new AbortController().signal)
-  await tick()
+  await tick(); await frame()
   input.pressEnter()
   expect(await second).toBe(false)
 })
