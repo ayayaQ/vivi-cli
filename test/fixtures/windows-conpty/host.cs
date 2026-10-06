@@ -243,6 +243,10 @@ public sealed class ConPtyProbeHost : IDisposable
             new UIntPtr((uint)IntPtr.Size), IntPtr.Zero, IntPtr.Zero), "UpdateProcThreadAttribute(PSEUDOCONSOLE)");
         STARTUPINFOEX startup = new STARTUPINFOEX();
         startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFOEX));
+        // Explicit NULL std handles prevent the redirected supervisor's pipes
+        // being duplicated into the child instead of genuine ConPTY console I/O.
+        // https://github.com/microsoft/terminal/discussions/15814
+        startup.StartupInfo.dwFlags = 0x00000100; // STARTF_USESTDHANDLES
         startup.lpAttributeList = attributes;
         StringBuilder command = new StringBuilder(Quote(bun) + " --no-env-file --no-install " + Quote(child) + " " + Quote(repository) + " " + Quote(prefix));
         Phase = "AttachBun";

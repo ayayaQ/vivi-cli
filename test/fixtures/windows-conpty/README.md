@@ -54,6 +54,8 @@ The child has an 18-second watchdog, the supervisor a 45-second deadline, finite
 
 The supervisor passes a small OS environment allowlist and runs Bun with `--no-env-file --no-install`, so repository .env files and automatic package fetches are excluded. Raw-capture flags are rejected in the child. No user credentials, provider requests, session saves, publication, or remote data transmission are involved.
 
+The supervisor explicitly supplies null standard handles with `STARTF_USESTDHANDLES`. Windows otherwise duplicates a redirected parent's pipe handles even when ordinary handle inheritance is disabled, bypassing the attached ConPTY. The child must independently report genuine stdin/stdout TTYs; that guard is never forged or skipped. See the [Microsoft Terminal maintainer's explanation](https://github.com/microsoft/terminal/discussions/15814).
+
 ## Limits
 
 This uses the runner's OS Kernel32/ConPTY backend, not necessarily Windows Terminal 1.24's packaged OpenConsole/ConPTY build. It emulates an outer terminal and does not test physical Windows Terminal keys, its forceVT preference, actual terminal focus, IME/layout mappings, account integration, or visual presentation. C#/PowerShell compilation and actual mode forwarding on that OS must succeed before calling it real Windows evidence. Old or different ConPTY implementations may fail the required transport assertions; do not convert that failure into a successful skip.
