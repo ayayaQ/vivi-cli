@@ -13,6 +13,12 @@ if (process.env.OTUI_STDIN_LOG || ['OTUI_DEBUG', 'OTUI_DEBUG_FFI', 'OTUI_TRACE_F
   .some(name => ['true', '1', 'on', 'yes'].includes((process.env[name] ?? '').trim().toLowerCase()))) process.exit(2)
 if (!process.stdin.isTTY || !process.stdout.isTTY) process.exit(2)
 
+// Fixed phase/protocol metadata helps diagnose a failed private harness without
+// ever retaining native output, ordinary input, exceptions or environment data.
+let phase = 'load-modules'
+const progressPath = `${prefix}.progress.json`
+writeFileSync(progressPath, JSON.stringify({ phase }))
+
 const { StdinParser } = await import(pathToFileURL(Bun.resolveSync('@opentui/core', repository)).href)
 const { WindowsInputDecoder } = await import(pathToFileURL(resolve(repository, 'src/windows-input.ts')).href)
 const { inputProbe } = await import(pathToFileURL(resolve(repository, 'src/input-diagnostic.ts')).href)
@@ -42,7 +48,7 @@ process.stdout.write = ((chunk: unknown, ...args: unknown[]) => {
 const saveAndExit = (exitCode: number): void => {
   if (finished) return
   finished = true
-  clearTimeout(watchdog); clearInterval(readyTimer); clearTimeout(restorationTimer)
+  clearTimeout(watchdog); clearInterval(readyTimer); clearTimeout(restorationTimer); clearInterval(progressTimer)
   try { io?.close() } catch { failed = true }
   postCloseParser?.destroy()
   process.stdin.removeListener('data', postCloseData)
@@ -75,12 +81,18 @@ const postCloseData = (chunk: Buffer): void => {
   })
 }
 const watchdog = setTimeout(() => { failed = true; saveAndExit(1) }, 18000)
+const progressTimer = setInterval(() => writeFileSync(progressPath, JSON.stringify({
+  phase, controls, windows: io?.windowsInput?.diagnostic
+})), 250)
 process.on('uncaughtException', () => { failed = true; saveAndExit(1) })
 process.on('unhandledRejection', () => { failed = true; saveAndExit(1) })
 
 try {
   // This is the real factory: native output setup occurs before bridge.start(), exactly as in the CLI.
+  phase = 'create-renderer'
+  writeFileSync(progressPath, JSON.stringify({ phase }))
   io = await OpenTuiIO.create({ stream: false })
+  phase = 'input-diagnostic'
   const bridge = io.windowsInput
   if (!bridge) throw new Error('Windows input bridge missing')
   const bridgeClose = bridge.close.bind(bridge)
@@ -114,6 +126,7 @@ try {
     writeFileSync(`${prefix}.ready`, 'ready')
   }, 5)
   diagnostic = await pending // Synthetic Escape closes the exact production surface.
+  phase = 'post-close'
   clearInterval(readyTimer)
   // A fresh raw reader proves consumer 9001l reset the inner encoder, independently of an outer DECRQM reply.
   // It receives just one known Shift+Enter tap in this same private ConPTY, then restores original state.

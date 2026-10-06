@@ -106,7 +106,11 @@ test('real Windows ConPTY preserves Bun Enter modifiers, paste, repeats and rest
     const line = hostProcess.stdout.trim().split(/\r?\n/).findLast(value => value.startsWith('{'))
     assert.ok(line, 'ConPTY host must return bounded protocol metadata')
     const host = JSON.parse(line)
-    assert.equal(hostProcess.status, 0, `ConPTY host failed in ${host.phase ?? 'unknown phase'}`)
+    let progress = { unavailable: true }
+    try { progress = JSON.parse(await readFile(`${prefix}.progress.json`, 'utf8')) } catch { }
+    assert.equal(hostProcess.status, 0, `ConPTY host failed: ${JSON.stringify({
+      phase: host.phase, errorType: host.errorType, protocol: host.progress, child: progress
+    })}`)
     const child = JSON.parse(await readFile(`${prefix}.json`, 'utf8'))
     assert.equal(child.bun, version.stdout.trim())
     // The diagnostic contains only allowlisted probe events and protocol/restoration metadata.

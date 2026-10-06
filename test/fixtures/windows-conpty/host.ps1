@@ -15,6 +15,8 @@ try {
   # No child stdout, raw input, paths or full exceptions are emitted.
   $errorType = $_.Exception.GetType().Name
   try { $phase = [ConPtyProbeHost]::Phase } catch { }
-  @{ hostFailed = $true; phase = $phase; errorType = $errorType } | ConvertTo-Json -Compress
+  $progress = $null
+  try { $progress = [ConPtyProbeHost]::Progress } catch { }
+  @{ hostFailed = $true; phase = $phase; errorType = $errorType; progress = $progress } | ConvertTo-Json -Compress
   exit 1
 }

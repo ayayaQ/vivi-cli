@@ -29,6 +29,7 @@ public sealed class ConPtyProbeResult
 public sealed class ConPtyProbeHost : IDisposable
 {
     public static string Phase = "Setup";
+    public static ConPtyProbeResult Progress = new ConPtyProbeResult();
     [StructLayout(LayoutKind.Sequential)] struct COORD { public short X, Y; }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct STARTUPINFO
     {
@@ -150,6 +151,12 @@ public sealed class ConPtyProbeHost : IDisposable
         }
         else if (sequence == "\x1b[c" || sequence == "\x1b[0c") Queue("\x1b[?61;4c");
         else if (sequence == "\x1b[6n") Queue("\x1b[1;1R");
+        lock (stateLock)
+        {
+            Progress.Queries = queries; Progress.QueryReplies = replies;
+            Progress.OuterEnablesBeforeTeardown = enables; Progress.OuterDisablesBeforeTeardown = disables;
+            Progress.OuterRestorationReassertions = reassertions; Progress.OuterModeAtRestore = outerMode;
+        }
     }
     void ParseOutput(byte[] buffer, int length)
     {
@@ -282,9 +289,13 @@ public sealed class ConPtyProbeHost : IDisposable
         string basic, string repeats, string paste, string finish, string restore, bool expectReset)
     {
         ConPtyProbeResult result = new ConPtyProbeResult();
+        // Live failure diagnostics must never alias the frozen success result:
+        // conhost shutdown may emit additional resets after consumer restoration.
+        Progress = new ConPtyProbeResult();
         result.OsVersion = Environment.OSVersion.Version.ToString();
         string conhost = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "conhost.exe");
         result.ConhostVersion = FileVersionInfo.GetVersionInfo(conhost).FileVersion;
+        Progress.OsVersion = result.OsVersion; Progress.ConhostVersion = result.ConhostVersion;
         using (ConPtyProbeHost host = new ConPtyProbeHost())
         {
             host.Start(bun, child, repository, prefix);
@@ -363,6 +374,7 @@ public sealed class ConPtyProbeHost : IDisposable
         stopReader = true;
         if (!readerStopped) readerStopped = reader.Join(1000);
         teardownCompleted = teardownCompleted && processStopped && writerStopped && readerStopped;
+        Progress.OutputDrained = outputDrained; Progress.TeardownCompleted = teardownCompleted;
         Close(ref outputRead); Close(ref process.hProcess); Close(ref process.hThread);
         if (attributes != IntPtr.Zero)
         {
