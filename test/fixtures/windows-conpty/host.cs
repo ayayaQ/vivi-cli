@@ -31,7 +31,13 @@ public sealed class ConPtyProbeResult
 
 public sealed class ConPtyProbeHost : IDisposable
 {
-    public static string Phase = "Setup";
+    static string phase = "Setup";
+    static string phaseFile;
+    public static string Phase
+    {
+        get { return phase; }
+        set { phase = value; if (phaseFile != null) File.WriteAllText(phaseFile, value); }
+    }
     public static ConPtyProbeResult Progress = new ConPtyProbeResult();
     [StructLayout(LayoutKind.Sequential)] struct COORD { public short X, Y; }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct STARTUPINFO
@@ -371,6 +377,8 @@ public sealed class ConPtyProbeHost : IDisposable
         string basic, string repeats, string paste, string finish, string restore, bool expectReset,
         string backendDirectory, string expectedDllHash, string expectedServerHash)
     {
+        phaseFile = prefix + ".host-phase";
+        Phase = "Setup";
         ConPtyProbeResult result = new ConPtyProbeResult();
         // Live failure diagnostics must never alias the frozen success result:
         // conhost shutdown may emit additional resets after consumer restoration.

@@ -107,14 +107,19 @@ test('pinned Microsoft WT1.24 ConPTY preserves the exact mode1 Bun transport', {
       cwd: repository, env, encoding: 'utf8', timeout: 45000, maxBuffer: 64 * 1024, windowsHide: true,
       killSignal: 'SIGKILL'
     })
-    assert.equal(hostProcess.error, undefined, 'Private ConPTY supervisor failed or exceeded its deadline')
+    let progress = { unavailable: true }, child = { unavailable: true }, hostPhase = 'unavailable'
+    try { progress = JSON.parse(await readFile(`${prefix}.progress.json`, 'utf8')) } catch { }
+    try { child = JSON.parse(await readFile(`${prefix}.json`, 'utf8')) } catch { }
+    try {
+      const phase = (await readFile(`${prefix}.host-phase`, 'utf8')).trim()
+      if (['Setup', 'LoadPinnedConpty', 'CreatePseudoConsole', 'AttachBun', 'Negotiate', 'Probe', 'Restore', 'Exit', 'Teardown'].includes(phase)) hostPhase = phase
+    } catch { }
+    assert.equal(Boolean(hostProcess.error), false, `Private ConPTY supervisor exceeded its deadline: ${JSON.stringify({
+      hostPhase, child: progress, report: child
+    })}`)
     const line = hostProcess.stdout.trim().split(/\r?\n/).findLast(value => value.startsWith('{'))
     assert.ok(line, 'ConPTY host must return bounded protocol metadata')
     const host = JSON.parse(line)
-    let progress = { unavailable: true }
-    try { progress = JSON.parse(await readFile(`${prefix}.progress.json`, 'utf8')) } catch { }
-    let child = { unavailable: true }
-    try { child = JSON.parse(await readFile(`${prefix}.json`, 'utf8')) } catch { }
     assert.equal(hostProcess.status, 0, `ConPTY host failed: ${JSON.stringify({
       phase: host.phase, errorType: host.errorType, protocol: host.progress, child: progress, report: child
     })}`)
