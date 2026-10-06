@@ -7,6 +7,31 @@ import type { Renderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
 import { newSession } from '../src/session.js'
 import { parseModelCatalog, documentedOpenAIModel } from '../src/models.js'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { FileMemoryStore } from '../src/memory.js'
+import { FileSessionStore } from '../src/session.js'
+import { CliHost } from '../src/host.js'
+
+// The optional pack must survive a compiled consumer, remain host-owned, and
+// contribute context without storing the per-turn memory prefix in a session.
+const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-memory-'))
+try {
+  const memory = new FileMemoryStore(directory)
+  await memory.commit(await memory.prepareCreate('Prefer compiled test fixtures', 'user'))
+  const host = await CliHost.create({ memory, enableMemory: true, enableTools: false,
+    store: new FileSessionStore(directory), settings: { provider: 'openai', model: 'fake' },
+    provider: { async generate({ messages, tools }) {
+      assert.deepEqual(tools, [])
+      assert.match(messages[1]!.content, /Prefer compiled test fixtures/)
+      return { content: 'Compiled memory works', toolCalls: [] }
+    } } })
+  const result = await host.send('Use opted-in memory')
+  assert.deepEqual(result.history.map(message => message.content), ['Use opted-in memory', 'Compiled memory works'])
+  assert.deepEqual((await new FileSessionStore(directory).load(host.session.id)).history, result.history)
+  await host.drainMemory()
+} finally { await rm(directory, { recursive: true, force: true }) }
 
 const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
   reasoning: { mandatory: false, supports_max_tokens: true } }] })[0]!

@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.4.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.5.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE and attribution records, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,7 +12,7 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.4.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.5.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
@@ -49,6 +49,27 @@ the diff and preserve every other dependency's locked version, resolution, integ
 and platform metadata. Do not commit npm pack outputs or vendor tarballs. Historical
 snapshots remain recoverable from Git. Keep this CLI's version and `private: true`
 unchanged unless a separate CLI release is requested.
+
+## Persistent app-wide memory
+
+Memory is opt-in via `--enable-memory` or `/memories`; `--disable-memory` overrides
+saved defaults. The default remains off. Memory is separate from existing session
+notes and is stored as private plaintext `memories.json` in the configured state
+directory. A custom `--session-dir` isolates its store. Enabled memories are sent to
+the selected provider as user-level context. Their turn-only prefix is removed from
+canonical session history, so edits/deletes do not leave obsolete saved snapshots.
+
+The shared `extensions/memory` API supplies v1 codecs, limits, revisions, prepared
+mutations and static tools. The CLI owns fresh disk loads, an app-wide commit lease,
+backup/evidence recovery, atomic durability, explicit review and shutdown draining.
+Every create/edit/delete requires a fresh human approval; pipe, EOF and cancellation
+default to denial. Memory context remains available in chat-only mode, but memory
+tools are omitted when tools are disabled or their support is unverified. Records
+are retained when the feature is disabled. No notes migration, embeddings or
+automatic summarization is added.
+
+Offline regression tests and native in-memory TUI tests do not claim real-device,
+interactive-terminal, OS-vault or live-provider acceptance.
 
 ## Check the checkout
 

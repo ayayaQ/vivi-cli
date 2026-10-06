@@ -12,6 +12,8 @@ import type { TuiPreferences } from '../src/preferences.js'
 import { main } from '../src/main.js'
 import { PreferenceStore } from '../src/preferences.js'
 import { FileSessionStore } from '../src/session.js'
+import { FileMemoryStore } from '../src/memory.js'
+import type { ApprovalRequest } from '../src/tools.js'
 
 
 /** Observe application readiness, including async file IO, before asking the renderer for a frame. */
@@ -47,6 +49,89 @@ function observeUI(io: OpenTuiIO) {
   } })
 }
 
+test('native memory manager reviews repeated writes, refreshes conflicts and makes Back/Cancel/disable safe', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-memory-'))
+  const setup = await createTestRenderer({ width: 110, height: 36, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer), ready = observeUI(io), memory = new FileMemoryStore(directory)
+  type Phase = { kind: 'choice'; title: string; names: string[] } | { kind: 'text'; title: string }
+    | { kind: 'approval'; request: ApprovalRequest }
+  const phases: Phase[] = [], requests: ApprovalRequest[] = []
+  let wake: ((phase: Phase) => void) | undefined
+  const announce = (phase: Phase): void => { if (wake) { const finish = wake; wake = undefined; finish(phase) } else phases.push(phase) }
+  const next = (): Promise<Phase> => phases.length ? Promise.resolve(phases.shift()!) : new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { wake = undefined; reject(new Error('Native memory input did not open')) }, 5000)
+    wake = phase => { clearTimeout(timer); resolve(phase) }
+  })
+  const originalChoose = io.choose.bind(io), originalText = io.askText.bind(io), originalApprove = io.approve.bind(io)
+  io.choose = (title, choices, initial) => {
+    const response = originalChoose(title, choices, initial)
+    announce({ kind: 'choice', title, names: choices.map(choice => choice.name) })
+    return response
+  }
+  io.askText = (title, initial) => { const response = originalText(title, initial); announce({ kind: 'text', title }); return response }
+  io.approve = (request, signal) => {
+    const response = originalApprove(request, signal); requests.push(request); announce({ kind: 'approval', request }); return response
+  }
+  const choose = async (name: string): Promise<void> => {
+    const phase = await next(); expect(phase.kind).toBe('choice')
+    if (phase.kind !== 'choice') throw new Error('Expected a native choice')
+    const index = phase.names.indexOf(name); expect(index).toBeGreaterThanOrEqual(0)
+    await setup.renderOnce()
+    for (let offset = 0; offset < index; offset++) setup.mockInput.pressArrow('down')
+    setup.mockInput.pressEnter()
+  }
+  const text = async (content?: string): Promise<void> => {
+    const phase = await next(); expect(phase.kind).toBe('text')
+    if (content === undefined) setup.mockInput.pressEscape()
+    else { setup.mockInput.pressKey('u', { ctrl: true }); await setup.mockInput.typeText(content); setup.mockInput.pressEnter() }
+  }
+  const approval = async (allow: boolean, beforeReply?: () => Promise<void>): Promise<void> => {
+    const phase = await next(); expect(phase.kind).toBe('approval')
+    await setup.renderOnce(); await new Promise(resolve => setTimeout(resolve, 2))
+    await beforeReply?.()
+    if (allow) await setup.mockInput.typeText('allow')
+    setup.mockInput.pressEnter()
+  }
+  let running: Promise<number> | undefined
+  try {
+    await new PreferenceStore(directory).save({ schemaVersion: 1, provider: 'openai', model: 'native-memory-model',
+      reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: true, stream: false, maxRounds: 25 })
+    running = main([], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
+      credentials: { status: async () => ({ available: false, label: 'Fake vault' }), load: async () => undefined, save: async () => { throw new Error('Fake storage') } },
+      providerFactory: () => ({ generate: async () => { throw new Error('Memory management must not call a provider') } }) })
+    await ready(state => state.kind === 'composer')
+    await setup.mockInput.typeText('/memories'); setup.mockInput.pressEnter()
+    await choose('Add memory'); await text() // Escape abandons content entry.
+    await choose('Add memory'); await text('Denied memory'); await approval(false)
+    await choose('Add memory'); await text('I prefer concise replies'); await approval(true)
+    const afterCreate = await next(); expect(afterCreate.kind).toBe('choice'); phases.unshift(afterCreate)
+    const first = (await memory.list()).memories[0]!
+    expect(first.content).toBe('I prefer concise replies'); expect(first.createdBy).toBe('user')
+    await choose('Edit memory'); await choose('Back')
+    await choose('Edit memory'); await choose(first.id); await text()
+    await choose('Edit memory'); await choose(first.id); await text('Stale proposed edit')
+    await approval(true, async () => { await memory.commit(await memory.prepareUpdate(first.id, first.revision, 'Changed elsewhere', 'user')) })
+    await choose('Refresh memories')
+    expect((await memory.list()).memories[0]!.content).toBe('Changed elsewhere')
+    await choose('Edit memory'); await choose(first.id); await text('Fresh approved edit'); await approval(true)
+    await choose('Delete memory'); await choose(first.id); await approval(false)
+    await choose('Disable for this launch')
+    const afterDisable = ready.nextComposer(); await choose('Back'); await afterDisable
+    expect((await memory.list()).memories[0]!.content).toBe('Fresh approved edit')
+    await setup.mockInput.typeText('/memories'); setup.mockInput.pressEnter()
+    await choose('Enable for this launch'); await choose('Delete memory'); await choose(first.id); await approval(true)
+    const afterMemory = ready.nextComposer(); await choose('Back'); await afterMemory
+    expect((await memory.list()).memories).toEqual([])
+    expect(requests.map(request => request.call.name)).toEqual(['create_memory', 'create_memory', 'edit_memory', 'edit_memory', 'delete_memory', 'delete_memory'])
+    expect(requests[0]!.currentRevision).toBe('new memory')
+    expect(requests[2]!.currentRevision).not.toBe(requests[3]!.currentRevision)
+    await setup.mockInput.typeText('/exit'); setup.mockInput.pressEnter()
+    expect(await running).toBe(0)
+    expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false)
+  } finally { io.close(); await running; setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+}, 20000)
+
 test('native surface runs saved-default chat, accepted Markdown, new session and exit through the canonical host', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-native-application-'))
   const setup = await createTestRenderer({ width: 100, height: 30, kittyKeyboard: true,
@@ -59,7 +144,7 @@ test('native surface runs saved-default chat, accepted Markdown, new session and
   io.setSession = session => { if (!ids.includes(session.id)) ids.push(session.id); setSession(session) }
   try {
     await new PreferenceStore(directory).save({ schemaVersion: 1, provider: 'openai', model: 'native-fake-model',
-      reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false, stream: true, maxRounds: 25 })
+      reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: false, stream: true, maxRounds: 25 })
     let calls = 0
     running = main([], { VIVI_SESSION_DIR: directory }, { tuiIO: io, credentials: { status: async () => ({ available: false, label: 'Fake vault' }), load: async () => undefined, save: async () => { throw new Error('Fake storage unavailable') } }, providerFactory: () => ({
       generate: async (input, _signal, progress) => {
@@ -293,7 +378,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
   const ready = observeUI(io)
   const preferences = new PreferenceStore(directory)
   const defaults: TuiPreferences = { schemaVersion: 1, provider, model: 'saved-default-model', reasoning: 'default',
-    reasoningCapabilities: [], enableTools: false, enableNotes: false, stream: true, maxRounds: 25 }
+    reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: false, stream: true, maxRounds: 25 }
   await preferences.save(defaults)
   let current: CliSession | undefined
   const setSession = io.setSession.bind(io)

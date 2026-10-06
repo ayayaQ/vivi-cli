@@ -4,6 +4,7 @@ import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
 import type { CliHost } from './host.js'
+import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
@@ -26,6 +27,77 @@ export interface TerminalOptions {
   tui?: boolean
   stream?: boolean
   secrets?: readonly string[]
+}
+export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires allow/deny review. Disabling retains existing records.'
+const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
+/memories add TEXT · review a new saved memory
+/memories edit ID REVISION TEXT · review an edit to the displayed revision
+/memories delete ID REVISION · review deletion of the displayed revision
+/memories on · enable for this launch; /memories off · disable without deleting\n`
+
+export function displayMemories(io: Pick<ChatIO, 'write'>, result: Awaited<ReturnType<CliHost['listMemories']>>): void {
+  io.write(result.memories.length ? `Saved memories (${result.memories.length}):\n` : 'No saved memories\n')
+  for (const memory of result.memories) {
+    // JSON quoting makes each record's content visibly distinct from IDs and commands.
+    io.write(`ID ${memory.id} · revision ${memory.revision}\n${JSON.stringify(memory.content)}\n`)
+  }
+  io.write(`Limits: ${result.limits.maximumMemories} memories, ${result.limits.maximumMemoryCharacters} characters each, ${result.limits.maximumTotalCharacters} total characters\n`)
+}
+
+/** Explicit human management uses the same exact-proposal approval as model-requested writes. */
+export async function reviewMemoryChange(host: CliHost, io: ChatIO, request: MemoryChangeRequest): Promise<void> {
+  const controller = new AbortController()
+  const dispose = io.onCancel(() => controller.abort())
+  try {
+    const result = await host.changeMemory(request, controller.signal)
+    if (result === undefined) io.write('Memory change denied; no records changed\n')
+    else if (result.contentWithheld) io.write('Memory change committed; contents were withheld after a credential was detected\n')
+    else {
+      io.write(`Memory ${request.kind === 'create' ? 'saved' : request.kind === 'update' ? 'updated' : 'deleted'}\n`)
+      displayMemories(io, result)
+    }
+  } finally { dispose() }
+}
+
+/** Accessible command surface; no command text is ever treated as a provider prompt. */
+export async function runMemoryCommand(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
+  const command = line.trim()
+  if (!/^\/memories(?:\s|$)/.test(command)) return false
+  const match = /^\/memories(?:\s+(\S+))?(?:\s+([\s\S]*))?$/.exec(command)!
+  const action = match[1] ?? 'list'
+  const input = match[2] ?? ''
+  if (action === 'on' && !input) {
+    host.setMemoryEnabled(true)
+    io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
+    return true
+  }
+  if (action === 'off' && !input) {
+    host.setMemoryEnabled(false)
+    io.write('Memory disabled for this launch; existing records retained\n')
+    return true
+  }
+  if (action === 'help') { io.write(`${MEMORY_DISCLOSURE}\n${MEMORY_COMMAND_HELP}`); return true }
+  if (!host.memoryEnabled) {
+    io.write(`Memory is disabled. Use /memories on to enable it for this launch\n${MEMORY_DISCLOSURE}\n`)
+    return true
+  }
+  if (action === 'list' && !input) {
+    io.write(`${MEMORY_DISCLOSURE}\n`)
+    displayMemories(io, await host.listMemories())
+    io.write(MEMORY_COMMAND_HELP)
+  } else if (action === 'add' && input) {
+    await reviewMemoryChange(host, io, { kind: 'create', content: input })
+  } else if (action === 'edit' || action === 'delete') {
+    const fields = /^(\S+)\s+(\S+)(?:\s+([\s\S]*))?$/.exec(input)
+    if (!fields || (action === 'edit' ? !fields[3] : fields[3] !== undefined)) {
+      io.write(MEMORY_COMMAND_HELP)
+      return true
+    }
+    await reviewMemoryChange(host, io, action === 'edit'
+      ? { kind: 'update', id: fields[1]!, expectedRevision: fields[2]!, content: fields[3]! }
+      : { kind: 'delete', id: fields[1]!, expectedRevision: fields[2]! })
+  } else io.write(MEMORY_COMMAND_HELP)
+  return true
 }
 type TtyReadable = Readable & { isTTY?: boolean }
 type TtyWritable = Writable & { isTTY?: boolean; rows?: number; columns?: number }
@@ -208,7 +280,8 @@ export class TerminalIO implements ChatIO {
     // An approval starts with fresh input, including text typed without a newline.
     this.lines = []
     this.clearEditableInput()
-    this.write(`Approval required (revision ${request.currentRevision}): ${request.description}\n`)
+    const scope = request.currentRevision === 'new memory' ? 'new memory' : `revision ${request.currentRevision}`
+    this.write(`Approval required (${scope}): ${request.description}\n`)
     // Piped or queued text cannot grant approval for an action that has not been shown yet.
     if (!this.input.isTTY || !this.output.isTTY) { this.write('Denied: interactive approval is required\n'); return false }
     for (;;) {
@@ -230,6 +303,7 @@ export class TerminalIO implements ChatIO {
 }
 
 export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): Promise<AgentResult | undefined> {
+  if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (prompt !== undefined) {
     const dispose = io.onCancel(() => host.cancel())
     try {
@@ -238,7 +312,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits and /session shows the session id\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /memories manages saved context\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
@@ -248,6 +322,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       continue
     }
     if (!line.trim()) continue
+    if (/^\/memories(?:\s|$)/.test(line.trim())) {
+      try { await runMemoryCommand(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Memory management failed'}\n`) }
+      continue
+    }
     const dispose = io.onCancel(() => host.cancel())
     try { io.result(await host.send(line)) }
     catch (error) { io.write(`${error instanceof Error ? error.message : 'CLI turn failed'}\n`) }

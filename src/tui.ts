@@ -29,7 +29,8 @@ export const SLASH_COMMANDS = [
   { command: '/effort', description: 'Choose reasoning effort' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
-  { command: '/settings', description: 'Change session settings' },
+  { command: '/settings', description: 'Change future defaults' },
+  { command: '/memories', description: 'Manage app-wide saved context' },
   { command: '/menu', description: 'Open the menu' },
   { command: '/help', description: 'Show commands and shortcuts' },
   { command: '/session', description: 'Show the current session' },
@@ -47,7 +48,7 @@ const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
 const MAX_QUERY = 200
-const HINTS = '/new /resume /settings /menu /help /exit · Tab complete · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
+const HINTS = '/new /resume /memories /settings /menu /help /exit · Tab complete · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
@@ -705,9 +706,10 @@ export class OpenTuiIO implements ChatIO {
   }
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
-    this.appendEntry({ label: `Approval required · current revision ${request.currentRevision}`,
+    const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
+    this.appendEntry({ label: `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false })
-    this.updateStatus(`Approval required · revision ${request.currentRevision} · denial is the default`)
+    this.updateStatus(`Approval required · ${scope} · denial is the default`)
     const reply = await this.openInput('approval', 'Type allow or deny (default: deny)', '', signal)
     return reply === 'allow' && !signal.aborted && !this.closed
   }

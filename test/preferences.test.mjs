@@ -13,7 +13,7 @@ import { MAX_PREFERENCES_BYTES, MAX_SESSION_LIST_ENTRIES, MAX_SESSION_PICKER_ITE
 const test = (name, fn) => nodeTest(name, { timeout: 10000 }, fn);
 const settings = { provider: 'openai', model: 'fake-model' };
 const preferences = () => ({ schemaVersion: 1, ...settings, reasoning: 'default', reasoningCapabilities: [],
-  stream: true, enableTools: false, enableNotes: false, maxRounds: 25 });
+  stream: true, enableTools: false, enableNotes: false, enableMemory: false, maxRounds: 25 });
 async function fixture(t, secrets = []) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-preferences-'));
   await chmod(directory, 0o700);
@@ -56,6 +56,20 @@ test('absent preference directories return no settings; saving creates a private
   assert.deepEqual(await store.load(), preferences());
 });
 
+test('old exact schema-1 preferences load memory disabled and save a complete current whitelist', async (t) => {
+  const { directory, store } = await fixture(t);
+  const old = preferences(); delete old.enableMemory;
+  await writeFile(join(directory, 'preferences.json'), JSON.stringify(old), { mode: 0o600 });
+  const loaded = await store.load();
+  assert.deepEqual(loaded, preferences());
+  assert.deepEqual(validatePreferences(old), preferences());
+  await store.save(loaded);
+  assert.deepEqual(JSON.parse(await readFile(join(directory, 'preferences.json'), 'utf8')), preferences());
+  assert.equal(validatePreferences({ ...preferences(), model: '', enableMemory: true }).enableMemory, true);
+  for (const invalid of [{ ...old, extra: false }, { ...preferences(), enableMemory: 'true' },
+    { ...preferences(), enableMemory: undefined }]) assert.throws(() => validatePreferences(invalid));
+});
+
 test('preferences reject unsupported, credential, extra and out-of-bounds settings without altering saved data', async (t) => {
   const { store } = await fixture(t);
   await store.save(preferences());
@@ -69,7 +83,7 @@ test('preferences reject unsupported, credential, extra and out-of-bounds settin
     { ...preferences(), reasoningCapabilities: ['high', 'high'] },
     { ...preferences(), reasoningCapabilities: Array(8).fill('low') },
     { ...preferences(), stream: 1 }, { ...preferences(), enableTools: 'true' },
-    { ...preferences(), enableNotes: 'true' }, { ...preferences(), enableNotes: true },
+    { ...preferences(), enableNotes: 'true' }, { ...preferences(), enableNotes: true }, { ...preferences(), enableMemory: 1 },
     ...[0, 101, 1.5, NaN, Infinity, '25'].map((maxRounds) => ({ ...preferences(), maxRounds }))];
   for (const input of invalid) {
     assert.throws(() => validatePreferences(input));
@@ -81,6 +95,7 @@ test('preferences reject unsupported, credential, extra and out-of-bounds settin
 test('preference validation rejects getters, hooks, sparse arrays and hidden fields without executing them', () => {
   let reads = 0;
   const getter = Object.defineProperty(preferences(), 'model', { enumerable: true, get() { reads++; return 'bad'; } });
+  const memoryGetter = Object.defineProperty(preferences(), 'enableMemory', { enumerable: true, get() { reads++; return true; } });
   const hidden = Object.defineProperty(preferences(), 'credential', { value: 'secret' });
   const symbol = { ...preferences(), [Symbol('credential')]: 'secret' };
   const hooked = { ...preferences(), toJSON() { reads++; return preferences(); } };
@@ -89,7 +104,7 @@ test('preference validation rejects getters, hooks, sparse arrays and hidden fie
   const capabilities = ['high'];
   Object.defineProperty(capabilities, '0', { enumerable: true, get() { reads++; return 'high'; } });
   const extraArrayField = Object.assign([], { credential: 'secret' });
-  for (const input of [getter, hidden, symbol, hooked, inherited, sparse,
+  for (const input of [getter, memoryGetter, hidden, symbol, hooked, inherited, sparse,
     { ...preferences(), reasoningCapabilities: capabilities }, { ...preferences(), reasoningCapabilities: extraArrayField }]) {
     assert.throws(() => validatePreferences(input));
   }
