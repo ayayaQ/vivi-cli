@@ -9,11 +9,12 @@ import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 import { createBuiltinToolset } from './tools.js'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
-import { newSession, redactSecrets, validateSession } from './session.js'
+import { newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
 import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES } from './workspace.js'
 import type { ReadOnlyWorkspace } from './workspace.js'
+import { normalizeSessionTitle, sessionTitleFromPrompt, validSessionTitle } from './session-display.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>(WORKSPACE_TOOL_NAMES)
@@ -108,6 +109,30 @@ export class CliHost {
   }
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
+  /** Revision-checked atomic metadata change; a failed write leaves the current session intact. */
+  async renameSession(input: string, expectedRevision: number): Promise<void> {
+    if (this.running) throw new Error('Wait for the current turn before renaming the session')
+    if (input.length > 65536) throw new Error('Session name is too long')
+    const title = normalizeSessionTitle(input)
+    if (!validSessionTitle(title)) throw new Error('Session name must contain 1..80 readable characters (at most 240 Unicode code units)')
+    if ((this.options.secrets ?? []).some(secret => secret && (input.includes(secret) || title.includes(secret)))) {
+      throw new Error('Session name contains a known credential; remove it before saving')
+    }
+    const operation = this.persistence.then(async () => {
+      if (this.running) throw new Error('Wait for the current turn before renaming the session')
+      const revision = this.current.titleRevision ?? 0
+      if (!Number.isSafeInteger(expectedRevision) || revision !== expectedRevision) throw new Error('Session name changed; reopen rename and try again')
+      if (revision === Number.MAX_SAFE_INTEGER) throw new Error('Session name revision limit reached')
+      const next = structuredClone(this.current)
+      next.title = title; next.titleRevision = revision + 1
+      next.updatedAt = new Date().toISOString()
+      try { await this.options.store.save(next) }
+      catch (error) { if (error instanceof SessionCommitError) this.current = next; throw error }
+      this.current = next
+    })
+    this.persistence = operation.catch(() => undefined)
+    await operation
+  }
   get memoryEnabled(): boolean { return this.enabledMemory }
   private reportMemoryCapability(): void {
     if (this.enabledMemory && this.options.enableTools === false) {
@@ -233,6 +258,10 @@ export class CliHost {
     let prefix: HistoryMessage[] = []
     let memoryContents: readonly string[] = []
     try {
+      // A metadata commit already admitted while idle must settle before this
+      // turn mutates current history. Otherwise its pre-turn snapshot could
+      // replace a newly accepted prompt while the initial checkpoint waits.
+      await this.persistence
       if (this.enabledMemory) {
         const memories = await this.listMemories(controller.signal)
         memoryContents = memories.memories.map(memory => memory.content)
@@ -240,8 +269,17 @@ export class CliHost {
           { kind: 'message', role: 'user', content: formatMemoryContext(memories.memories) }]
       }
       if (workspace) prefix.push({ kind: 'message', role: 'system', content: WORKSPACE_GUIDANCE })
+      // Accept the prompt and its title in one successful checkpoint. A failed
+      // initial write must not leave an unsaved prompt/title in memory for a retry.
+      const previous = structuredClone(this.current)
+      const firstPrompt = !this.current.history.some(message => message.kind === 'message' && message.role === 'user')
       this.current.history.push({ kind: 'message', role: 'user', content })
-      await this.save()
+      if (firstPrompt && this.current.title === undefined) {
+        const title = sessionTitleFromPrompt(content)
+        if (title !== undefined) { this.current.title = title; this.current.titleRevision = 1 }
+      }
+      try { await this.save() }
+      catch (error) { if (!(error instanceof SessionCommitError)) this.current = previous; throw error }
       const generate = this.options.provider.generate.bind(this.options.provider)
       const result = await runAgent({
         provider: { generate: async (input, signal, options) => {

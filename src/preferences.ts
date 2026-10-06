@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import { isSessionId } from './session.js'
 import type { CliProviderName, FileSessionStore } from './session.js'
+import { sessionDisplayTitle } from './session-display.js'
 
 export const MAX_PREFERENCES_BYTES = 8 * 1024
 export const MAX_SESSION_PICKER_ITEMS = 100
@@ -33,6 +34,7 @@ export interface TuiPreferences {
 
 export interface SessionPickerEntry {
   id: string
+  title: string
   provider: CliProviderName
   model: string
   reasoning?: string
@@ -231,7 +233,7 @@ export async function listSessions(store: FileSessionStore, limit = MAX_SESSION_
         try { await lstat(join(store.directory, `${id}.json.lock`)) }
         catch (error) { if (isMissing(error)) locked = false }
         const metadata: SessionPickerEntry = {
-          id: session.id, provider: session.provider, model: session.model,
+          id: session.id, title: sessionDisplayTitle(session), provider: session.provider, model: session.model,
           updatedAt: session.updatedAt, locked
         }
         if (session.reasoning !== undefined) metadata.reasoning = session.reasoning

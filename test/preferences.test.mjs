@@ -258,7 +258,7 @@ test('preference stores and session listing refuse symlinked directories', async
   assert.deepEqual(await readdir(actual), []);
 });
 
-test('session picker emits validated metadata, newest first, with live lock flags and no transcript snippets', async (t) => {
+test('session picker emits bounded title metadata, newest first, with live lock flags and no extra transcript or notes', async (t) => {
   const { sessions } = await fixture(t);
   const older = newSession(settings); older.updatedAt = '2024-01-01T00:00:00.000Z';
   older.history = [{ kind: 'message', role: 'user', content: 'private-transcript' }]; older.notes = { private: 'private-note' };
@@ -268,10 +268,10 @@ test('session picker emits validated metadata, newest first, with live lock flag
   const release = await sessions.acquire(newer.id);
   const listed = await listSessions(sessions);
   assert.deepEqual(listed, [
-    { id: newer.id, provider: newer.provider, model: newer.model, reasoning: 'high', updatedAt: newer.updatedAt, locked: true },
-    { id: older.id, provider: older.provider, model: older.model, updatedAt: older.updatedAt, locked: false },
+    { id: newer.id, title: 'Untitled conversation', provider: newer.provider, model: newer.model, reasoning: 'high', updatedAt: newer.updatedAt, locked: true },
+    { id: older.id, title: 'private-transcript', provider: older.provider, model: older.model, updatedAt: older.updatedAt, locked: false },
   ]);
-  assert.ok(!JSON.stringify(listed).includes('private-'));
+  assert.ok(!JSON.stringify(listed).includes('private-note')); assert.ok(!JSON.stringify(listed).includes('history'));
   assert.deepEqual(await listSessions(sessions, 1), [listed[0]]);
   await release(); assert.equal((await listSessions(sessions))[0].locked, false);
 });

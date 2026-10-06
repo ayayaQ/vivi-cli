@@ -9,7 +9,8 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn } from './terminal.js'
+import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
 import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } from './models.js'
@@ -64,7 +65,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
 }
 const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
-/new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
+/new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
@@ -310,7 +311,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const selectResume = async (): Promise<string | undefined> => {
     const sessions = await listSessions(store)
     const choices = sessions.filter(session => !session.locked).map(session => ({
-      name: `${session.model} · ${session.provider}`, description: `${session.updatedAt} · ${session.id}`, value: session.id
+      name: session.title, description: `${formatSessionDate(session.updatedAt)} · ${session.model} · ${session.provider} · ${session.id}`, value: session.id
     }))
     if (!choices.length) { io.write('No unlocked valid sessions found. Check the previous process before removing a session lock\n'); return }
     return io.choose('Resume a local session', choices)
@@ -449,7 +450,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
         try {
-          const result = await host.send(options.prompt, controller.signal)
+          const result = await sendChatTurn(host, io, options.prompt, controller.signal)
           if (io.failed) await io.readLine('')
           io.result(result)
           return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0
@@ -464,6 +465,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Continue conversation', value: 'continue' }, { name: 'Set up provider', value: '/provider' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
+          { name: 'Rename conversation', value: '/rename' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
@@ -478,6 +480,17 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           continue
         }
         if (command === '/resume') { const id = await selectResume(); if (id && id !== host?.session.id) selected = { resume: id }; continue }
+        if (/^\/rename(?:\s|$)/.test(command)) {
+          if (!host) { io.write('Choose a model before naming a session\n'); continue }
+          const current = host.session
+          const supplied = command.replace(/^\/rename(?:\s+|$)/, '')
+          const name = supplied || await io.askText('Session name · Escape cancels', sessionDisplayTitle(current))
+          if (name === undefined) continue
+          try { await host.renameSession(name, current.titleRevision ?? 0) }
+          finally { io.setSession(host.session) }
+          io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`)
+          continue
+        }
         if (command === '/provider') {
           const configured = await setupProvider(activeSettings ?? settings)
           if (configured) {
@@ -494,7 +507,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nSession tokens: ${formatUsage(session.usage)}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
           io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\n` : 'Workspace: disabled\n')
           continue
@@ -504,7 +517,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (!host) { io.write('Use /provider and /models before sending a message\n'); continue }
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
-        try { const result = await host.send(line, controller.signal); io.result(result); io.setSession(host.session) }
+        try { const result = await sendChatTurn(host, io, line, controller.signal); io.result(result); io.setSession(host.session) }
         finally { dispose() }
       } catch (error) { report(error) }
     }

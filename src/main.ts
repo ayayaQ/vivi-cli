@@ -66,7 +66,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
 
 Credentials: environment variables, or masked /provider setup in the full-screen UI.
 Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
-Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id and usage.
+Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its name, id and usage; /rename NAME changes its name.
 Streaming is display-only. Notes never access other files; piped approval is denied.
 Saved memory is off by default. When enabled, it is sent to the selected provider.
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.

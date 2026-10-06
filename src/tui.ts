@@ -22,9 +22,12 @@ import type { InputDiagnosticReport, InputProbe } from './input-diagnostic.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
+import { RunStatus } from './run-status.js'
+import type { RunClock, RunOutcome } from './run-status.js'
+import { sessionDisplayTitle } from './session-display.js'
 
 export type { Choice } from './picker.js'
-export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[] }
+export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
 
 export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: '#18181b',
   foreground: '#e4e4e7', selectedBackground: '#3d2946' } as const
@@ -34,6 +37,7 @@ export const SLASH_COMMANDS = [
   { command: '/effort', description: 'Choose reasoning effort' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
+  { command: '/rename', description: 'Rename the current session' },
   { command: '/settings', description: 'Change future defaults' },
   { command: '/memories', description: 'Manage app-wide saved context' },
   { command: '/menu', description: 'Open the menu' },
@@ -53,12 +57,21 @@ const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
 const MAX_QUERY = 200
+const statusSegments = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
 /** Conservative cell budget keeps wide Unicode paths on one terminal row. */
-function fitStatusColumns(text: string, columns: number): string {
-  const characters = [...text]
-  const width = (character: string): number => character.codePointAt(0)! <= 0x7f ? 1 : 2
+function fitStatusColumns(text: string, columns: number, keepStart = false): string {
+  const characters = [...statusSegments.segment(text)].map(item => item.segment)
+  const width = (character: string): number => [...character].reduce((total, point) => total + (point.codePointAt(0)! <= 0x7f ? 1 : 2), 0)
   if (characters.reduce((total, character) => total + width(character), 0) <= columns) return text
   if (columns < 2) return columns > 0 ? '…' : ''
+  if (keepStart) {
+    let prefix = '', used = 0
+    for (const character of characters) {
+      if (used + width(character) > columns - 2) break
+      prefix += character; used += width(character)
+    }
+    return `${prefix}…`
+  }
   const leftBudget = Math.ceil((columns - 2) / 2), rightBudget = Math.floor((columns - 2) / 2)
   let left = '', right = '', used = 0
   for (const character of characters) {
@@ -176,6 +189,7 @@ export class OpenTuiIO implements ChatIO {
   private changingInput = false
   private cancelCallbacks = new Set<() => void>()
   private status = 'Ready'
+  private readonly runStatus: RunStatus
   private workspaceDirectory: string | undefined
   private workspaceStatus = false
   private sessionTitle = 'vivi · fresh conversation'
@@ -206,6 +220,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     this.updateActionBar()
     this.updateApprovalLayout()
+    this.updateHeader()
     if (this.workspaceStatus) this.updateStatus()
     this.renderDialogActions()
     if (this.searchPicker) this.renderSearchPicker(false)
@@ -247,6 +262,7 @@ export class OpenTuiIO implements ChatIO {
   }
 
   constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}) {
+    this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
     this.secrets = [...new Set(options.secrets ?? [])].filter(Boolean).sort((a, b) => b.length - a.length)
     this.stream = options.stream ?? true
     if (renderer.isDestroyed) throw new Error('Cannot use a destroyed OpenTUI renderer')
@@ -407,7 +423,7 @@ export class OpenTuiIO implements ChatIO {
     this.entries = this.entries.map(redactEntry)
     this.resultNotices = this.resultNotices.map(redactEntry)
     this.sessionTitle = this.safe(this.sessionTitle, 4096)
-    this.header.content = this.sessionTitle
+    this.updateHeader()
     this.composerBox.title = this.safe(this.composerBox.title ?? '', 4096)
     this.pickerBox.title = this.safe(this.pickerBox.title ?? '', 4096)
     if (this.picker) this.picker.options = this.picker.options.map((option) => ({ ...option,
@@ -551,8 +567,16 @@ export class OpenTuiIO implements ChatIO {
     const folder = this.workspaceDirectory === undefined ? 'disabled'
       : `${fitStatusColumns(this.safe(JSON.stringify(this.workspaceDirectory)), Math.max(0, columns - 23))} · read only`
     const workspace = this.workspaceStatus ? `\n${fitStatusColumns(`Workspace: ${folder}`, columns)}` : ''
-    const summary = this.workspaceStatus ? fitStatusColumns(this.status.replace(/[\t\n]+/g, ' '), columns) : this.status
+    const run = this.runStatus.label
+    const detail = this.status.startsWith('Tool running:') ? ` · ${this.status}` : ''
+    const summaryText = run === undefined ? this.status : `${run}${detail}`
+    const summary = this.workspaceStatus || run !== undefined ? fitStatusColumns(summaryText.replace(/[\t\n]+/g, ' '), columns) : summaryText
     this.statusLine.content = `${summary}${workspace}\n${this.usageScope} tokens: ${formatUsage(this.usage)}`
+  }
+  private updateHeader(): void {
+    if (this.closed) return
+    this.header.content = this.sessionTitle.split('\n').map((line, index) =>
+      fitStatusColumns(line, Math.max(1, this.renderer.terminalWidth), index === 0)).join('\n')
   }
   private disableComposer(): void {
     this.composer?.blur()
@@ -805,6 +829,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.pending?.kind === 'approval') this.pending.finish(undefined)
     this.clearInput()
     if (this.cancelCallbacks.size) {
+      this.runStatus.setPhase('cancelling')
       this.updateStatus('Cancelling…')
       for (const callback of [...this.cancelCallbacks]) callback()
     } else if (!escape) this.close()
@@ -837,6 +862,11 @@ export class OpenTuiIO implements ChatIO {
     if (this.failure) return Promise.reject(this.failure)
     if (this.closed) return Promise.resolve(undefined)
     if (signal?.aborted) return kind === 'chat' ? Promise.reject(new Error('Input cancelled')) : Promise.resolve(undefined)
+    if (kind !== 'chat' && !this.runStatus.running && this.runStatus.label !== undefined) {
+      this.runStatus.reset()
+      if (['Completed', 'Cancelled', 'Error'].includes(this.status)) this.status = 'Ready'
+      this.updateStatus()
+    }
     this.pending?.finish(undefined)
     this.mouseActivation.clear()
     this.clearInput()
@@ -1008,11 +1038,28 @@ export class OpenTuiIO implements ChatIO {
     this.pickerBox.title = 'Review this change (default: deny)'
     this.pickerBox.height = 3
     this.pickerBox.visible = true
-    const reply = await answer
-    return reply === 'allow' && !signal.aborted && !this.closed
+    this.runStatus.setPhase('waiting_approval')
+    try {
+      const reply = await answer
+      return reply === 'allow' && !signal.aborted && !this.closed
+    } finally {
+      this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
+      if (!this.closed && !this.runStatus.running) this.updateStatus('Ready')
+    }
+  }
+  runStarted(): void {
+    if (this.closed) return
+    this.runStatus.start()
+    this.updateStatus('Working · Escape / Ctrl+C cancels')
+  }
+  runFinished(outcome: RunOutcome): void {
+    if (this.closed) return
+    this.runStatus.finish(outcome)
+    this.updateStatus(outcome === 'completed' ? 'Completed' : outcome === 'cancelled' ? 'Cancelled' : 'Error')
   }
   onCancel(callback: () => void): () => void {
     if (this.closed) { callback(); return () => undefined }
+    if (!this.runStatus.running) this.runStatus.reset()
     this.cancelCallbacks.add(callback)
     this.mouseActivation.clear()
     this.updateActionBar()
@@ -1092,9 +1139,10 @@ export class OpenTuiIO implements ChatIO {
   }
   setDraft(provider: CliProviderName): void {
     if (this.closed) return
+    this.runStatus.reset()
     this.sessionId = undefined
     this.sessionTitle = `vivi · fresh conversation · ${provider} · choose a model with /models`
-    this.header.content = this.sessionTitle
+    this.updateHeader()
     this.clearStream()
     this.entries = []
     this.resultNotices = []
@@ -1114,13 +1162,14 @@ export class OpenTuiIO implements ChatIO {
   setSession(session: CliSession): void {
     if (this.closed) return
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
+      this.runStatus.reset()
       this.resultNotices = []
       this.clearStream()
       this.status = 'Ready'
     }
     this.sessionId = session.id
-    this.sessionTitle = this.safe(`vivi · ${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}\nSession ${session.id}`, 4096)
-    this.header.content = this.sessionTitle
+    this.sessionTitle = this.safe(`vivi · ${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}\n${sessionDisplayTitle(session)} · Session ${session.id}`, 4096)
+    this.updateHeader()
     this.usage = { ...session.usage }
     this.usageScope = 'Session'
     this.entries = [...this.historyEntries(session.history), ...this.resultNotices]
@@ -1179,6 +1228,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus(`Tool running: ${event.call.name}`)
       this.appendEntry({ label: 'Tool activity', content: `${event.call.name} · running`, markdown: false })
     } else if (event.type === 'tool_completed') {
+      this.updateStatus('Working')
       this.appendEntry({ label: `Tool ${event.message.name} · ${event.message.isError ? 'error' : 'done'}`,
         content: event.message.content, markdown: false })
     } else if (event.type === 'round_completed') {
@@ -1205,6 +1255,7 @@ export class OpenTuiIO implements ChatIO {
   private dispose(destroyRenderer: boolean): void {
     if (this.closed) return
     this.closed = true
+    this.runStatus.reset()
     // Pending input is settled before the native widgets disappear.
     this.pending?.finish(undefined)
     for (const callback of [...this.cancelCallbacks]) {
