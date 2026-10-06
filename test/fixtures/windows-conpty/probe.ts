@@ -34,7 +34,23 @@ const { OpenTuiIO } = await import(pathToFileURL(resolve(repository, 'src/tui.ts
 const originalRaw = process.stdin.isRaw === true
 const originalFlowing = process.stdin.readableFlowing === true
 const controls = { query: 0, enable: 0, disable: 0 }
-const pasteSummary = { count: 0, matchesKnownFixture: false, byteCount: 0 }
+const pasteSummary = { count: 0, matchesKnownFixture: false, byteCount: 0, knownTransform: 'unknown',
+  rawStartObserved: false, rawEndObserved: false }
+const knownPasteVariants = new Map([
+  [pasteText, 'literal'],
+  [pasteText.replace(/\r/g, '\x1b[13;1u').replace(/\n/g, '\x1b[13;5u'), 'translated-return-linebreaks'],
+  [pasteText.replace(/\r/g, '\x1b[13;1u').replace(/\n/g, '\x1b[106;5u'), 'translated-ctrl-j-linebreaks'],
+  [pasteText.replace(/[\r\n]/g, '\x1b[13;1u'), 'translated-enter-linebreaks'],
+  [`\x1b[200~${pasteText}\x1b[201~`, 'nested-raw-markers'],
+  [`\0[200~${pasteText}\0[201~`, 'nested-neutralized-markers']
+])
+let markerTail = ''
+const observeKnownMarkers = (chunk: Buffer): void => {
+  const text = markerTail + chunk.toString('utf8')
+  if (text.includes('\x1b[200~')) pasteSummary.rawStartObserved = true
+  if (text.includes('\x1b[201~')) pasteSummary.rawEndObserved = true
+  markerTail = text.slice(-5)
+}
 const restoration = { rawCR: false, win32Records: 0, rawModeRestored: false, flowingRestored: false }
 const restorationDecoder = new WindowsInputDecoder()
 let io: InstanceType<typeof OpenTuiIO> | undefined
@@ -60,6 +76,8 @@ const saveAndExit = (exitCode: number): void => {
   try { io?.close() } catch { failed = true }
   postCloseParser?.destroy()
   process.stdin.removeListener('data', postCloseData)
+  process.stdin.removeListener('data', observeKnownMarkers)
+  markerTail = ''
   // Defensive cleanup is separate from the bridge-close observations recorded below.
   process.stdin.setRawMode(originalRaw)
   if (originalFlowing) process.stdin.resume(); else process.stdin.pause()
@@ -99,6 +117,9 @@ try {
   // This is the real factory: native output setup occurs before bridge.start(), exactly as in the CLI.
   loading('create-renderer')
   io = await OpenTuiIO.create({ stream: false })
+  // Add a non-consuming known-marker observer only after the production factory
+  // has captured original raw/flow state; never change its startup ownership.
+  process.stdin.on('data', observeKnownMarkers)
   phase = 'input-diagnostic'
   const bridge = io.windowsInput
   if (!bridge) throw new Error('Windows input bridge missing')
@@ -123,6 +144,7 @@ try {
     const expected = Buffer.from(pasteText)
     pasteSummary.count++
     pasteSummary.byteCount += event.bytes.byteLength
+    pasteSummary.knownTransform = knownPasteVariants.get(Buffer.from(event.bytes).toString('utf8')) ?? 'unknown'
     pasteSummary.matchesKnownFixture = pasteSummary.count === 1 &&
       createHash('sha256').update(event.bytes).digest('hex') === createHash('sha256').update(expected).digest('hex')
   })
