@@ -8,11 +8,16 @@ import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
+import type { RunOutcome } from './run-status.js'
+import { sessionDisplayTitle } from './session-display.js'
 
 export interface ChatIO {
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
+  /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
+  runStarted?(): void
+  runFinished?(outcome: RunOutcome): void
   readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined>
   write(text: string): void
   event(event: AgentEvent): void
@@ -20,6 +25,18 @@ export interface ChatIO {
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
   onCancel(callback: () => void): () => void
   close(): void
+}
+
+/** Share explicit turn boundaries across interactive, one-shot and accessible line flows. */
+export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal): Promise<AgentResult> {
+  let outcome: RunOutcome = 'error'
+  try {
+    io.runStarted?.()
+    const result = await host.send(content, signal)
+    outcome = result.status
+    return result
+  } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
+  finally { io.runFinished?.(outcome) }
 }
 export interface TerminalOptions {
   input?: Readable
@@ -307,28 +324,35 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
   if (prompt !== undefined) {
     const dispose = io.onCancel(() => host.cancel())
     try {
-      const result = await host.send(prompt)
+      const result = await sendChatTurn(host, io, prompt)
       io.result(result)
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /memories manages saved context\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /memories manages saved context\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
     if (line.trim() === '/session') {
       const session = host.session
-      io.write(`Session: ${session.id}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`)
       continue
     }
     if (!line.trim()) continue
+    if (/^\/rename(?:\s|$)/.test(line.trim())) {
+      const name = line.trim().replace(/^\/rename(?:\s+|$)/, '')
+      if (!name) io.write('Use /rename NAME to name this session\n')
+      else try { await host.renameSession(name, host.session.titleRevision ?? 0); io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Session rename failed'}\n`) }
+      continue
+    }
     if (/^\/memories(?:\s|$)/.test(line.trim())) {
       try { await runMemoryCommand(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Memory management failed'}\n`) }
       continue
     }
     const dispose = io.onCancel(() => host.cancel())
-    try { io.result(await host.send(line)) }
+    try { io.result(await sendChatTurn(host, io, line)) }
     catch (error) { io.write(`${error instanceof Error ? error.message : 'CLI turn failed'}\n`) }
     finally { dispose() }
   }

@@ -25,6 +25,7 @@ then choose a model.
 - `/effort` — choose a supported reasoning effort
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
+- `/rename` — rename the current conversation (or `/rename NAME` in line mode)
 - `/settings` — change defaults for future conversations
 - `/memories` — manage this launch’s app-wide saved context
 - `/session` — show the current session ID and saved usage
@@ -33,6 +34,17 @@ then choose a model.
 
 Changing provider, model or effort starts a new conversation and keeps the old
 transcript available through `/resume`.
+
+Sessions get a readable name from the first accepted message, without an extra
+model call. Rename keeps that name through later turns and resumes. The resume
+picker shows names and local dates such as Today or Yesterday, with the model
+and session ID still available. Older unnamed sessions use a display-only
+first-message fallback; browsing them does not rewrite saved files.
+
+The full-screen status shows an animated Working indicator and total elapsed
+turn time, including time spent waiting for approval. Waiting for approval and
+Cancelling have separate labels. The timer stops when the turn settles or the UI
+closes, including non-streaming requests and failed turns.
 
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
 terminal reports those modifiers. Tab completes slash commands.
