@@ -15,6 +15,8 @@ import { redactSecrets } from './session.js'
 import type { ChatIO } from './terminal.js'
 import type { ApprovalRequest } from './tools.js'
 import { matchingChoiceIndices } from './picker.js'
+import { createWindowsInputBridge } from './windows-input.js'
+import type { WindowsInputBridge } from './windows-input.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
@@ -51,7 +53,7 @@ const MAX_ENTRIES = 256
 const MAX_QUERY = 200
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const HINTS = '/new /resume /memories /settings /menu /help /exit · Tab complete · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
+const HINTS = 'Enter send · Ctrl+J newline · /new /resume /memories /settings /menu /help /exit'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
@@ -159,6 +161,7 @@ export class OpenTuiIO implements ChatIO {
   private usageScope: 'Session' | 'Round' | 'Turn' = 'Session'
   private streamed = ''
   private streamOverflow = false
+  private windowsInput: WindowsInputBridge | undefined
 
   private readonly keyHandler = (key: KeyEvent): void => {
     try { this.handleKey(key) } catch (error) { this.errorHandler({ error }) }
@@ -311,13 +314,27 @@ export class OpenTuiIO implements ChatIO {
   }
 
   static async create(options: OpenTuiOptions = {}): Promise<OpenTuiIO> {
+    let renderer: CliRenderer | undefined
+    const windowsInput = process.platform === 'win32' && process.stdin.isTTY
+      ? createWindowsInputBridge(process.stdin, text => { process.stdout.write(text) }, () => {
+        renderer?.emit(CliRenderEvents.HANDLER_ERROR, { error: new Error('Windows console input failed') })
+      }) : undefined
     // The official factory rolls back a failed async terminal setup.
-    const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [],
-      screenMode: 'alternate-screen', consoleMode: 'disabled', openConsoleOnError: false,
-      externalOutputMode: 'passthrough', useKittyKeyboard: { disambiguate: true, alternateKeys: true },
-      useMouse: true, backgroundColor: '#18181b' })
-    try { return new OpenTuiIO(renderer, options) }
-    catch (error) { if (!renderer.isDestroyed) renderer.destroy(); throw error }
+    try {
+      renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [],
+        ...(windowsInput ? { stdin: windowsInput.stdin } : {}),
+        screenMode: 'alternate-screen', consoleMode: 'disabled', openConsoleOnError: false,
+        externalOutputMode: 'passthrough', useKittyKeyboard: { disambiguate: true, alternateKeys: true },
+        useMouse: true, backgroundColor: '#18181b' })
+      if (windowsInput?.failure) throw windowsInput.failure
+      const io = new OpenTuiIO(renderer, options)
+      io.windowsInput = windowsInput
+      windowsInput?.start()
+      return io
+    } catch (error) {
+      try { windowsInput?.close() } finally { if (renderer && !renderer.isDestroyed) renderer.destroy() }
+      throw error
+    }
   }
 
   get failed(): boolean { return this.failure !== undefined }
@@ -639,7 +656,7 @@ export class OpenTuiIO implements ChatIO {
         this.transcript.scrollTo(this.transcript.scrollTop + (key.name === 'pageup' ? -1 : 1) *
           Math.max(1, this.transcript.viewport.height - 1)); return
       }
-      if (!this.ready() || key.eventType === 'repeat' || key.ctrl || key.meta || key.super || key.hyper) return
+      if (!this.ready() || key.eventType === 'repeat' || key.repeated || key.ctrl || key.meta || key.super || key.hyper) return
       if (['left', 'up', 'home'].includes(key.name)) this.approvalIndex = 0
       else if (['right', 'down', 'end'].includes(key.name)) this.approvalIndex = 1
       else if (key.name === 'tab') this.approvalIndex = 1 - this.approvalIndex
@@ -663,6 +680,16 @@ export class OpenTuiIO implements ChatIO {
     if (!pending?.armed) { this.consume(key); return }
     if (this.cancelCallbacks.size && pending.kind !== 'approval') { this.consume(key); return }
     if (pending.kind === 'secret') { this.handleSecretKey(key); return }
+    // Legacy terminals encode Ctrl+J as LF and may encode Shift+Enter exactly
+    // like Enter (CR). Only chat/text editors use LF as a newline fallback;
+    // search, secret, choice and approval prompts keep their confirmation keys.
+    if ((pending.kind === 'chat' || pending.kind === 'text') && !key.shift && !key.meta && !key.super && !key.hyper &&
+      ((!key.ctrl && key.name === 'linefeed') || (key.ctrl && key.name === 'j'))) {
+      this.consume(key)
+      this.composer.insertText('\n')
+      this.inputChanged()
+      return
+    }
     if (pending.kind === 'chat' && this.completions.length && !key.ctrl && !key.meta && !key.super && !key.hyper) {
       if (key.name === 'up' || key.name === 'down') {
         this.consume(key)
@@ -743,7 +770,7 @@ export class OpenTuiIO implements ChatIO {
       : kind === 'search' ? 'Type to search · ↑/↓ select · PgUp/PgDn · Home/End'
       : kind === 'choice' ? '↑/↓ select · Enter or click choose · Escape back'
       : kind === 'secret' ? 'Input hidden · Enter confirm · Escape back · Ctrl+U clear'
-      : 'Enter confirm · Shift/Alt+Enter newline · Escape back'
+      : 'Enter confirm · Ctrl+J newline · Shift/Alt+Enter if supported · Escape back'
     if (kind !== 'choice' && kind !== 'secret') this.composer.setText(this.safe(initial, MAX_INPUT).slice(0, MAX_INPUT))
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -1102,6 +1129,9 @@ export class OpenTuiIO implements ChatIO {
     this.entries = []
     this.clearSecret()
     this.secrets = []
+    try { this.windowsInput?.close() }
+    catch { this.failure ??= new Error('Windows console reporting restoration failed') }
+    this.windowsInput = undefined
     if (destroyRenderer && !this.renderer.isDestroyed) this.renderer.destroy()
   }
   close(): void { this.dispose(true) }

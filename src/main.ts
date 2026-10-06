@@ -181,6 +181,18 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   let release: (() => Promise<void>) | undefined
   let host: CliHost | undefined
   const secrets = environmentSecrets(env)
+  const closeIO = (): boolean => {
+    const closing = io
+    if (!closing) return false
+    io = undefined
+    const failedBeforeClose = closing.failed
+    closing.close()
+    if (!failedBeforeClose && closing.failed) {
+      process.stderr.write('vivi: terminal cleanup failed. Close this terminal window or tab before restarting vivi.\n')
+      return true
+    }
+    return false
+  }
   try {
     const interactive = dependencies.tuiIO !== undefined || (!dependencies.io && Boolean(process.stdin.isTTY && process.stdout.isTTY) &&
       !args.includes('--no-tui') && (!args.includes('--prompt') || args.includes('--tui')) && !args.includes('--help') && !args.includes('-h'))
@@ -192,11 +204,13 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const { runApplication } = await import('./application.js')
       const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets })
       io = tui
-      return await runApplication({ io: tui, options, args, env, secrets,
+      const status = await runApplication({ io: tui, options, args, env, secrets,
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
         ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
         registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
         providerFactory: dependencies.providerFactory ?? providerForSession })
+      const cleanupFailed = closeIO()
+      return cleanupFailed && status === 0 ? 1 : status
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
@@ -232,7 +246,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   } finally {
     await host?.drainMemory().catch(() => undefined)
     await release?.().catch(() => undefined)
-    io?.close()
+    closeIO()
   }
 }
 

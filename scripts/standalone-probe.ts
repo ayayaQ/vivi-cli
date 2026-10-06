@@ -5,6 +5,7 @@ import { createTestRenderer } from '@opentui/core/testing'
 import { CodeRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
+import { WindowsInputDecoder } from '../src/windows-input.js'
 import { newSession } from '../src/session.js'
 import { parseModelCatalog, documentedOpenAIModel } from '../src/models.js'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
@@ -79,8 +80,13 @@ try {
   assert(setup.captureCharFrame().includes('Cache input: read 0 / write unreported'))
   assert(!setup.captureCharFrame().includes('# Embedded renderer'), 'Embedded Markdown grammar did not conceal markup')
   await setup.mockInput.typeText('Embedded input works')
+  const windowsInput = new WindowsInputDecoder()
+  await setup.mockInput.pressKeys([windowsInput.write('\x1b[13;28;13;1;16;1_')])
+  await setup.mockInput.typeText('second')
+  setup.mockInput.pressKey('j', { ctrl: true })
+  await setup.mockInput.typeText('third')
   await setup.mockInput.pressEnter()
-  assert.equal(await reading, 'Embedded input works')
+  assert.equal(await reading, 'Embedded input works\nsecond\nthird')
   const models = Array.from({ length: 1500 }, (_, index) => ({ name: `vendor/model-${index}`,
     searchTerms: ['Embedded Provider'], value: `vendor/model-${index}` }))
   const selecting = io.chooseSearchable('Embedded models', models, { refresh: true })

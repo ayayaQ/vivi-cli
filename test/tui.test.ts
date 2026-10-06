@@ -8,15 +8,17 @@ import type { TestRendererSetup } from '@opentui/core/testing'
 import type { AgentResult, HistoryMessage } from '@ayayaq/vivi'
 import { getSlashCommandCompletions, OpenTuiIO, SLASH_COMMANDS, TUI_THEME } from '../src/tui.js'
 import { newSession } from '../src/session.js'
+import { WindowsInputDecoder } from '../src/windows-input.js'
 
 const fixtures: { io: OpenTuiIO; setup: TestRendererSetup }[] = []
 afterEach(async () => {
   for (const { io } of fixtures.splice(0)) io.close()
   await Promise.resolve()
 })
-async function fixture(options: { stream?: boolean; secrets?: readonly string[]; width?: number; height?: number } = {}) {
+async function fixture(options: { stream?: boolean; secrets?: readonly string[]; width?: number; height?: number;
+  kittyKeyboard?: boolean } = {}) {
   const setup = await createTestRenderer({ width: options.width ?? 100, height: options.height ?? 30,
-    kittyKeyboard: true, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+    kittyKeyboard: options.kittyKeyboard ?? true, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer, options)
   fixtures.push({ io, setup })
   const frame = async (): Promise<string> => {
@@ -473,6 +475,286 @@ test('Enter submits; Shift and Alt Enter compose multiline with preserved draft'
   const next = io.readLine('Message')
   input.pressEnter()
   expect(await next).toBe('')
+})
+
+test('reported Shift+Enter inserts one newline through Kitty, keypad and modifyOtherKeys input', async () => {
+  for (const sequence of ['\x1b[13;2u', '\x1b[57414;2u', '\x1b[27;2;13~']) {
+    const { io, setup, input } = await fixture()
+    const line = io.readLine('Message')
+    let submitted = false
+    void line.then(() => { submitted = true })
+    await input.typeText('first')
+    await input.pressKeys([sequence])
+    const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+    expect(composer.plainText).toBe('first\n')
+    await Promise.resolve()
+    expect(submitted).toBe(false)
+    await input.typeText('second')
+    input.pressEnter()
+    expect(await line).toBe('first\nsecond')
+  }
+})
+
+test('Ctrl+J fallback inserts a newline in legacy and Kitty terminals without submitting', async () => {
+  for (const kittyKeyboard of [false, true]) {
+    const { io, setup, input, frame } = await fixture({ kittyKeyboard })
+    const line = io.readLine('Message')
+    let submitted = false
+    void line.then(() => { submitted = true })
+    await input.typeText('first')
+    input.pressKey('j', { ctrl: true })
+    const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+    expect(composer.plainText).toBe('first\n')
+    await Promise.resolve()
+    expect(submitted).toBe(false)
+    expect(await frame()).toContain('Ctrl+J newline')
+    await input.pasteBracketedText('second\nthird')
+    input.pressEnter()
+    expect(await line).toBe('first\nsecond\nthird')
+  }
+})
+
+test('legacy Shift+Enter remains indistinguishable from Enter while Ctrl+J is a separate fallback', async () => {
+  const { io, input } = await fixture({ kittyKeyboard: false })
+  const first = io.readLine('Message')
+  await input.typeText('plain CR')
+  input.pressEnter({ shift: true }) // Legacy input has no Shift modifier, only CR.
+  expect(await first).toBe('plain CR')
+  const next = io.readLine('Message')
+  await input.typeText('first')
+  await input.pressKeys(['\n']) // The LF byte from Ctrl+J is not a CR submit.
+  await input.typeText('second')
+  input.pressEnter()
+  expect(await next).toBe('first\nsecond')
+})
+
+test('newline fallback preserves cursor position, selection replacement and undo history', async () => {
+  const { io, setup, input } = await fixture()
+  const line = io.readLine('Message')
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  await input.typeText('leftright')
+  for (let i = 0; i < 5; i++) input.pressArrow('left')
+  input.pressKey('j', { ctrl: true })
+  expect(composer.plainText).toBe('left\nright')
+  expect(composer.cursorOffset).toBe(5)
+  input.pressKey('-', { ctrl: true })
+  expect(composer.plainText).toBe('leftright')
+  input.pressKey('.', { ctrl: true })
+  expect(composer.plainText).toBe('left\nright')
+  input.pressArrow('right', { shift: true })
+  input.pressArrow('right', { shift: true })
+  input.pressKey('j', { ctrl: true })
+  expect(composer.plainText).toBe('left\n\nht')
+  input.pressEnter()
+  expect(await line).toBe('left\n\nht')
+})
+
+test('newline fallback hides slash completions and leaves Unicode and multiline paste intact', async () => {
+  const { io, setup, input } = await fixture({ kittyKeyboard: false })
+  const line = io.readLine('Message')
+  await input.typeText('/m')
+  const completions = setup.renderer.root.findDescendantById('vivi-completions')!
+  expect(completions.visible).toBe(true)
+  input.pressKey('j', { ctrl: true })
+  expect(completions.visible).toBe(false)
+  await input.pasteBracketedText('中文🙂é\nlast')
+  input.pressArrow('left')
+  await input.typeText('!')
+  input.pressEnter()
+  expect(await line).toBe('/m\n中文🙂é\nlas!t')
+})
+
+test('Ctrl+J adds lines to ordinary text prompts while confirmation prompts keep their keys', async () => {
+  for (const kittyKeyboard of [false, true]) {
+    const { io, setup, input, frame } = await fixture({ kittyKeyboard })
+    const answer = io.askText('Edit text', 'first')
+    const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+    composer.gotoBufferEnd()
+    input.pressKey('j', { ctrl: true })
+    await input.typeText('second')
+    expect(await frame()).toContain('Ctrl+J newline')
+    input.pressEnter()
+    expect(await answer).toBe('first\nsecond')
+    const choice = io.choose('Pick a choice', [{ name: 'One', value: 'one' }])
+    input.pressEnter()
+    expect(await choice).toBe('one')
+    const secret = io.askSecret('Fake API key')
+    await input.typeText('fake')
+    input.pressEnter()
+    expect(await secret).toBe('fake')
+  }
+})
+
+test('newline key releases, running turns and cancelled drafts cannot edit a subsequent prompt', async () => {
+  const { io, setup, input } = await fixture()
+  const controller = new AbortController()
+  const line = io.readLine('Message', controller.signal)
+  const rejected = line.catch((error: Error) => error.message)
+  await input.typeText('draft')
+  await input.pressKeys(['\x1b[13;2:3u', '\x1b[106;5:3u'])
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  expect(composer.plainText).toBe('draft')
+  const dispose = io.onCancel(() => {})
+  input.pressKey('j', { ctrl: true })
+  expect(composer.plainText).toBe('')
+  dispose()
+  controller.abort()
+  expect(await rejected).toBe('Input cancelled')
+  input.pressKey('j', { ctrl: true }) // There is no active editor.
+  const next = io.readLine('Message')
+  expect(composer.plainText).toBe('')
+  input.pressEnter()
+  expect(await next).toBe('')
+})
+
+test('Windows input-record Shift+Enter and keypad Enter compose without submitting', async () => {
+  const { io, setup, input } = await fixture()
+  const decoder = new WindowsInputDecoder()
+  const record = async (text: string): Promise<void> => {
+    const decoded = decoder.write(text)
+    if (decoded) await input.pressKeys([decoded])
+  }
+  const line = io.readLine('Message')
+  let submitted = false
+  void line.then(() => { submitted = true })
+  await input.typeText('first')
+  await record('\x1b[13;28;13;1;16;1_')
+  await record('\x1b[13;28;13;0;16;1_') // Key-up must not add a second line.
+  await input.typeText('second')
+  await record('\x1b[13;28;13;1;272;1_') // Keypad Enter retains Shift + ENHANCED_KEY.
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  expect(composer.plainText).toBe('first\nsecond\n')
+  await Promise.resolve()
+  expect(submitted).toBe(false)
+  await input.typeText('third')
+  await record('\x1b[13;28;13;1;0;1_')
+  expect(await line).toBe('first\nsecond\nthird')
+})
+
+test('Windows input-record editing, Ctrl+J, IME text and bracketed paste preserve the draft', async () => {
+  const { io, setup, input } = await fixture()
+  const decoder = new WindowsInputDecoder()
+  const record = async (text: string): Promise<void> => {
+    const decoded = decoder.write(text)
+    if (decoded) await input.pressKeys([decoded])
+  }
+  const line = io.readLine('Message')
+  await record('\x1b[65;30;97;1;0;2_')
+  await record('\x1b[37;75;0;1;256;1_')
+  await record('\x1b[74;36;10;1;8;1_')
+  await record('\x1b[0;0;20013;1;0;1_\x1b[0;0;25991;1;0;1_')
+  await record('\x1b[0;0;55357;1;0;1_\x1b[0;0;56898;1;0;1_')
+  await record('\x1b[200~pasted\n\x1b[13;28;13;1;16;1_\x1b[201~')
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  expect(composer.plainText).toBe('a\n中文🙂pasted\na')
+  // The record-looking paste stayed text; the ordinary Enter record still submits.
+  await record('\x1b[13;28;13;1;0;1_')
+  expect(await line).toBe('a\n中文🙂pasted\na')
+})
+
+test('Windows zero-character undo/redo records and injected Unicode keep native editor semantics', async () => {
+  const { io, setup, input } = await fixture()
+  const decoder = new WindowsInputDecoder()
+  const record = async (text: string): Promise<void> => {
+    const decoded = decoder.write(text)
+    if (decoded) await input.pressKeys([decoded])
+  }
+  const line = io.readLine('Message')
+  await input.typeText('draft')
+  await record('\x1b[66;48;0;1;2;1_')
+  const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  expect(composer.cursorOffset).toBe(0)
+  await record('\x1b[70;33;0;1;2;1_')
+  expect(composer.cursorOffset).toBe(5)
+  await record('\x1b[74;36;10;1;8;1_')
+  expect(composer.plainText).toBe('draft\n')
+  await record('\x1b[189;12;0;1;8;1_')
+  expect(composer.plainText).toBe('draft')
+  await record('\x1b[190;52;0;1;8;1_')
+  expect(composer.plainText).toBe('draft\n')
+  await record('\x1b[231;0;20013;1;8;1_')
+  expect(composer.plainText).toBe('draft\n中')
+  await record('\x1b[36;71;0;1;2;1_') // NumLock-off Alt-code digit must not move to Home.
+  await record('\x1b[18;56;233;0;0;1_')
+  expect(composer.plainText).toBe('draft\n中é')
+  await record('\x1b[13;28;13;1;0;1_')
+  expect(await line).toBe('draft\n中é')
+})
+
+test('Kitty repeat metadata cannot select or confirm an approval', async () => {
+  const { io, input, frame } = await fixture()
+  const answer = io.approve(request, new AbortController().signal)
+  let finished = false
+  void answer.then(() => { finished = true })
+  await tick(); await frame()
+  await input.pressKeys(['\x1b[9;1:2u', '\x1b[57351;1:2u'])
+  expect(await frame()).toContain('› Deny')
+  input.pressTab()
+  expect(await frame()).toContain('› Approve')
+  await input.pressKeys(['\x1b[13;1:2u', '\x1b[32;1:2u'])
+  await Promise.resolve()
+  expect(finished).toBe(false)
+  input.pressKey(' ')
+  expect(await answer).toBe(true)
+})
+
+test('Windows held keys and native repeat counts cannot act on later approval dialogs', async () => {
+  const { io, input, frame } = await fixture()
+  const decoder = new WindowsInputDecoder()
+  const key = async (virtual: number, character: number, down = 1, repeat = 1): Promise<void> => {
+    const decoded = decoder.write(`\x1b[${virtual};0;${character};${down};0;${repeat}_`)
+    if (decoded) await input.pressKeys([decoded])
+  }
+  // These keys are already held before a proposal exists.
+  for (const [virtual, character] of [[9, 9], [39, 0], [13, 13], [32, 32]]) await key(virtual!, character!)
+  const first = io.approve(request, new AbortController().signal)
+  let firstFinished = false
+  void first.then(() => { firstFinished = true })
+  await tick(); await frame()
+  await key(9, 9, 1, 3)
+  await key(39, 0)
+  expect(await frame()).toContain('› Deny')
+  await key(9, 0, 0)
+  await key(9, 9)
+  expect(await frame()).toContain('› Approve')
+  await key(13, 13)
+  await key(32, 32, 1, 3)
+  await Promise.resolve()
+  expect(firstFinished).toBe(false)
+  await key(13, 0, 0)
+  await key(13, 13)
+  expect(await first).toBe(true)
+
+  const second = io.approve(request, new AbortController().signal)
+  let secondFinished = false
+  void second.then(() => { secondFinished = true })
+  await tick(); await frame()
+  await key(39, 0)
+  expect(await frame()).toContain('› Deny')
+  await key(39, 0, 0)
+  await key(39, 0)
+  expect(await frame()).toContain('› Approve')
+  await key(13, 13, 1, 3)
+  await key(32, 32)
+  await Promise.resolve()
+  expect(secondFinished).toBe(false)
+  input.pressEscape()
+  expect(await second).toBe(false)
+})
+
+test('reporting restoration failure marks IO failed while closing the renderer and settling input', async () => {
+  const { io, setup } = await fixture()
+  const line = io.readLine('Message')
+  // The real bridge's permanent-write failure is exercised in its stream tests.
+  // Here, verify that the TUI does not silently report a successful shutdown.
+  ;(io as unknown as { windowsInput: { close(): void } }).windowsInput = {
+    close() { throw new Error('fake-output-detail') }
+  }
+  io.close()
+  expect(await line).toBeUndefined()
+  expect(io.failed).toBe(true)
+  expect(io.isClosed).toBe(true)
+  expect(setup.renderer.isDestroyed).toBe(true)
 })
 
 test('pickers dismiss with Escape and work repeatedly with typed values intact', async () => {
