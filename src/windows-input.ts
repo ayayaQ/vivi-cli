@@ -28,10 +28,12 @@ export class WindowsInputDecoder {
   private pending = ''
   private pasted = false
   private readonly heldKeys = new Set<string>()
+  private enterRecords = 0
   private surrogate: { code: number; modifiers: number; literal: boolean } | undefined
   constructor(private readonly modeReply: (status: number) => void = () => {}) {}
   get pendingLength(): number { return this.pending.length }
   get inPaste(): boolean { return this.pasted }
+  get enterRecordsObserved(): number { return this.enterRecords }
 
   write(text: string): string {
     this.pending += text
@@ -119,6 +121,7 @@ export class WindowsInputDecoder {
     if (values.some(value => !Number.isInteger(value) || value < 0 || value > 65535)) return undefined
     const [virtual, scan, character, down, state, repeat] = values as [number, number, number, number, number, number]
     if (down !== 0 && down !== 1) return undefined
+    if (virtual === 13) this.enterRecords++
     const identity = virtual && virtual !== 231 ? `${virtual}:${scan}:${state & 0x100}` : undefined
     const held = identity !== undefined && this.heldKeys.has(identity)
     if (!down && identity !== undefined) this.heldKeys.delete(identity)
@@ -167,6 +170,9 @@ export class WindowsInputDecoder {
 export interface WindowsInputBridge {
   readonly stdin: NodeJS.ReadStream
   readonly failure: Error | undefined
+  /** Nonsecret protocol state; never includes input text, bytes or paths. */
+  readonly diagnostic: { started: boolean; waiting: boolean; closed: boolean;
+    modeReply?: number; enableRequested: boolean; enterRecordsObserved: number; restorationFailed: boolean }
   start(): void
   close(): void
 }
@@ -179,6 +185,8 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
   let started = false
   let changedMode = false
   let waiting = false
+  let modeReply: number | undefined
+  let enableRequested = false
   let failure: Error | undefined
   let flushTimer: ReturnType<typeof setTimeout> | undefined
   let queryTimer: ReturnType<typeof setTimeout> | undefined
@@ -188,8 +196,9 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
   const decoder = new WindowsInputDecoder(status => {
     if (!waiting || closed) return
     waiting = false
+    modeReply = status
     clearTimeout(queryTimer)
-    if (status === 2) { changedMode = true; write(ENABLE_MODE) }
+    if (status === 2) { changedMode = true; enableRequested = true; write(ENABLE_MODE) }
   })
   const stdin = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
@@ -265,7 +274,11 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
     try { close() } catch { /* Failure still reaches the owner if restoration also fails. */ }
     finally { onFailure() }
   })
-  return { stdin: stdin as unknown as NodeJS.ReadStream, get failure() { return failure }, close, start(): void {
+  return { stdin: stdin as unknown as NodeJS.ReadStream, get failure() { return failure },
+    get diagnostic() { return { started, waiting, closed, ...(modeReply === undefined ? {} : { modeReply }),
+      enableRequested, enterRecordsObserved: decoder.enterRecordsObserved,
+      restorationFailed: failure?.message === 'Windows console reporting restoration failed' } },
+    close, start(): void {
     if (closed || started) return
     started = true
     waiting = true

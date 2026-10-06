@@ -164,7 +164,8 @@ test('model picker reaches saved and selected IDs beyond the old 250-row cutoff 
   assert.equal(await run(directory, io, services), 0)
   assert.equal(io.searches[0].values.length, 2002)
   assert.equal(io.searches[0].values[io.searches[0].options.initialIndex].value, ids.at(-1))
-  assert.equal(services.catalogCalls.length, 1)
+  // Saved OpenRouter selections verify capabilities at startup, then /models loads its picker.
+  assert.equal(services.catalogCalls.length, 2)
   assert.equal(JSON.parse(await readFile(join(directory, 'preferences.json'))).model, '__refresh')
 })
 test('settings affect future sessions while explicit new resets transcripts and retains nonsecret setup', async t => {

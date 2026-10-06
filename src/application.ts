@@ -93,7 +93,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
-  try { settings = await preferences.load() ?? settings }
+  let savedSettings: TuiPreferences | undefined
+  try { savedSettings = await preferences.load(); settings = savedSettings ? structuredClone(savedSettings) : settings }
   catch (error) { io.write('Saved defaults could not be loaded; use /provider or /resume\n'); report(error) }
   // App-wide consent belongs to the launch, not to a model's session settings.
   let activeMemory = args.includes('--enable-memory') || args.includes('--disable-memory')
@@ -137,6 +138,51 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       if (key) { register(key); env[name] = validateApiKey(key) }
       return env[name]
     } catch (error) { report(error); return undefined }
+  }
+  // OpenRouter capability metadata is live catalog data, not a persisted toggle.
+  // Hydrate it before the first fresh host, just as /models does before /new.
+  // Already-selected models in this launch need no second discovery request.
+  const hydrateModel = async (): Promise<string | false | undefined> => {
+    if (settings.provider !== 'openrouter' || knownModels.has(modelKey(settings.provider, settings.model))) return
+    const key = await loadKey(settings.provider)
+    const controller = new AbortController()
+    const dispose = io.onCancel(() => controller.abort())
+    try {
+      io.write(`Loading ${settings.provider} model capabilities…\n`)
+      const result = await catalog.list(settings.provider, key, controller.signal)
+      if (io.isClosed || controller.signal.aborted) return false
+      let notice = ''
+      for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
+      const model = result.models.find(model => model.id === settings.model)
+      if (model) {
+        const previous = settings
+        settings = settingsForModel(settings, model)
+        // A saved chat-only choice and an explicit launch opt-out remain off.
+        // Unknown tool metadata cannot promote a saved claim into permission;
+        // openSession still requires this launch's explicit --tools declaration.
+        if (model.tools === 'unknown') {
+          settings.enableTools = previous.enableTools; settings.enableNotes = previous.enableNotes
+        }
+        if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
+          savedSettings.model === settings.model && !savedSettings.enableTools &&
+          !args.includes('--tools') && !args.includes('--enable-notes')) {
+          settings.enableTools = false; settings.enableNotes = false
+        }
+        if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
+          settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
+        }
+        if (previous.reasoning !== settings.reasoning) notice += 'Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n'
+      }
+      notice += result.warning ? `${result.warning}. Using a stale cached catalog\n`
+        : result.state === 'cached' ? 'Using the cached model catalog (up to 15 minutes old)\n' : ''
+      return notice || undefined
+    } catch (error) {
+      if (io.isClosed || controller.signal.aborted) return false
+      // Authentication denial is not an offline fallback and cannot authorize a
+      // provider attempt, even when --tools was explicitly declared this launch.
+      if (modelAccessDenied(error)) throw error
+      return `${redactSecrets(error instanceof Error ? error.message : 'Model capabilities could not be loaded', secrets)}\n`
+    } finally { dispose() }
   }
   const setupProvider = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
     const provider = await io.choose('Provider', [
@@ -322,6 +368,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   }
   const openSession = async (selection: { resume?: string; fresh?: boolean }): Promise<boolean> => {
     if (!selection.resume && !settings.model) return false
+    const capabilityNotice = selection.resume ? undefined : await hydrateModel()
+    if (capabilityNotice === false) return false
     await host?.drainMemory()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
     const nextRelease = await store.acquire(selection.resume ?? fresh!.id)
@@ -370,6 +418,9 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     release = nextRelease; host = nextHost
     await previousRelease?.().catch(report)
     io.setSession(host.session)
+    // Native transcript setup clears earlier loading output. Keep stale-cache
+    // disclosure visible after that rebuild and before the first provider turn.
+    if (capabilityNotice) io.write(capabilityNotice)
     return true
   }
   let workspaceNoticePending = true
