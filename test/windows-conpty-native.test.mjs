@@ -108,10 +108,11 @@ test('real Windows ConPTY preserves Bun Enter modifiers, paste, repeats and rest
     const host = JSON.parse(line)
     let progress = { unavailable: true }
     try { progress = JSON.parse(await readFile(`${prefix}.progress.json`, 'utf8')) } catch { }
+    let child = { unavailable: true }
+    try { child = JSON.parse(await readFile(`${prefix}.json`, 'utf8')) } catch { }
     assert.equal(hostProcess.status, 0, `ConPTY host failed: ${JSON.stringify({
-      phase: host.phase, errorType: host.errorType, protocol: host.progress, child: progress
+      phase: host.phase, errorType: host.errorType, protocol: host.progress, child: progress, report: child
     })}`)
-    const child = JSON.parse(await readFile(`${prefix}.json`, 'utf8'))
     assert.equal(child.bun, version.stdout.trim())
     // The diagnostic contains only allowlisted probe events and protocol/restoration metadata.
     assertTransportReport(host, child, expectation)
