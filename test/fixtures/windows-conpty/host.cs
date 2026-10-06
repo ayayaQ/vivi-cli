@@ -7,11 +7,14 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 
 public sealed class ConPtyProbeResult
 {
+    public string Backend;
+    public string BackendDllVersion;
     public int ExitCode;
     public int Queries;
     public int QueryReplies;
@@ -80,8 +83,22 @@ public sealed class ConPtyProbeHost : IDisposable
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint threadId);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CancelSynchronousIo(IntPtr thread);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryExW(string filename, IntPtr file, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetModuleFileNameW(IntPtr module, StringBuilder filename, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeLibrary(IntPtr module);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] delegate int CreatePtyFunction(COORD size, IntPtr input, IntPtr output, uint flags, out IntPtr pseudoConsole);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] delegate void ClosePtyFunction(IntPtr pseudoConsole);
 
     IntPtr inputRead, inputWrite, outputRead, outputWrite, pseudoConsole, attributes, job;
+    IntPtr backendModule;
+    FileStream backendServerLock;
+    FileStream backendDllLock;
+    CreatePtyFunction backendCreate;
+    ClosePtyFunction backendClose;
+    string backendName = "inbox";
+    string backendServerVersion;
+    string backendDllVersion;
     PROCESS_INFORMATION process;
     bool attributesInitialized;
     Thread reader, writer;
@@ -97,6 +114,51 @@ public sealed class ConPtyProbeHost : IDisposable
     bool outputDrained, teardownCompleted;
     int outputBytes;
     string csi = ""; // At most 64 bytes, control sequences only; ordinary output is discarded.
+
+    static string HashLockedFile(FileStream file)
+    {
+        using (SHA256 sha = SHA256.Create())
+            return BitConverter.ToString(sha.ComputeHash(file)).Replace("-", "").ToLowerInvariant();
+    }
+    void SelectBackend(string directory, string expectedDllHash, string expectedServerHash)
+    {
+        if (directory == null) return; // The existing stock lane is unchanged.
+        Phase = "LoadPinnedConpty";
+        if (directory.Length == 0 || !Path.IsPathRooted(directory))
+            throw new InvalidOperationException("Packaged ConPTY needs an absolute directory");
+        string root = Path.GetFullPath(directory);
+        string dll = Path.Combine(root, "conpty.dll");
+        string server = Path.Combine(root, "OpenConsole.exe");
+        if (!File.Exists(dll) || !File.Exists(server))
+            throw new InvalidOperationException("Pinned ConPTY DLL/server pair is missing");
+        // The invoking test verified the release archive and both extracted file hashes.
+        // Keep the sibling server present and immutable until joined teardown: the DLL
+        // otherwise silently falls back to inbox conhost. No user/system handles change.
+        backendServerLock = new FileStream(server, FileMode.Open, FileAccess.Read, FileShare.Read);
+        backendDllLock = new FileStream(dll, FileMode.Open, FileAccess.Read, FileShare.Read);
+        // Expected hashes come from entries inside the official hash-verified
+        // archive, not from mutable provenance. Recheck while holding read-only
+        // locks so neither peer can be replaced between verification and loading.
+        if (!String.Equals(HashLockedFile(backendDllLock), expectedDllHash, StringComparison.Ordinal) ||
+            !String.Equals(HashLockedFile(backendServerLock), expectedServerHash, StringComparison.Ordinal))
+            throw new InvalidOperationException("Locked backend differs from the official archive entries");
+        // Per-call DLL directory + System32 dependency search, without global search-path changes.
+        backendModule = LoadLibraryExW(dll, IntPtr.Zero, 0x00000900);
+        Check(backendModule != IntPtr.Zero, "LoadLibraryExW(pinned ConPTY)");
+        StringBuilder loaded = new StringBuilder(32768);
+        uint length = GetModuleFileNameW(backendModule, loaded, (uint)loaded.Capacity);
+        Check(length > 0 && length < loaded.Capacity, "GetModuleFileNameW(pinned ConPTY)");
+        if (!String.Equals(Path.GetFullPath(loaded.ToString()), dll, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Unexpected loaded ConPTY module");
+        IntPtr create = GetProcAddress(backendModule, "ConptyCreatePseudoConsole");
+        IntPtr close = GetProcAddress(backendModule, "ConptyClosePseudoConsole");
+        Check(create != IntPtr.Zero && close != IntPtr.Zero, "GetProcAddress(pinned ConPTY)");
+        backendCreate = (CreatePtyFunction)Marshal.GetDelegateForFunctionPointer(create, typeof(CreatePtyFunction));
+        backendClose = (ClosePtyFunction)Marshal.GetDelegateForFunctionPointer(close, typeof(ClosePtyFunction));
+        backendName = "microsoft-wt-1.24.12741.0";
+        backendServerVersion = FileVersionInfo.GetVersionInfo(server).FileVersion;
+        backendDllVersion = FileVersionInfo.GetVersionInfo(dll).FileVersion;
+    }
 
     static void Check(bool succeeded, string operation)
     {
@@ -226,7 +288,10 @@ public sealed class ConPtyProbeHost : IDisposable
         Check(CreatePipe(out inputRead, out inputWrite, IntPtr.Zero, 4096), "CreatePipe(input)");
         Check(CreatePipe(out outputRead, out outputWrite, IntPtr.Zero, 4096), "CreatePipe(output)");
         Phase = "CreatePseudoConsole";
-        int result = CreatePseudoConsole(new COORD { X = 100, Y = 30 }, inputRead, outputWrite, 0, out pseudoConsole);
+        COORD sizeOfConsole = new COORD { X = 100, Y = 30 };
+        int result = backendCreate == null
+            ? CreatePseudoConsole(sizeOfConsole, inputRead, outputWrite, 0, out pseudoConsole)
+            : backendCreate(sizeOfConsole, inputRead, outputWrite, 0, out pseudoConsole);
         if (result < 0) Marshal.ThrowExceptionForHR(result);
         // Drain on another thread even during creation and ClosePseudoConsole.
         writer = new Thread(WriteInput); writer.IsBackground = true; writer.Start();
@@ -300,6 +365,12 @@ public sealed class ConPtyProbeHost : IDisposable
     public static ConPtyProbeResult Run(string bun, string child, string repository, string prefix,
         string basic, string repeats, string paste, string finish, string restore, bool expectReset)
     {
+        return Run(bun, child, repository, prefix, basic, repeats, paste, finish, restore, expectReset, null, null, null);
+    }
+    public static ConPtyProbeResult Run(string bun, string child, string repository, string prefix,
+        string basic, string repeats, string paste, string finish, string restore, bool expectReset,
+        string backendDirectory, string expectedDllHash, string expectedServerHash)
+    {
         ConPtyProbeResult result = new ConPtyProbeResult();
         // Live failure diagnostics must never alias the frozen success result:
         // conhost shutdown may emit additional resets after consumer restoration.
@@ -310,6 +381,13 @@ public sealed class ConPtyProbeHost : IDisposable
         Progress.OsVersion = result.OsVersion; Progress.ConhostVersion = result.ConhostVersion;
         using (ConPtyProbeHost host = new ConPtyProbeHost())
         {
+            host.SelectBackend(backendDirectory, expectedDllHash, expectedServerHash);
+            result.Backend = host.backendName;
+            result.BackendDllVersion = host.backendDllVersion;
+            if (host.backendServerVersion != null) result.ConhostVersion = host.backendServerVersion;
+            Progress.Backend = result.Backend;
+            Progress.BackendDllVersion = result.BackendDllVersion;
+            Progress.ConhostVersion = result.ConhostVersion;
             host.Start(bun, child, repository, prefix);
             Phase = "Negotiate";
             host.WaitMarker(prefix + ".ready", 12000);
@@ -368,7 +446,10 @@ public sealed class ConPtyProbeHost : IDisposable
         if (pseudoConsole != IntPtr.Zero)
         {
             IntPtr value = pseudoConsole; pseudoConsole = IntPtr.Zero;
-            Thread closer = new Thread(delegate() { ClosePseudoConsole(value); }); closer.IsBackground = true; closer.Start();
+            // Pair the selected DLL's HPCON with that DLL's close, never Kernel32's.
+            Thread closer = new Thread(delegate() {
+                if (backendClose == null) ClosePseudoConsole(value); else backendClose(value);
+            }); closer.IsBackground = true; closer.Start();
             // Keep output drainage alive until close completes, as Microsoft requires.
             teardownCompleted = closer.Join(4000);
             if (!teardownCompleted)
@@ -386,7 +467,6 @@ public sealed class ConPtyProbeHost : IDisposable
         stopReader = true;
         if (!readerStopped) readerStopped = reader.Join(1000);
         teardownCompleted = teardownCompleted && processStopped && writerStopped && readerStopped;
-        Progress.OutputDrained = outputDrained; Progress.TeardownCompleted = teardownCompleted;
         Close(ref outputRead); Close(ref process.hProcess); Close(ref process.hThread);
         if (attributes != IntPtr.Zero)
         {
@@ -394,5 +474,18 @@ public sealed class ConPtyProbeHost : IDisposable
             Marshal.FreeHGlobal(attributes); attributes = IntPtr.Zero;
         }
         if (writerStopped) { pendingWrites.Dispose(); writerStarted.Dispose(); }
+        // A worker still inside DLL code must keep the module/server pinned until
+        // process shutdown. Only verified joined teardown permits unloading them.
+        if (teardownCompleted)
+        {
+            if (backendModule != IntPtr.Zero)
+            {
+                teardownCompleted = FreeLibrary(backendModule);
+                if (teardownCompleted) backendModule = IntPtr.Zero;
+            }
+            if (backendServerLock != null) { backendServerLock.Dispose(); backendServerLock = null; }
+            if (backendDllLock != null) { backendDllLock.Dispose(); backendDllLock = null; }
+        }
+        Progress.OutputDrained = outputDrained; Progress.TeardownCompleted = teardownCompleted;
     }
 }

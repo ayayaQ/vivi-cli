@@ -441,6 +441,27 @@ test('a delayed split paste-end marker cannot leave subsequent Windows keys in p
   } finally { input.close(); source.destroy() }
 })
 
+test('owned reporting buffers delayed bare-ESC paste and key-record prefixes instead of applying legacy timeout', async () => {
+  for (const status of [1, 2]) {
+    const { source, input, text } = fixture()
+    try {
+      input.stdin.setRawMode(true); input.start()
+      source.write(`\x1b[?9001;${status}$y`)
+      source.write('\x1b')
+      await new Promise(resolve => setTimeout(resolve, 150))
+      assert.equal(text(), '')
+      source.write('[200~one' + tap(13, 13) + 'two' + tap(13, 10, 8) + 'three\x1b[201~')
+      await nextTick()
+      assert.equal(text(), '\x1b[200~one\rtwo\nthree\x1b[201~')
+      source.write('\x1b')
+      await new Promise(resolve => setTimeout(resolve, 150))
+      source.write(tap(27, 27).slice(1))
+      await nextTick()
+      assert.equal(text(), '\x1b[200~one\rtwo\nthree\x1b[201~\x1b[27;1u')
+    } finally { input.close(); source.destroy() }
+  }
+})
+
 test('delayed record fragments preserve modifiers and a fresh Escape sequence recovers malformed input', async () => {
   const { source, input, text } = fixture()
   try {

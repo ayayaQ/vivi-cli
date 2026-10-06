@@ -56,6 +56,23 @@ test('ConPTY Shift+Enter edits without submission and multiline paste stays opaq
   } finally { f.close() }
 })
 
+test('ConPTY delayed paste-start prefixes preserve lines while native Escape still cancels normally', async () => {
+  const f = await fixture()
+  try {
+    const reading = f.io.readLine('Message'); await f.frame()
+    f.conpty.source.write('\x1b'); await new Promise(resolve => setTimeout(resolve, 35))
+    f.conpty.source.write('[200~one\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_two' +
+      '\x1b[13;28;10;1;8;1_\x1b[13;28;10;0;8;1_three\x1b[201~')
+    await f.frame()
+    expect((f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('one\ntwo\nthree')
+    f.conpty.tap(13, 13)
+    expect(await reading).toBe('one\ntwo\nthree')
+    const editing = f.io.askText('Fixed test edit'); await f.frame()
+    f.conpty.tap(27, 27)
+    expect(await editing).toBeUndefined()
+  } finally { f.close() }
+})
+
 test('ConPTY pasted native functional records cannot select or confirm approval', async () => {
   const f = await fixture()
   try {

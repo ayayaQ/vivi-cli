@@ -266,9 +266,10 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
         clearTimeout(flushTimer)
         const text = decoder.write(utf8.write(chunk))
         if (text) this.push(Buffer.from(text))
-        // Only a bare Escape needs a timer. A numeric input record or paste
-        // marker may be split across delayed reads; keep it until completion.
-        if (decoder.pendingLength === 1 && !decoder.inPaste) {
+        // Owned reporting encodes the Escape key as a native record. A raw ESC
+        // can instead begin a delayed paste delimiter or terminal response and
+        // must stay buffered; only the legacy route needs a bare-key timeout.
+        if (decoder.pendingLength === 1 && !decoder.inPaste && !ownsConsumerMode) {
           flushTimer = setTimeout(() => {
             flushTimer = undefined
             if (!closed) this.push(Buffer.from(decoder.flush()))

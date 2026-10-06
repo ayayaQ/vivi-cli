@@ -89,3 +89,32 @@ jobs:
           name: windows-node-${{ matrix.node }}-headless-evidence
           path: ${{ runner.temp }}/windows-package-evidence.json
           if-no-files-found: error
+
+  packaged-conpty:
+    # Additional mode1 transport lane. Stock OS jobs and their paste gate stay independent.
+    needs: candidate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+          architecture: x64
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - name: Prepare hash-pinned official Microsoft ConPTY pair
+        run: |
+          ./test/fixtures/windows-conpty/prepare-pinned-backend.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0')
+      - name: Verify real pinned mode1 transport
+        run: |
+          $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
+          $env:VIVI_TEST_CONPTY_PINNED_DIRECTORY = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
+          node --test test/windows-conpty-packaged-native.test.mjs
+      - name: Remove the private Microsoft backend
+        if: always()
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
+          if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }

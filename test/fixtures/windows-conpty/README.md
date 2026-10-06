@@ -76,3 +76,13 @@ The restoration claim is the standard topology of inner consumer disabled and ou
 - [Exact 1.24 forwarded output/injections](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/host/_stream.cpp#L335-L386)
 - [Bun module resolution](https://bun.sh/docs/runtime/utils#bun-resolvesync)
 - [Bun environment-file control](https://bun.sh/docs/runtime/environment-variables)
+
+## Additional pinned Windows Terminal backend lane
+
+`packaged-conpty` is an additional Windows x64 job pinned to Node 26.4.0 and Bun 1.4.2. It keeps the stock OS jobs and their paste gate independent. It downloads only the official Microsoft `v1.24.12741.0` release asset `Microsoft.Windows.Console.ConPTY.1.24.261001001.nupkg`, checks SHA256 `eceaafe3bdcc85e95d18666eb647e0b8e7e00af45dbcad7034cdc61c4a29fe74` before extracting two exact x64 entries, and removes the private pair on completion/failure. There is no system install, production dependency change, global setting change or binary commit.
+
+The additional test rechecks the archive and extracted file hashes before launching the private host. The host loads the selected DLL by absolute path, verifies the loaded module identity, and requires/pins its sibling `OpenConsole.exe`; missing peers fail before process creation. This prevents the documented silent fallback to inbox conhost. Create and close come from the same selected DLL, kept loaded until joined teardown. Normal host invocation still uses Kernel32. Production `OpenTuiIO.create`, genuine TTY guards, exact mode1/paste/repeat/inner-reset/outer-reassertion assertions and bounded cleanup remain intact.
+
+The pinned lane is prepared here, not Windows-validated. It does not turn a failing stock paste test into a pass and does not test physical Windows Terminal keys.
+
+Primary provenance: [exact Microsoft release and asset digest](https://github.com/microsoft/terminal/releases/tag/v1.24.12741.0), [package entry paths](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/winconpty/package/winconpty.nuspec), [DLL exports](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/winconpty/dll/winconpty.def), [API declarations](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/inc/conpty-static.h), and [sibling/fallback selection](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/winconpty/winconpty.cpp#L49-L102).
