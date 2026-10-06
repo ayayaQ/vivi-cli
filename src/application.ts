@@ -4,12 +4,14 @@ import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import type { CliOptions } from './main.js'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
+import { FileSkillStore } from './skills.js'
+import { join } from 'node:path'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt } from './terminal.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
 import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } from './models.js'
@@ -25,6 +27,7 @@ export interface InteractiveIO extends ChatIO {
   askSecret?(title: string): Promise<string | undefined>
   addSecrets?(secrets: readonly string[]): void
   setDraft?(provider: CliProviderName): void
+  setComposerDraft?(content: string): void
   setSession(session: CliSession): void
   setWorkspace?(directory?: string): void
 }
@@ -66,7 +69,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
-/menu opens actions; /session shows the current ID and usage; /exit quits.
+/skills lists and inspects standard instruction-only skills, drafts a new skill with the agent, or disables skills for this launch.\n/menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
@@ -83,6 +86,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const store = new FileSessionStore(options.sessionDirectory, secrets)
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
+  const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io.write(`${message}\n`) })
+  let activeSkills = options.enableSkills
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
   io.setWorkspace?.(workspace?.directory)
   const knownModels = new Map<string, ModelEntry>()
@@ -90,7 +95,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
   const register = (key: string): void => {
     if (!key || secrets.includes(key)) return
-    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
+    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); skills.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
   try { settings = await preferences.load() ?? settings }
@@ -320,9 +325,56 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       // Reload after approval, cancellation or conflicts; never reuse a stale edit revision.
     }
   }
+  const manageSkills = async (): Promise<void> => {
+    io.write(`${SKILLS_DISCLOSURE}\n`)
+    for (;;) {
+      if (io.isClosed) return
+      let snapshot: Awaited<ReturnType<CliHost['listSkills']>> | undefined
+      if (activeSkills) {
+        try { snapshot = await skills.snapshot(); displaySkills(io, snapshot, skills.diagnostics) }
+        catch (error) { report(error) }
+      }
+      const action = await io.choose(`Skills · ${activeSkills ? 'enabled' : 'disabled'} for this launch`, [
+        { name: 'Back', description: 'Return to the conversation', value: 'back' },
+        { name: activeSkills ? 'Disable for this launch' : 'Enable for this launch', description: SKILLS_DISCLOSURE, value: 'toggle' },
+        ...(activeSkills ? [{ name: 'Refresh skills', description: 'Reload metadata and diagnostics', value: 'refresh' },
+          ...(snapshot?.skills.length ? [{ name: 'Inspect SKILL.md', description: 'View exact source as inert text', value: 'inspect' }] : []),
+          { name: 'Create with agent', description: 'Put a draft request in the composer; every save still requires review', value: 'create' }] : [])
+      ])
+      if (action === undefined || action === 'back') return
+      if (action === 'toggle') { activeSkills = !activeSkills; host?.setSkillsEnabled(activeSkills); continue }
+      if (action === 'inspect' && snapshot) {
+        const name = await io.choose('Inspect a skill', [{ name: 'Back', value: '' },
+          ...snapshot.skills.map(skill => ({ name: skill.name, description: `${skill.readOnly ? 'read only · ' : ''}${skill.description}`, value: skill.name }))])
+        if (name) {
+          const content = snapshot.document(name)!.content
+          const pages = Math.max(1, Math.ceil(content.length / 8192))
+          let page = 0
+          for (;;) {
+            io.write(`SKILL.md ${JSON.stringify(name)} · page ${page + 1}/${pages} (inert exact-source portion):\n${JSON.stringify(content.slice(page * 8192, (page + 1) * 8192))}\n`)
+            const navigation = await io.choose('Inspect SKILL.md', [{ name: 'Close', value: 'close' },
+              ...(page > 0 ? [{ name: 'Previous page', value: 'previous' }] : []),
+              ...(page + 1 < pages ? [{ name: 'Next page', value: 'next' }] : [])])
+            if (navigation === undefined || navigation === 'close') break
+            page += navigation === 'next' ? 1 : -1
+          }
+        }
+      } else if (action === 'create') {
+        if (!host) { io.write('Choose a provider and model before drafting a skill\n'); continue }
+        const description = await io.askText('What should the new skill do? · Escape cancels')
+        if (description?.trim()) {
+          const prompt = skillCreationPrompt(description)
+          if (io.setComposerDraft) io.setComposerDraft(prompt)
+          else io.write(`Send this request to draft the skill:\n${prompt}\n`)
+          return
+        }
+      }
+    }
+  }
   const openSession = async (selection: { resume?: string; fresh?: boolean }): Promise<boolean> => {
     if (!selection.resume && !settings.model) return false
     await host?.drainMemory()
+    await host?.drainSkills()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
     const nextRelease = await store.acquire(selection.resume ?? fresh!.id)
     let nextHost: CliHost
@@ -349,14 +401,15 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       const effective: CliOptions = { ...options, reasoningCapabilities: capabilities,
         stream: metadata?.streaming === 'unsupported' ? false : settings.stream,
         enableTools, enableNotes: enableTools && (sameModel ? settings.enableNotes : explicitResume && args.includes('--enable-notes')),
-        enableMemory: activeMemory,
+        enableMemory: activeMemory, enableSkills: activeSkills,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
       if (io.isClosed) { await nextRelease(); return false }
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await nextRelease(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
+        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         onMemoryNotice: message => io.write(`${message}\n`),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       await store.save(nextHost.session)
@@ -374,6 +427,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   }
   let workspaceNoticePending = true
   try {
+    if (activeSkills) io.write(`${SKILLS_DISCLOSURE}\n`)
     if (activeMemory) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {
@@ -413,7 +467,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Continue conversation', value: 'continue' }, { name: 'Set up provider', value: '/provider' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
-          { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
+          { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' }, { name: 'Skills', value: '/skills' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
         if (!action || action === 'continue') continue
@@ -439,6 +493,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true } }; continue }
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
+        if (command === '/skills') { await manageSkills(); continue }
         if (command === '/memories') { await manageMemories(); continue }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
@@ -457,5 +512,5 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         finally { dispose() }
       } catch (error) { report(error) }
     }
-  } finally { try { await host?.drainMemory() } finally { await release?.() } }
+  } finally { try { await host?.drainMemory(); await skills.drain({ close: true }) } finally { await release?.() } }
 }

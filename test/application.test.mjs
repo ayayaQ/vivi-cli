@@ -75,14 +75,21 @@ test('slash provider setup masks and securely saves keys, model picker selects w
   let turns = 0
   assert.equal(await run(directory, io, services, (session, options, env) => {
     assert.equal(session.model, 'gpt-5.1'); assert.equal(env.OPENAI_API_KEY, key); assert.equal(options.enableTools, true)
-    return { generate: async input => { turns++; assert.equal(input.tools.length, 2); return answer('Hello back') } }
+    return { generate: async input => { turns++; assert.equal(input.tools.length, 5); return answer('Hello back') } }
   }), 0)
   assert.equal(turns, 1); assert.deepEqual(services.saves, [{ provider: 'openai', key }])
   assert.equal(io.secretTitles.length, 1); assert(io.protected.includes(key)); assert(!io.output.includes(key))
   const prefs = await readFile(join(directory, 'preferences.json'), 'utf8')
   assert.equal(JSON.parse(prefs).model, 'gpt-5.1'); assert(!prefs.includes(key))
   const session = io.sessions.at(-1); assert.equal(session.history[1].content, 'Hello back')
-  for (const file of await readdir(directory)) assert(!(await readFile(join(directory, file), 'utf8')).includes(key))
+  const inspectFiles = async path => {
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const file = join(path, entry.name)
+      if (entry.isDirectory()) await inspectFiles(file)
+      else assert(!(await readFile(file, 'utf8')).includes(key))
+    }
+  }
+  await inspectFiles(directory)
   const next = fakeIO([], [], ['Again', '/exit'])
   assert.equal(await run(directory, next, services, (_session, _options, env) => { assert.equal(env.OPENAI_API_KEY, key); return defaultFactory() }), 0)
   assert.equal(next.choices.length, 0); assert.notEqual(next.sessions.at(-1).id, session.id)

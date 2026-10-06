@@ -34,6 +34,7 @@ export const SLASH_COMMANDS = [
   { command: '/resume', description: 'Resume a saved session' },
   { command: '/settings', description: 'Change future defaults' },
   { command: '/memories', description: 'Manage app-wide saved context' },
+  { command: '/skills', description: 'List, inspect and draft standard skills' },
   { command: '/menu', description: 'Open the menu' },
   { command: '/help', description: 'Show commands and shortcuts' },
   { command: '/session', description: 'Show the current session' },
@@ -72,7 +73,7 @@ function fitStatusColumns(text: string, columns: number): string {
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const HINTS = 'Enter send · Ctrl+J newline · /new /resume /memories /settings /menu /help /exit'
+const HINTS = 'Enter send · Ctrl+J newline · /new /resume /memories /skills /settings /menu /help /exit'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
@@ -261,7 +262,7 @@ export class OpenTuiIO implements ChatIO {
       this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
         flexDirection: 'row', visible: false })
       for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
-        ['Memory', '/memories'], ['Settings', '/settings']] as const) {
+        ['Memory', '/memories'], ['Skills', '/skills'], ['Settings', '/settings']] as const) {
         this.actionBar.add(this.mouseButton(`vivi-action-${command.slice(1)}`, label, () => {
           const pending = this.pending
           if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish(command)
@@ -853,8 +854,16 @@ export class OpenTuiIO implements ChatIO {
       }
     })
   }
+  private nextComposerDraft = ''
+  setComposerDraft(content: string): void {
+    if (this.closed) return
+    if (content.length > 65536) throw new Error('Skill draft request exceeds composer limit')
+    this.nextComposerDraft = this.safe(content)
+  }
   async readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined> {
-    const value = await this.openInput('chat', prompt, '', signal)
+    const initial = this.nextComposerDraft
+    this.nextComposerDraft = ''
+    const value = await this.openInput('chat', prompt, initial, signal)
     return typeof value === 'string' ? value : undefined
   }
   async askText(title: string, initial = ''): Promise<string | undefined> {
@@ -938,6 +947,7 @@ export class OpenTuiIO implements ChatIO {
   }
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
+    if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     this.appendEntry({ label: `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false })

@@ -204,3 +204,67 @@ included in input and total counts. A missing cache count is shown as `unreporte
 while an explicitly reported zero is shown as `0`. Each session cache count is
 complete only if every accepted provider round reported that field. Old sessions
 keep missing metrics unreported; no cache policy, price or savings is inferred.
+
+## Instruction-only Agent Skills
+
+The CLI uses the verified `@ayayaq/vivi@0.6.0` optional skills extension. Skills use
+ordinary Agent Skills directories containing `SKILL.md`, with YAML `name` and
+`description` frontmatter. No vivi-specific manifest or conversion is required.
+
+Skills are enabled by default for each CLI launch. The app-wide owned store is
+`<session-dir>/agent-skills/<name>/SKILL.md`; it is independent of session notes
+and saved memories. The original bundled `skill-creator` is read-only. `/skills`
+opens the full-screen manager for listing metadata, viewing source in bounded
+pages, drafting a new skill with the agent, and enabling/disabling this launch.
+Creating with the agent puts a request in the composer for you to review and send.
+Line mode supports `/skills list`, `/skills inspect NAME`, `/skills create DESCRIPTION`,
+`/skills on`, and `/skills off`. `--no-skills` disables the feature for the launch.
+
+To use an existing standard skills folder, pass `--skills-dir PATH`. This flag is
+repeatable up to eight roots, read-only, and never remembered in sessions or defaults.
+It authorizes only bounded discovery and inert text reads in those roots. The CLI
+never automatically scans workspace, home or repository skills. Extra roots cannot
+overlap the private state profile; move shared skills to a separate ordinary folder.
+Invalid documents, unsupported fields, duplicate canonical names, symlinks and
+unsafe paths are excluded with diagnostics. Original imported files/resources are
+neither rewritten nor copied. NFKC-equivalent physical directory names are read
+unchanged using canonical catalog names, but remain read-only; saves use canonical
+names only, and normalized aliases cannot be shadowed.
+
+Only compact name/description metadata is sent as ephemeral user-level context.
+The agent reads relevant instructions/resources progressively using `list_skills`
+and `read_skill`; catalog summaries never become saved user messages. Selected
+instructions and tool results are sent to your provider and may remain in the
+session transcript. Skill text is untrusted guidance and cannot change tool access,
+approvals, model capability policy or credential protections. `allowed-tools` is
+descriptive. Chat-only models receive metadata but cannot load or save via tools.
+
+**Saving is currently supported only on Linux**, where descriptor-relative file
+operations anchor the destination throughout the transaction. On Windows/macOS,
+reads and creator drafts work, but `save_skill` is omitted and direct saves fail
+closed until safe native handle-relative transactions have been implemented and
+validated. Read-only platforms never create the skill store or its lock files.
+
+On Linux, `save_skill` writes one `SKILL.md` only in the owned store, after exact destination,
+before/after and revision review. Deny is the default; piped/queued input cannot
+approve. Built-ins and imported roots stay read-only. Human review holds no file
+lease; the store takes a short cross-process lease afterward, rechecks the actual
+revision, backs up the validated prior source, then atomically replaces the file.
+Cancellation before replacement prevents the commit. A committed save is retained
+and reported even if cancellation races the tool result. Changes activate only on
+the next turn. Corrupt primary/backup files are preserved read-only; locks are never
+stolen automatically. After a crash, verify the owning process has stopped before
+removing a stale lock.
+
+The standard format is supported within explicit bounds: 100 skills including the
+creator, 64 KiB strict UTF-8 per document/resource, 2 MiB total documents and 24 KiB
+catalog metadata. YAML complexity and safe path limits follow the shared core.
+The CLI additionally refuses saves whose combined exact review exceeds 60 KiB of
+display text, and refuses tool reads whose serialized response exceeds the 64 KiB
+canonical transcript-message limit (the manager still supports paged source inspection).
+Unsupported YAML/frontmatter semantics are diagnosed and excluded.
+This is instruction-only compatibility: existing skills requiring shell commands,
+executable scripts, binary assets, runtimes, network tools or unavailable permissions
+cannot perform those steps. Script resources may be read as text, never executed.
+No dependency installation, command execution, workspace editing, resource creation,
+deletion or builtin editing is introduced by skills.

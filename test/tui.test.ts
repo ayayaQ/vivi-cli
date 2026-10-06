@@ -48,7 +48,7 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/models', '/effort', '/new', '/resume', '/settings', '/memories', '/menu', '/help', '/session', '/exit'
+    '/provider', '/models', '/effort', '/new', '/resume', '/settings', '/memories', '/skills', '/menu', '/help', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/memories', '/menu'])
@@ -420,7 +420,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   expect(output).toContain('A heading')
   expect(output).toContain('Tool calculate')
   expect(output).toContain('9 in / 8 out / 17 total')
-  expect(output).toContain('/new /resume /memories /settings /menu /help /exit')
+  expect(output).toContain('/new /resume /memories /skills /settings /menu /help /exit')
 })
 
 test('native status labels round, turn and session cache telemetry without inventing zero', async () => {

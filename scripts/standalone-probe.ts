@@ -11,6 +11,8 @@ import { parseModelCatalog, documentedOpenAIModel } from '../src/models.js'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { FileSkillStore } from '../src/skills.js'
+import { skillCreatorSource, parseSkillDocument } from '@ayayaq/vivi/extensions/skills'
 import { FileMemoryStore } from '../src/memory.js'
 import { FileSessionStore } from '../src/session.js'
 import { CliHost } from '../src/host.js'
@@ -19,6 +21,7 @@ import { createToolRegistry } from '@ayayaq/vivi/extensions'
 
 // The optional pack must survive a compiled consumer, remain host-owned, and
 // contribute context without storing the per-turn memory prefix in a session.
+function expectCompiledCreator(content: string | undefined): void { assert.equal(content, skillCreatorSource.content) }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-memory-'))
 try {
   const memory = new FileMemoryStore(directory)
@@ -34,6 +37,12 @@ try {
   assert.deepEqual(result.history.map(message => message.content), ['Use opted-in memory', 'Compiled memory works'])
   assert.deepEqual((await new FileSessionStore(directory).load(host.session.id)).history, result.history)
   await host.drainMemory()
+  const skills = new FileSkillStore(join(directory, 'agent-skills'))
+  const catalog = await skills.snapshot()
+  expectCompiledCreator(catalog.document('skill-creator')?.content)
+  assert.equal(catalog.skills.find(skill => skill.name === 'skill-creator')?.readOnly, true)
+  assert.equal(parseSkillDocument(skillCreatorSource.content).metadata.name, 'skill-creator')
+  await skills.drain({ close: true })
   const project = join(directory, 'project')
   await mkdir(project)
   await writeFile(join(project, 'readme.txt'), 'Compiled workspace works')
@@ -95,5 +104,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads, skills creator/parser and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

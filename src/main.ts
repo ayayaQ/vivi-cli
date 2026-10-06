@@ -10,6 +10,7 @@ import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers
 import type { ModelProvider } from '@ayayaq/vivi'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
+import { FileSkillStore } from './skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
@@ -32,6 +33,8 @@ export interface CliOptions {
   tui: boolean
   enableNotes: boolean
   enableMemory: boolean
+  enableSkills: boolean
+  skillsDirectories: string[]
   enableTools: boolean
   startNew: boolean
   maxRounds: number
@@ -60,6 +63,8 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --enable-notes              Enable session-only revisioned notes with allow/deny prompts
   --enable-memory             Use reviewed app-wide saved context (plaintext local storage)
   --disable-memory            Override saved memory defaults for this launch
+  --skills-dir PATH           Explicit read-only standard skills root (repeatable, max 8)
+  --no-skills                 Disable skills for this launch
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
   --help                      Show this help
 
@@ -72,6 +77,9 @@ Workspace defaults to the directory where vivi was launched; --workspace overrid
 Selected files may be sent to your provider and saved in session history.
 Workspace tools omit symlinks, private/ignored files, writes and commands; this is not an OS sandbox.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
+/skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
+Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
+The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 /** Only CLI callers supplying their captured launch directory get a default workspace. */
@@ -79,7 +87,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    stream: true, tui: true, enableNotes: false, enableMemory: false, enableTools: true, startNew: false, maxRounds: 25, help: false,
+    stream: true, tui: true, enableNotes: false, enableMemory: false, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
     ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
@@ -124,6 +132,13 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--enable-notes': options.enableNotes = true; break
       case '--enable-memory': options.enableMemory = true; break
       case '--disable-memory': options.enableMemory = false; break
+      case '--no-skills': options.enableSkills = false; break
+      case '--skills-dir': {
+        if (options.skillsDirectories.length >= 8) throw new Error('At most eight explicit skills directories are supported')
+        const directory = value()
+        options.skillsDirectories.push(launchDirectory === undefined ? resolve(directory) : resolve(launchDirectory, directory))
+        break
+      }
       case '--tools': options.enableTools = true; break
       case '--no-tools': options.enableTools = false; break
       case '--max-rounds': {
@@ -232,6 +247,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
+    const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
     const fresh = options.resume ? undefined : newSession({
       provider: options.provider ?? 'openai', model: options.model!,
       ...(options.reasoning ? { reasoning: options.reasoning } : {})
@@ -244,7 +260,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
-      enableTools, enableMemory: options.enableMemory, memory, ...(workspace ? { workspace } : {}),
+      enableTools, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
+      onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
@@ -260,6 +277,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     return 1
   } finally {
     await host?.drainMemory().catch(() => undefined)
+    await host?.drainSkills().catch(() => undefined)
     await release?.().catch(() => undefined)
     closeIO()
   }

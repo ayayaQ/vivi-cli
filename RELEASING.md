@@ -4,15 +4,15 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.5.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.6.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
-dependency, including its source, LICENSE, NOTICE and attribution records, so the shared core needs no separate registry request. OpenTUI and its native platform
+dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
 dependencies remain registry dependencies; offline installs need a populated npm cache.
 
 ## Shared registry dependency
 
-The published shared vivi `0.5.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.6.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
@@ -199,3 +199,9 @@ notice collection is an aid, not a substitute for that release review. No binari
 or native archives are vendored into Git, and no executable publishing workflow is
 enabled. npm publication, GitHub publication and binary release remain separately
 authorized operations.
+
+## Agent Skills adoption checks
+
+The exact published shared 0.6.0 bytes were verified before pinning. Skills remain a host-only adoption; no agent loop changes are copied into this repository. Run the new skills-store, skills-host and skills-controls tests along with the full existing suite. The canonical npm candidate includes the unchanged bundled creator and verifies ESM/CJS skills exports, parser legal bytes, fresh catalogs and packed host execution. Windows headless CI consumes those same canonical npm archive bytes under Node 26.4.0 and current 26, plus Bun 1.4.2. Real native credential-store and real TTY acceptance remain separate and unclaimed. No live provider or key is needed for these tests.
+
+Current inspection blocker: automatic skill saves are supported on Linux only. Windows/macOS hosts omit save_skill and refuse direct writes because a validated native handle-relative transaction is still required. List/read and standard creator drafts remain available. This must be resolved or explicitly accepted as a scope reduction before the Windows creator goal can be called complete. Independent review stopped during filesystem concurrency assessment after a tool restriction; no complete security-review approval is claimed.
