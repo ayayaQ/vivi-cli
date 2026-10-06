@@ -8,7 +8,7 @@ import { mkdtempSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { CliRenderer, KeyEvent, PasteEvent, Renderable } from '@opentui/core'
+import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable } from '@opentui/core'
 import type { AgentEvent, AgentResult, HistoryMessage, Usage } from '@ayayaq/vivi'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
@@ -17,6 +17,7 @@ import type { ApprovalRequest } from './tools.js'
 import { matchingChoiceIndices } from './picker.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 import { aggregateUsage, formatUsage } from './usage.js'
+import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[] }
@@ -48,11 +49,14 @@ const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
 const MAX_QUERY = 200
+// OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
+const APPROVAL_REPEAT_WINDOW_MS = 600
 const HINTS = '/new /resume /memories /settings /menu /help /exit · Tab complete · Enter send · Shift/Alt+Enter newline · PgUp/PgDn scroll'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
   armed: boolean
+  openedFrame: number
   finish(value: string | number | undefined, aborted?: boolean): void
 }
 interface DisplayEntry { label: string; content: string; markdown: boolean }
@@ -113,6 +117,14 @@ export class OpenTuiIO implements ChatIO {
   private parserDirectory: string | undefined
   private shell!: BoxRenderable
   private header!: TextRenderable
+  private actionBar!: BoxRenderable
+  private dialogActions: BoxRenderable | undefined
+  private approvalIndex = 0
+  private approvalMouseNotBefore = 0
+  private readonly mouseActivation = new MouseActivation()
+  private pickerChangedFrame = 0
+  private completionChangedFrame = 0
+  private lastRenderedFrame = 0
   private transcript!: ScrollBoxRenderable
   private statusLine!: TextRenderable
   private composerBox!: BoxRenderable
@@ -151,7 +163,17 @@ export class OpenTuiIO implements ChatIO {
   private readonly keyHandler = (key: KeyEvent): void => {
     try { this.handleKey(key) } catch (error) { this.errorHandler({ error }) }
   }
+  private readonly frameHandler = (event: { frameId: number }): void => { this.lastRenderedFrame = event.frameId }
+  private readonly focusHandler = (): void => { this.mouseActivation.clear() }
+  private readonly blurHandler = (): void => {
+    this.mouseActivation.clear()
+    if (this.pending?.kind === 'approval') { this.approvalIndex = 0; this.renderDialogActions() }
+  }
   private readonly resizeHandler = (): void => {
+    this.mouseActivation.clear()
+    this.updateActionBar()
+    this.updateApprovalLayout()
+    this.renderDialogActions()
     if (this.searchPicker) this.renderSearchPicker(false)
     if (this.completions.length) this.renderCompletions()
   }
@@ -203,10 +225,24 @@ export class OpenTuiIO implements ChatIO {
         conceal: { fg: '#71717a' }
       })
       this.shell = new BoxRenderable(renderer, { id: 'vivi-root', width: '100%', height: '100%',
-        flexDirection: 'column', backgroundColor: '#18181b' })
+        flexDirection: 'column', backgroundColor: '#18181b', onMouse: (event) => {
+          if (event.type !== 'over') this.mouseActivation.clear()
+          // Transcript scrolling must not steal the next keystroke from an input.
+          if (event.type === 'down' && this.pending) event.preventDefault()
+        } })
       renderer.root.add(this.shell)
       this.header = new TextRenderable(renderer, { id: 'vivi-header', height: 2, flexShrink: 0,
         content: this.sessionTitle, fg: TUI_THEME.pink, wrapMode: 'word' })
+      this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
+        flexDirection: 'row', visible: false })
+      for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
+        ['Memory', '/memories'], ['Settings', '/settings']] as const) {
+        this.actionBar.add(this.mouseButton(`vivi-action-${command.slice(1)}`, label, () => {
+          const pending = this.pending
+          if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish(command)
+          else this.updateStatus('Finish or clear your draft before opening an action')
+        }))
+      }
       this.transcript = new ScrollBoxRenderable(renderer, { id: 'vivi-transcript', flexGrow: 1,
         minHeight: 1, width: '100%', scrollX: false, scrollY: true, stickyScroll: true,
         stickyStart: 'bottom', contentOptions: { flexDirection: 'column', paddingX: 1 },
@@ -223,6 +259,10 @@ export class OpenTuiIO implements ChatIO {
           { name, action: 'submit' as const }, { name, shift: true, action: 'newline' as const },
           { name, meta: true, action: 'newline' as const }
         ]), onSubmit: () => this.submit(), onContentChange: () => this.inputChanged() })
+      this.composer.onMouse = (event) => {
+        if (event.type === 'down' && event.button === 0 && this.ready() && !this.cancelCallbacks.size &&
+          ['chat', 'text', 'search'].includes(this.pending!.kind)) this.composer.focus()
+      }
       this.composerBox.add(this.composer)
       this.secretMask = new TextRenderable(renderer, { id: 'vivi-secret-mask', width: '100%', height: 2,
         visible: false, content: '', fg: TUI_THEME.lavender, wrapMode: 'none' })
@@ -232,18 +272,23 @@ export class OpenTuiIO implements ChatIO {
         titleColor: TUI_THEME.lavender, title: 'Commands · ↑/↓ choose · Tab complete', paddingX: 1 })
       this.completionList = new TextRenderable(renderer, { id: 'vivi-completion-list', width: '100%',
         height: '100%', fg: TUI_THEME.lavender, wrapMode: 'none' })
+      this.completionList.selectable = false
+      this.completionList.onMouse = (event) => this.handleCompletionMouse(event)
       this.completionBox.add(this.completionList)
       this.hintLine = new TextRenderable(renderer, { id: 'vivi-hints', height: 1, flexShrink: 0,
         fg: '#71717a', content: HINTS, wrapMode: 'none' })
       this.pickerBox = new BoxRenderable(renderer, { id: 'vivi-picker-box', visible: false,
-        height: 8, flexShrink: 0, border: true, borderColor: TUI_THEME.lavender,
+        height: 8, flexShrink: 0, flexDirection: 'column', border: true, borderColor: TUI_THEME.lavender,
         titleColor: TUI_THEME.lavender, paddingX: 1 })
-      for (const child of [this.header, this.transcript, this.statusLine, this.pickerBox,
+      for (const child of [this.header, this.actionBar, this.transcript, this.statusLine, this.pickerBox,
         this.completionBox, this.composerBox, this.hintLine]) this.shell.add(child)
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
       renderer.keyInput.on('paste', this.pasteHandler)
       renderer.on(CliRenderEvents.RESIZE, this.resizeHandler)
+      renderer.on(CliRenderEvents.FRAME, this.frameHandler)
+      renderer.on(CliRenderEvents.BLUR, this.blurHandler)
+      renderer.on(CliRenderEvents.FOCUS, this.focusHandler)
       renderer.on(CliRenderEvents.RENDER_ERROR, this.errorHandler)
       renderer.on(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
       process.on('SIGINT', this.signalHandler)
@@ -255,7 +300,7 @@ export class OpenTuiIO implements ChatIO {
       // Destroy detached widgets too; renderer.destroy only owns attached children.
       for (const widget of [this.composer, this.secretMask, this.completionList, this.header,
         this.transcript, this.statusLine, this.composerBox, this.completionBox,
-        this.pickerBox, this.hintLine, this.shell]) {
+        this.pickerBox, this.hintLine, this.actionBar, this.shell]) {
         if (widget && !widget.parent && !widget.isDestroyed) {
           try { widget.destroyRecursively() } catch { /* Still release the renderer and hooks below. */ }
         }
@@ -270,7 +315,7 @@ export class OpenTuiIO implements ChatIO {
     const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [],
       screenMode: 'alternate-screen', consoleMode: 'disabled', openConsoleOnError: false,
       externalOutputMode: 'passthrough', useKittyKeyboard: { disambiguate: true, alternateKeys: true },
-      backgroundColor: '#18181b' })
+      useMouse: true, backgroundColor: '#18181b' })
     try { return new OpenTuiIO(renderer, options) }
     catch (error) { if (!renderer.isDestroyed) renderer.destroy(); throw error }
   }
@@ -300,6 +345,106 @@ export class OpenTuiIO implements ChatIO {
   private safe(text: string, limit = MAX_DISPLAY): string {
     const safe = redactSecrets(stripControls(text), this.secrets)
     return safe.length > limit ? `${safe.slice(0, limit)}\n[display truncated]` : safe
+  }
+  private ready(pending = this.pending): boolean {
+    return !!pending?.armed && !this.closed &&
+      (pending.kind !== 'approval' || this.lastRenderedFrame > pending.openedFrame)
+  }
+  private updateApprovalLayout(): void {
+    const compact = this.pending?.kind === 'approval' && this.renderer.terminalHeight < 12
+    this.header.height = compact ? 1 : 2
+    this.statusLine.height = compact ? 1 : 'auto'
+  }
+  private updateActionBar(): void {
+    if (this.actionBar) this.actionBar.visible = this.pending?.kind === 'chat' &&
+      !this.cancelCallbacks.size && !this.completions.length && this.renderer.terminalWidth >= 40 && this.renderer.terminalHeight >= 14
+  }
+  private mouseButton(id: string, label: string, activate: () => void): TextRenderable {
+    const button = new TextRenderable(this.renderer, { id, content: ` ${label} `, width: label.length + 2,
+      height: 1, flexShrink: 0, fg: TUI_THEME.lavender, bg: TUI_THEME.selectedBackground, wrapMode: 'none' })
+    button.selectable = false
+    button.onMouse = (event) => {
+      const pending = this.pending
+      this.mouseActivation.handle(event, button, id, pending, this.ready(pending) &&
+        (!this.cancelCallbacks.size || pending?.kind === 'approval') &&
+        (id !== 'vivi-approve' || performance.now() >= this.approvalMouseNotBefore), activate)
+    }
+    return button
+  }
+  private renderDialogActions(): void {
+    this.mouseActivation.clear()
+    if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
+    const pending = this.pending
+    if (!pending || pending.kind === 'chat') return
+    // Preserve room for the query in very small terminals; keyboard paths remain.
+    if (pending.kind !== 'approval' && this.renderer.terminalHeight < (pending.kind === 'search' ? 20 : 16)) return
+    this.dialogActions = new BoxRenderable(this.renderer, { id: 'vivi-dialog-actions', height: 1,
+      flexShrink: 0, flexDirection: 'row', gap: 1 })
+    const add = (id: string, label: string, activate: () => void): void => {
+      this.dialogActions!.add(this.mouseButton(id, label, activate))
+    }
+    if (pending.kind === 'approval') {
+      add('vivi-deny', this.approvalIndex === 0 ? '› Deny' : '  Deny', () => pending.finish('deny'))
+      add('vivi-approve', this.approvalIndex === 1 ? '› Approve' : '  Approve', () => {
+        // Mouse protocols have no cross-dialog click identity. Treat a rapid second
+        // click as part of the first gesture, never approval of the next proposal.
+        this.approvalMouseNotBefore = performance.now() + APPROVAL_REPEAT_WINDOW_MS
+        pending.finish('allow')
+      })
+    } else {
+      add('vivi-confirm', pending.kind === 'choice' || pending.kind === 'search' ? 'Choose' : 'Confirm', () => {
+        if (pending.kind === 'choice') pending.finish(this.picker?.getSelectedIndex())
+        else this.submit()
+      })
+      if (pending.kind === 'search' && this.searchPicker?.refresh) {
+        add('vivi-refresh', 'Refresh', () => { this.inputChanged(); pending.finish(-1) })
+      }
+      add('vivi-back', pending.kind === 'choice' || pending.kind === 'search' ? 'Back' : 'Cancel', () => pending.finish(undefined))
+    }
+    if (pending.kind === 'choice' || pending.kind === 'search' || pending.kind === 'approval') {
+      this.pickerBox.add(this.dialogActions)
+    } else this.shell.insertBefore(this.dialogActions, this.hintLine)
+  }
+  private handlePickerMouse(event: MouseEvent): void {
+    const picker = this.picker
+    const pending = this.pending
+    if (!picker || !pending) return
+    if (pending.kind === 'search' && this.searchPicker?.query !== this.composer.plainText) this.inputChanged()
+    if (event.type === 'scroll') {
+      this.mouseActivation.clear()
+      event.preventDefault(); event.stopPropagation()
+      if (this.ready() && event.scroll && ['up', 'down'].includes(event.scroll.direction)) {
+        const delta = Math.max(1, Math.min(20, event.scroll.delta))
+        if (event.scroll.direction === 'up') picker.moveUp(delta)
+        else picker.moveDown(delta)
+      }
+      return
+    }
+    const index = pickerIndexAt(picker, event.x, event.y)
+    const option = index === undefined ? undefined : picker.options[index]
+    const key = `${index}:${option?.value}:${this.searchPicker?.query ?? ''}`
+    this.mouseActivation.handle(event, picker, key, pending, this.ready() && this.lastRenderedFrame > this.pickerChangedFrame && index !== undefined &&
+      (pending.kind === 'choice' || pending.kind === 'search') && option?.value !== -1, () => {
+        if (pending.kind === 'search') pending.finish(option!.value)
+        else pending.finish(index)
+      })
+  }
+  private acceptCompletion(index = this.completionIndex): void {
+    const item = this.completions[index]
+    if (!item) return
+    this.acceptedCompletion = item.command
+    this.composer.setText(this.acceptedCompletion)
+    this.composer.gotoBufferEnd()
+    this.hideCompletions()
+    this.composer.focus()
+  }
+  private handleCompletionMouse(event: MouseEvent): void {
+    const rows = this.completionBox.height - 2
+    const first = Math.min(Math.max(0, this.completionIndex - rows + 1), this.completions.length - rows)
+    const index = first + event.y - this.completionList.y
+    const item = this.completions[index]
+    this.mouseActivation.handle(event, this.completionList, `${index}:${item?.command}:${this.composer.plainText}`,
+      this.pending, this.ready() && this.lastRenderedFrame > this.completionChangedFrame && this.pending?.kind === 'chat' && !!item, () => this.acceptCompletion(index))
   }
   private updateStatus(status = this.status): void {
     if (this.closed) return
@@ -343,6 +488,8 @@ export class OpenTuiIO implements ChatIO {
     const previous = search.matches[this.picker.getSelectedIndex()]
     const query = this.composer.plainText
     if (queryChanged || query !== search.query) {
+      this.mouseActivation.clear()
+      this.pickerChangedFrame = this.renderer.frameId
       search.query = query
       search.matches = matchingChoiceIndices(search.choices, query)
       this.picker.options = search.matches.length ? search.matches.map(index => {
@@ -354,9 +501,9 @@ export class OpenTuiIO implements ChatIO {
       this.picker.setSelectedIndex(0)
     } else if (previous !== undefined) this.picker.setSelectedIndex(search.matches.indexOf(previous))
     this.composerBox.title = `Search models · ${search.matches.length} / ${search.choices.length} results`
-    const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - 9, Math.max(1, search.matches.length) * 2 + 2))
+    const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - 9, Math.max(1, search.matches.length) * 2 + 2 + (this.dialogActions ? 1 : 0)))
     this.pickerBox.height = height
-    this.picker.showDescription = height >= 4
+    this.picker.showDescription = height - 2 - (this.dialogActions ? 1 : 0) >= 2
   }
   private handleSearchKey(key: KeyEvent): boolean {
     const search = this.searchPicker
@@ -386,6 +533,7 @@ export class OpenTuiIO implements ChatIO {
     this.completionInput = ''
     if (this.completionBox) this.completionBox.visible = false
     if (this.completionList && !this.completionList.isDestroyed) this.completionList.content = ''
+    this.updateActionBar()
   }
   private updateCompletions(): void {
     const input = this.composer.plainText
@@ -401,10 +549,12 @@ export class OpenTuiIO implements ChatIO {
   private renderCompletions(): void {
     const rows = Math.max(1, Math.min(4, this.completions.length, this.renderer.terminalHeight - 11))
     const first = Math.min(Math.max(0, this.completionIndex - rows + 1), this.completions.length - rows)
+    this.completionChangedFrame = this.renderer.frameId
     this.completionList.content = this.completions.slice(first, first + rows).map((item, offset) =>
       `${first + offset === this.completionIndex ? '›' : ' '} ${item.command}  ${item.description}`).join('\n')
     this.completionBox.height = rows + 2
     this.completionBox.visible = true
+    this.updateActionBar()
   }
   private clearSecret(): void {
     this.secretInput.fill('')
@@ -453,12 +603,15 @@ export class OpenTuiIO implements ChatIO {
   }
   private consume(key: KeyEvent | PasteEvent): void { key.preventDefault(); key.stopPropagation() }
   private handlePaste(event: PasteEvent): void {
+    this.mouseActivation.clear()
     this.consume(event)
     if (!this.pending?.armed || this.closed || this.pending.kind === 'choice') return
     if (this.cancelCallbacks.size && this.pending.kind !== 'approval') return
     if (this.pending.kind === 'approval') {
       this.clearInput()
-      this.updateStatus('Approval requires typing allow or deny; pasted text ignored')
+      this.approvalIndex = 0
+      this.renderDialogActions()
+      this.updateStatus('Select Deny or Approve; pasted approvals are ignored')
       return
     }
     if (this.pending.kind === 'secret') { this.insertSecret(decodePasteBytes(event.bytes)); return }
@@ -468,6 +621,7 @@ export class OpenTuiIO implements ChatIO {
     this.composer.insertText(text)
   }
   private handleKey(key: KeyEvent): void {
+    this.mouseActivation.clear()
     if (this.closed) { this.consume(key); return }
     if (key.eventType === 'release') { this.consume(key); return }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
@@ -477,6 +631,23 @@ export class OpenTuiIO implements ChatIO {
       } else if (key.name === 'escape' && this.pending?.kind === 'chat' && !this.cancelCallbacks.size) {
         this.clearInput()
       } else this.cancelOrClose(key.name === 'escape')
+      return
+    }
+    if (this.pending?.kind === 'approval') {
+      this.consume(key)
+      if (key.name === 'pageup' || key.name === 'pagedown') {
+        this.transcript.scrollTo(this.transcript.scrollTop + (key.name === 'pageup' ? -1 : 1) *
+          Math.max(1, this.transcript.viewport.height - 1)); return
+      }
+      if (!this.ready() || key.eventType === 'repeat' || key.ctrl || key.meta || key.super || key.hyper) return
+      if (['left', 'up', 'home'].includes(key.name)) this.approvalIndex = 0
+      else if (['right', 'down', 'end'].includes(key.name)) this.approvalIndex = 1
+      else if (key.name === 'tab') this.approvalIndex = 1 - this.approvalIndex
+      else if (['return', 'kpenter', 'linefeed', 'space'].includes(key.name) && !key.shift) {
+        this.pending.finish(this.approvalIndex === 1 ? 'allow' : 'deny'); return
+      }
+      else return
+      this.renderDialogActions()
       return
     }
     if (this.pending?.armed && this.pending.kind === 'search' && this.handleSearchKey(key)) return
@@ -501,10 +672,7 @@ export class OpenTuiIO implements ChatIO {
       }
       if (key.name === 'tab') {
         this.consume(key)
-        this.acceptedCompletion = this.completions[this.completionIndex]!.command
-        this.composer.setText(this.acceptedCompletion)
-        this.composer.gotoBufferEnd()
-        this.hideCompletions()
+        this.acceptCompletion()
         return
       }
     }
@@ -542,15 +710,7 @@ export class OpenTuiIO implements ChatIO {
       return
     }
     const text = this.composer.plainText
-    if (pending.kind === 'approval') {
-      const reply = text.trim().toLowerCase()
-      if (reply === 'allow' || reply === 'deny' || !reply) pending.finish(reply || 'deny')
-      else {
-        this.clearInput()
-        this.updateStatus('Please type allow or deny; Enter alone denies')
-      }
-      return
-    }
+    if (pending.kind === 'approval') return
     if (pending.kind === 'chat' && text.trim() && !text.trim().startsWith('/')) {
       this.appendEntry({ label: 'You', content: this.safe(text), markdown: false })
     }
@@ -561,6 +721,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return Promise.resolve(undefined)
     if (signal?.aborted) return kind === 'chat' ? Promise.reject(new Error('Input cancelled')) : Promise.resolve(undefined)
     this.pending?.finish(undefined)
+    this.mouseActivation.clear()
     this.clearInput()
     this.disableComposer()
     if (kind === 'secret') {
@@ -573,23 +734,27 @@ export class OpenTuiIO implements ChatIO {
         throw new Error('Disable OTUI_STDIN_LOG and OTUI_DEBUG, then restart vivi before entering an API key')
       }
     }
-    this.composerBox.visible = kind !== 'choice'
+    this.composerBox.visible = kind !== 'choice' && kind !== 'approval'
     this.composer.visible = kind !== 'secret'
     this.secretMask.visible = kind === 'secret'
     this.composerBox.title = this.safe(title, 4096)
     this.hintLine.content = kind === 'chat' ? HINTS : kind === 'approval'
-      ? 'Type allow or deny · Enter defaults to deny · Escape cancels · pasted approvals are ignored'
+      ? '←/→ or Tab select · Enter confirm · Click Deny / Approve · Escape denies'
       : kind === 'search' ? 'Type to search · ↑/↓ select · PgUp/PgDn · Home/End'
-      : kind === 'choice' ? '↑/↓ select · Enter confirm · Escape back'
+      : kind === 'choice' ? '↑/↓ select · Enter or click choose · Escape back'
       : kind === 'secret' ? 'Input hidden · Enter confirm · Escape back · Ctrl+U clear'
       : 'Enter confirm · Shift/Alt+Enter newline · Escape back'
     if (kind !== 'choice' && kind !== 'secret') this.composer.setText(this.safe(initial, MAX_INPUT).slice(0, MAX_INPUT))
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const abort = (): void => pending.finish(undefined, true)
-      const pending: PendingInput = { kind, armed: kind !== 'approval', finish: (value, aborted = false): void => {
+      const pending: PendingInput = { kind, armed: kind !== 'approval', openedFrame: this.renderer.frameId, finish: (value, aborted = false): void => {
         if (this.pending !== pending) return
         this.pending = undefined
+        this.mouseActivation.clear()
+        if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
+        this.updateActionBar()
+        this.updateApprovalLayout()
         if (timer !== undefined) clearTimeout(timer)
         signal?.removeEventListener('abort', abort)
         this.disableComposer()
@@ -609,6 +774,10 @@ export class OpenTuiIO implements ChatIO {
         else resolve(value)
       } }
       this.pending = pending
+      this.approvalIndex = 0
+      this.updateApprovalLayout()
+      this.updateActionBar()
+      this.renderDialogActions()
       signal?.addEventListener('abort', abort, { once: true })
       if (signal?.aborted) { abort(); return }
       if (kind === 'approval') {
@@ -618,9 +787,6 @@ export class OpenTuiIO implements ChatIO {
           if (this.pending !== pending || this.closed) return
           this.clearInput()
           pending.armed = true
-          this.composer.traits = {}
-          this.composer.showCursor = true
-          this.composer.focus()
         }, 0)
       } else if (kind === 'secret') this.renderSecret()
       else if (kind !== 'choice') {
@@ -649,11 +815,13 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || choices.length === 0) return undefined
     if (choices.length > MAX_ENTRIES) throw new Error('A picker supports at most 256 choices')
     const selection = this.openInput('choice', title)
+    this.pickerChangedFrame = this.renderer.frameId
     this.pickerBox.title = this.safe(title, 4096)
-    this.pickerBox.height = Math.max(4, Math.min(10, this.renderer.terminalHeight - 5, choices.length * 2 + 2))
+    this.pickerBox.height = Math.max(4, Math.min(10, this.renderer.terminalHeight - 5, choices.length * 2 + 2 + (this.dialogActions ? 1 : 0)))
     this.pickerBox.visible = true
     try {
       this.picker = new SelectRenderable(this.renderer, { id: 'vivi-picker', width: '100%', height: '100%',
+        minHeight: 1, flexShrink: 1, onMouse: (event) => this.handlePickerMouse(event),
         options: choices.map((choice, index) => ({ name: this.safe(choice.name, 1024),
           description: this.safe(choice.description ?? '', 2048), value: index })),
         selectedIndex: Math.max(0, Math.min(choices.length - 1, Number.isFinite(initialIndex) ? Math.trunc(initialIndex) : 0)),
@@ -662,7 +830,11 @@ export class OpenTuiIO implements ChatIO {
         selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
         descriptionColor: '#a1a1aa', selectedDescriptionColor: TUI_THEME.lavender })
       this.picker.on(SelectRenderableEvents.ITEM_SELECTED, (index: number) => this.pending?.finish(index))
-      this.pickerBox.add(this.picker)
+      this.picker.on(SelectRenderableEvents.SELECTION_CHANGED, () => {
+        this.mouseActivation.clear(); this.pickerChangedFrame = this.renderer.frameId
+      })
+      this.pickerBox.add(this.picker, 0)
+      this.renderDialogActions()
       this.picker.focus()
     } catch (error) {
       this.pending?.finish(undefined)
@@ -684,6 +856,7 @@ export class OpenTuiIO implements ChatIO {
     try {
       this.searchPicker = { choices, matches: [], query, refresh: options.refresh ?? false }
       this.picker = new SelectRenderable(this.renderer, { id: 'vivi-picker', width: '100%', height: '100%',
+        minHeight: 1, flexShrink: 1, onMouse: (event) => this.handlePickerMouse(event),
         options: [], showDescription: true, showScrollIndicator: true, wrapSelection: false,
         backgroundColor: TUI_THEME.background, textColor: TUI_THEME.foreground,
         selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
@@ -691,7 +864,11 @@ export class OpenTuiIO implements ChatIO {
       // This is a result view, not a second input target. Mouse autofocus must not
       // redirect later query typing into SelectRenderable's own key handler.
       this.picker.focusable = false
-      this.pickerBox.add(this.picker)
+      this.picker.on(SelectRenderableEvents.SELECTION_CHANGED, () => {
+        this.mouseActivation.clear(); this.pickerChangedFrame = this.renderer.frameId
+      })
+      this.pickerBox.add(this.picker, 0)
+      this.renderDialogActions()
       this.renderSearchPicker(true)
       const initial = Number.isFinite(options.initialIndex) ? Math.trunc(options.initialIndex!) : 0
       const selected = this.searchPicker.matches.indexOf(initial)
@@ -710,17 +887,23 @@ export class OpenTuiIO implements ChatIO {
     this.appendEntry({ label: `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false })
     this.updateStatus(`Approval required · ${scope} · denial is the default`)
-    const reply = await this.openInput('approval', 'Type allow or deny (default: deny)', '', signal)
+    const answer = this.openInput('approval', 'Review this change (default: deny)', '', signal)
+    this.pickerBox.title = 'Review this change (default: deny)'
+    this.pickerBox.height = 3
+    this.pickerBox.visible = true
+    const reply = await answer
     return reply === 'allow' && !signal.aborted && !this.closed
   }
   onCancel(callback: () => void): () => void {
     if (this.closed) { callback(); return () => undefined }
     this.cancelCallbacks.add(callback)
+    this.mouseActivation.clear()
+    this.updateActionBar()
     this.resultNotices = []
     this.clearInput()
     this.disableComposer()
     this.updateStatus('Running · Escape / Ctrl+C cancels')
-    return () => { this.cancelCallbacks.delete(callback) }
+    return () => { this.cancelCallbacks.delete(callback); this.updateActionBar() }
   }
 
   private markdown(content: string, streaming = false): MarkdownRenderable {
@@ -906,6 +1089,9 @@ export class OpenTuiIO implements ChatIO {
     this.renderer.keyInput.off('keypress', this.keyHandler)
     this.renderer.keyInput.off('paste', this.pasteHandler)
     this.renderer.off(CliRenderEvents.RESIZE, this.resizeHandler)
+    this.renderer.off(CliRenderEvents.FRAME, this.frameHandler)
+    this.renderer.off(CliRenderEvents.BLUR, this.blurHandler)
+    this.renderer.off(CliRenderEvents.FOCUS, this.focusHandler)
     this.renderer.off(CliRenderEvents.RENDER_ERROR, this.errorHandler)
     this.renderer.off(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
     process.off('SIGINT', this.signalHandler)

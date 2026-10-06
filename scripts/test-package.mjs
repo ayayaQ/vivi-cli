@@ -86,6 +86,7 @@ try {
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts',
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
+    'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
@@ -306,12 +307,24 @@ try {
   await setup.mockInput.typeText('PROVIDER model 1499')
   setup.mockInput.pressEnter()
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
+  const request = { call: { id: 'packed-approval', name: 'memory_create', arguments: {} },
+    description: 'Packed fake approval only', currentRevision: 'new memory' }
+  const approve = io.approve(request, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce()
+  const button = setup.renderer.root.findDescendantById('vivi-approve')
+  assert(button && button.y >= 0 && button.y < 24)
+  await setup.mockMouse.click(button.x + 1, button.y)
+  assert.equal(await approve, true)
+  const deny = io.approve(request, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce()
+  setup.mockInput.pressEnter()
+  assert.equal(await deny, false)
   io.close()
 } finally { io.close(); setup.renderer.destroy() }
 `)
     run(process.env.VIVI_TEST_BUN, [join(installed, 'tui-consumer.ts')], temporary)
     assert.match(run(process.env.VIVI_TEST_BUN, [launcher, '--help'], temporary), /--provider/)
-    console.log('Packed native renderer, model search and Bun CLI entrypoint passed')
+    console.log('Packed native renderer, model search, mouse approvals and Bun CLI entrypoint passed')
   }
   const sha256 = candidate.artifact.sha256
   const bun = process.env.VIVI_TEST_BUN ? run(process.env.VIVI_TEST_BUN, ['--version']).trim() : undefined
