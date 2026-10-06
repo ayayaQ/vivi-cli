@@ -3,9 +3,17 @@ import { StringDecoder } from 'node:string_decoder'
 import { Transform } from 'node:stream'
 
 // Windows' stream input otherwise loses native modifiers on keys such as Enter.
-// Negotiate the console's input-record VT format and translate it to encodings
+// Request the application's input-record VT format and translate it to encodings
 // already supported by OpenTUI. No second console reader or native module is used.
 // https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md
+// ConPTY forwards DECRQM to its hosting terminal and suppresses its own replies.
+// A reported 9001=1 therefore describes the outer WT→ConPTY link, while ConPTY's
+// application-facing encoder may still be off. Explicitly enable that inner
+// stage for this full-screen application's lifetime, then reset it on close.
+// ConPTY reasserts the outer mode when forwarding the reset; its inner prior
+// state cannot be queried this way, so this is consumer ownership, not a snapshot.
+// https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/host/outputStream.cpp
+// https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/host/_stream.cpp
 const QUERY_MODE = '\x1b[?9001$p'
 const ENABLE_MODE = '\x1b[?9001h'
 const DISABLE_MODE = '\x1b[?9001l'
@@ -23,14 +31,15 @@ const CONTROL_PUNCTUATION: Readonly<Record<number, number>> = {
 }
 const keySequence = (code: number, modifiers: number): string => `\x1b[${code};${modifiers + 1}u`
 
-/** Incremental decoder. Bracketed paste is opaque, including record-shaped text. */
+/** Incremental decoder. Bracketed paste never generates key actions. */
 export class WindowsInputDecoder {
   private pending = ''
   private pasted = false
   private readonly heldKeys = new Set<string>()
   private enterRecords = 0
   private surrogate: { code: number; modifiers: number; literal: boolean } | undefined
-  constructor(private readonly modeReply: (status: number) => void = () => {}) {}
+  constructor(private readonly modeReply: (status: number) => void = () => {},
+    private readonly recordsInPaste: () => boolean = () => false) {}
   get pendingLength(): number { return this.pending.length }
   get inPaste(): boolean { return this.pasted }
   get enterRecordsObserved(): number { return this.enterRecords }
@@ -40,6 +49,17 @@ export class WindowsInputDecoder {
     let output = ''
     while (this.pending) {
       if (this.pasted) {
+        if (this.recordsInPaste()) {
+          // ConPTY forwards paste delimiters raw but may encode pasted C0/IME
+          // characters as Win32 records. Decode only their Unicode payload,
+          // never shortcuts or mode replies, while the renderer retains paste.
+          const part = this.pasteRecord()
+          if (!part) break
+          output += part.text
+          this.pending = this.pending.slice(part.length)
+          if (part.finished) { this.pasted = false; this.surrogate = undefined }
+          continue
+        }
         const end = this.pending.indexOf(PASTE_END)
         if (end < 0) {
           // Retain only a possible split end marker; all paste content stays raw.
@@ -77,7 +97,7 @@ export class WindowsInputDecoder {
       }
       const sequence = this.pending.slice(0, end + 1)
       this.pending = this.pending.slice(end + 1)
-      if (sequence === PASTE_START) { this.pasted = true; output += sequence; continue }
+      if (sequence === PASTE_START) { this.pasted = true; this.surrogate = undefined; output += sequence; continue }
       const reply = /^\x1b\[\?9001;([0-4])\$y$/.exec(sequence)
       if (reply) { this.modeReply(Number(reply[1])); continue }
       output += this.record(sequence) ?? sequence
@@ -95,6 +115,33 @@ export class WindowsInputDecoder {
 
   reset(): void { this.pending = ''; this.pasted = false; this.surrogate = undefined; this.heldKeys.clear() }
 
+  private pasteRecord(): { text: string; length: number; finished?: boolean } | undefined {
+    const raw = (text: string, length: number, completeCSI = false): { text: string; length: number } => {
+      this.surrogate = undefined
+      // A partial raw escape must not join decoded character records into a
+      // forged delimiter. Complete non-delimiter CSI already has safe framing.
+      return { text: completeCSI ? text : text.replace(/[\x1b\x90\x98\x9b\x9d\x9e\x9f]/g, '\0'), length }
+    }
+    if (this.pending.startsWith(PASTE_END)) return { text: PASTE_END, length: PASTE_END.length, finished: true }
+    if (PASTE_END.startsWith(this.pending)) return undefined
+    if (this.pending.startsWith('\x1b[')) {
+      let end = 2
+      while (end < this.pending.length && !/[\x40-\x7e]/.test(this.pending[end]!)) end++
+      const restart = this.pending.indexOf('\x1b', 1)
+      if (restart >= 0 && restart < end) return raw(this.pending.slice(0, restart), restart)
+      if (end === this.pending.length) {
+        return this.pending.length > MAX_SEQUENCE ? raw(this.pending, this.pending.length) : undefined
+      }
+      const sequence = this.pending.slice(0, end + 1)
+      const text = this.record(sequence, true)
+      return text === undefined ? raw(sequence, sequence.length, true) : { text, length: sequence.length }
+    }
+    const escape = this.pending.indexOf('\x1b')
+    // Retain a possible split delimiter/record; unrelated pasted escapes stay text.
+    const length = escape === 0 ? 1 : escape > 0 ? escape : this.pending.length
+    return raw(this.pending.slice(0, length), length)
+  }
+
   private character(code: number, modifiers: number, literal: boolean): string {
     if (code >= 0xd800 && code <= 0xdbff) {
       this.surrogate = { code, modifiers, literal }
@@ -111,7 +158,7 @@ export class WindowsInputDecoder {
     return literal ? String.fromCodePoint(code) : keySequence(code, modifiers)
   }
 
-  private record(sequence: string): string | undefined {
+  private record(sequence: string, paste = false): string | undefined {
     const match = /^\x1b\[([\d;]*)_$/.exec(sequence)
     if (!match) return undefined
     const parts = match[1]!.split(';')
@@ -122,6 +169,19 @@ export class WindowsInputDecoder {
     const [virtual, scan, character, down, state, repeat] = values as [number, number, number, number, number, number]
     if (down !== 0 && down !== 1) return undefined
     if (virtual === 13) this.enterRecords++
+    if (paste) {
+      // Paste framing is transport, not consent. No held-key state, functional
+      // bindings or Ctrl/Alt transformations may escape into an editor action.
+      if (!repeat || !down && virtual !== 18) return ''
+      // A real Ctrl+Space NUL is invalid secret text, unlike a modifier-only or
+      // navigation record with no character. Preserve its invalidity in paste.
+      if (!character) return virtual === 32 && down && (state & 0x0c) ? this.character(0, 0, true).repeat(repeat) : ''
+      // A decoded ESC/C1 introducer must not forge the raw paste-end delimiter
+      // or other parser framing. Keep a harmless control marker so secret input
+      // rejects the invalid paste rather than silently accepting altered text.
+      const literal = [0x1b, 0x90, 0x98, 0x9b, 0x9d, 0x9e, 0x9f].includes(character) ? 0 : character
+      return this.character(literal, 0, true).repeat(repeat)
+    }
     const identity = virtual && virtual !== 231 ? `${virtual}:${scan}:${state & 0x100}` : undefined
     const held = identity !== undefined && this.heldKeys.has(identity)
     if (!down && identity !== undefined) this.heldKeys.delete(identity)
@@ -183,7 +243,7 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
   if (inputOwners.has(source)) throw new Error('Windows console input is already in use')
   let closed = false
   let started = false
-  let changedMode = false
+  let ownsConsumerMode = false
   let waiting = false
   let modeReply: number | undefined
   let enableRequested = false
@@ -198,8 +258,8 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
     waiting = false
     modeReply = status
     clearTimeout(queryTimer)
-    if (status === 2) { changedMode = true; enableRequested = true; write(ENABLE_MODE) }
-  })
+    if (status === 1 || status === 2) { ownsConsumerMode = true; enableRequested = true; write(ENABLE_MODE) }
+  }, () => ownsConsumerMode)
   const stdin = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       try {
@@ -243,7 +303,7 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
     decoder.reset()
     utf8.end()
     try {
-      if (changedMode) {
+      if (ownsConsumerMode) {
         // The reset is idempotent. Retry one transient output failure before
         // reporting that console restoration could not be established.
         try { write(DISABLE_MODE) }
@@ -251,7 +311,7 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
           try { write(DISABLE_MODE) }
           catch { failure = new Error('Windows console reporting restoration failed'); throw failure }
         }
-        changedMode = false
+        ownsConsumerMode = false
       }
     }
     finally {

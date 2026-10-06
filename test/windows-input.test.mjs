@@ -90,6 +90,84 @@ test('paste, mouse, Kitty and other terminal input are passed through without re
   assert.equal(input.flush(), '\x1b')
 })
 
+test('owned ConPTY paste records decode Unicode only across every fragmented boundary', () => {
+  const replies = []
+  const mixed = `\x1b[200~first${tap(13, 13, 16)}${tap(74, 10, 8)}second` +
+    record(0, 0xd83d) + record(0, 0xde42) + record(65, 97, 2 | 8, 1, 3) +
+    record(39, 0) + record(16, 0, 16) + record(0, 0) + record(65, 65, 0, 0) +
+    record(18, 233, 0, 0) + '\x1b[?9001;2$y\x1b[201~' + tap(13, 13, 16)
+  const expected = '\x1b[200~first\r\nsecond🙂aaaé\x1b[?9001;2$y\x1b[201~\x1b[13;2u'
+  for (let split = 0; split <= mixed.length; split++) {
+    const input = new WindowsInputDecoder(status => replies.push(status), () => true)
+    assert.equal(input.write(mixed.slice(0, split)) + input.write(mixed.slice(split)), expected)
+    assert.equal(input.pendingLength, 0)
+    assert.equal(input.inPaste, false)
+  }
+  const input = new WindowsInputDecoder(status => replies.push(status), () => true)
+  let output = ''
+  for (const character of mixed) output += input.write(character)
+  assert.equal(output, expected)
+  assert.deepEqual(replies, [], 'Mode-shaped pasted text must not negotiate reporting')
+})
+
+test('owned pasted key records never change held-key consent state', () => {
+  const input = new WindowsInputDecoder(() => {}, () => true)
+  assert.equal(input.write(record(13, 13)), '\x1b[13;1u') // Held before paste.
+  assert.equal(input.write('\x1b[200~' + record(13, 0, 0, 0) + record(39, 0) +
+    record(13, 13, 8, 1, 2) + '\x1b[201~'), '\x1b[200~\r\r\x1b[201~')
+  assert.equal(input.write(record(13, 13)), '\x1b[13;1:2u', 'A pasted release cannot authorize the held key')
+  assert.equal(input.write(record(13, 0, 0, 0) + record(13, 13)), '\x1b[13;1u')
+  input.reset()
+  assert.equal(input.write('\x1b[200~' + record(13, 13) + '\x1b[201~' + record(13, 13)),
+    '\x1b[200~\r\x1b[201~\x1b[13;1u', 'A pasted down record cannot mark a later fresh key held')
+})
+
+test('decoded terminal framing controls cannot escape owned paste', () => {
+  const input = new WindowsInputDecoder(() => { assert.fail('Pasted reply executed') }, () => true)
+  const encoded = [...'\x1b[201~\x1b[C\r'].map(character => record(0, character.charCodeAt(0))).join('')
+  assert.equal(input.write('\x1b[200~' + encoded + '\x1b[201~'), '\x1b[200~\0[201~\0[C\r\x1b[201~')
+  const suffix = [...'[201~\x1b[C\r'].map(character => record(0, character.charCodeAt(0))).join('')
+  assert.equal(input.write('\x1b[200~\x1b' + suffix + '\x1b[201~'), '\x1b[200~\0[201~\0[C\r\x1b[201~')
+  for (const content of [encoded, '\x1b' + suffix]) {
+    const paste = '\x1b[200~' + content + '\x1b[201~'
+    for (let split = 0; split <= paste.length; split++) {
+      const fragmented = new WindowsInputDecoder(() => { assert.fail('Pasted reply executed') }, () => true)
+      assert.equal(fragmented.write(paste.slice(0, split)) + fragmented.write(paste.slice(split)),
+        '\x1b[200~\0[201~\0[C\r\x1b[201~')
+    }
+  }
+  assert.equal(input.write('\x1b[200~' + record(32, 0, 8) + '\x1b[201~'), '\x1b[200~\0\x1b[201~')
+  for (const code of [0x90, 0x98, 0x9b, 0x9d, 0x9e, 0x9f]) {
+    assert.equal(input.write('\x1b[200~' + record(0, code) + '\x1b[201~'), '\x1b[200~\0\x1b[201~')
+  }
+})
+
+test('pasted surrogate state cannot cross raw text or paste boundaries', () => {
+  const input = new WindowsInputDecoder(() => {}, () => true)
+  assert.equal(input.write(record(0, 0xd83d) + '\x1b[200~' + record(0, 0xde42)), '\x1b[200~\ufffd')
+  assert.equal(input.write(record(0, 0xd83d) + 'raw' + record(0, 0xde42)), 'raw\ufffd')
+  assert.equal(input.write(record(0, 0xd83d) + '\x1b[?9001;2$y' + record(0, 0xde42)), '\x1b[?9001;2$y\ufffd')
+  assert.equal(input.write(record(0, 0xd83d) + '\x1b[201~' + record(0, 0xde42)), '\x1b[201~\ufffd')
+  assert.equal(input.write('\x1b[200~' + record(0, 0xd83d) + record(32, 0, 8) + record(0, 0xde42) + '\x1b[201~'),
+    '\x1b[200~\0\ufffd\x1b[201~')
+  assert.equal(input.write('\x1b[200~' + record(0, 0xd83d) + record(0, 0, 0, 0) + record(0, 0xde42) + '\x1b[201~'),
+    '\x1b[200~🙂\x1b[201~')
+})
+
+test('malformed owned pasted records remain literal and buffering stays bounded', () => {
+  const input = new WindowsInputDecoder(() => { assert.fail('Pasted reply executed') }, () => true)
+  const malformed = '\x1b[13;0;65536;1;16;1_'
+  assert.equal(input.write('\x1b[200~' + malformed), '\x1b[200~' + malformed)
+  const oversized = '\x1b[' + '1'.repeat(129)
+  assert.equal(input.write(oversized), '\0' + oversized.slice(1))
+  assert.equal(input.pendingLength, 0)
+  assert.equal(input.write('\x1b[13;'), '')
+  assert.equal(input.flush(), '', 'Paste record fragments must not time out into key actions')
+  assert.equal(input.write('0;13;1;0;1_\x1b[20'), '\r')
+  assert.equal(input.write('1~' + tap(13, 13)), '\x1b[201~\x1b[13;1u')
+  assert.equal(input.inPaste, false)
+})
+
 test('malformed records are not interpreted and incomplete input has a bounded buffer', () => {
   const input = new WindowsInputDecoder()
   for (const sequence of ['\x1b[13;0;13;2;16;1_', '\x1b[13;0;65536;1;16;1_', '\x1b[13;0;13;1;16;1;1_',
@@ -261,7 +339,7 @@ test('process-exit hook resets an owned mode and releases neutral stdin in a fak
     raw: false, flowing: false, detached: true, destroyed: true })
 })
 
-test('bridge negotiates and restores only the mode it changed, preserves raw mode and detaches input', async () => {
+test('bridge requests supported consumer reporting, resets its request, preserves raw mode and detaches input', async () => {
   for (const status of [0, 1, 2, 3, 4]) {
     const { source, input, writes, text } = fixture()
     try {
@@ -273,10 +351,10 @@ test('bridge negotiates and restores only the mode it changed, preserves raw mod
       await nextTick()
       assert.equal(text(), '\x1b[13;2u')
       assert.equal(source.isRaw, true)
-      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 2 ? ['\x1b[?9001h'] : [])])
+      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 1 || status === 2 ? ['\x1b[?9001h'] : [])])
       input.close()
       input.close()
-      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 2 ? ['\x1b[?9001h', '\x1b[?9001l'] : [])])
+      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 1 || status === 2 ? ['\x1b[?9001h', '\x1b[?9001l'] : [])])
       assert.equal(source.isRaw, false)
       assert.equal(source.isPaused(), true)
       assert.equal(input.stdin.destroyed, true)
