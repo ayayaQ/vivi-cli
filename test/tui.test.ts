@@ -507,7 +507,8 @@ test('Ctrl+J fallback inserts a newline in legacy and Kitty terminals without su
     expect(composer.plainText).toBe('first\n')
     await Promise.resolve()
     expect(submitted).toBe(false)
-    expect(await frame()).toContain('Ctrl+J newline')
+    // Chat now uses this row for the bottom actions; help still documents Ctrl+J.
+    expect(await frame()).toContain('Menu  Models')
     await input.pasteBracketedText('second\nthird')
     input.pressEnter()
     expect(await line).toBe('first\nsecond\nthird')

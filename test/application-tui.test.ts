@@ -157,7 +157,7 @@ test('native surface runs saved-default chat, accepted Markdown, new session and
       }
     }) })
     await ready(state => state.kind === 'session')
-    await setup.waitForFrame(frame => frame.includes('openai / native-fake-model') && frame.includes('Enter send'))
+    await setup.waitForFrame(frame => frame.includes('openai / native-fake-model') && frame.includes('Menu  Models'))
     await setup.mockInput.typeText('first')
     setup.mockInput.pressEnter({ shift: true })
     await setup.mockInput.typeText('second')
@@ -360,7 +360,7 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
     const afterProviderCancel = ready.nextComposer()
     setup.mockInput.pressEscape()
     await afterProviderCancel
-    await setup.waitForFrame(frame => frame.includes('Enter send') && !frame.includes('Responses API'))
+    await setup.waitForFrame(frame => frame.includes('Menu  Models') && !frame.includes('Responses API'))
     await setup.mockInput.typeText('/provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Responses API'))
@@ -377,7 +377,7 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
     const afterModel = ready.nextComposer()
     setup.mockInput.pressEnter()
     await afterModel
-    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('Enter send') && !frame.includes('Models ·'))
+    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('Menu  Models') && !frame.includes('Models ·'))
     expect(vault.get('openai')).toBe(key)
     await setup.mockInput.typeText('/effort')
     setup.mockInput.pressEnter()
@@ -460,7 +460,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
     await setup.mockInput.typeText(text)
     setup.mockInput.pressEnter()
     await afterSend
-    await setup.waitForFrame(frame => frame.includes('Native catalog answer') && frame.includes('Enter send'))
+    await setup.waitForFrame(frame => frame.includes('Native catalog answer') && frame.includes('Menu  Models'))
     expect(requests.at(-1)?.prompt).toBe(text)
     expect(composer().plainText).toBe('')
   }
@@ -471,7 +471,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
   }
   try {
     await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('Enter send'))
+    await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('Menu  Models'))
   } catch (error) { await close(); throw error }
   return { directory, setup, io, ready, preferences, defaults, sessions, requests, running, composer, session, openModels, chat, close }
 }
@@ -530,7 +530,8 @@ for (const provider of ['openai', 'openrouter'] as const) {
         await app.chat(`clean chat after ${index + 1}`)
         expect(app.requests.at(-1)).toEqual({ sessionId: app.session().id, model: model.id, prompt: `clean chat after ${index + 1}` })
       }
-      expect(catalogCalls).toBe(3)
+      // OpenRouter verifies its saved model before the three explicit picker reads.
+      expect(catalogCalls).toBe(provider === 'openrouter' ? 4 : 3)
       expect(app.sessions.map(session => session.model)).toEqual(['saved-default-model', byId.id, byName.id, byProvider.id])
       await app.setup.mockInput.typeText('/exit')
       app.setup.mockInput.pressEnter()
@@ -560,7 +561,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
         const afterCancel = app.ready.nextComposer()
         app.setup.mockInput.pressEscape()
         await afterCancel
-        await app.setup.waitForFrame(frame => frame.includes('Enter send') && !frame.includes('Models ·'))
+        await app.setup.waitForFrame(frame => frame.includes('Menu  Models') && !frame.includes('Models ·'))
         expect(app.session()).toEqual(originalSession)
         expect(await app.preferences.load()).toEqual(app.defaults)
         expect(await new FileSessionStore(app.directory).load(originalSession.id)).toEqual(originalSession)
@@ -582,6 +583,8 @@ for (const provider of ['openai', 'openrouter'] as const) {
       expect(app.session().id).toBe(originalSession.id)
       expect(await app.preferences.load()).toEqual(app.defaults)
       expect(calls).toEqual([
+        // OpenAI has documented local capabilities; OpenRouter verifies at startup.
+        ...(provider === 'openrouter' ? [{ provider, refresh: false }] : []),
         { provider, refresh: false }, { provider, refresh: false }, { provider, refresh: false }, { provider, refresh: true }
       ])
       const afterModel = app.ready.nextComposer()

@@ -39,10 +39,23 @@ terminal reports those modifiers. Tab completes slash commands.
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
-to preserve Shift+Enter, including on Windows Terminal 1.24. It restores the prior
+to preserve reported Enter modifiers. Physical Shift+Enter behavior on Windows
+Terminal 1.24 remains unverified after a user-reported failure. It restores the prior
 reporting mode when the UI closes. Other terminals use the supported Kitty keyboard
 protocol automatically, or Ctrl+J when modifiers are unavailable. Alt+Enter may be
 intercepted by the terminal's own fullscreen shortcut.
+The composer grows as explicit or wrapped lines are added, up to ten editable
+rows where the terminal has room. Larger drafts scroll inside the composer.
+
+If reported modifiers do not work, run `vivi --diagnose-input` by itself in the
+same terminal. It opens the normal native input transport without loading
+credentials, preferences, workspaces, sessions or providers. Press Enter,
+Shift+Enter, then Ctrl+J once each; press Escape to restore the terminal and print
+the report. It collects only those key names and modifier flags, runtime/TTY
+facts and Windows negotiation state. Ordinary typing and paste are ignored.
+Raw input logging/debug capture must be disabled. No report is saved or sent;
+review it before sharing it voluntarily. This is a diagnostic, not evidence that
+physical Shift+Enter has been fixed.
 Escape or Ctrl+C cancels a running turn; Ctrl+C while idle exits.
 In `/models`, type to filter by ID, name or provider; words can be in any order.
 Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,
@@ -51,7 +64,7 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 ### Mouse controls
 
 The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Memory or Settings above the transcript to open an action when the draft
+Effort, Memory or Settings below the composer to open an action when the draft
 is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
@@ -79,6 +92,10 @@ will succeed. Provider default sends no reasoning override. The explicit disable
 is offered only when supported, including optional OpenRouter token-budget models that
 have no named effort choices. A documented non-streaming model uses complete responses;
 unknown streaming keeps your selected stream setting.
+Saved OpenRouter selections are checked against the provider catalog before the
+first session opens, so supported workspace tools are available on the first
+turn. Explicit tools-off choices stay off; unavailable or unknown metadata stays
+chat-only unless tool support was explicitly declared for this launch.
 
 Keys can be saved in an available OS credential store or used for this launch only.
 There is no plaintext key-storage fallback. Conversations are stored locally in
