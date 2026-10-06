@@ -52,7 +52,14 @@ unchanged unless a separate CLI release is requested.
 
 ## Read-only workspace policy
 
-`--workspace PATH` grants a host-owned, launch-only read capability. The shared core
+The CLI captures its current working directory once at launch and uses it as a
+host-owned, launch-only read capability. `--workspace PATH` overrides that folder;
+relative paths resolve from the captured launch directory. `--no-workspace` disables
+access, and combining it with `--workspace` is an error. Both interfaces display the
+active canonical folder at startup. Invalid or disallowed roots fail closed before
+provider construction; there is no fallback to the install or profile directory.
+Library `CliHost` construction remains explicit-only and gets no ambient cwd access.
+The shared core
 does not load extensions or own filesystem policy. The CLI reserves `workspace_list`,
 `workspace_read` and `workspace_search` even when disabled, and advertises/executed
 tools share a fixed registry. Tool support gating remains unchanged: selecting a

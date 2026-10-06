@@ -31,7 +31,7 @@ function fakeIO(lines = []) {
     async choose() { return undefined }, async chooseSearchable() { return undefined }, async askText() { return undefined } }
 }
 
-test('workspace selection is absent by default and never loaded from environment or a session', () => {
+test('argument parsing without a CLI launch directory and library toolsets keep workspace access explicit', () => {
   assert.equal(parseArguments(['--model', 'fixture'], { VIVI_WORKSPACE: '/unused' }).workspace, undefined)
   assert.equal(parseArguments(['--model', 'fixture', '--workspace', 'project']).workspace, 'project')
   assert.equal(parseArguments(['--model', 'fixture', '--workspace', 'one', '--workspace', 'two']).workspace, 'two')

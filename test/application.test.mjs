@@ -58,7 +58,7 @@ async function fixture(t) {
 }
 const base = { ...DEFAULT_PREFERENCES, model: 'saved-model' }
 async function run(directory, io, services, providerFactory = defaultFactory, args = [], env = {}) {
-  return main(args, { VIVI_SESSION_DIR: directory, ...env }, { tuiIO: io, providerFactory, ...services })
+  return main(['--no-workspace', ...args], { VIVI_SESSION_DIR: directory, ...env }, { tuiIO: io, providerFactory, ...services })
 }
 test('first launch opens a fresh composer without welcome, provider call, credential read or saved session', async t => {
   const directory = await fixture(t), io = fakeIO([], [], ['Hello', '/exit']), services = fakeServices()

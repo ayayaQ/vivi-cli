@@ -99,14 +99,22 @@ Use `node dist/launcher.js --help` for all options, including `--resume UUID` an
 
 ## Read-only workspace tools
 
-Workspace access is off by default. Choose one project folder explicitly for each
-launch with `--workspace PATH`; its root is never saved as a preference or restored
-from a session. The model cannot select or switch folders. For an unverified model,
-also declare its tool support with `--tools`; `--no-tools` always omits these tools.
+The CLI uses the current working directory where you launch vivi as its read-only
+workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
+disable workspace access for that launch. These flags cannot be combined. Relative
+paths are resolved from the launch directory, not the installed CLI or private
+profile folder. The active canonical folder is shown at startup in both interfaces.
+The full-screen status keeps it visible through conversation changes; long paths
+are shortened there. Use `/session` in the full-screen UI to see the full folder.
+Its root is never saved as a preference or restored from a session; a resumed
+conversation uses the current launch’s folder. The model cannot select or switch
+folders. For an unverified model, also declare its tool support with `--tools`;
+`--no-tools` always omits these tools.
 
 ```sh
 bun dist/launcher.js --workspace ./my-project
 node dist/launcher.js --no-tui --model YOUR_MODEL --tools --workspace ./my-project
+bun dist/launcher.js --no-workspace
 ```
 
 The assistant can list files, read UTF-8 text, and search literal text. Reads may be
@@ -114,6 +122,10 @@ sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
 are treated as untrusted data. No writes, shell commands, automatic execution,
 network tools, plugin discovery, or permanent folder trust are added.
+
+The default applies to CLI launches only. Library users of `CliHost` must still
+explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
+does not grant access to the application’s working directory.
 
 Root and nested `.gitignore` files apply to all three tools, including direct reads.
 Symlinks, multi-link files, repository internals, common credential locations,

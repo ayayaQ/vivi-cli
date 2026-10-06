@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, test } from 'bun:test'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createTestRenderer } from '@opentui/core/testing'
@@ -347,7 +347,7 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
       providerFactory: (session, options, env) => {
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
-        return { generate: async input => { expect(input.tools).toHaveLength(2); return { content: `${session.reasoning} response`, toolCalls: [] } } }
+        return { generate: async input => { expect(input.tools).toHaveLength(5); return { content: `${session.reasoning} response`, toolCalls: [] } } }
       }
     })
     await ready(state => state.kind === 'composer')
@@ -606,3 +606,49 @@ for (const provider of ['openai', 'openrouter'] as const) {
     } finally { await app.close() }
   }, 20000)
 }
+
+test('native CLI keeps the canonical launch workspace visible through new conversations and transcript rebuilds', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-workspace-'))
+  const project = join(directory, 'project'), state = join(directory, 'state')
+  await mkdir(project)
+  const canonical = await realpath(project)
+  const setup = await createTestRenderer({ width: 180, height: 30, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  let running: Promise<number> | undefined, sessions = 0
+  try {
+    running = main(['--model', 'fixture', '--tools'], { VIVI_SESSION_DIR: state }, {
+      tuiIO: io, launchDirectory: project,
+      credentials: { status: async () => ({ available: false, label: 'Fixture' }), load: async () => undefined,
+        save: async () => { throw new Error('No credential storage expected') } },
+      providerFactory: (_session, options) => {
+        sessions++; expect(options.workspace).toBe(project)
+        return { generate: async () => { throw new Error('No provider turn expected') } }
+      }
+    })
+    await ready(state => state.kind === 'composer')
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain('Files read by tools are sent to the selected provider')
+    const next = ready.nextComposer()
+    await setup.mockInput.typeText('/new'); setup.mockInput.pressEnter()
+    await next; await setup.renderOnce()
+    expect(sessions).toBe(2)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    io.setDraft('openrouter')
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    io.addSecrets(['project'])
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain('[REDACTED]')
+    expect(setup.captureCharFrame()).not.toContain(canonical)
+    io.setWorkspace()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain('Workspace: disabled')
+    await setup.mockInput.typeText('/exit'); setup.mockInput.pressEnter()
+    expect(await running).toBe(0)
+  } finally {
+    io.close(); await running?.catch(() => undefined); setup.renderer.destroy()
+    await rm(directory, { recursive: true, force: true })
+  }
+})

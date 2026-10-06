@@ -1509,3 +1509,51 @@ test('registering cancellation after close immediately aborts a late-starting op
   expect(io.isClosed).toBe(true)
   dispose()
 })
+
+test('long workspace paths stay on one status row and keep the composer visible after resize', async () => {
+  const { io, setup, frame } = await fixture({ width: 180, height: 30 })
+  io.setSession(newSession({ provider: 'openai', model: 'fixture' }))
+  const reading = io.readLine('Message')
+  for (const path of [`/project/${'long-folder/'.repeat(100)}last`, `C:\\project\\${'日本語-folder\\'.repeat(100)}last`]) {
+    io.setWorkspace(path)
+    for (const [width, height] of [[180, 30], [80, 24], [60, 20], [40, 20]] as const) {
+      setup.resize(width, height)
+      await frame()
+      const status = setup.renderer.root.findDescendantById('vivi-status') as TextRenderable
+      const composer = setup.renderer.root.findDescendantById('vivi-composer-box')!
+      const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
+      expect(status.plainText.split('\n')[1]).toContain('Workspace:')
+      expect(status.plainText.split('\n')[1]).toContain('…')
+      expect(status.plainText.split('\n')[1]!.length).toBeLessThanOrEqual(width)
+      expect(composer.y + composer.height).toBeLessThanOrEqual(height)
+      expect(transcript.height).toBeGreaterThan(1)
+      expect(status.height).toBeLessThanOrEqual(6)
+    }
+  }
+  io.close(); expect(await reading).toBeUndefined()
+})
+
+test('workspace status keeps search results, editor and refresh hints visible in a compact terminal', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 110, height: 32 })
+  io.setSession(newSession({ provider: 'openai', model: 'fixture' }))
+  io.setWorkspace(`/project/${'long-folder/'.repeat(100)}last`)
+  const selecting = io.chooseSearchable('Workspace models', [{ name: 'model-599', value: 'selected-model' }], { refresh: true })
+  for (const [width, height] of [[40, 12], [70, 20], [110, 32]] as const) {
+    setup.resize(width, height)
+    const display = await frame()
+    expect(display).toContain('Workspace:')
+    expect(display).toContain('model-599')
+    expect(display).toContain('Ctrl+R refresh')
+    expect(display).toContain('Enter choose')
+    expect(display).toContain('Esc back')
+    const { composerBox } = searchableWidgets(setup)
+    expect(composerBox.y + composerBox.height).toBeLessThanOrEqual(height)
+  }
+  setup.resize(40, 12)
+  io.event({ type: 'text_delta', text: 'Streaming fixture' })
+  const streaming = await frame()
+  expect(streaming).toContain('Workspace:')
+  expect(streaming).toContain('Ctrl+R refresh')
+  expect(streaming).toContain('model-599')
+  input.pressEnter(); expect(await selecting).toEqual({ kind: 'selected', value: 'selected-model', query: '' })
+})

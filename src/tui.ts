@@ -51,6 +51,25 @@ const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
 const MAX_QUERY = 200
+/** Conservative cell budget keeps wide Unicode paths on one terminal row. */
+function fitStatusColumns(text: string, columns: number): string {
+  const characters = [...text]
+  const width = (character: string): number => character.codePointAt(0)! <= 0x7f ? 1 : 2
+  if (characters.reduce((total, character) => total + width(character), 0) <= columns) return text
+  if (columns < 2) return columns > 0 ? '…' : ''
+  const leftBudget = Math.ceil((columns - 2) / 2), rightBudget = Math.floor((columns - 2) / 2)
+  let left = '', right = '', used = 0
+  for (const character of characters) {
+    if (used + width(character) > leftBudget) break
+    left += character; used += width(character)
+  }
+  used = 0
+  for (const character of characters.reverse()) {
+    if (used + width(character) > rightBudget) break
+    right = character + right; used += width(character)
+  }
+  return `${left}…${right}`
+}
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
 const HINTS = 'Enter send · Ctrl+J newline · /new /resume /memories /settings /menu /help /exit'
@@ -155,6 +174,8 @@ export class OpenTuiIO implements ChatIO {
   private changingInput = false
   private cancelCallbacks = new Set<() => void>()
   private status = 'Ready'
+  private workspaceDirectory: string | undefined
+  private workspaceStatus = false
   private sessionTitle = 'vivi · fresh conversation'
   private sessionId: string | undefined
   private usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
@@ -176,6 +197,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     this.updateActionBar()
     this.updateApprovalLayout()
+    if (this.workspaceStatus) this.updateStatus()
     this.renderDialogActions()
     if (this.searchPicker) this.renderSearchPicker(false)
     if (this.completions.length) this.renderCompletions()
@@ -368,9 +390,10 @@ export class OpenTuiIO implements ChatIO {
       (pending.kind !== 'approval' || this.lastRenderedFrame > pending.openedFrame)
   }
   private updateApprovalLayout(): void {
-    const compact = this.pending?.kind === 'approval' && this.renderer.terminalHeight < 12
-    this.header.height = compact ? 1 : 2
-    this.statusLine.height = compact ? 1 : 'auto'
+    const compactApproval = this.pending?.kind === 'approval' && this.renderer.terminalHeight < 12
+    const compactWorkspace = this.workspaceStatus && this.renderer.terminalHeight < 14
+    this.header.height = compactApproval || compactWorkspace ? 1 : 2
+    this.statusLine.height = compactApproval ? 1 : compactWorkspace ? 2 : 'auto'
   }
   private updateActionBar(): void {
     if (this.actionBar) this.actionBar.visible = this.pending?.kind === 'chat' &&
@@ -466,7 +489,12 @@ export class OpenTuiIO implements ChatIO {
   private updateStatus(status = this.status): void {
     if (this.closed) return
     this.status = this.safe(status, 1024)
-    this.statusLine.content = `${this.status}\n${this.usageScope} tokens: ${formatUsage(this.usage)}`
+    const columns = Math.max(1, this.renderer.terminalWidth)
+    const folder = this.workspaceDirectory === undefined ? 'disabled'
+      : `${fitStatusColumns(this.safe(JSON.stringify(this.workspaceDirectory)), Math.max(0, columns - 23))} · read only`
+    const workspace = this.workspaceStatus ? `\n${fitStatusColumns(`Workspace: ${folder}`, columns)}` : ''
+    const summary = this.workspaceStatus ? fitStatusColumns(this.status.replace(/[\t\n]+/g, ' '), columns) : this.status
+    this.statusLine.content = `${summary}${workspace}\n${this.usageScope} tokens: ${formatUsage(this.usage)}`
   }
   private disableComposer(): void {
     this.composer?.blur()
@@ -1012,6 +1040,14 @@ export class OpenTuiIO implements ChatIO {
     this.usageScope = 'Session'
     this.rebuild()
     this.updateStatus('Ready')
+  }
+  /** Launch-owned context survives conversation changes and transcript rebuilds. */
+  setWorkspace(directory?: string): void {
+    if (this.closed) return
+    this.workspaceDirectory = directory
+    this.workspaceStatus = true
+    this.updateApprovalLayout()
+    this.updateStatus()
   }
   setSession(session: CliSession): void {
     if (this.closed) return
