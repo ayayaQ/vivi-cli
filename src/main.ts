@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { homedir } from 'node:os'
 import { realpathSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
@@ -51,7 +51,8 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
-  --workspace PATH            Opt in to read-only files in one folder for this launch
+  --workspace PATH            Read-only folder for this launch (default: launch directory)
+  --no-workspace              Disable workspace files for this launch
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
@@ -67,18 +68,23 @@ Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id and usage.
 Streaming is display-only. Notes never access other files; piped approval is denied.
 Saved memory is off by default. When enabled, it is sent to the selected provider.
-Workspace reads are off by default. Selected files may be sent to your provider and saved in session history.
+Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
+Selected files may be sent to your provider and saved in session history.
 Workspace tools omit symlinks, private/ignored files, writes and commands; this is not an OS sandbox.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+/** Only CLI callers supplying their captured launch directory get a default workspace. */
 export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv = process.env,
-  interactiveSetup = false): CliOptions {
+  interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    stream: true, tui: true, enableNotes: false, enableMemory: false, enableTools: true, startNew: false, maxRounds: 25, help: false
+    stream: true, tui: true, enableNotes: false, enableMemory: false, enableTools: true, startNew: false, maxRounds: 25, help: false,
+    ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
+  let explicitWorkspace = false
+  let noWorkspace = false
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]
     const value = (): string => {
@@ -108,7 +114,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       }
       case '--resume': options.resume = value(); break
       case '--session-dir': options.sessionDirectory = value(); break
-      case '--workspace': options.workspace = value(); break
+      case '--workspace': explicitWorkspace = true; options.workspace = value(); break
+      case '--no-workspace': noWorkspace = true; delete options.workspace; break
       case '--prompt': options.prompt = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
@@ -127,6 +134,10 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       }
       default: throw new Error('Unknown argument; credentials are accepted only through environment variables. Use --help')
     }
+  }
+  if (explicitWorkspace && noWorkspace) throw new Error('Use either --workspace PATH or --no-workspace, not both')
+  if (options.workspace !== undefined && launchDirectory !== undefined) {
+    options.workspace = resolve(launchDirectory, options.workspace)
   }
   if (options.help) return options
   if (options.resume && (!isSessionId(options.resume) || explicitlyNew)) throw new Error('Use a valid session UUID and either new or resume')
@@ -176,7 +187,7 @@ export function providerForSession(session: CliSession, options: CliOptions, env
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
   dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
-    credentials?: CredentialStore; catalog?: Catalog } = {}): Promise<number> {
+    credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string } = {}): Promise<number> {
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
   let host: CliHost | undefined
@@ -194,12 +205,16 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     return false
   }
   try {
+    // Capture before any async setup. Never use the install/bin or private profile folder.
+    // Help and opt-outs do not need a usable cwd; injected directories keep tests isolated.
+    const launchDirectory = dependencies.launchDirectory ?? (args.includes('--no-workspace') || args.includes('--help') ||
+      args.includes('-h') ? undefined : process.cwd())
     const interactive = dependencies.tuiIO !== undefined || (!dependencies.io && Boolean(process.stdin.isTTY && process.stdout.isTTY) &&
       !args.includes('--no-tui') && (!args.includes('--prompt') || args.includes('--tui')) && !args.includes('--help') && !args.includes('-h'))
     if (interactive && !dependencies.tuiIO && !supportsBunTui()) {
       throw new Error('The full-screen UI requires Bun >=1.3.0. Install Bun from https://bun.sh, then run bun dist/main.js. Use --no-tui --model MODEL for Node line mode.')
     }
-    const options = parseArguments(args, env, interactive)
+    const options = parseArguments(args, env, interactive, launchDirectory)
     if (interactive) {
       const { runApplication } = await import('./application.js')
       const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets })

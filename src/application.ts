@@ -26,6 +26,7 @@ export interface InteractiveIO extends ChatIO {
   addSecrets?(secrets: readonly string[]): void
   setDraft?(provider: CliProviderName): void
   setSession(session: CliSession): void
+  setWorkspace?(directory?: string): void
 }
 export interface ApplicationOptions {
   io: InteractiveIO
@@ -83,6 +84,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
+  io.setWorkspace?.(workspace?.directory)
   const knownModels = new Map<string, ModelEntry>()
   const modelKey = (provider: CliProviderName, id: string): string => `${provider}:${id}`
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
@@ -370,8 +372,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     io.setSession(host.session)
     return true
   }
+  let workspaceNoticePending = true
   try {
-    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (activeMemory) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {
@@ -386,6 +388,11 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         selected = undefined
       }
       if (io.isClosed) continue
+      // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
+      if (workspaceNoticePending) {
+        workspaceNoticePending = false
+        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+      }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
         const controller = new AbortController()
@@ -438,6 +445,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           const session = host?.session
           io.write(session ? `Session: ${session.id}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
+          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\n` : 'Workspace: disabled\n')
           continue
         }
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }
