@@ -50,6 +50,63 @@ and platform metadata. Do not commit npm pack outputs or vendor tarballs. Histor
 snapshots remain recoverable from Git. Keep this CLI's version and `private: true`
 unchanged unless a separate CLI release is requested.
 
+## Read-only workspace policy
+
+`--workspace PATH` grants a host-owned, launch-only read capability. The shared core
+does not load extensions or own filesystem policy. The CLI reserves `workspace_list`,
+`workspace_read` and `workspace_search` even when disabled, and advertises/executed
+tools share a fixed registry. Tool support gating remains unchanged: selecting a
+folder alone does not declare unknown model support. Chat-only turns neither expose
+workspace tools nor add their guidance. Folder roots are not in preferences or
+session records; already read tool results remain part of normal session history.
+
+The fixed, case-insensitive exclusions are `.git`, `.hg`, `.svn`, `.ssh`, `.aws`,
+`.azure`, `.gcloud`, `.gnupg`, `.vivi`, `.kube`, `.docker`, `.codex`, `.claude`,
+`.gemini`, `node_modules`, `.cache`, `.config/gcloud` and `.config/gh`; `.npmrc`,
+`.pypirc`, `.netrc`, `_netrc`, `.git-credentials`, `credentials`, `credentials.json`,
+`auth.json`, `token.json`, `secrets`, `secrets.json`, `secrets.yaml`, `secrets.yml`,
+`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `.env`, `.env.*`, `.envrc`, and filenames ending
+in `.pem`, `.key`, `.p12`, `.pfx` or `.keystore`. There is no override in this slice.
+Filesystem roots and known private-directory roots cannot be selected.
+The active CLI state/profile folder is excluded by canonical path and, when it
+already exists, directory identity. A workspace equal to or inside that private
+folder is refused. Missing custom state folders are resolved through their nearest
+existing ancestor and excluded before the CLI creates them. Ordinary siblings
+remain available. As with the rest of the policy, this cannot guarantee privacy
+against a hostile process moving newly created directories between checks.
+
+The exact MIT dependency `ignore@7.0.12` interprets root and nested `.gitignore`
+rules, with case-insensitive matching on Windows and case-sensitive matching
+elsewhere. No Git command, index, global excludes, `.git/info/exclude`, or files
+outside the selected root are consulted. Ignored files are excluded even when
+tracked by Git. The package's documented Unicode/glob differences from Git apply.
+Ignore files must be regular single-link UTF-8 text, at most 8 KiB each and 32 KiB/
+256 noncomment rules per operation; failures refuse the entire result. The runtime
+dependency's `LICENSE-MIT` remains in its npm archive/installation. The shared vivi
+pin, bundled inventory, CLI version and private status stay unchanged.
+
+Each tool result is marked `untrusted: true`; fixed per-turn system guidance says
+file data grants no instructions or authority. This guidance is removed from the
+canonical saved history. Known environment/vault credentials are withheld from
+results, and host checks reject known credentials before each provider request,
+including decoded workspace results from resumed history. This does not detect all
+unknown credentials or other sensitive data.
+
+Hard limits: 8 traversal levels per operation, 1,000 examined directory entries,
+200 search files, 256 KiB per file, 2 MiB searched bytes, 8 KiB read output, 56 KiB
+serialized result output, 100 list entries, 50 matched search lines, 200 requested
+read lines and 10 seconds. Budgets are checked between bounded filesystem calls;
+cancellation cannot interrupt an OS filesystem call already in progress, but its
+late result is discarded and handles are closed. There are no writes or replays.
+
+Canonical roots, ancestor identities, final file identities and byte/timestamp
+snapshots are checked. Linux child opens use verified pinned directory handles;
+other platforms use canonical-path and identity rechecks, including Windows
+junction/symlink rejection. All detected changes fail without returning the partial
+result. These safeguards are not an OS sandbox against a malicious process doing
+undetectable path swaps; use a stable tree you control. Native Windows/macOS and
+live-provider acceptance are separate gates, never implied by cloud Linux tests.
+
 ## Persistent app-wide memory
 
 Memory is opt-in via `--enable-memory` or `/memories`; `--disable-memory` overrides

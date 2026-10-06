@@ -46,6 +46,7 @@
   "dependencies": {
     "@ayayaq/vivi": "0.5.0",
     "@opentui/core": "0.5.14",
+    "ignore": "7.0.12",
     "web-tree-sitter": "0.25.10"
   },
   "bundledDependencies": [

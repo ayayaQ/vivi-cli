@@ -10,6 +10,7 @@ import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers
 import type { ModelProvider } from '@ayayaq/vivi'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
+import { ReadOnlyWorkspace } from './workspace.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { TerminalIO, runChatLoop } from './terminal.js'
@@ -26,6 +27,7 @@ export interface CliOptions {
   reasoningCapabilities: ReasoningEffort[]
   resume?: string
   sessionDirectory: string
+  workspace?: string
   stream: boolean
   tui: boolean
   enableNotes: boolean
@@ -49,6 +51,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
+  --workspace PATH            Opt in to read-only files in one folder for this launch
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
@@ -64,6 +67,8 @@ Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id and usage.
 Streaming is display-only. Notes never access other files; piped approval is denied.
 Saved memory is off by default. When enabled, it is sent to the selected provider.
+Workspace reads are off by default. Selected files may be sent to your provider and saved in session history.
+Workspace tools omit symlinks, private/ignored files, writes and commands; this is not an OS sandbox.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
@@ -103,6 +108,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       }
       case '--resume': options.resume = value(); break
       case '--session-dir': options.sessionDirectory = value(); break
+      case '--workspace': options.workspace = value(); break
       case '--prompt': options.prompt = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
@@ -194,6 +200,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
+    const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
     const fresh = options.resume ? undefined : newSession({
@@ -208,12 +215,13 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
-      enableTools, enableMemory: options.enableMemory, memory,
+      enableTools, enableMemory: options.enableMemory, memory, ...(workspace ? { workspace } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
     await store.save(host.session)
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\n`)
+    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     const result = await runChatLoop(host, io, options.prompt)
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {

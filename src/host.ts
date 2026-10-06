@@ -12,8 +12,11 @@ import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { newSession, redactSecrets, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
+import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES } from './workspace.js'
+import type { ReadOnlyWorkspace } from './workspace.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
+const workspaceToolNames = new Set<string>(WORKSPACE_TOOL_NAMES)
 
 function memoryContextContainsSecret(value: unknown, secrets: readonly string[]): boolean {
   const pending = [value]
@@ -58,6 +61,8 @@ export interface CliHostOptions {
   /** Opt-in, app-wide state, independent of session-only notes. */
   enableMemory?: boolean
   memory?: CliMemoryStore
+  /** Explicit launch-only read capability; never recovered from a session or preferences. */
+  workspace?: ReadOnlyWorkspace
   /** Trusted, explicitly imported tool packs. Registration is captured once per turn. */
   extensions?: readonly ToolExtension[]
   /** A host can omit tools when the selected model's tool support is undeclared. */
@@ -210,7 +215,8 @@ export class CliHost {
       listMemories: async ({ signal }) => memoryToolResult(await this.listMemories(signal)),
       executeMutation: (call, { signal }) => this.executeMemory(call, signal)
     }) : undefined
-    const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory)
+    const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets) : undefined
+    const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace)
     const controller = new AbortController()
     this.controller = controller
     const abort = (): void => controller.abort()
@@ -233,6 +239,7 @@ export class CliHost {
         prefix = [{ kind: 'message', role: 'system', content: `${MEMORY_GUIDANCE}\nEvery memory write requires explicit human approval.${enableTools ? '' : '\nMemory tools are unavailable this turn; do not claim memory changes were saved.'}` },
           { kind: 'message', role: 'user', content: formatMemoryContext(memories.memories) }]
       }
+      if (workspace) prefix.push({ kind: 'message', role: 'system', content: WORKSPACE_GUIDANCE })
       this.current.history.push({ kind: 'message', role: 'user', content })
       await this.save()
       const generate = this.options.provider.generate.bind(this.options.provider)
@@ -243,17 +250,17 @@ export class CliHost {
           // provider request, without silently rewriting approved context.
           const memoryToolContext: unknown[] = []
           for (const message of input.messages) {
-            if (message.kind === 'tool_result' && memoryToolNames.has(message.name)) {
+            if (message.kind === 'tool_result' && (memoryToolNames.has(message.name) || workspaceToolNames.has(message.name))) {
               // Decode quoted/escaped content before checking, including resumed
               // canonical results that were serialized by an older host.
               try { memoryToolContext.push(JSON.parse(message.content)) }
               catch { memoryToolContext.push(message.content) }
             } else if (message.kind === 'assistant') {
-              for (const call of message.toolCalls) if (memoryToolNames.has(call.name)) memoryToolContext.push(call.arguments)
+              for (const call of message.toolCalls) if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name)) memoryToolContext.push(call.arguments)
             }
           }
           if (memoryContextContainsSecret([memoryContents, memoryToolContext], this.options.secrets ?? [])) {
-            throw new Error('Saved memory contains a known credential; provider request was blocked')
+            throw new Error('Saved memory or workspace context contains a known credential; provider request was blocked')
           }
           const output = await generate(input, signal, options)
           // Reject session-wide overflow before this response enters canonical history.

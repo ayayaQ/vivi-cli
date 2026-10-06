@@ -7,12 +7,14 @@ import type { Renderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
 import { newSession } from '../src/session.js'
 import { parseModelCatalog, documentedOpenAIModel } from '../src/models.js'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FileMemoryStore } from '../src/memory.js'
 import { FileSessionStore } from '../src/session.js'
 import { CliHost } from '../src/host.js'
+import { ReadOnlyWorkspace, createWorkspaceExtension } from '../src/workspace.js'
+import { createToolRegistry } from '@ayayaq/vivi/extensions'
 
 // The optional pack must survive a compiled consumer, remain host-owned, and
 // contribute context without storing the per-turn memory prefix in a session.
@@ -31,6 +33,24 @@ try {
   assert.deepEqual(result.history.map(message => message.content), ['Use opted-in memory', 'Compiled memory works'])
   assert.deepEqual((await new FileSessionStore(directory).load(host.session.id)).history, result.history)
   await host.drainMemory()
+  const project = join(directory, 'project')
+  await mkdir(project)
+  await writeFile(join(project, 'readme.txt'), 'Compiled workspace works')
+  await writeFile(join(project, '.gitignore'), '*.log')
+  await writeFile(join(project, 'ignored.log'), 'Compiled ignored fixture')
+  const workspace = await ReadOnlyWorkspace.open(project)
+  const registry = createToolRegistry([createWorkspaceExtension(workspace)])
+  const listing = await registry.executeTool({ id: 'compiled-list', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
+  assert(!JSON.parse(listing.content).entries.some((item: { path: string }) => item.path === 'ignored.log'))
+  let rounds = 0
+  const workspaceHost = await CliHost.create({ workspace, store: new FileSessionStore(directory),
+    settings: { provider: 'openai', model: 'fake' }, provider: { async generate() {
+      return ++rounds === 1 ? { content: '', toolCalls: [{ id: 'compiled-read', name: 'workspace_read', arguments: { path: 'readme.txt' } }] }
+        : { content: 'Compiled workspace accepted', toolCalls: [] }
+    } } })
+  const workspaceResult = await workspaceHost.send('Use selected workspace')
+  assert.equal(workspaceResult.status, 'completed')
+  assert.equal(JSON.parse(workspaceResult.history[2]!.content).content, 'Compiled workspace works')
 } finally { await rm(directory, { recursive: true, force: true }) }
 
 const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
@@ -69,5 +89,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

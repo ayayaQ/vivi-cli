@@ -89,6 +89,45 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
 
+## Read-only workspace tools
+
+Workspace access is off by default. Choose one project folder explicitly for each
+launch with `--workspace PATH`; its root is never saved as a preference or restored
+from a session. The model cannot select or switch folders. For an unverified model,
+also declare its tool support with `--tools`; `--no-tools` always omits these tools.
+
+```sh
+bun dist/launcher.js --workspace ./my-project
+node dist/launcher.js --no-tui --model YOUR_MODEL --tools --workspace ./my-project
+```
+
+The assistant can list files, read UTF-8 text, and search literal text. Reads may be
+sent to your selected provider and saved in the local conversation transcript.
+Choose a folder whose contents you are comfortable sharing. File names and contents
+are treated as untrusted data. No writes, shell commands, automatic execution,
+network tools, plugin discovery, or permanent folder trust are added.
+
+Root and nested `.gitignore` files apply to all three tools, including direct reads.
+Symlinks, multi-link files, repository internals, common credential locations,
+`.env`/`.env.*`, key files, `node_modules`, and `.cache` are unavailable. Ignore rules
+cannot override these exclusions. The active CLI state folder is also excluded,
+including a custom `--session-dir` inside the project. Ordinary config such as `package.json` and
+`tsconfig.json` remains readable. This policy cannot identify every secret: move
+sensitive files outside the selected folder or exclude them with `.gitignore`.
+
+Output is bounded: listings have at most 100 entries; literal searches at most 50
+matches; reads return up to 8 KiB from text files no larger than 256 KiB. Traversal
+is at most 8 levels per call and stops after 1,000 entries, 200 search files, 2 MiB
+of searched text, or 10 seconds. `truncated: true` means the result is incomplete,
+including deeper directories not visited. Escape/Ctrl+C cancels a running turn.
+
+Paths are workspace-relative, with forward slashes. Parent traversal, drive/UNC
+paths, ambiguous Windows components, and link aliases are refused. The host checks
+canonical paths and file identities and withholds results when it detects concurrent
+changes. This is not an OS sandbox against hostile programs changing the tree;
+use a project folder you control. Exact policy and verification limits are in
+[RELEASING.md](RELEASING.md#read-only-workspace-policy).
+
 ## Persistent memory
 
 Memory is off by default. Use `--enable-memory` for a launch, or choose the future
