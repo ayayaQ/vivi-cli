@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import type { HistoryMessage, Usage } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
+import { validSessionTitle } from './session-display.js'
 
 export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
@@ -17,6 +18,9 @@ export interface CliSession {
   reasoning?: string
   createdAt: string
   updatedAt: string
+  /** Optional schema-1 metadata; legacy sessions derive a title only for display. */
+  title?: string
+  titleRevision?: number
   history: HistoryMessage[]
   /** Cache subsets are optional complete-session totals; omission means unreported. */
   usage: Usage
@@ -78,11 +82,14 @@ export function validateSession(value: unknown): CliSession {
   json(value)
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
-    'history', 'usage', 'noteRevision', 'notes'])
+    'history', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision'])
   check(value.schemaVersion === 1, 'unsupported schema version')
   check(isSessionId(value.id), 'invalid id')
   check(value.provider === 'openai' || value.provider === 'openrouter', 'unsupported provider')
   check(identifier(value.model), 'invalid model')
+  if ('title' in value) check(typeof value.title === 'string' && validSessionTitle(value.title), 'invalid title')
+  if ('titleRevision' in value) check('title' in value && Number.isSafeInteger(value.titleRevision) &&
+    Number(value.titleRevision) >= 0, 'invalid title revision')
   if ('reasoning' in value) check(typeof value.reasoning === 'string' &&
     ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value.reasoning), 'invalid reasoning')
   for (const field of ['createdAt', 'updatedAt']) {
@@ -153,6 +160,14 @@ export function newSession(settings: { provider: CliProviderName; model: string;
 export interface SessionPersistence {
   load(id: string): Promise<CliSession>
   save(session: CliSession): Promise<void>
+}
+
+/** The atomic replacement succeeded; only its durability confirmation failed. */
+export class SessionCommitError extends Error {
+  constructor(cause: unknown) {
+    super('Session was saved, but durable persistence could not be confirmed', { cause })
+    this.name = 'SessionCommitError'
+  }
 }
 
 /** Host-owned session files only. No arbitrary paths or model-controlled filenames. */
@@ -257,16 +272,21 @@ export class FileSessionStore implements SessionPersistence {
     }
     const temporary = join(this.directory, `.${session.id}.${randomUUID()}.tmp`)
     const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    let committed = false
     try {
       await file.writeFile(`${safe}\n`, 'utf8')
       await file.sync()
       await file.close()
       await rename(temporary, target)
+      committed = true
       // Ensure rename is durable where directory fsync is supported.
       if (process.platform !== 'win32') {
         const directory = await open(this.directory, constants.O_RDONLY)
         try { await directory.sync() } finally { await directory.close() }
       }
+    } catch (error) {
+      if (committed) throw new SessionCommitError(error)
+      throw error
     } finally {
       await file.close().catch(() => undefined)
       await unlink(temporary).catch(() => undefined)

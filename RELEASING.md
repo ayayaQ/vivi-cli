@@ -205,3 +205,10 @@ authorized operations.
 The exact published shared 0.6.0 bytes were verified before pinning. Skills remain a host-only adoption; no agent loop changes are copied into this repository. Run the new skills-store, skills-host and skills-controls tests along with the full existing suite. The canonical npm candidate includes the unchanged bundled creator and verifies ESM/CJS skills exports, parser legal bytes, fresh catalogs and packed host execution. Windows headless CI consumes those same canonical npm archive bytes under Node 26.4.0 and current 26, plus Bun 1.4.2. Real native credential-store and real TTY acceptance remain separate and unclaimed. No live provider or key is needed for these tests.
 
 Current inspection blocker: automatic skill saves are supported on Linux only. Windows/macOS hosts omit save_skill and refuse direct writes because a validated native handle-relative transaction is still required. List/read and standard creator drafts remain available. This must be resolved or explicitly accepted as a scope reduction before the Windows creator goal can be called complete. Independent review stopped during filesystem concurrency assessment after a tool restriction; no complete security-review approval is claimed.
+
+The ordinary follow-up fixes Windows canonical path identity and portable capability
+expectations, manual readonly folder permissions, root-specific diagnostics, and merged
+UI/session lifecycle preservation. Test classification runs portable readonly cases on
+all platforms and Linux save cases only on Linux, while previously restricted/adversarial
+assessment cases remain explicitly excluded. Actual macOS execution is still unverified;
+simulated POSIX manual-permission/read-only cases do not establish macOS acceptance.

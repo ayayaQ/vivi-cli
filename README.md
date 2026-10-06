@@ -25,6 +25,7 @@ then choose a model.
 - `/effort` — choose a supported reasoning effort
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
+- `/rename` — rename the current conversation (or `/rename NAME` in line mode)
 - `/settings` — change defaults for future conversations
 - `/memories` — manage this launch’s app-wide saved context
 - `/session` — show the current session ID and saved usage
@@ -34,15 +35,39 @@ then choose a model.
 Changing provider, model or effort starts a new conversation and keeps the old
 transcript available through `/resume`.
 
+Sessions get a readable name from the first accepted message, without an extra
+model call. Rename keeps that name through later turns and resumes. The resume
+picker shows names and local dates such as Today or Yesterday, with the model
+and session ID still available. Older unnamed sessions use a display-only
+first-message fallback; browsing them does not rewrite saved files.
+
+The full-screen status shows an animated Working indicator and total elapsed
+turn time, including time spent waiting for approval. Waiting for approval and
+Cancelling have separate labels. The timer stops when the turn settles or the UI
+closes, including non-streaming requests and failed turns.
+
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
 terminal reports those modifiers. Tab completes slash commands.
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
-to preserve Shift+Enter, including on Windows Terminal 1.24. It restores the prior
+to preserve reported Enter modifiers. Physical Shift+Enter behavior on Windows
+Terminal 1.24 remains unverified after a user-reported failure. It restores the prior
 reporting mode when the UI closes. Other terminals use the supported Kitty keyboard
 protocol automatically, or Ctrl+J when modifiers are unavailable. Alt+Enter may be
 intercepted by the terminal's own fullscreen shortcut.
+The composer grows as explicit or wrapped lines are added, up to ten editable
+rows where the terminal has room. Larger drafts scroll inside the composer.
+
+If reported modifiers do not work, run `vivi --diagnose-input` by itself in the
+same terminal. It opens the normal native input transport without loading
+credentials, preferences, workspaces, sessions or providers. Press Enter,
+Shift+Enter, then Ctrl+J once each; press Escape to restore the terminal and print
+the report. It collects only those key names and modifier flags, runtime/TTY
+facts and Windows negotiation state. Ordinary typing and paste are ignored.
+Raw input logging/debug capture must be disabled. No report is saved or sent;
+review it before sharing it voluntarily. This is a diagnostic, not evidence that
+physical Shift+Enter has been fixed.
 Escape or Ctrl+C cancels a running turn; Ctrl+C while idle exits.
 In `/models`, type to filter by ID, name or provider; words can be in any order.
 Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,
@@ -51,7 +76,7 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 ### Mouse controls
 
 The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Memory or Settings above the transcript to open an action when the draft
+Effort, Memory or Settings below the composer to open an action when the draft
 is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
@@ -79,6 +104,10 @@ will succeed. Provider default sends no reasoning override. The explicit disable
 is offered only when supported, including optional OpenRouter token-budget models that
 have no named effort choices. A documented non-streaming model uses complete responses;
 unknown streaming keeps your selected stream setting.
+Saved OpenRouter selections are checked against the provider catalog before the
+first session opens, so supported workspace tools are available on the first
+turn. Explicit tools-off choices stay off; unavailable or unknown metadata stays
+chat-only unless tool support was explicitly declared for this launch.
 
 Keys can be saved in an available OS credential store or used for this launch only.
 There is no plaintext key-storage fallback. Conversations are stored locally in
@@ -223,8 +252,9 @@ Line mode supports `/skills list`, `/skills inspect NAME`, `/skills create DESCR
 To use an existing standard skills folder, pass `--skills-dir PATH`. This flag is
 repeatable up to eight roots, read-only, and never remembered in sessions or defaults.
 It authorizes only bounded discovery and inert text reads in those roots. The CLI
-never automatically scans workspace, home or repository skills. Extra roots cannot
-overlap the private state profile; move shared skills to a separate ordinary folder.
+never automatically scans workspace, home or repository skills. Extra roots overlapping the state profile are excluded with diagnostics; use a
+separate ordinary collection folder. Canonical filesystem identity handles normal
+Windows letter-case/short-path aliases without assuming a macOS volume case policy.
 Invalid documents, unsupported fields, duplicate canonical names, symlinks and
 unsafe paths are excluded with diagnostics. Original imported files/resources are
 neither rewritten nor copied. NFKC-equivalent physical directory names are read
@@ -243,7 +273,11 @@ descriptive. Chat-only models receive metadata but cannot load or save via tools
 operations anchor the destination throughout the transaction. On Windows/macOS,
 reads and creator drafts work, but `save_skill` is omitted and direct saves fail
 closed until safe native handle-relative transactions have been implemented and
-validated. Read-only platforms never create the skill store or its lock files.
+validated. Read-only platforms never create the skill store or its lock files. Manually
+created ordinary folders and 0644 text files can be read without changing their
+permissions. Unavailable owned folders and invalid import roots produce diagnostics
+while the creator and unrelated valid imports remain available. Windows reads do
+not assert a POSIX mode or an ACL guarantee.
 
 On Linux, `save_skill` writes one `SKILL.md` only in the owned store, after exact destination,
 before/after and revision review. Deny is the default; piped/queued input cannot
@@ -268,3 +302,12 @@ executable scripts, binary assets, runtimes, network tools or unavailable permis
 cannot perform those steps. Script resources may be read as text, never executed.
 No dependency installation, command execution, workspace editing, resource creation,
 deletion or builtin editing is introduced by skills.
+
+Ordinary remediation coverage includes portable format/resource/permission/root-diagnostic
+and UI cases. Linux save cases are separate. Previously restricted/adversarial filesystem
+assessment cases are explicitly skipped and unrun; no full security certification is claimed.
+Existing private Linux owned-store reads use the short exclusive lease and may wait up to
+two seconds; a unavailable/locked owned collection is diagnosed and omitted while unrelated
+imports remain usable. Manually non-private collections are read-only, and writes never
+chmod user files. File identity/time checks are operational consistency checks, not a claim
+of complete isolation from hostile same-user mutation on every filesystem.

@@ -69,7 +69,6 @@ interface SourceBinding {
   readonly rootEntry: Stats
   readonly name: string
   readonly directoryName: string
-  readonly ownedRoot: boolean
   readonly directoryEntry: Stats
   readonly revision: string
   readonly readOnly: boolean
@@ -78,7 +77,7 @@ interface Candidate { readonly source: SkillSource; readonly document: SkillDocu
 
 function missing(error: unknown): boolean { return error instanceof Error && 'code' in error && error.code === 'ENOENT' }
 function exists(error: unknown): boolean { return error instanceof Error && 'code' in error && error.code === 'EEXIST' }
-function sameFile(left: Stats, right: Stats): boolean { return left.dev === right.dev && left.ino === right.ino }
+function sameFile(left: Stats, right: Stats): boolean { return left.dev === right.dev && left.ino !== 0 && left.ino === right.ino }
 function unchanged(left: Stats, right: Stats): boolean {
   return sameFile(left, right) && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
 }
@@ -134,10 +133,6 @@ function canonicalName(name: unknown): string {
   if (name !== canonical) throw new Error('Skill save name must be canonical')
   return canonical
 }
-function containsPath(parent: string, child: string): boolean {
-  const difference = relative(parent, child)
-  return difference === '' || (!difference.startsWith(`..${sep}`) && difference !== '..' && !parse(difference).root)
-}
 function safeResource(path: string): void {
   validateSkillResourcePath(path)
   const forbidden = /^(?:\.git|\.aws|\.codex|\.env(?:[._-].*)?|credentials?(?:[._-].*)?|auth(?:[._-].*)?|tokens?(?:[._-].*)?|passwords?(?:[._-].*)?|secrets?(?:[._-].*)?|private[-_]keys?(?:[._-].*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|sessions?(?:[._-].*)?|preferences?(?:[._-].*)?|memories?(?:[._-].*)?|.*\.(?:pem|key|p12|pfx))$/iu
@@ -165,10 +160,7 @@ export class FileSkillStore implements CliSkillStore {
   constructor(directory: string, options: SkillStoreOptions = {}) {
     this.directory = resolve(directory)
     this.roots = Object.freeze([...new Set((options.readOnlyRoots ?? []).map(root => resolve(root)))])
-    const profile = dirname(this.directory)
-    if (this.roots.some(root => containsPath(profile, root) || containsPath(root, profile))) {
-      throw new Error('Additional skill roots must be separate from the owned store and its host-state profile')
-    }
+    if (this.roots.length > 8) throw new Error('At most eight explicitly supplied skill roots are supported')
     this.notice = options.notice
     this.addSecrets(options.secrets ?? [])
   }
@@ -201,7 +193,7 @@ export class FileSkillStore implements CliSkillStore {
       message = message.split(secret).join('[REDACTED]')
       message = message.split(JSON.stringify(secret).slice(1, -1)).join('[REDACTED]')
     }
-    message = message.replace(/[\u0000-\u001f\u007f]/gu, character => JSON.stringify(character).slice(1, -1))
+    message = message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)
     const result = new Error(message)
     if (error instanceof Error && error.name === 'AbortError') result.name = 'AbortError'
     return result
@@ -211,7 +203,7 @@ export class FileSkillStore implements CliSkillStore {
   }
   get diagnostics(): readonly string[] {
     return Object.freeze(this.latestDiagnostics.map(diagnostic => {
-      try { this.noSecrets(diagnostic); return `${diagnostic.name ? `${JSON.stringify(diagnostic.name)}: ` : ''}${diagnostic.message}` }
+      try { this.noSecrets(diagnostic); return `${diagnostic.name ? `${JSON.stringify(diagnostic.name).replace(/[\u0000-\u001f\u007f-\u009f]/gu, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)}: ` : ''}${diagnostic.message}` }
       catch { return 'A skill containing known credentials was excluded' }
     }))
   }
@@ -238,7 +230,14 @@ export class FileSkillStore implements CliSkillStore {
       }
     }
     const canonical = await realpath(directory.path)
-    if (resolve(canonical) !== directory.path) throw new Error('Skill roots and directories must not contain symlinks or junctions')
+    // Windows may expand 8.3 paths and normalize letter case. Identity, not
+    // byte equality (or blanket case folding on APFS), proves that this canonical
+    // spelling denotes the already checked directory. Every supplied ancestor
+    // remains independently checked for reparse/symlink entries and identity.
+    const canonicalEntry = await lstat(canonical)
+    if (!canonicalEntry.isDirectory() || canonicalEntry.isSymbolicLink() || !sameFile(canonicalEntry, directory.entry)) {
+      throw new Error('Canonical skill directory identity differs from the approved directory')
+    }
     const current = await lstat(directory.path)
     if (!sameFile(current, directory.entry) || (directory.private && !ownedPrivate(current))) {
       throw new Error('Skill directory changed or is not an owned private directory')
@@ -358,12 +357,40 @@ export class FileSkillStore implements CliSkillStore {
     if (document.warnings.length) throw new Error('Skill is read-only: unsupported frontmatter fields must be reviewed before discovery or saving')
     return document
   }
+  private async approvedExternalRoot(path: string, signal?: AbortSignal): Promise<Directory> {
+    const root = await this.openDirectory(path, false)
+    let profile: Directory | undefined
+    try {
+      let nearest = dirname(this.directory)
+      let complete = true
+      for (;;) {
+        signal?.throwIfAborted()
+        try { profile = await this.openDirectory(nearest, false); break }
+        catch (error) {
+          if (!missing(error)) throw error
+          const parent = dirname(nearest)
+          if (parent === nearest) throw error
+          nearest = parent; complete = false
+        }
+      }
+      const rootContainsProfile = profile.ancestry.some(item => sameFile(item.entry, root.entry))
+      const profileContainsRoot = complete && root.ancestry.some(item => sameFile(item.entry, profile!.entry))
+      if (rootContainsProfile || profileContainsRoot) {
+        throw new Error('Additional skill root overlaps the host-state profile; it was excluded')
+      }
+      await this.checkDirectory(root)
+      await this.checkDirectory(profile)
+      return root
+    } catch (error) { await this.closeDirectory(root); throw error }
+    finally { if (profile) await this.closeDirectory(profile) }
+  }
   private async resource(binding: SourceBinding, request: SkillReadRequest, signal: AbortSignal): Promise<string> {
-    return this.admit(signal, async () => {
+    return this.admit(signal, async (_owned, ownedError) => {
       signal.throwIfAborted()
+      if (binding.root === this.directory && ownedError) throw ownedError
       safeResource(request.path)
       if (request.name !== binding.name || request.expectedRevision !== binding.revision) throw new Error('Skill resource revision is stale')
-      const root = await this.openDirectory(binding.root, binding.ownedRoot)
+      const root = binding.root === this.directory ? await this.openDirectory(binding.root, false) : await this.approvedExternalRoot(binding.root, signal)
       const directories: Directory[] = [root]
       try {
         if (!sameFile(root.entry, binding.rootEntry)) throw new Error('Approved skill root changed; take a fresh catalog')
@@ -396,7 +423,7 @@ export class FileSkillStore implements CliSkillStore {
   }
 
   snapshot(signal?: AbortSignal): Promise<SkillCatalog> {
-    return this.admit(signal, async owned => {
+    return this.admit(signal, async (owned, ownedError) => {
       const diagnostics: SkillDiagnostic[] = []
       const candidates: Candidate[] = [{ source: skillCreatorSource, document: parseSkillDocument(skillCreatorSource.content) }]
       let considered = 1
@@ -407,12 +434,17 @@ export class FileSkillStore implements CliSkillStore {
         try { this.noSecrets(diagnostic); diagnostics.push(Object.freeze(diagnostic)) }
         catch { diagnostics.push(Object.freeze({ message: 'A skill containing known credentials was excluded' })) }
       }
-      for (const rootPath of [this.directory, ...this.roots]) {
+      if (ownedError) diagnose(`Owned skill folder unavailable: ${this.safeError(ownedError).message}`)
+      const scannedRoots = new Set<string>()
+      for (const [rootIndex, rootPath] of [this.directory, ...this.roots].entries()) {
         signal?.throwIfAborted()
         let root: Directory | undefined
         try {
-          if (rootPath === this.directory && !owned) continue
-          root = rootPath === this.directory ? owned! : await this.openDirectory(rootPath, false)
+          if (rootIndex === 0 && !owned) continue
+          root = rootIndex === 0 ? owned! : await this.approvedExternalRoot(rootPath, signal)
+          const identity = `${root.entry.dev}:${root.entry.ino}`
+          if (scannedRoots.has(identity)) { diagnose('Repeated import root denotes an already scanned directory; duplicate discovery omitted'); continue }
+          scannedRoots.add(identity)
           const names: string[] = []
           const iterator = await opendir(this.ioPath(root))
           try {
@@ -443,8 +475,9 @@ export class FileSkillStore implements CliSkillStore {
               if (total > SKILL_LIMITS.maximumTotalDocumentBytes) throw new Error('Skill total document byte limit reached')
               const document = this.document(file, name)
               const binding: SourceBinding = { root: rootPath, rootEntry: root.entry, directoryEntry: skill.entry,
-                name: document.metadata.name, directoryName: name, ownedRoot: rootPath === this.directory,
-                revision: document.revision, readOnly: rootPath !== this.directory || name !== document.metadata.name }
+                name: document.metadata.name, directoryName: name,
+                revision: document.revision, readOnly: !this.writable || rootPath !== this.directory || name !== document.metadata.name ||
+                  !ownedPrivate(root.entry) || !ownedPrivate(skill.entry) || !ownedPrivate(file.entry) }
               candidates.push({ document, binding, source: { content: file.content, readOnly: binding.readOnly,
                 readResource: (request, context) => this.resource(binding, request, context.signal) } })
             } catch (error) {
@@ -452,7 +485,7 @@ export class FileSkillStore implements CliSkillStore {
               diagnose(this.safeError(error).message, name)
             } finally { if (skill) await this.closeDirectory(skill) }
           }
-        } catch (error) { signal?.throwIfAborted(); diagnose(this.safeError(error).message) }
+        } catch (error) { signal?.throwIfAborted(); diagnose(`Root ${JSON.stringify(this.safeError(new Error(rootPath)).message)}: ${this.safeError(error).message}`) }
         finally { if (root && root !== owned) await this.closeDirectory(root) }
       }
       const counts = new Map<string, number>()
@@ -520,9 +553,9 @@ export class FileSkillStore implements CliSkillStore {
   }
   private async assertWritableName(owned: Directory, name: string, signal?: AbortSignal): Promise<void> {
     let entries = 0
-    for (const path of [this.directory, ...this.roots]) {
+    for (const [rootIndex, path] of [this.directory, ...this.roots].entries()) {
       signal?.throwIfAborted()
-      const root = path === this.directory ? owned : await this.openDirectory(path, false)
+      const root = rootIndex === 0 ? owned : await this.approvedExternalRoot(path, signal)
       try {
         const iterator = await opendir(this.ioPath(root))
         try {
@@ -530,7 +563,7 @@ export class FileSkillStore implements CliSkillStore {
             signal?.throwIfAborted()
             if (++entries > MAXIMUM_SCAN_ENTRIES) throw new Error('Skill save cannot verify normalized aliases: scan entry limit reached')
             if (entry.name.trim().normalize('NFKC') === name &&
-              (path !== this.directory || entry.name !== name)) {
+              (rootIndex !== 0 || entry.name !== name)) {
               throw new Error('Additional-root or normalized-alias skills are read-only and cannot be shadowed')
             }
           }
@@ -563,6 +596,7 @@ export class FileSkillStore implements CliSkillStore {
     let count = 2 // The immutable creator and this proposal, replacing any owned source.
     let bytes = Buffer.byteLength(creator.content, 'utf8') + Buffer.byteLength(proposal.after.content, 'utf8')
     let entries = 0
+    const countedRoots = new Set<string>()
     const summary = (document: SkillDocument, readOnly: boolean): number => Buffer.byteLength(JSON.stringify({
       name: document.metadata.name, description: document.metadata.description, revision: document.revision, readOnly
     }), 'utf8')
@@ -572,10 +606,13 @@ export class FileSkillStore implements CliSkillStore {
         summaries > SKILL_LIMITS.maximumCatalogBytes) throw new Error('Skill save exceeds the next-turn catalog count, document or summary capacity; no skill was changed')
     }
     withinLimits()
-    for (const path of [this.directory, ...this.roots]) {
+    for (const [rootIndex, path] of [this.directory, ...this.roots].entries()) {
       signal?.throwIfAborted()
-      const root = path === this.directory ? owned : await this.openDirectory(path, false)
+      const root = rootIndex === 0 ? owned : await this.approvedExternalRoot(path, signal)
       try {
+        const identity = `${root.entry.dev}:${root.entry.ino}`
+        if (countedRoots.has(identity)) continue
+        countedRoots.add(identity)
         const iterator = await opendir(this.ioPath(root))
         try {
           for await (const entry of iterator) {
@@ -583,7 +620,7 @@ export class FileSkillStore implements CliSkillStore {
             if (++entries > MAXIMUM_SCAN_ENTRIES) throw new Error('Skill save cannot verify capacity: scan entry limit reached')
             if (entry.name === LOCK || entry.name.startsWith('.skills.')) continue
             if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
-            if (path === this.directory && entry.name === proposal.name) continue
+            if (rootIndex === 0 && entry.name === proposal.name) continue
             count++
             withinLimits()
             const child = await this.childDirectory(root, entry.name)
@@ -628,7 +665,7 @@ export class FileSkillStore implements CliSkillStore {
         before: captured.before, after: captured.after, proposal: captured })
       this.noSecrets(result)
       return result
-    })
+    }, true)
   }
   private async checkTarget(directory: Directory, name: string, expected: StoredFile | undefined): Promise<void> {
     await this.checkDirectory(directory)
@@ -719,7 +756,7 @@ export class FileSkillStore implements CliSkillStore {
         if (receipt) { this.report('Skill changes committed; post-commit verification could not be completed'); return this.safeReceipt(receipt) }
         throw error
       } finally { if (directory) await this.closeDirectory(directory) }
-    })
+    }, true)
   }
   private async acquire(directory: Directory, signal?: AbortSignal): Promise<() => Promise<void>> {
     const target = join(this.ioPath(directory), LOCK)
@@ -759,21 +796,34 @@ export class FileSkillStore implements CliSkillStore {
     } catch (error) { await file.close().catch(() => undefined); await release().catch(() => undefined); throw error }
     return release
   }
-  private admit<T>(signal: AbortSignal | undefined, action: (directory: Directory | undefined) => Promise<T>): Promise<T> {
+  private admit<T>(signal: AbortSignal | undefined, action: (directory: Directory | undefined, ownedError?: Error) => Promise<T>, mutation = false): Promise<T> {
     if (this.closed) return Promise.reject(new Error('Skill store is closing; no new operations are accepted'))
     const job = this.chain.then(async () => {
       signal?.throwIfAborted()
-      // Read-only fallback platforms do not create directories or lease files.
-      // Existing roots are checked before/after reads; missing owned roots simply
-      // leave the creator and explicitly supplied imports available.
+      // Reads accept ordinary manual directory/file permissions and never chmod.
+      // Invalid/locked owned roots become diagnostics; unrelated imports and the
+      // immutable creator remain available. Only Linux writes create private roots.
       let directory: Directory | undefined
-      try { directory = await this.openDirectory(this.directory, true, this.writable) }
-      catch (error) { if (this.writable || !missing(error)) throw error }
+      let ownedError: Error | undefined
+      try { directory = await this.openDirectory(this.directory, mutation, mutation) }
+      catch (error) {
+        signal?.throwIfAborted()
+        if (mutation) throw error
+        if (!missing(error)) ownedError = this.safeError(error)
+      }
       let release: (() => Promise<void>) | undefined
       try {
-        if (directory && this.writable) release = await this.acquire(directory, signal)
+        if (directory && this.writable && (mutation || ownedPrivate(directory.entry))) {
+          try { release = await this.acquire(directory, signal) }
+          catch (error) {
+            signal?.throwIfAborted()
+            if (mutation) throw error
+            ownedError = this.safeError(error)
+            await this.closeDirectory(directory); directory = undefined
+          }
+        }
         signal?.throwIfAborted()
-        return await action(directory)
+        return await action(directory, ownedError)
       } finally {
         if (release) await release().catch(() => this.report('Skill lease cleanup failed; inspect the owning process and lock before retrying'))
         if (directory) await this.closeDirectory(directory)

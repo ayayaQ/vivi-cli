@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { main, parseArguments } from '../dist/main.js'
 import { chooseEffort, settingsForModel, DEFAULT_PREFERENCES } from '../dist/application.js'
+import { FileSkillStore } from '../dist/skills.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 import { PreferenceStore } from '../dist/preferences.js'
 import { parseModelCatalog, unknownModel } from '../dist/models.js'
@@ -75,7 +76,7 @@ test('slash provider setup masks and securely saves keys, model picker selects w
   let turns = 0
   assert.equal(await run(directory, io, services, (session, options, env) => {
     assert.equal(session.model, 'gpt-5.1'); assert.equal(env.OPENAI_API_KEY, key); assert.equal(options.enableTools, true)
-    return { generate: async input => { turns++; assert.equal(input.tools.length, 5); return answer('Hello back') } }
+    return { generate: async input => { turns++; const names = input.tools.map(tool => tool.name); for (const name of ['calculate', 'current_time', 'list_skills', 'read_skill']) assert(names.includes(name)); assert.equal(names.includes('save_skill'), new FileSkillStore(join(directory, 'agent-skills')).writable); return answer('Hello back') } }
   }), 0)
   assert.equal(turns, 1); assert.deepEqual(services.saves, [{ provider: 'openai', key }])
   assert.equal(io.secretTitles.length, 1); assert(io.protected.includes(key)); assert(!io.output.includes(key))
@@ -171,7 +172,8 @@ test('model picker reaches saved and selected IDs beyond the old 250-row cutoff 
   assert.equal(await run(directory, io, services), 0)
   assert.equal(io.searches[0].values.length, 2002)
   assert.equal(io.searches[0].values[io.searches[0].options.initialIndex].value, ids.at(-1))
-  assert.equal(services.catalogCalls.length, 1)
+  // Saved OpenRouter selections verify capabilities at startup, then /models loads its picker.
+  assert.equal(services.catalogCalls.length, 2)
   assert.equal(JSON.parse(await readFile(join(directory, 'preferences.json'))).model, '__refresh')
 })
 test('settings affect future sessions while explicit new resets transcripts and retains nonsecret setup', async t => {

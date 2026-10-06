@@ -56,6 +56,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
   --workspace PATH            Read-only folder for this launch (default: launch directory)
   --no-workspace              Disable workspace files for this launch
+  --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
@@ -70,7 +71,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
 
 Credentials: environment variables, or masked /provider setup in the full-screen UI.
 Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
-Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id and usage.
+Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its name, id and usage; /rename NAME changes its name.
 Streaming is display-only. Notes never access other files; piped approval is denied.
 Saved memory is off by default. When enabled, it is sent to the selected provider.
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
@@ -202,7 +203,24 @@ export function providerForSession(session: CliSession, options: CliOptions, env
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
   dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
-    credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string } = {}): Promise<number> {
+    credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
+    inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
+  // This isolated path never reads credentials, preferences, workspace or sessions.
+  if (args.includes('--diagnose-input')) {
+    if (args.length !== 1) { process.stderr.write('Use --diagnose-input by itself\n'); return 1 }
+    if (!dependencies.inputDiagnostic && (!supportsBunTui() || !process.stdin.isTTY || !process.stdout.isTTY)) {
+      process.stderr.write('Input diagnostics require Bun >=1.3.0 in an interactive terminal. Run vivi --diagnose-input there.\n')
+      return 1
+    }
+    try {
+      const diagnose = dependencies.inputDiagnostic ?? (await import('./input-diagnostic.js')).runInputDiagnostic
+      process.stdout.write(await diagnose())
+      return 0
+    } catch {
+      process.stderr.write('Input diagnostic failed; no input contents were saved or reported. Close this terminal tab if restoration failed.\n')
+      return 1
+    }
+  }
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
   let host: CliHost | undefined

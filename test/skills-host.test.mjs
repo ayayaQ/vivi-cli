@@ -155,3 +155,9 @@ test('read-only platform store never advertises agent saving', async () => {
   } } })
   await subject.send('Draft a skill'); assert.deepEqual(skills.operations, ['snapshot'])
 })
+
+test('disabled skills do not emit cached root diagnostics or load a catalog', async () => {
+  const skills = skillStore(), notices = []; skills.diagnostics = ['Owned skill folder unavailable: ordinary invalid collection']
+  const subject = host(skills, { enableSkills: false, onSkillsNotice: text => notices.push(text) })
+  await subject.send('Ordinary request'); assert.deepEqual(notices, []); assert.deepEqual(skills.operations, [])
+})

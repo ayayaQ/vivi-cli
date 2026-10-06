@@ -11,7 +11,8 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt } from './terminal.js'
+import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
 import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } from './models.js'
@@ -67,7 +68,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
 }
 const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
-/new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
+/new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /skills lists and inspects standard instruction-only skills, drafts a new skill with the agent, or disables skills for this launch.\n/menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
@@ -98,7 +99,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); skills.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
-  try { settings = await preferences.load() ?? settings }
+  let savedSettings: TuiPreferences | undefined
+  try { savedSettings = await preferences.load(); settings = savedSettings ? structuredClone(savedSettings) : settings }
   catch (error) { io.write('Saved defaults could not be loaded; use /provider or /resume\n'); report(error) }
   // App-wide consent belongs to the launch, not to a model's session settings.
   let activeMemory = args.includes('--enable-memory') || args.includes('--disable-memory')
@@ -142,6 +144,51 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       if (key) { register(key); env[name] = validateApiKey(key) }
       return env[name]
     } catch (error) { report(error); return undefined }
+  }
+  // OpenRouter capability metadata is live catalog data, not a persisted toggle.
+  // Hydrate it before the first fresh host, just as /models does before /new.
+  // Already-selected models in this launch need no second discovery request.
+  const hydrateModel = async (): Promise<string | false | undefined> => {
+    if (settings.provider !== 'openrouter' || knownModels.has(modelKey(settings.provider, settings.model))) return
+    const key = await loadKey(settings.provider)
+    const controller = new AbortController()
+    const dispose = io.onCancel(() => controller.abort())
+    try {
+      io.write(`Loading ${settings.provider} model capabilities…\n`)
+      const result = await catalog.list(settings.provider, key, controller.signal)
+      if (io.isClosed || controller.signal.aborted) return false
+      let notice = ''
+      for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
+      const model = result.models.find(model => model.id === settings.model)
+      if (model) {
+        const previous = settings
+        settings = settingsForModel(settings, model)
+        // A saved chat-only choice and an explicit launch opt-out remain off.
+        // Unknown tool metadata cannot promote a saved claim into permission;
+        // openSession still requires this launch's explicit --tools declaration.
+        if (model.tools === 'unknown') {
+          settings.enableTools = previous.enableTools; settings.enableNotes = previous.enableNotes
+        }
+        if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
+          savedSettings.model === settings.model && !savedSettings.enableTools &&
+          !args.includes('--tools') && !args.includes('--enable-notes')) {
+          settings.enableTools = false; settings.enableNotes = false
+        }
+        if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
+          settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
+        }
+        if (previous.reasoning !== settings.reasoning) notice += 'Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n'
+      }
+      notice += result.warning ? `${result.warning}. Using a stale cached catalog\n`
+        : result.state === 'cached' ? 'Using the cached model catalog (up to 15 minutes old)\n' : ''
+      return notice || undefined
+    } catch (error) {
+      if (io.isClosed || controller.signal.aborted) return false
+      // Authentication denial is not an offline fallback and cannot authorize a
+      // provider attempt, even when --tools was explicitly declared this launch.
+      if (modelAccessDenied(error)) throw error
+      return `${redactSecrets(error instanceof Error ? error.message : 'Model capabilities could not be loaded', secrets)}\n`
+    } finally { dispose() }
   }
   const setupProvider = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
     const provider = await io.choose('Provider', [
@@ -269,7 +316,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const selectResume = async (): Promise<string | undefined> => {
     const sessions = await listSessions(store)
     const choices = sessions.filter(session => !session.locked).map(session => ({
-      name: `${session.model} · ${session.provider}`, description: `${session.updatedAt} · ${session.id}`, value: session.id
+      name: session.title, description: `${formatSessionDate(session.updatedAt)} · ${session.model} · ${session.provider} · ${session.id}`, value: session.id
     }))
     if (!choices.length) { io.write('No unlocked valid sessions found. Check the previous process before removing a session lock\n'); return }
     return io.choose('Resume a local session', choices)
@@ -373,6 +420,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   }
   const openSession = async (selection: { resume?: string; fresh?: boolean }): Promise<boolean> => {
     if (!selection.resume && !settings.model) return false
+    const capabilityNotice = selection.resume ? undefined : await hydrateModel()
+    if (capabilityNotice === false) return false
     await host?.drainMemory()
     await host?.drainSkills()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
@@ -423,6 +472,9 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     release = nextRelease; host = nextHost
     await previousRelease?.().catch(report)
     io.setSession(host.session)
+    // Native transcript setup clears earlier loading output. Keep stale-cache
+    // disclosure visible after that rebuild and before the first provider turn.
+    if (capabilityNotice) io.write(capabilityNotice)
     return true
   }
   let workspaceNoticePending = true
@@ -452,7 +504,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
         try {
-          const result = await host.send(options.prompt, controller.signal)
+          const result = await sendChatTurn(host, io, options.prompt, controller.signal)
           if (io.failed) await io.readLine('')
           io.result(result)
           return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0
@@ -467,7 +519,9 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Continue conversation', value: 'continue' }, { name: 'Set up provider', value: '/provider' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
-          { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' }, { name: 'Skills', value: '/skills' },
+          { name: 'Rename conversation', value: '/rename' },
+          { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
+          { name: 'Skills', value: '/skills' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
         if (!action || action === 'continue') continue
@@ -481,6 +535,17 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           continue
         }
         if (command === '/resume') { const id = await selectResume(); if (id && id !== host?.session.id) selected = { resume: id }; continue }
+        if (/^\/rename(?:\s|$)/.test(command)) {
+          if (!host) { io.write('Choose a model before naming a session\n'); continue }
+          const current = host.session
+          const supplied = command.replace(/^\/rename(?:\s+|$)/, '')
+          const name = supplied || await io.askText('Session name · Escape cancels', sessionDisplayTitle(current))
+          if (name === undefined) continue
+          try { await host.renameSession(name, current.titleRevision ?? 0) }
+          finally { io.setSession(host.session) }
+          io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`)
+          continue
+        }
         if (command === '/provider') {
           const configured = await setupProvider(activeSettings ?? settings)
           if (configured) {
@@ -498,7 +563,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nSession tokens: ${formatUsage(session.usage)}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
           io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\n` : 'Workspace: disabled\n')
           continue
@@ -508,7 +573,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (!host) { io.write('Use /provider and /models before sending a message\n'); continue }
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
-        try { const result = await host.send(line, controller.signal); io.result(result); io.setSession(host.session) }
+        try { const result = await sendChatTurn(host, io, line, controller.signal); io.result(result); io.setSession(host.session) }
         finally { dispose() }
       } catch (error) { report(error) }
     }

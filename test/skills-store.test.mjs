@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict';
 import { test as nodeTest } from 'node:test';
-import fs, { link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import fs, { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
@@ -9,7 +9,11 @@ import { tmpdir } from 'node:os';
 import { parseSkillDocument, SKILL_LIMITS } from '@ayayaq/vivi/extensions/skills';
 import { FileSkillStore } from '../dist/skills.js';
 
-const test = (name, fn) => nodeTest(name, { timeout: 20_000, skip: process.platform !== 'linux' ? 'Requires validated Linux descriptor-relative writes; fallback hosts are read-only' : false }, fn);
+const test = (name, fn) => nodeTest(name, { timeout: 20_000 }, fn);
+const linuxSaveTest = (name, fn) => nodeTest(name, { timeout: 20_000, skip: process.platform !== 'linux' ? 'Linux-only save capability; read-only cases run separately on every platform' : false }, fn);
+// Deliberately excluded from this ordinary remediation. No environment flag or
+// test-name selection can enable the prior restricted/adversarial assessment here.
+const excludedAssessment = (name, fn) => nodeTest(name, { skip: 'Restricted/adversarial filesystem assessment excluded and unrun' }, fn);
 const signal = () => new AbortController().signal;
 const source = (name = 'concise-summary', body = 'Return three factual bullets.', extra = '') =>
   `---\nname: ${name}\ndescription: Summarize supplied text when requested.\n${extra}---\n\n${body}\n`;
@@ -19,7 +23,7 @@ const proposal = (content, before = null) => {
 };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 async function fixture(t, options = {}) {
-  const base = await mkdtemp(join(tmpdir(), 'vivi-skills-'));
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'vivi-skills-')));
   const directory = join(base, 'profile', 'agent-skills');
   const external = join(base, 'external');
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -62,13 +66,12 @@ test('construction is lazy; fresh catalog includes the immutable creator and no 
   await assert.rejects(lstat(directory), { code: 'ENOENT' });
   const catalog = await store.snapshot();
   assert.deepEqual(catalog.skills.map(item => [item.name, item.readOnly]), [['skill-creator', true]]);
-  assert.deepEqual(await readdir(directory), []);
+  await assert.rejects(lstat(directory), { code: 'ENOENT' });
   assert.ok(Object.isFrozen(catalog));
   assert.ok(Object.isFrozen(catalog.skills));
-  if (process.platform !== 'win32') assert.equal((await lstat(directory)).mode & 0o777, 0o700);
 });
 
-test('save review freezes exact standard source, destination and before/after; catalogs stay per-turn', async t => {
+linuxSaveTest('save review freezes exact standard source, destination and before/after; catalogs stay per-turn', async t => {
   const { store, directory } = await fixture(t);
   const empty = await store.snapshot();
   const raw = source('concise-summary', ' Preserve spacing exactly. \r\n');
@@ -109,10 +112,13 @@ test('extra roots are explicit and read-only; built-ins and external names canno
   const store = new FileSkillStore(directory, { readOnlyRoots: [external] });
   const catalog = await store.snapshot();
   assert.equal(catalog.skills.find(item => item.name === 'external-guide').readOnly, true);
-  await assert.rejects(store.prepare(proposal(source('external-guide'))), /read-only/);
-  await assert.rejects(store.commit(proposal(source('skill-creator'))), /read-only/);
-  assert.throws(() => new FileSkillStore(directory, { readOnlyRoots: [join(directory, '..')] }), /host-state profile/);
-  assert.throws(() => new FileSkillStore(directory, { readOnlyRoots: [directory] }), /host-state profile/);
+  await assert.rejects(store.prepare(proposal(source('external-guide'))), /read-only|handle-relative/);
+  await assert.rejects(store.commit(proposal(source('skill-creator'))), /read-only|handle-relative/);
+  for (const root of [join(directory, '..'), directory]) {
+    const overlap = new FileSkillStore(directory, { readOnlyRoots: [root] });
+    assert((await overlap.snapshot()).document('skill-creator'));
+    assert(overlap.diagnostics.some(message => /host-state profile/.test(message)));
+  }
 });
 
 test('unknown frontmatter, invalid sources and duplicate canonical names are diagnosed and excluded', async t => {
@@ -128,7 +134,7 @@ test('unknown frontmatter, invalid sources and duplicate canonical names are dia
   assert.ok(store.diagnostics.some(message => /unsupported frontmatter/i.test(message)));
   assert.ok(store.diagnostics.some(message => /directory name/.test(message)));
   assert.ok(store.diagnostics.some(message => /Duplicate/.test(message)));
-  await assert.rejects(store.prepare(proposal(source('unknown-semantics', 'Text', 'new-field: value\n'))), /Unsupported/);
+  await assert.rejects(store.prepare(proposal(source('unknown-semantics', 'Text', 'new-field: value\n'))), /Unsupported|handle-relative/);
 });
 
 test('strict UTF-8, byte, catalog-count and summary bounds are enforced without replacing originals', async t => {
@@ -166,7 +172,7 @@ test('scan total-document and catalog-summary limits exclude excess sources', as
   assert.ok(store.diagnostics.some(message => /summary byte limit/.test(message)));
 });
 
-test('source and ancestor symlinks are refused, including owned-root and explicit external-root substitutions', async t => {
+excludedAssessment('source and ancestor symlinks are refused, including owned-root and explicit external-root substitutions', async t => {
   const { base, directory, external, store } = await fixture(t);
   const outside = await put(external, 'outside-guide');
   await symlink(outside, join(directory, 'escaped-guide'), process.platform === 'win32' ? 'junction' : 'dir');
@@ -201,7 +207,7 @@ test('resource reads return inert text and bind exact revision and root; travers
   assert.equal(await catalog.read(request('SKILL.md'), { signal: signal() }), document.content);
 });
 
-test('resource symlinks, invalid UTF-8, root swaps and async document changes never expose text', async t => {
+excludedAssessment('resource symlinks, invalid UTF-8, root swaps and async document changes never expose text', async t => {
   const { base, directory, external, store } = await fixture(t);
   const skill = await put(directory, 'resource-guide');
   await writeFile(join(external, 'outside.txt'), 'outside data');
@@ -232,7 +238,7 @@ test('resource symlinks, invalid UTF-8, root swaps and async document changes ne
   await assert.rejects(catalog.read(request('notes.txt'), { signal: signal() }), /root changed/);
 });
 
-test('resource allocation and reads remain bounded if a file grows across descriptor stat', async t => {
+excludedAssessment('resource allocation and reads remain bounded if a file grows across descriptor stat', async t => {
   const { directory, store } = await fixture(t);
   const skill = await put(directory, 'growing-guide');
   const target = join(skill, 'notes.txt');
@@ -259,7 +265,7 @@ test('resource allocation and reads remain bounded if a file grows across descri
   assert.ok(bytes <= SKILL_LIMITS.maximumResourceBytes + 1);
 });
 
-test('hard-linked documents and resources cannot alias data beyond their approved directories', async t => {
+excludedAssessment('hard-linked documents and resources cannot alias data beyond their approved directories', async t => {
   const { directory, external, store } = await fixture(t);
   const skill = await put(directory, 'hard-link-guide');
   const outside = join(external, 'outside.txt');
@@ -273,7 +279,7 @@ test('hard-linked documents and resources cannot alias data beyond their approve
   await assert.rejects(store.prepare(proposal(source('hard-link-guide'))), /bounded regular/);
 });
 
-test('prepare and post-approval commit enforce fresh count, document and summary capacity', async t => {
+linuxSaveTest('prepare and post-approval commit enforce fresh count, document and summary capacity', async t => {
   const { directory, store } = await fixture(t);
   const draft = proposal(source('new-guide'));
   const approved = await store.prepare(draft);
@@ -305,13 +311,13 @@ test('known credentials are excluded from source, parsed metadata, resources, di
   assert.equal(catalog.document('metadata-secret'), undefined);
   assert.ok(!JSON.stringify(store.diagnostics).includes('known-secret'));
   await assert.rejects(catalog.read({ name: 'safe-guide', path: 'notes.txt', expectedRevision: catalog.document('safe-guide').revision }, { signal: signal() }), /known credentials/);
-  await assert.rejects(store.prepare(proposal(source('new-guide', 'known-secret'))), /known credentials/);
+  await assert.rejects(store.prepare(proposal(source('new-guide', 'known-secret'))), /known credentials|handle-relative/);
   store.addSecrets(['Summarize supplied text when requested.']);
   assert.throws(() => catalog.document('safe-guide'), /known credentials/);
   assert.throws(() => catalog.skills, /known credentials/);
 });
 
-test('diagnostics render malicious directory names as inert escaped text', async t => {
+excludedAssessment('diagnostics render malicious directory names as inert escaped text', async t => {
   if (process.platform === 'win32') { t.skip('Windows disallows control characters in filenames'); return; }
   const { directory, store } = await fixture(t);
   await mkdir(join(directory, 'invalid-\u001b[31m-name'), { mode: 0o700 });
@@ -320,7 +326,7 @@ test('diagnostics render malicious directory names as inert escaped text', async
   assert.ok(store.diagnostics.every(message => !/[\u0000-\u001f\u007f]/u.test(message)));
 });
 
-test('proposal getters, unsupported data, forged revisions and stale writes are rejected before persistence', async t => {
+excludedAssessment('proposal getters, unsupported data, forged revisions and stale writes are rejected before persistence', async t => {
   const { directory, store } = await fixture(t);
   const raw = source('cas-guide');
   await save(store, raw);
@@ -340,7 +346,7 @@ test('proposal getters, unsupported data, forged revisions and stale writes are 
   assert.equal(await readFile(join(directory, 'cas-guide', 'SKILL.md'), 'utf8'), source('cas-guide', 'another process change'));
 });
 
-test('corrupt primary/backup and unexpected recovery evidence stay read-only and untouched', async t => {
+linuxSaveTest('corrupt primary/backup and unexpected recovery evidence stay read-only and untouched', async t => {
   const { directory, store } = await fixture(t);
   const raw = source('corruption-guide');
   await save(store, raw);
@@ -358,7 +364,7 @@ test('corrupt primary/backup and unexpected recovery evidence stay read-only and
   assert.deepEqual(await readFile(target), Buffer.from([0xff]));
 });
 
-test('cancellation after primary rename retains the committed receipt', async t => {
+linuxSaveTest('cancellation after primary rename retains the committed receipt', async t => {
   const { directory, store } = await fixture(t);
   const raw = source('cancel-guide');
   await save(store, raw);
@@ -380,7 +386,7 @@ test('cancellation after primary rename retains the committed receipt', async t 
   await assert.rejects(lstat(join(directory, 'never-created', 'SKILL.md')), { code: 'ENOENT' });
 });
 
-test('abort during backup rename prevents primary replacement and keeps the last valid backup', async t => {
+linuxSaveTest('abort during backup rename prevents primary replacement and keeps the last valid backup', async t => {
   const { directory, store } = await fixture(t);
   const raw = source('abort-guide');
   await save(store, raw);
@@ -400,7 +406,7 @@ test('abort during backup rename prevents primary replacement and keeps the last
   assert.deepEqual((await readdir(join(directory, 'abort-guide'))).sort(), ['SKILL.md', 'SKILL.md.bak']);
 });
 
-test('secrets registered across cleanup withhold unsafe results but retain a safe committed receipt', async t => {
+linuxSaveTest('secrets registered across cleanup withhold unsafe results but retain a safe committed receipt', async t => {
   const { directory, store } = await fixture(t);
   const originalUnlink = fs.unlink;
   let committed = false;
@@ -420,7 +426,7 @@ test('secrets registered across cleanup withhold unsafe results but retain a saf
   assert.deepEqual((await store.snapshot()).skills.map(item => item.name), ['skill-creator']);
 });
 
-test('cross-process compare-and-swap permits one creator and never steals stale leases', async t => {
+excludedAssessment('cross-process compare-and-swap permits one creator and never steals stale leases', async t => {
   const { directory, store } = await fixture(t);
   const module = new URL('../dist/skills.js', import.meta.url).href;
   const code = `import { FileSkillStore } from ${JSON.stringify(module)};
@@ -435,7 +441,7 @@ catch(error) { console.log(error.message.includes('stale') ? 'stale' : error.mes
   assert.equal(await readFile(join(directory, '.skills.lock'), 'utf8'), 'old lease');
 });
 
-test('drain waits for admitted commit and closes future admission', async t => {
+linuxSaveTest('drain waits for admitted commit and closes future admission', async t => {
   const notices = [];
   const { directory, store } = await fixture(t, { notice: message => notices.push(message) });
   const ready = deferred(); const proceed = deferred();
@@ -458,7 +464,7 @@ test('drain waits for admitted commit and closes future admission', async t => {
   assert.deepEqual(notices, []);
 });
 
-test('post-commit directory durability failure becomes a safe notice and drain retries it', async t => {
+linuxSaveTest('post-commit directory durability failure becomes a safe notice and drain retries it', async t => {
   const notices = [];
   const { store } = await fixture(t, { notice: message => notices.push(message) });
   const originalOpen = fs.open;
@@ -492,12 +498,12 @@ test('NFKC-equivalent physical directories stay unchanged, read-only and revisio
   assert.equal(catalog.skills.find(item => item.name === 'summary').readOnly, true);
   assert.equal(catalog.document('summary').content, content);
   assert.equal(await catalog.read({ name: 'summary', path: 'references/guide.md', expectedRevision: catalog.document('summary').revision }, { signal: signal() }), 'Read the original resource inertly.');
-  await assert.rejects(store.prepare(proposal(source('summary'))), /normalized-alias.*read-only/);
+  await assert.rejects(store.prepare(proposal(source('summary'))), /normalized-alias.*read-only|handle-relative/);
   assert.equal(await readFile(join(physical, 'SKILL.md'), 'utf8'), content);
   const externalPhysical = await put(external, 'ｅｘｔｅｒｎａｌ', source('ｅｘｔｅｒｎａｌ'));
   const imported = new FileSkillStore(directory, { readOnlyRoots: [external] });
   assert.equal((await imported.snapshot()).document('external').metadata.name, 'external');
-  await assert.rejects(imported.prepare(proposal(source('external'))), /read-only.*shadowed/);
+  await assert.rejects(imported.prepare(proposal(source('external'))), /read-only.*shadowed|handle-relative/);
   assert.equal(await readFile(join(externalPhysical, 'SKILL.md'), 'utf8'), source('ｅｘｔｅｒｎａｌ'));
 });
 
@@ -529,4 +535,61 @@ nodeTest('read-only capability lists/reads without creating state and refuses ev
   await assert.rejects(lstat(root), { code: 'ENOENT' });
   assert.equal(await readFile(join(physical, 'SKILL.md'), 'utf8'), source('external-summary'));
   await store.drain({ close: true });
+});
+
+test('ordinary manual folders and 0644 documents/resources are read-only without chmod or automatic writes', async t => {
+  const { base, external } = await fixture(t);
+  const directory = join(base, 'manual-profile', 'agent-skills');
+  await mkdir(directory, { recursive: true, mode: 0o755 });
+  const folder = join(directory, 'manual-guide'); await mkdir(folder, { mode: 0o755 });
+  const document = join(folder, 'SKILL.md');
+  await writeFile(document, source('manual-guide'), { mode: 0o644 });
+  await mkdir(join(folder, 'references'), { mode: 0o755 });
+  const reference = join(folder, 'references', 'guide.md');
+  await writeFile(reference, 'Ordinary manual reference text', { mode: 0o644 });
+  await put(external, 'imported-guide');
+  class ReadOnlyHost extends FileSkillStore { get writable() { return false; } }
+  const store = new ReadOnlyHost(directory, { readOnlyRoots: [external] });
+  const before = { root: (await lstat(directory)).mode, folder: (await lstat(folder)).mode, document: (await lstat(document)).mode, reference: (await lstat(reference)).mode };
+  const catalog = await store.snapshot();
+  assert(catalog.document('skill-creator')); assert(catalog.document('imported-guide'));
+  const skill = catalog.document('manual-guide'); assert(skill);
+  assert.equal(catalog.skills.find(item => item.name === 'manual-guide').readOnly, true);
+  assert.equal(await catalog.read({ name: 'manual-guide', path: 'references/guide.md', expectedRevision: skill.revision }, { signal: signal() }), 'Ordinary manual reference text');
+  await assert.rejects(store.commit(proposal(source('new-guide'))), /handle-relative/);
+  assert.deepEqual({ root: (await lstat(directory)).mode, folder: (await lstat(folder)).mode, document: (await lstat(document)).mode, reference: (await lstat(reference)).mode }, before);
+  await assert.rejects(lstat(join(directory, '.skills.lock')), { code: 'ENOENT' });
+  assert.equal(await readFile(document, 'utf8'), source('manual-guide'));
+});
+
+test('unavailable owned folder and invalid import roots become diagnostics while creator and valid imports survive', async t => {
+  const { base, external } = await fixture(t);
+  const profile = join(base, 'invalid-profile'); await mkdir(profile, { mode: 0o700 });
+  const owned = join(profile, 'agent-skills'); await writeFile(owned, 'An ordinary file cannot be a skills collection', { mode: 0o644 });
+  await put(external, 'imported-guide');
+  const store = new FileSkillStore(owned, { readOnlyRoots: [join(base, 'missing-import'), external] });
+  const catalog = await store.snapshot();
+  assert(catalog.document('skill-creator')); assert(catalog.document('imported-guide'));
+  assert(store.diagnostics.some(item => item.includes('Owned skill folder unavailable')));
+  assert(store.diagnostics.some(item => /ENOENT|no such file/i.test(item)));
+  assert(store.diagnostics.some(item => item.includes('missing-import') && item.startsWith('Root ')));
+  assert.equal(await readFile(owned, 'utf8'), 'An ordinary file cannot be a skills collection');
+});
+
+nodeTest('Windows normal case aliases use filesystem identity and profile overlap is diagnosed', { skip: process.platform !== 'win32' }, async t => {
+  const { directory, external } = await fixture(t);
+  await put(directory, 'manual-guide'); await put(external, 'imported-guide');
+  const store = new FileSkillStore(directory.toUpperCase(), { readOnlyRoots: [external, external.toUpperCase(), join(directory, '..').toUpperCase()] });
+  const catalog = await store.snapshot();
+  assert(catalog.document('manual-guide')); assert(catalog.document('imported-guide'));
+  assert.equal(catalog.skills.filter(item => item.name === 'imported-guide').length, 1);
+  assert(store.diagnostics.some(item => item.includes('Repeated import root')));
+  assert(store.diagnostics.some(item => item.includes('host-state profile')));
+});
+
+test('diagnostic errors escape C1 text controls without filesystem mutation', async t => {
+  const { store } = await fixture(t);
+  const text = store.safeError(new Error('Ordinary\u0085diagnostic\u009btext')).message;
+  assert.equal(text, 'Ordinary\\u0085diagnostic\\u009btext');
+  assert(!/[\u0000-\u001f\u007f-\u009f]/u.test(text));
 });

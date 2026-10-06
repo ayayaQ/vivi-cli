@@ -46,3 +46,14 @@ test('oversized skill review fails closed rather than showing an approving trunc
   expect(await f.frame()).toContain('exact review exceeds')
   expect(f.setup.renderer.root.findDescendantById('vivi-picker-box')!.visible).toBe(false)
 })
+
+test('40-column footer retains compact hints rather than clipping fixed action buttons', async () => {
+  const setup = await createTestRenderer({ width: 40, height: 24, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' });
+  const io = new OpenTuiIO(setup.renderer); instances.push(io);
+  const reading = io.readLine('Message');
+  await setup.renderOnce(); await setup.renderOnce();
+  expect(setup.renderer.root.findDescendantById('vivi-actions')!.visible).toBe(false);
+  expect(setup.captureCharFrame()).toContain('Enter send');
+  io.close(); expect(await reading).toBeUndefined();
+});

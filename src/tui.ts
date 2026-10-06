@@ -17,12 +17,17 @@ import type { ApprovalRequest } from './tools.js'
 import { matchingChoiceIndices } from './picker.js'
 import { createWindowsInputBridge } from './windows-input.js'
 import type { WindowsInputBridge } from './windows-input.js'
+import { inputProbe } from './input-diagnostic.js'
+import type { InputDiagnosticReport, InputProbe } from './input-diagnostic.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
+import { RunStatus } from './run-status.js'
+import type { RunClock, RunOutcome } from './run-status.js'
+import { sessionDisplayTitle } from './session-display.js'
 
 export type { Choice } from './picker.js'
-export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[] }
+export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
 
 export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: '#18181b',
   foreground: '#e4e4e7', selectedBackground: '#3d2946' } as const
@@ -32,6 +37,7 @@ export const SLASH_COMMANDS = [
   { command: '/effort', description: 'Choose reasoning effort' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
+  { command: '/rename', description: 'Rename the current session' },
   { command: '/settings', description: 'Change future defaults' },
   { command: '/memories', description: 'Manage app-wide saved context' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
@@ -52,12 +58,21 @@ const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
 const MAX_ENTRIES = 256
 const MAX_QUERY = 200
+const statusSegments = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
 /** Conservative cell budget keeps wide Unicode paths on one terminal row. */
-function fitStatusColumns(text: string, columns: number): string {
-  const characters = [...text]
-  const width = (character: string): number => character.codePointAt(0)! <= 0x7f ? 1 : 2
+function fitStatusColumns(text: string, columns: number, keepStart = false): string {
+  const characters = [...statusSegments.segment(text)].map(item => item.segment)
+  const width = (character: string): number => [...character].reduce((total, point) => total + (point.codePointAt(0)! <= 0x7f ? 1 : 2), 0)
   if (characters.reduce((total, character) => total + width(character), 0) <= columns) return text
   if (columns < 2) return columns > 0 ? '…' : ''
+  if (keepStart) {
+    let prefix = '', used = 0
+    for (const character of characters) {
+      if (used + width(character) > columns - 2) break
+      prefix += character; used += width(character)
+    }
+    return `${prefix}…`
+  }
   const leftBudget = Math.ceil((columns - 2) / 2), rightBudget = Math.floor((columns - 2) / 2)
   let left = '', right = '', used = 0
   for (const character of characters) {
@@ -175,6 +190,7 @@ export class OpenTuiIO implements ChatIO {
   private changingInput = false
   private cancelCallbacks = new Set<() => void>()
   private status = 'Ready'
+  private readonly runStatus: RunStatus
   private workspaceDirectory: string | undefined
   private workspaceStatus = false
   private sessionTitle = 'vivi · fresh conversation'
@@ -184,11 +200,18 @@ export class OpenTuiIO implements ChatIO {
   private streamed = ''
   private streamOverflow = false
   private windowsInput: WindowsInputBridge | undefined
+  private diagnosticKey: ((key: KeyEvent) => void) | undefined
+  private finishDiagnostic: (() => void) | undefined
 
   private readonly keyHandler = (key: KeyEvent): void => {
     try { this.handleKey(key) } catch (error) { this.errorHandler({ error }) }
   }
-  private readonly frameHandler = (event: { frameId: number }): void => { this.lastRenderedFrame = event.frameId }
+  private readonly frameHandler = (event: { frameId: number }): void => {
+    this.lastRenderedFrame = event.frameId
+    // Native undo/deletion notifications can precede the new buffer contents.
+    // Reconcile after a completed frame as well as at ordinary edit callbacks.
+    this.updateComposerLayout()
+  }
   private readonly focusHandler = (): void => { this.mouseActivation.clear() }
   private readonly blurHandler = (): void => {
     this.mouseActivation.clear()
@@ -198,10 +221,12 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     this.updateActionBar()
     this.updateApprovalLayout()
+    this.updateHeader()
     if (this.workspaceStatus) this.updateStatus()
     this.renderDialogActions()
     if (this.searchPicker) this.renderSearchPicker(false)
     if (this.completions.length) this.renderCompletions()
+    this.updateComposerLayout()
   }
   private readonly pasteHandler = (event: PasteEvent): void => {
     try { this.handlePaste(event) } catch (error) { this.errorHandler({ error }) }
@@ -238,6 +263,7 @@ export class OpenTuiIO implements ChatIO {
   }
 
   constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}) {
+    this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
     this.secrets = [...new Set(options.secrets ?? [])].filter(Boolean).sort((a, b) => b.length - a.length)
     this.stream = options.stream ?? true
     if (renderer.isDestroyed) throw new Error('Cannot use a destroyed OpenTUI renderer')
@@ -306,8 +332,8 @@ export class OpenTuiIO implements ChatIO {
       this.pickerBox = new BoxRenderable(renderer, { id: 'vivi-picker-box', visible: false,
         height: 8, flexShrink: 0, flexDirection: 'column', border: true, borderColor: TUI_THEME.lavender,
         titleColor: TUI_THEME.lavender, paddingX: 1 })
-      for (const child of [this.header, this.actionBar, this.transcript, this.statusLine, this.pickerBox,
-        this.completionBox, this.composerBox, this.hintLine]) this.shell.add(child)
+      for (const child of [this.header, this.transcript, this.statusLine, this.pickerBox,
+        this.completionBox, this.composerBox, this.actionBar, this.hintLine]) this.shell.add(child)
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
       renderer.keyInput.on('paste', this.pasteHandler)
@@ -363,6 +389,32 @@ export class OpenTuiIO implements ChatIO {
   get failed(): boolean { return this.failure !== undefined }
   get isClosed(): boolean { return this.closed }
 
+  /** Explicit offline probe. No editable text, provider or session is opened. */
+  async diagnoseInput(): Promise<InputDiagnosticReport> {
+    if (this.closed || this.pending || this.diagnosticKey) throw new Error('Input diagnostic requires a fresh surface')
+    const bridge = this.windowsInput
+    const probes: InputProbe[] = []
+    this.write('Offline input probe: press Enter, Shift+Enter, then Ctrl+J, once each. Press Escape to finish.\nOnly these key names and modifiers are collected. Ordinary typing and paste are ignored.\n')
+    return new Promise(resolve => {
+      this.finishDiagnostic = (): void => {
+        this.finishDiagnostic = undefined
+        this.diagnosticKey = undefined
+        resolve({ platform: process.platform, nodeCompatibilityVersion: process.versions.node,
+          ...(process.versions.bun ? { bun: process.versions.bun } : {}),
+          stdinTTY: process.stdin.isTTY === true, stdoutTTY: process.stdout.isTTY === true,
+          ...(bridge ? { windows: bridge.diagnostic } : {}), probes, failed: this.failed })
+      }
+      this.diagnosticKey = (key): void => {
+        if (key.name === 'escape' || key.name === 'c' && key.ctrl) { this.close(); return }
+        const probe = inputProbe(key)
+        if (probe && probes.length < 32) {
+          probes.push(probe)
+          this.updateStatus(`Input probe: ${probes.length} known key events collected · Escape finishes`)
+        }
+      }
+    })
+  }
+
   /** Register credentials before any provider output can reach the surface. */
   addSecrets(secrets: readonly string[]): void {
     this.secrets = [...new Set([...this.secrets, ...secrets])].filter(Boolean).sort((a, b) => b.length - a.length)
@@ -372,7 +424,7 @@ export class OpenTuiIO implements ChatIO {
     this.entries = this.entries.map(redactEntry)
     this.resultNotices = this.resultNotices.map(redactEntry)
     this.sessionTitle = this.safe(this.sessionTitle, 4096)
-    this.header.content = this.sessionTitle
+    this.updateHeader()
     this.composerBox.title = this.safe(this.composerBox.title ?? '', 4096)
     this.pickerBox.title = this.safe(this.pickerBox.title ?? '', 4096)
     if (this.picker) this.picker.options = this.picker.options.map((option) => ({ ...option,
@@ -398,7 +450,29 @@ export class OpenTuiIO implements ChatIO {
   }
   private updateActionBar(): void {
     if (this.actionBar) this.actionBar.visible = this.pending?.kind === 'chat' &&
-      !this.cancelCallbacks.size && !this.completions.length && this.renderer.terminalWidth >= 40 && this.renderer.terminalHeight >= 14
+      !this.cancelCallbacks.size && !this.completions.length && this.renderer.terminalWidth >= 48 && this.renderer.terminalHeight >= 14
+    // The actions occupy the footer row formerly used by chat shortcut hints.
+    // Modal input still has its own explicit confirmation/navigation guidance.
+    if (this.hintLine) this.hintLine.visible = !this.actionBar?.visible
+    this.updateComposerLayout()
+  }
+  private updateComposerLayout(): void {
+    if (!this.composer || !this.composerBox || this.closed) return
+    const kind = this.pending?.kind
+    const multiline = kind === 'chat' || kind === 'text'
+    // Measure wrapped terminal cells using the same native editor as the draft.
+    // Its current viewport only counts visible lines, so measuring the complete
+    // buffer is essential for both explicit newlines and long wrapped lines.
+    const width = Math.max(1, this.renderer.terminalWidth - 4) // border + padding
+    const measured = multiline ? this.composer.editorView.measureForDimensions(width, 65536)?.lineCount : 2
+    const otherRows = this.shell.getChildren().reduce((rows, child) => child.visible &&
+      child !== this.transcript && child !== this.composerBox ? rows + Number(child.height) : rows, 0)
+    // Keep a transcript viewport and leave bounded drafts scrollable. Tiny
+    // terminals can reduce the two-row idle composer to one editable row.
+    const maximum = Math.max(1, Math.min(10, this.renderer.terminalHeight - otherRows - 4))
+    const height = multiline ? Math.min(maximum, Math.max(2, measured ?? this.composer.lineCount)) : Math.min(2, maximum)
+    if (this.composer.height !== height) this.composer.height = height
+    if (this.composerBox.height !== height + 2) this.composerBox.height = height + 2
   }
   private mouseButton(id: string, label: string, activate: () => void): TextRenderable {
     const button = new TextRenderable(this.renderer, { id, content: ` ${label} `, width: label.length + 2,
@@ -494,8 +568,16 @@ export class OpenTuiIO implements ChatIO {
     const folder = this.workspaceDirectory === undefined ? 'disabled'
       : `${fitStatusColumns(this.safe(JSON.stringify(this.workspaceDirectory)), Math.max(0, columns - 23))} · read only`
     const workspace = this.workspaceStatus ? `\n${fitStatusColumns(`Workspace: ${folder}`, columns)}` : ''
-    const summary = this.workspaceStatus ? fitStatusColumns(this.status.replace(/[\t\n]+/g, ' '), columns) : this.status
+    const run = this.runStatus.label
+    const detail = this.status.startsWith('Tool running:') ? ` · ${this.status}` : ''
+    const summaryText = run === undefined ? this.status : `${run}${detail}`
+    const summary = this.workspaceStatus || run !== undefined ? fitStatusColumns(summaryText.replace(/[\t\n]+/g, ' '), columns) : summaryText
     this.statusLine.content = `${summary}${workspace}\n${this.usageScope} tokens: ${formatUsage(this.usage)}`
+  }
+  private updateHeader(): void {
+    if (this.closed) return
+    this.header.content = this.sessionTitle.split('\n').map((line, index) =>
+      fitStatusColumns(line, Math.max(1, this.renderer.terminalWidth), index === 0)).join('\n')
   }
   private disableComposer(): void {
     this.composer?.blur()
@@ -511,6 +593,7 @@ export class OpenTuiIO implements ChatIO {
     if (!this.composer || this.composer.isDestroyed) return
     this.changingInput = true
     try { this.composer.setText('') } finally { this.changingInput = false }
+    this.updateComposerLayout()
   }
   private inputChanged(): void {
     if (this.closed || this.changingInput) return
@@ -527,6 +610,7 @@ export class OpenTuiIO implements ChatIO {
     }
     if (this.searchPicker) this.renderSearchPicker(this.composer.plainText !== this.searchPicker.query)
     else this.updateCompletions()
+    this.updateComposerLayout()
   }
   private renderSearchPicker(queryChanged: boolean): void {
     const search = this.searchPicker
@@ -651,6 +735,7 @@ export class OpenTuiIO implements ChatIO {
   private handlePaste(event: PasteEvent): void {
     this.mouseActivation.clear()
     this.consume(event)
+    if (this.diagnosticKey) return
     if (!this.pending?.armed || this.closed || this.pending.kind === 'choice') return
     if (this.cancelCallbacks.size && this.pending.kind !== 'approval') return
     if (this.pending.kind === 'approval') {
@@ -669,6 +754,7 @@ export class OpenTuiIO implements ChatIO {
   private handleKey(key: KeyEvent): void {
     this.mouseActivation.clear()
     if (this.closed) { this.consume(key); return }
+    if (this.diagnosticKey) { this.consume(key); this.diagnosticKey(key); return }
     if (key.eventType === 'release') { this.consume(key); return }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
       this.consume(key)
@@ -744,6 +830,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.pending?.kind === 'approval') this.pending.finish(undefined)
     this.clearInput()
     if (this.cancelCallbacks.size) {
+      this.runStatus.setPhase('cancelling')
       this.updateStatus('Cancelling…')
       for (const callback of [...this.cancelCallbacks]) callback()
     } else if (!escape) this.close()
@@ -776,6 +863,11 @@ export class OpenTuiIO implements ChatIO {
     if (this.failure) return Promise.reject(this.failure)
     if (this.closed) return Promise.resolve(undefined)
     if (signal?.aborted) return kind === 'chat' ? Promise.reject(new Error('Input cancelled')) : Promise.resolve(undefined)
+    if (kind !== 'chat' && !this.runStatus.running && this.runStatus.label !== undefined) {
+      this.runStatus.reset()
+      if (['Completed', 'Cancelled', 'Error'].includes(this.status)) this.status = 'Ready'
+      this.updateStatus()
+    }
     this.pending?.finish(undefined)
     this.mouseActivation.clear()
     this.clearInput()
@@ -956,11 +1048,28 @@ export class OpenTuiIO implements ChatIO {
     this.pickerBox.title = 'Review this change (default: deny)'
     this.pickerBox.height = 3
     this.pickerBox.visible = true
-    const reply = await answer
-    return reply === 'allow' && !signal.aborted && !this.closed
+    this.runStatus.setPhase('waiting_approval')
+    try {
+      const reply = await answer
+      return reply === 'allow' && !signal.aborted && !this.closed
+    } finally {
+      this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
+      if (!this.closed && !this.runStatus.running) this.updateStatus('Ready')
+    }
+  }
+  runStarted(): void {
+    if (this.closed) return
+    this.runStatus.start()
+    this.updateStatus('Working · Escape / Ctrl+C cancels')
+  }
+  runFinished(outcome: RunOutcome): void {
+    if (this.closed) return
+    this.runStatus.finish(outcome)
+    this.updateStatus(outcome === 'completed' ? 'Completed' : outcome === 'cancelled' ? 'Cancelled' : 'Error')
   }
   onCancel(callback: () => void): () => void {
     if (this.closed) { callback(); return () => undefined }
+    if (!this.runStatus.running) this.runStatus.reset()
     this.cancelCallbacks.add(callback)
     this.mouseActivation.clear()
     this.updateActionBar()
@@ -1040,9 +1149,10 @@ export class OpenTuiIO implements ChatIO {
   }
   setDraft(provider: CliProviderName): void {
     if (this.closed) return
+    this.runStatus.reset()
     this.sessionId = undefined
     this.sessionTitle = `vivi · fresh conversation · ${provider} · choose a model with /models`
-    this.header.content = this.sessionTitle
+    this.updateHeader()
     this.clearStream()
     this.entries = []
     this.resultNotices = []
@@ -1062,13 +1172,14 @@ export class OpenTuiIO implements ChatIO {
   setSession(session: CliSession): void {
     if (this.closed) return
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
+      this.runStatus.reset()
       this.resultNotices = []
       this.clearStream()
       this.status = 'Ready'
     }
     this.sessionId = session.id
-    this.sessionTitle = this.safe(`vivi · ${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}\nSession ${session.id}`, 4096)
-    this.header.content = this.sessionTitle
+    this.sessionTitle = this.safe(`vivi · ${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}\n${sessionDisplayTitle(session)} · Session ${session.id}`, 4096)
+    this.updateHeader()
     this.usage = { ...session.usage }
     this.usageScope = 'Session'
     this.entries = [...this.historyEntries(session.history), ...this.resultNotices]
@@ -1127,6 +1238,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus(`Tool running: ${event.call.name}`)
       this.appendEntry({ label: 'Tool activity', content: `${event.call.name} · running`, markdown: false })
     } else if (event.type === 'tool_completed') {
+      this.updateStatus('Working')
       this.appendEntry({ label: `Tool ${event.message.name} · ${event.message.isError ? 'error' : 'done'}`,
         content: event.message.content, markdown: false })
     } else if (event.type === 'round_completed') {
@@ -1153,6 +1265,7 @@ export class OpenTuiIO implements ChatIO {
   private dispose(destroyRenderer: boolean): void {
     if (this.closed) return
     this.closed = true
+    this.runStatus.reset()
     // Pending input is settled before the native widgets disappear.
     this.pending?.finish(undefined)
     for (const callback of [...this.cancelCallbacks]) {
@@ -1179,6 +1292,7 @@ export class OpenTuiIO implements ChatIO {
     catch { this.failure ??= new Error('Windows console reporting restoration failed') }
     this.windowsInput = undefined
     if (destroyRenderer && !this.renderer.isDestroyed) this.renderer.destroy()
+    this.finishDiagnostic?.()
   }
   close(): void { this.dispose(true) }
 }
