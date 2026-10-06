@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.4.0'
-const coreIntegrity = 'sha512-dejKuQcP5YxHuiqL16Vbg7h36mNkruZhEOyyt4ErjOAKxL/Cr9DXjvr+rPDvcjcASWYJ0/jzRpWCbt/eeQkglg=='
+const coreVersion = '0.5.0'
+const coreIntegrity = 'sha512-9Y8PJF4EGKEJRfNoP1adJ3zhCe3mGebSl9bX3u6RmBPC6IOzflAo6wJyFeZV4JLsgFrfMzi0WrGMCYRbNeXPmA=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -54,7 +54,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.4.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.5.0 release bytes')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -85,12 +85,15 @@ try {
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts',
-    'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts']) assert(paths.has(path), `Missing ${path}`)
+    'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
+    'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
     'dist/cjs/extensions.js', 'dist/cjs/extensions/calculator.js',
     'CAPABILITIES.md', 'examples/model-capabilities.mjs', 'src/providers/models.ts',
+    'examples/memory.mjs', 'src/extensions/memory.ts', 'dist/extensions/memory.js', 'dist/extensions/memory.d.ts',
+    'dist/cjs/extensions/memory.js', 'dist/cjs/extensions/memory.d.ts',
     'dist/providers/models.js', 'dist/providers/models.d.ts',
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
@@ -152,10 +155,11 @@ import { createRequire } from 'node:module'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
+import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContext } from '@ayayaq/vivi/extensions/memory'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
@@ -200,6 +204,26 @@ try {
   assert.deepEqual(aggregateUsage([result.usage, result.usage]),
     { inputTokens: 6, outputTokens: 4, totalTokens: 14, cachedInputTokens: 0 })
   assert.match(formatUsage(result.usage), /Cache input: read 0 \\/ write unreported/)
+  const memory = new FileMemoryStore(directory)
+  const prepared = await memory.prepareCreate('Packed persistent preference', 'user')
+  await memory.commit(prepared)
+  assert.equal((await memory.list()).memories[0].content, 'Packed persistent preference')
+  const memoryHost = await CliHost.create({ store: new FileSessionStore(directory),
+    memory, enableMemory: true, enableTools: false,
+    settings: { provider: 'openai', model: 'fake' },
+    provider: { generate: async ({ messages, tools }) => {
+      assert.deepEqual(tools, [])
+      assert.match(messages[1].content, /Packed persistent preference/)
+      return { content: 'Packed context works', toolCalls: [] }
+    } } })
+  const memoryResult = await memoryHost.send('Use opted-in context')
+  assert.deepEqual(memoryResult.history.map(message => message.content), ['Use opted-in context', 'Packed context works'])
+  assert.deepEqual((await new FileSessionStore(directory).load(memoryHost.session.id)).history, memoryResult.history)
+  await memoryHost.drainMemory()
+  const cjsMemory = createRequire(import.meta.url)('@ayayaq/vivi/extensions/memory')
+  assert.equal(cjsMemory.encodeMemories(cjsMemory.decodeMemories('{"version":1,"memories":[]}')), encodeMemories(decodeMemories('{"version":1,"memories":[]}')))
+  assert.equal(cjsMemory.formatMemoryContext([]), formatMemoryContext([]))
+  assert.equal(typeof createMemoryService, 'function')
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
@@ -222,7 +246,7 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, FileMemoryStore, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
@@ -235,6 +259,9 @@ const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
 session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
 const usageText: string = formatUsage(aggregateUsage([session.usage, undefined]))
 const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
+const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
+const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
+void memory; void change
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
 const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }

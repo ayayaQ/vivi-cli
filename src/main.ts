@@ -9,12 +9,14 @@ import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers/openrouter'
 import type { ModelProvider } from '@ayayaq/vivi'
 import { CliHost } from './host.js'
+import { FileMemoryStore } from './memory.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { TerminalIO, runChatLoop } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
 import type { Catalog } from './models.js'
+import { documentedOpenAIModel } from './models.js'
 import type { CredentialStore } from './credentials.js'
 
 export interface CliOptions {
@@ -27,6 +29,7 @@ export interface CliOptions {
   stream: boolean
   tui: boolean
   enableNotes: boolean
+  enableMemory: boolean
   enableTools: boolean
   startNew: boolean
   maxRounds: number
@@ -51,6 +54,8 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
   --tools / --no-tools        Declare tool support / use chat only
   --enable-notes              Enable session-only revisioned notes with allow/deny prompts
+  --enable-memory             Use reviewed app-wide saved context (plaintext local storage)
+  --disable-memory            Override saved memory defaults for this launch
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
   --help                      Show this help
 
@@ -58,13 +63,15 @@ Credentials: environment variables, or masked /provider setup in the full-screen
 Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its id and usage.
 Streaming is display-only. Notes never access other files; piped approval is denied.
+Saved memory is off by default. When enabled, it is sent to the selected provider.
+/memories lists, adds, edits, deletes, enables or disables saved memory.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv = process.env,
   interactiveSetup = false): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    stream: true, tui: true, enableNotes: false, enableTools: true, startNew: false, maxRounds: 25, help: false
+    stream: true, tui: true, enableNotes: false, enableMemory: false, enableTools: true, startNew: false, maxRounds: 25, help: false
   }
   let explicitlyNew = false
   for (let index = 0; index < args.length; index++) {
@@ -102,6 +109,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--tui': options.tui = true; break
       case '--no-tui': options.tui = false; break
       case '--enable-notes': options.enableNotes = true; break
+      case '--enable-memory': options.enableMemory = true; break
+      case '--disable-memory': options.enableMemory = false; break
       case '--tools': options.enableTools = true; break
       case '--no-tools': options.enableTools = false; break
       case '--max-rounds': {
@@ -164,6 +173,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     credentials?: CredentialStore; catalog?: Catalog } = {}): Promise<number> {
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
+  let host: CliHost | undefined
   const secrets = environmentSecrets(env)
   try {
     const interactive = dependencies.tuiIO !== undefined || (!dependencies.io && Boolean(process.stdin.isTTY && process.stdout.isTTY) &&
@@ -185,15 +195,21 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
     const store = new FileSessionStore(options.sessionDirectory, secrets)
+    const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
     const fresh = options.resume ? undefined : newSession({
       provider: options.provider ?? 'openai', model: options.model!,
       ...(options.reasoning ? { reasoning: options.reasoning } : {})
     })
     release = await store.acquire(options.resume ?? fresh!.id)
     const session = options.resume ? await store.load(options.resume) : fresh!
-    const provider = (dependencies.providerFactory ?? providerForSession)(session, options, env)
-    const host = new CliHost({ provider, store, session, secrets, enableNotes: options.enableNotes,
-      enableTools: options.enableTools,
+    const metadata = session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined
+    const enableTools = !args.includes('--no-tools') && (metadata?.tools === 'supported' ||
+      metadata?.tools !== 'unsupported' && (args.includes('--tools') || args.includes('--enable-notes')))
+    const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
+    const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
+    host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
+      enableTools, enableMemory: options.enableMemory, memory,
+      onMemoryNotice: message => io!.write(`${message}\n`),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
     await store.save(host.session)
@@ -206,6 +222,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     else process.stderr.write(`${message}\n`)
     return 1
   } finally {
+    await host?.drainMemory().catch(() => undefined)
     await release?.().catch(() => undefined)
     io?.close()
   }

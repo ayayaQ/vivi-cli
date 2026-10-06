@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { main, parseArguments } from '../dist/main.js'
@@ -142,7 +142,7 @@ test('catalog failure keeps saved selection explicit and downgrades unknown capa
   await new PreferenceStore(directory).save({ ...base, enableTools: true })
   const io = fakeIO([true], [], ['/models', '/exit']), seen = []
   assert.equal(await run(directory, io, services, (_s, options) => { seen.push(options.enableTools); return defaultFactory() }), 0)
-  assert.deepEqual(seen, [true, false]); assert.match(io.output, /Catalog offline/)
+  assert.deepEqual(seen, [false, false]); assert.match(io.output, /Catalog offline/)
 })
 test('live model picker gets the full catalog and retains the query across explicit refresh', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'alpha' }, { id: 'beta' }])
@@ -170,7 +170,7 @@ test('model picker reaches saved and selected IDs beyond the old 250-row cutoff 
 test('settings affect future sessions while explicit new resets transcripts and retains nonsecret setup', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'new-model' }])
   await new PreferenceStore(directory).save(base)
-  const io = fakeIO(['openai', 'current', 'new-model', 'default'], [], ['First', '/settings', 'Still first', '/new', 'Second', '/exit']), models = []
+  const io = fakeIO(['openai', 'current', 'new-model', 'default', false], [], ['First', '/settings', 'Still first', '/new', 'Second', '/exit']), models = []
   assert.equal(await run(directory, io, services, session => ({ generate: async () => { models.push(session.model); return answer('Done') } }), [], { OPENAI_API_KEY: 'fake-key' }), 0)
   assert.deepEqual(models, ['saved-model', 'saved-model', 'new-model'])
 })
@@ -388,4 +388,141 @@ test('unknown streaming retains the user toggle while documented unsupported str
     }, ['--resume', saved.id]), 0)
     assert.equal((await new PreferenceStore(directory).load()).stream, stream)
   }
+})
+
+async function seedMemory(directory, content = 'I prefer concise replies') {
+  await writeFile(join(directory, 'memories.json'), JSON.stringify({ version: 1, memories: [{ id: 'seed-memory', content,
+    createdAt: '2026-10-01', updatedAt: '2026-10-01', createdBy: 'user', updatedBy: 'user' }] }), { mode: 0o600 })
+}
+const hasMemory = input => input.messages.some(message => message.content.includes('I prefer concise replies'))
+
+test('default-off TUI memory manager reads no store and Back leaves corrupt evidence untouched', async t => {
+  const directory = await fixture(t)
+  await new PreferenceStore(directory).save(base)
+  await writeFile(join(directory, 'memories.json'), 'corrupt evidence', { mode: 0o600 })
+  const io = fakeIO(['back'], [], ['/memories', 'Hello', '/exit'])
+  assert.equal(await run(directory, io, fakeServices(), () => ({ generate: async input => {
+    assert.equal(hasMemory(input), false); assert.deepEqual(input.tools, []); return answer('Done')
+  } })), 0)
+  assert.equal(await readFile(join(directory, 'memories.json'), 'utf8'), 'corrupt evidence')
+  assert(!(await readdir(directory)).some(name => name.includes('memories.json.') || name.endsWith('.lock')))
+  assert.match(io.choices[0].title, /disabled for this launch/)
+  assert(io.choices[0].values.some(choice => choice.value === 'on'))
+  assert(!io.choices[0].values.some(choice => choice.value === 'add'))
+})
+
+test('app-wide memory opt-in survives new, model, other-provider resume and provider transitions without entering history', async t => {
+  const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5.1' }, { id: 'gpt-5' }])
+  await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1', enableMemory: true })
+  await seedMemory(directory)
+  const original = newSession({ provider: 'openrouter', model: 'original-other-model' })
+  await new FileSessionStore(directory).save(original)
+  const io = fakeIO(['gpt-5', original.id, 'openrouter', 'current', 'gpt-5'], [],
+    ['First', '/new', 'Second', '/models', 'Third', '/resume', 'Fourth', '/provider', 'Fifth', '/exit'])
+  const launches = []
+  assert.equal(await run(directory, io, services, (session, options) => {
+    launches.push([session.provider, session.model, options.enableMemory])
+    return { generate: async input => { assert.equal(hasMemory(input), true); return answer('Done') } }
+  }, [], { OPENAI_API_KEY: 'fake-openai-key', OPENROUTER_API_KEY: 'fake-router-key' }), 0)
+  assert.equal(launches.length, 5); assert(launches.every(([, , enabled]) => enabled))
+  assert.deepEqual(launches[3].slice(0, 2), ['openrouter', 'original-other-model'])
+  assert.equal(io.results.length, 5)
+  for (const session of io.sessions) assert(!session.history.some(message => message.content.includes('Saved user memories')))
+  assert.equal((await new PreferenceStore(directory).load()).enableMemory, true)
+})
+
+test('explicit disable overrides saved default and /memories toggles only this launch across new sessions', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save({ ...base, enableMemory: true })
+  await seedMemory(directory)
+  const io = fakeIO(['on', 'back', 'off', 'back'], [], ['Before', '/memories', 'Enabled', '/new', 'Still enabled', '/memories', 'Disabled', '/new', 'Still disabled', '/exit'])
+  const seen = []
+  assert.equal(await run(directory, io, services, () => ({ generate: async input => { seen.push(hasMemory(input)); return answer('Done') } }), ['--disable-memory']), 0)
+  assert.deepEqual(seen, [false, true, true, false, false])
+  assert.equal((await new PreferenceStore(directory).load()).enableMemory, true)
+  assert.equal(JSON.parse(await readFile(join(directory, 'memories.json'), 'utf8')).memories.length, 1)
+  assert.match(io.output, /existing records retained/)
+})
+
+test('future memory defaults stay distinct from current launch through /settings and /new', async t => {
+  for (const active of [false, true]) {
+    const directory = await fixture(t), services = fakeServices([{ id: 'future-selected' }])
+    await new PreferenceStore(directory).save({ ...base, enableMemory: active })
+    await seedMemory(directory)
+    const io = fakeIO(['openai', 'current', 'future-selected', 'default', !active], [], ['First', '/settings', 'Still first', '/new', 'Second', '/exit'])
+    const seen = []
+    assert.equal(await run(directory, io, services, () => ({ generate: async input => { seen.push(hasMemory(input)); return answer('Done') } }), [], { OPENAI_API_KEY: 'fake-key' }), 0)
+    assert.deepEqual(seen, [active, active, active])
+    assert.equal((await new PreferenceStore(directory).load()).enableMemory, !active)
+    assert.match(io.output, /Memory defaults apply to future launches/)
+  }
+})
+
+test('TUI manager repeats reviewed actions, refreshes stale revisions, and Back/Cancel never submits', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save({ ...base, enableMemory: true })
+  await seedMemory(directory)
+  const io = fakeIO(['add', 'add', 'edit', -1, 'edit', 0, 'edit', 0, 'edit', 0, 'delete', 0, 'back'],
+    [undefined, 'I prefer careful explanations', undefined, 'Stale edit should fail', 'Fresh approved edit'], ['/memories', '/exit'])
+  const approvals = []
+  io.approve = async request => {
+    approvals.push(request)
+    if (approvals.length === 1) return false
+    if (approvals.length === 2) {
+      const stored = JSON.parse(await readFile(join(directory, 'memories.json'), 'utf8'))
+      stored.memories[0].content = 'Changed by another process'
+      stored.memories[0].updatedAt = '2026-10-02'
+      await writeFile(join(directory, 'memories.json'), JSON.stringify(stored), { mode: 0o600 })
+    }
+    return true
+  }
+  assert.equal(await run(directory, io, services), 0)
+  assert.deepEqual(approvals.map(request => request.call.name), ['create_memory', 'edit_memory', 'edit_memory', 'delete_memory'])
+  assert.equal(approvals[1].currentRevision !== approvals[2].currentRevision, true)
+  assert.match(approvals[2].description, /Changed by another process/)
+  assert.match(approvals[2].description, /Fresh approved edit/)
+  assert.match(io.output, /[Ss]tale memory revision/)
+  assert.match(io.output, /Memory change denied/)
+  assert.equal(JSON.parse(await readFile(join(directory, 'memories.json'), 'utf8')).memories.length, 0)
+  assert(io.choices.filter(choice => choice.title.startsWith('Persistent memories')).length > 6)
+})
+
+test('memory can be enabled or disabled before model setup without reading or creating its store', async t => {
+  const directory = await fixture(t), io = fakeIO(['on', 'off', 'back'], [], ['/memories', '/exit'])
+  let calls = 0
+  assert.equal(await run(directory, io, fakeServices(), () => { calls++; return defaultFactory() }), 0)
+  assert.equal(calls, 0); assert.deepEqual(await readdir(directory), [])
+  assert.match(io.output, /Choose a model.*before listing or changing/)
+})
+
+test('unknown saved and resumed models omit tools without a current declaration while memory context stays enabled', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save({ ...base, enableTools: true, enableMemory: true })
+  await seedMemory(directory)
+  const resumed = newSession({ provider: 'openrouter', model: 'unverified-resume-model' })
+  await new FileSessionStore(directory).save(resumed)
+  for (const [args, expected] of [[[], false], [['--tools'], true], [['--tools', '--no-tools'], false],
+    [['--resume', resumed.id], false], [['--resume', resumed.id, '--tools'], true],
+    [['--resume', resumed.id, '--tools', '--no-tools'], false]]) {
+    const io = fakeIO([], [], ['Hello', '/exit'])
+    assert.equal(await run(directory, io, services, (_session, options) => {
+      assert.equal(options.enableTools, expected)
+      return { generate: async input => {
+        assert.equal(input.tools.length > 0, expected); assert.equal(hasMemory(input), true); return answer('Done')
+      } }
+    }, args), 0)
+  }
+})
+
+test('verified unsupported tool metadata overrides an explicit launch declaration without disabling memory context', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save({ ...base, enableTools: true, enableMemory: true })
+  await seedMemory(directory)
+  services.catalog.list = async () => ({ state: 'fresh', models: [{ ...unknownModel(base.model), conversation: 'supported', tools: 'unsupported' }] })
+  const seen = [], io = fakeIO([base.model], [], ['Before verification', '/models', 'After verification', '/exit'])
+  assert.equal(await run(directory, io, services, (_session, options) => {
+    seen.push(options.enableTools)
+    return { generate: async input => { assert.equal(hasMemory(input), true); return answer('Done') } }
+  }, ['--tools']), 0)
+  assert.deepEqual(seen, [true, false])
 })

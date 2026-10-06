@@ -3,10 +3,12 @@ import type { ModelProvider } from '@ayayaq/vivi'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import type { CliOptions } from './main.js'
 import { CliHost } from './host.js'
+import { FileMemoryStore } from './memory.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange } from './terminal.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
 import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } from './models.js'
@@ -36,7 +38,7 @@ export interface ApplicationOptions {
   providerFactory(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
-  reasoningCapabilities: [], stream: true, enableNotes: false, enableTools: false, maxRounds: 25 }
+  reasoningCapabilities: [], stream: true, enableNotes: false, enableMemory: false, enableTools: false, maxRounds: 25 }
 const envName = (provider: CliProviderName): string => provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
 
 export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPreferences {
@@ -61,6 +63,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
 const COMMAND_HELP = `Enter submits; Shift/Alt+Enter adds a line. Tab completes slash commands above the composer.
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /settings changes future defaults.
+/memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
@@ -76,16 +79,20 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const catalog = input.catalog ?? new ModelCatalog()
   const store = new FileSessionStore(options.sessionDirectory, secrets)
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
+  const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
   const knownModels = new Map<string, ModelEntry>()
   const modelKey = (provider: CliProviderName, id: string): string => `${provider}:${id}`
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
   const register = (key: string): void => {
     if (!key || secrets.includes(key)) return
-    secrets.push(key); preferences.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
+    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
   try { settings = await preferences.load() ?? settings }
   catch (error) { io.write('Saved defaults could not be loaded; use /provider or /resume\n'); report(error) }
+  // App-wide consent belongs to the launch, not to a model's session settings.
+  let activeMemory = args.includes('--enable-memory') || args.includes('--disable-memory')
+    ? options.enableMemory : settings.enableMemory
   if ((options.provider !== undefined && options.provider !== settings.provider) ||
     (options.model !== undefined && options.model !== settings.model)) {
     settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false }
@@ -111,6 +118,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       if (args.includes('--no-tools')) { settings.enableTools = false; settings.enableNotes = false }
     }
   }
+  const declaredToolTarget = { provider: settings.provider, model: settings.model }
   let host: CliHost | undefined
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
@@ -225,7 +233,10 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       return settingsForModel(base, model)
     }
   }
-  const save = async (next: TuiPreferences): Promise<void> => { await preferences.save(next); settings = next }
+  const save = async (next: TuiPreferences, changeMemoryDefault = false): Promise<void> => {
+    const defaults = { ...next, enableMemory: changeMemoryDefault ? next.enableMemory : settings.enableMemory }
+    await preferences.save(defaults); settings = defaults
+  }
   const configure = async (): Promise<boolean> => {
     const provider = await setupProvider(settings)
     if (!provider) return false
@@ -238,7 +249,12 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       { name: 'Enable session notes', description: 'Each write requires an allow/deny approval', value: true }
     ], effort.enableNotes ? 1 : 0) : false
     if (notes === undefined) return false
-    await save({ ...effort, enableNotes: notes }); return true
+    const enableMemory = await io.choose('Persistent memory default · future launches', [
+      { name: 'Keep memory disabled by default', description: 'No saved memory is read or sent unless you enable it', value: false },
+      { name: 'Enable memory by default', description: MEMORY_DISCLOSURE, value: true }
+    ], settings.enableMemory ? 1 : 0)
+    if (enableMemory === undefined) return false
+    await save({ ...effort, enableNotes: notes, enableMemory }, true); return true
   }
   const selectResume = async (): Promise<string | undefined> => {
     const sessions = await listSessions(store)
@@ -248,8 +264,60 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     if (!choices.length) { io.write('No unlocked valid sessions found. Check the previous process before removing a session lock\n'); return }
     return io.choose('Resume a local session', choices)
   }
+  const manageMemories = async (): Promise<void> => {
+    io.write(`${MEMORY_DISCLOSURE}\n`)
+    for (;;) {
+      if (io.isClosed) return
+      let snapshot: Awaited<ReturnType<CliHost['listMemories']>> | undefined
+      if (activeMemory && host) {
+        try { snapshot = await host.listMemories(); displayMemories(io, snapshot) }
+        catch (error) { report(error) }
+      }
+      if (activeMemory && !host) io.write('Choose a model with /models before listing or changing saved memories\n')
+      const choices = [{ name: 'Back', description: 'Return to the conversation without changing memory', value: 'back' },
+        ...(activeMemory ? [{ name: 'Disable for this launch', description: 'Stop using saved context; retain existing records', value: 'off' }]
+          : [{ name: 'Enable for this launch', description: MEMORY_DISCLOSURE, value: 'on' }]),
+        ...(activeMemory && host ? [
+          { name: 'Refresh memories', description: 'Reload current app-wide records', value: 'refresh' },
+          ...(snapshot ? [{ name: 'Add memory', description: 'Enter content, then review the exact proposed change', value: 'add' },
+            ...(snapshot.memories.length ? [{ name: 'Edit memory', description: 'Choose a displayed ID and revision', value: 'edit' },
+              { name: 'Delete memory', description: 'Choose a displayed ID and revision, then review deletion', value: 'delete' }] : [])] : [])
+        ] : [])]
+      const action = await io.choose(`Persistent memories · ${activeMemory ? 'enabled' : 'disabled'} for this launch`, choices)
+      if (action === undefined || action === 'back') return
+      if (action === 'on' || action === 'off') {
+        activeMemory = action === 'on'; host?.setMemoryEnabled(activeMemory)
+        io.write(activeMemory ? 'Memory enabled for this launch\n' : 'Memory disabled for this launch; existing records retained\n')
+        continue
+      }
+      if (action === 'refresh' || !host || !snapshot) continue
+      try {
+        if (action === 'add') {
+          const content = await io.askText('New app-wide memory · Escape cancels')
+          if (content !== undefined && content.trim()) await reviewMemoryChange(host, io, { kind: 'create', content })
+          continue
+        }
+        const index = await io.choose(`Choose memory to ${action}`, [
+          { name: 'Back', description: 'No memory change', value: -1 },
+          ...snapshot.memories.map((item, index) => ({ name: item.id,
+            description: `revision ${item.revision} · ${JSON.stringify(item.content)}`, value: index }))
+        ])
+        if (index === undefined || index < 0) continue
+        const selectedMemory = snapshot.memories[index]
+        if (!selectedMemory) continue
+        if (action === 'edit') {
+          const content = await io.askText(`Edit ${selectedMemory.id} · revision ${selectedMemory.revision} · Escape cancels`, selectedMemory.content)
+          if (content !== undefined && content.trim()) await reviewMemoryChange(host, io,
+            { kind: 'update', id: selectedMemory.id, expectedRevision: selectedMemory.revision, content })
+        } else if (action === 'delete') await reviewMemoryChange(host, io,
+          { kind: 'delete', id: selectedMemory.id, expectedRevision: selectedMemory.revision })
+      } catch (error) { report(error) }
+      // Reload after approval, cancellation or conflicts; never reuse a stale edit revision.
+    }
+  }
   const openSession = async (selection: { resume?: string; fresh?: boolean }): Promise<boolean> => {
     if (!selection.resume && !settings.model) return false
+    await host?.drainMemory()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
     const nextRelease = await store.acquire(selection.resume ?? fresh!.id)
     let nextHost: CliHost
@@ -269,18 +337,22 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (!declared) { await nextRelease(); return false }
         capabilities = [session.reasoning as ReasoningEffort]
       }
-      const enableTools = args.includes('--no-tools') ? false : sameModel ? settings.enableTools
-        : metadata?.tools === 'supported' || explicitResume && (args.includes('--tools') || args.includes('--enable-notes'))
+      const declaredTools = (args.includes('--tools') || args.includes('--enable-notes')) &&
+        (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model)
+      const enableTools = !args.includes('--no-tools') && metadata?.tools !== 'unsupported' &&
+        (metadata?.tools === 'supported' ? !sameModel || settings.enableTools : declaredTools)
       const effective: CliOptions = { ...options, reasoningCapabilities: capabilities,
         stream: metadata?.streaming === 'unsupported' ? false : settings.stream,
         enableTools, enableNotes: enableTools && (sameModel ? settings.enableNotes : explicitResume && args.includes('--enable-notes')),
+        enableMemory: activeMemory,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
       if (io.isClosed) { await nextRelease(); return false }
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await nextRelease(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, maxRounds: effective.maxRounds,
+        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, maxRounds: effective.maxRounds,
+        onMemoryNotice: message => io.write(`${message}\n`),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       await store.save(nextHost.session)
       if (io.isClosed) { await nextRelease(); return false }
@@ -295,6 +367,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     return true
   }
   try {
+    if (activeMemory) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {
       if (io.setDraft) io.setDraft(settings.provider)
@@ -328,7 +401,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Continue conversation', value: 'continue' }, { name: 'Set up provider', value: '/provider' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
-          { name: 'Future defaults', value: '/settings' }, { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
+          { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
+          { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
         if (!action || action === 'continue') continue
         if (action === '/exit') return 0
@@ -352,7 +426,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         }
         if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true } }; continue }
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
-        if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready\n'); continue }
+        if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
+        if (command === '/memories') { await manageMemories(); continue }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
@@ -369,5 +444,5 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         finally { dispose() }
       } catch (error) { report(error) }
     }
-  } finally { await release?.() }
+  } finally { try { await host?.drainMemory() } finally { await release?.() } }
 }

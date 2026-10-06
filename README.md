@@ -26,6 +26,7 @@ then choose a model.
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/settings` — change defaults for future conversations
+- `/memories` — manage this launch’s app-wide saved context
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -63,6 +64,43 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
+
+## Persistent memory
+
+Memory is off by default. Use `--enable-memory` for a launch, or choose the future
+launch default in `/settings` in the full-screen UI. `--disable-memory` overrides
+an enabled saved default. `/memories` enables or disables the current launch and
+lets you list, add, edit and delete records. Back, Escape and Cancel never submit
+a change. Each create, edit and delete shows the exact proposal and requires a
+fresh interactive `allow` response; piped input cannot approve writes.
+
+Memories are stored as plaintext in `memories.json` alongside the CLI’s private
+session files, normally `~/.vivi/sessions`. When enabled, saved context is sent to
+the selected OpenAI or OpenRouter provider. Keep secrets out of memory. Disabling
+memory retains existing records and stops reading or using them. Memory stays
+enabled or disabled across provider/model changes, `/new` and `/resume` during
+the launch. Changing its `/settings` default affects future launches only.
+
+The store is shared by CLI sessions using that state directory. A custom
+`--session-dir` (or `VIVI_SESSION_DIR`) isolates its memory; desktop memory is
+separate. Existing session notes remain session-only. Saved context works with
+chat-only models too, but model-requested memory writes are available only when
+tools are supported or explicitly declared with `--tools`. Unknown line-mode
+models omit tools unless declared; `--no-tools` always omits them. Human
+`/memories` actions still use the reviewed mutation path.
+
+In line mode, first use `/memories on` or launch with `--enable-memory`, then:
+
+```text
+/memories list
+/memories add I prefer concise replies
+/memories edit ID REVISION Updated content
+/memories delete ID REVISION
+/memories off
+```
+
+Use the ID and revision shown by `list` for edits and deletions. A concurrent edit
+requires refreshing and reviewing again; it is never silently overwritten.
 
 ## Development
 

@@ -13,7 +13,8 @@ export const MAX_SESSION_PICKER_ITEMS = 100
 export const MAX_SESSION_LIST_ENTRIES = 1000
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 const preferenceKeys = ['schemaVersion', 'provider', 'model', 'reasoning',
-  'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'maxRounds'] as const
+  'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'enableMemory', 'maxRounds'] as const
+const legacyPreferenceKeys = preferenceKeys.filter(key => key !== 'enableMemory')
 
 /** Host preferences only. Credentials, transcripts, prompts and paths are never settings. */
 export interface TuiPreferences {
@@ -25,6 +26,8 @@ export interface TuiPreferences {
   stream: boolean
   enableTools: boolean
   enableNotes: boolean
+  /** Future launch default; persistent context is independent of model tool support. */
+  enableMemory: boolean
   maxRounds: number
 }
 
@@ -53,11 +56,15 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     'expected plain object')
   check(Object.getOwnPropertySymbols(value).length === 0, 'unexpected field')
   const descriptors = Object.getOwnPropertyDescriptors(value)
-  check(Object.keys(descriptors).length === preferenceKeys.length &&
-    Object.keys(descriptors).every((key) => preferenceKeys.includes(key as typeof preferenceKeys[number])),
+  const keys = Object.keys(descriptors)
+  const legacy = keys.length === legacyPreferenceKeys.length &&
+    keys.every(key => legacyPreferenceKeys.includes(key as typeof legacyPreferenceKeys[number]))
+  check(legacy || (keys.length === preferenceKeys.length &&
+    keys.every((key) => preferenceKeys.includes(key as typeof preferenceKeys[number]))),
   'unexpected or missing field')
   const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>
   for (const key of preferenceKeys) {
+    if (key === 'enableMemory' && legacy) { fields[key] = false; continue }
     const descriptor = descriptors[key]
     check(descriptor && descriptor.enumerable && 'value' in descriptor, 'expected enumerable data fields')
     fields[key] = descriptor.value
@@ -85,7 +92,7 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
   check(fields.reasoning === 'default' || supported.includes(fields.reasoning as ReasoningEffort),
     'selected reasoning requires an explicit supported capability')
   check(typeof fields.stream === 'boolean' && typeof fields.enableTools === 'boolean' &&
-    typeof fields.enableNotes === 'boolean', 'invalid toggle')
+    typeof fields.enableNotes === 'boolean' && typeof fields.enableMemory === 'boolean', 'invalid toggle')
   check(!fields.enableNotes || fields.enableTools, 'notes require explicitly enabled tools')
   check(fields.model !== '' || (fields.reasoning === 'default' && supported.length === 0 && !fields.enableTools && !fields.enableNotes),
     'unselected model cannot declare capabilities')
@@ -94,7 +101,7 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
   const preferences: TuiPreferences = {
     schemaVersion: 1, provider: fields.provider, model: fields.model, reasoning: fields.reasoning,
     reasoningCapabilities: supported, stream: fields.stream, enableTools: fields.enableTools,
-    enableNotes: fields.enableNotes,
+    enableNotes: fields.enableNotes, enableMemory: fields.enableMemory,
     maxRounds: fields.maxRounds as number
   }
   const encoded = JSON.stringify(preferences)
