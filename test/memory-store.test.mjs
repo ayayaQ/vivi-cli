@@ -6,7 +6,6 @@ import { syncBuiltinESMExports } from 'node:module';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { decodeMemories, memoryRevision } from '@ayayaq/vivi/extensions/memory';
 import { FileMemoryStore, MAX_MEMORY_STORE_BYTES } from '../dist/memory.js';
 
@@ -250,22 +249,68 @@ test('reads remain bounded if a file grows after its descriptor stat', async t =
 });
 
 test('a directory swap during read is detected and replacement-directory files stay untouched', async t => {
+  if (process.platform === 'win32') {
+    t.skip('Windows refuses directory renames while a file handle is open; identity changes are tested separately');
+    return;
+  }
   const { store, primary, directory } = await fixture(t);
   await writeFile(primary, encoded([record()]), { mode: 0o600 });
   const moved = `${directory}-moved`; t.after(() => rm(moved, { recursive: true, force: true }));
   const originalOpen = fs.open;
   mockFs(t, 'open', async (path, ...args) => {
     const handle = await originalOpen(path, ...args);
-    if (path === primary) {
-      await rename(directory, moved); await mkdir(directory, { mode: 0o700 });
-      await writeFile(primary, 'replacement evidence', { mode: 0o600 });
-      await writeFile(join(directory, 'memories.json.lock'), 'replacement lock', { mode: 0o600 });
-    }
-    return handle;
+    try {
+      if (path === primary) {
+        await rename(directory, moved); await mkdir(directory, { mode: 0o700 });
+        await writeFile(primary, 'replacement evidence', { mode: 0o600 });
+        await writeFile(join(directory, 'memories.json.lock'), 'replacement lock', { mode: 0o600 });
+      }
+      return handle;
+    } catch (error) { await handle.close(); throw error; }
   });
   await assert.rejects(store.list(), /directory changed/);
   assert.equal(await readFile(primary, 'utf8'), 'replacement evidence');
   assert.equal(await readFile(join(directory, 'memories.json.lock'), 'utf8'), 'replacement lock');
+});
+
+test('Windows directory identity changes reject reads and preserve files and replacement leases', async t => {
+  const { store, primary, directory } = await fixture(t);
+  const raw = encoded([record()]); const lock = join(directory, 'memories.json.lock');
+  await writeFile(primary, raw, { mode: 0o600 });
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  const originalOpen = fs.open; const originalLstat = fs.lstat;
+  let changed = false; let reads = 0; let changedChecks = 0;
+  // Exercise the actual Windows path even on POSIX, without an OS-forbidden rename.
+  mockFs(t, 'lstat', async (path, ...args) => {
+    const info = await originalLstat(path, ...args);
+    if (path === directory && changed) {
+      changedChecks++;
+      return Object.assign(Object.create(Object.getPrototypeOf(info)), info, { ino: info.ino === 0 ? 1 : 0 });
+    }
+    return info;
+  });
+  mockFs(t, 'open', async (path, ...args) => {
+    assert.notEqual(path, directory, 'Windows must not open directory file handles');
+    const handle = await originalOpen(path, ...args);
+    try {
+      if (path === primary) {
+        const originalRead = handle.read.bind(handle);
+        handle.read = (...values) => { reads++; return originalRead(...values); };
+        await writeFile(lock, 'replacement lock', { mode: 0o600 });
+        changed = true;
+      }
+      return handle;
+    } catch (error) { await handle.close(); throw error; }
+  });
+  await assert.rejects(store.list(), /directory changed/);
+  assert.equal(changed, true);
+  assert.equal(reads, 0);
+  assert.ok(changedChecks >= 2, 'both the read guard and lease cleanup must check directory identity');
+  assert.equal(await readFile(primary, 'utf8'), raw);
+  assert.equal(await readFile(lock, 'utf8'), 'replacement lock');
+  assert.deepEqual((await readdir(directory)).sort(), ['memories.json', 'memories.json.lock']);
 });
 
 test('saves sync each exclusive temporary file before rename and the directory afterwards', async t => {
@@ -356,7 +401,7 @@ test('concurrent prepared creates recheck duplicates and collection limits at co
 
 test('two processes with different session identities cannot lose app-wide creates', async t => {
   const { store, directory } = await fixture(t);
-  const module = fileURLToPath(new URL('../dist/memory.js', import.meta.url));
+  const module = new URL('../dist/memory.js', import.meta.url).href;
   const code = `import { FileMemoryStore } from ${JSON.stringify(module)};
     const store = new FileMemoryStore(process.argv[1]);
     const proposal = await store.prepareCreate('Preference from session ' + process.argv[2], 'user');
