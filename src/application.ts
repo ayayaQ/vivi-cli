@@ -4,6 +4,7 @@ import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import type { CliOptions } from './main.js'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
+import { ReadOnlyWorkspace } from './workspace.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
@@ -81,6 +82,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const store = new FileSessionStore(options.sessionDirectory, secrets)
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
+  const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
   const knownModels = new Map<string, ModelEntry>()
   const modelKey = (provider: CliProviderName, id: string): string => `${provider}:${id}`
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
@@ -352,10 +354,11 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await nextRelease(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, maxRounds: effective.maxRounds,
+        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         onMemoryNotice: message => io.write(`${message}\n`),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       await store.save(nextHost.session)
+      if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
       if (io.isClosed) { await nextRelease(); return false }
       activeSettings = { ...settings, provider: session.provider, model: session.model,
         reasoning: session.reasoning ?? 'default', reasoningCapabilities: [...capabilities],
@@ -368,6 +371,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     return true
   }
   try {
+    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (activeMemory) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {

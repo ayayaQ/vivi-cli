@@ -2,6 +2,7 @@
 import type { ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
 import { createToolRegistry, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
+import { WORKSPACE_TOOL_NAMES } from './workspace.js'
 export { calculate }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
@@ -36,20 +37,22 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 }
 
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
-export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension): {
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension): {
   tools: ToolDefinition[]
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
 } {
   const registry = createToolRegistry([calculatorExtension, ...extensions], {
-    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory']
+    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
   const memoryRegistry = memory ? createToolRegistry([memory]) : undefined
+  const workspaceRegistry = workspace ? createToolRegistry([workspace]) : undefined
   return {
-    tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? [])],
+    tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? []), ...(workspaceRegistry?.tools ?? [])],
     executeTool: (call, signal, host) => memoryRegistry?.has(call.name)
-      ? memoryRegistry.executeTool(call, { signal }) : executeHostTool(call, signal, host, registry)
+      ? memoryRegistry.executeTool(call, { signal }) : workspaceRegistry?.has(call.name)
+        ? workspaceRegistry.executeTool(call, { signal }) : executeHostTool(call, signal, host, registry)
   }
 }
 

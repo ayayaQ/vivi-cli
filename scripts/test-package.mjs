@@ -87,7 +87,8 @@ try {
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts',
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
-    'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts']) assert(paths.has(path), `Missing ${path}`)
+    'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
+    'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
@@ -109,7 +110,7 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
@@ -125,6 +126,12 @@ try {
   assert.equal(installedManifest.engines.node, manifest.engines.node)
   assert.equal(installedManifest.license, 'Apache-2.0')
   assert.equal(installedManifest.dependencies[coreName], coreVersion)
+  assert.equal(installedManifest.dependencies.ignore, '7.0.12')
+  const ignoreManifest = JSON.parse(await readFile(join(temporary, 'node_modules/ignore/package.json'), 'utf8'))
+  assert.equal(ignoreManifest.version, '7.0.12')
+  assert.equal(ignoreManifest.license, 'MIT')
+  assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/ignore/LICENSE-MIT'))),
+    normalizeLicense(await readFile(join(root, 'node_modules/ignore/LICENSE-MIT'))), 'Ignore MIT legal text mismatch')
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
     normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
@@ -153,10 +160,10 @@ try {
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, FileMemoryStore, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
@@ -225,6 +232,26 @@ try {
   assert.equal(cjsMemory.encodeMemories(cjsMemory.decodeMemories('{"version":1,"memories":[]}')), encodeMemories(decodeMemories('{"version":1,"memories":[]}')))
   assert.equal(cjsMemory.formatMemoryContext([]), formatMemoryContext([]))
   assert.equal(typeof createMemoryService, 'function')
+  const project = join(directory, 'project')
+  await mkdir(project)
+  await writeFile(join(project, 'readme.txt'), 'Packed workspace works')
+  await writeFile(join(project, '.gitignore'), '*.log')
+  await writeFile(join(project, 'ignored.log'), 'Packed ignored fixture')
+  const workspace = await ReadOnlyWorkspace.open(project)
+  const workspaceRegistry = createToolRegistry([createWorkspaceExtension(workspace)])
+  const listing = await workspaceRegistry.executeTool({ id: 'packed-workspace', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
+  assert.equal(JSON.parse(listing.content).untrusted, true)
+  assert(!JSON.parse(listing.content).entries.some(item => item.path === 'ignored.log'))
+  assert.equal(WORKSPACE_LIMITS.maximumReadBytes, 8192)
+  let workspaceRounds = 0
+  const workspaceHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++workspaceRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-read', name: 'workspace_read', arguments: { path: 'readme.txt' } }] }
+      : { content: 'Packed workspace accepted', toolCalls: [] } } })
+  const workspaceResult = await workspaceHost.send('Test opted-in workspace')
+  assert.equal(workspaceResult.status, 'completed')
+  assert.equal(JSON.parse(workspaceResult.history[2].content).content, 'Packed workspace works')
+  assert.deepEqual((await new FileSessionStore(directory).load(workspaceHost.session.id)).history, workspaceResult.history)
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
@@ -247,7 +274,7 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
@@ -263,6 +290,8 @@ const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
 const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
 const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
+const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')
+void workspace; void createWorkspaceExtension; void WORKSPACE_LIMITS
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
 const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
