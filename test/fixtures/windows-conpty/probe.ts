@@ -8,20 +8,28 @@ import { pathToFileURL } from 'node:url'
 import { pasteText } from './protocol.mjs'
 
 const [repository, prefix] = process.argv.slice(2)
-if (!repository || !prefix || process.platform !== 'win32' || !process.versions.bun) process.exit(2)
+if (!repository || !prefix) process.exit(2)
+// Fixed phase/protocol metadata helps diagnose a failed private harness without
+// ever retaining native output, ordinary input, exceptions or environment data.
+let phase = 'startup-checks'
+const progressPath = `${prefix}.progress.json`
+writeFileSync(progressPath, JSON.stringify({ phase, platform: process.platform, bun: process.versions.bun }))
+const startup = { platform: process.platform, bun: process.versions.bun,
+  stdinTTY: process.stdin.isTTY === true, stdoutTTY: process.stdout.isTTY === true }
+const loading = (next: string): void => { phase = next; writeFileSync(progressPath, JSON.stringify({ phase, ...startup })) }
+loading(phase)
+if (process.platform !== 'win32' || !process.versions.bun) process.exit(2)
 if (process.env.OTUI_STDIN_LOG || ['OTUI_DEBUG', 'OTUI_DEBUG_FFI', 'OTUI_TRACE_FFI', 'OTUI_DUMP_CAPTURES']
   .some(name => ['true', '1', 'on', 'yes'].includes((process.env[name] ?? '').trim().toLowerCase()))) process.exit(2)
 if (!process.stdin.isTTY || !process.stdout.isTTY) process.exit(2)
 
-// Fixed phase/protocol metadata helps diagnose a failed private harness without
-// ever retaining native output, ordinary input, exceptions or environment data.
-let phase = 'load-modules'
-const progressPath = `${prefix}.progress.json`
-writeFileSync(progressPath, JSON.stringify({ phase }))
-
+loading('load-parser')
 const { StdinParser } = await import(pathToFileURL(Bun.resolveSync('@opentui/core', repository)).href)
+loading('load-decoder')
 const { WindowsInputDecoder } = await import(pathToFileURL(resolve(repository, 'src/windows-input.ts')).href)
+loading('load-diagnostic')
 const { inputProbe } = await import(pathToFileURL(resolve(repository, 'src/input-diagnostic.ts')).href)
+loading('load-tui')
 const { OpenTuiIO } = await import(pathToFileURL(resolve(repository, 'src/tui.ts')).href)
 const originalRaw = process.stdin.isRaw === true
 const originalFlowing = process.stdin.readableFlowing === true
@@ -82,15 +90,14 @@ const postCloseData = (chunk: Buffer): void => {
 }
 const watchdog = setTimeout(() => { failed = true; saveAndExit(1) }, 18000)
 const progressTimer = setInterval(() => writeFileSync(progressPath, JSON.stringify({
-  phase, controls, windows: io?.windowsInput?.diagnostic
+  phase, ...startup, controls, windows: io?.windowsInput?.diagnostic
 })), 250)
 process.on('uncaughtException', () => { failed = true; saveAndExit(1) })
 process.on('unhandledRejection', () => { failed = true; saveAndExit(1) })
 
 try {
   // This is the real factory: native output setup occurs before bridge.start(), exactly as in the CLI.
-  phase = 'create-renderer'
-  writeFileSync(progressPath, JSON.stringify({ phase }))
+  loading('create-renderer')
   io = await OpenTuiIO.create({ stream: false })
   phase = 'input-diagnostic'
   const bridge = io.windowsInput

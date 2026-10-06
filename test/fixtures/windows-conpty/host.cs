@@ -263,8 +263,16 @@ public sealed class ConPtyProbeHost : IDisposable
         while (!File.Exists(path))
         {
             CheckWorker();
-            if (WaitForSingleObject(process.hProcess, 0) == 0) throw new InvalidOperationException("Private Bun child exited before marker");
-            if (deadline.ElapsedMilliseconds >= milliseconds) throw new TimeoutException("Private Bun child marker timeout");
+            if (WaitForSingleObject(process.hProcess, 0) == 0)
+            {
+                uint exited; if (GetExitCodeProcess(process.hProcess, out exited)) Progress.ExitCode = unchecked((int)exited);
+                throw new InvalidOperationException("Private Bun child exited before marker");
+            }
+            if (deadline.ElapsedMilliseconds >= milliseconds)
+            {
+                uint state; if (GetExitCodeProcess(process.hProcess, out state)) Progress.ExitCode = unchecked((int)state);
+                throw new TimeoutException("Private Bun child marker timeout");
+            }
             Thread.Sleep(5);
         }
         CheckWorker();
@@ -291,7 +299,7 @@ public sealed class ConPtyProbeHost : IDisposable
         ConPtyProbeResult result = new ConPtyProbeResult();
         // Live failure diagnostics must never alias the frozen success result:
         // conhost shutdown may emit additional resets after consumer restoration.
-        Progress = new ConPtyProbeResult();
+        Progress = new ConPtyProbeResult { ExitCode = -1 };
         result.OsVersion = Environment.OSVersion.Version.ToString();
         string conhost = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "conhost.exe");
         result.ConhostVersion = FileVersionInfo.GetVersionInfo(conhost).FileVersion;
