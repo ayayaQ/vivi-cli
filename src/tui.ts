@@ -745,7 +745,7 @@ export class OpenTuiIO implements ChatIO {
       return
     }
     if (this.pending.kind === 'secret') { this.insertSecret(decodePasteBytes(event.bytes)); return }
-    const text = this.safe(decodePasteBytes(event.bytes), MAX_INPUT)
+    const text = this.safe(decodePasteBytes(event.bytes).replace(/\r\n?/g, '\n'), MAX_INPUT)
     const remaining = MAX_INPUT - this.composer.plainText.length
     if (text.length > remaining) { this.updateStatus('Paste ignored: input limit is 65536 characters'); return }
     this.composer.insertText(text)

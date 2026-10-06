@@ -51,9 +51,16 @@ terminal reports those modifiers. Tab completes slash commands.
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
-to preserve reported Enter modifiers. Physical Shift+Enter behavior on Windows
-Terminal 1.24 remains unverified after a user-reported failure. It restores the prior
-reporting mode when the UI closes. Other terminals use the supported Kitty keyboard
+to preserve reported Enter modifiers. ConPTY forwards mode queries to the outer
+terminal, so an "already enabled" reply does not establish that its separate
+application-facing encoder is enabled. Vivi explicitly requests that consumer
+encoder for the full-screen UI and resets it to standard input on close;
+ConPTY keeps its outer transport enabled. The query cannot reveal a prior inner
+encoder state. Physical Shift+Enter behavior on Windows Terminal 1.24 remains
+unverified until a user retest. Bracketed paste retains literal Unicode and
+line breaks even when ConPTY mixes raw text with native character records;
+chat drafts normalize CRLF or CR to LF, and pasted input never confirms approval.
+Other terminals use the supported Kitty keyboard
 protocol automatically, or Ctrl+J when modifiers are unavailable. Alt+Enter may be
 intercepted by the terminal's own fullscreen shortcut.
 The composer grows as explicit or wrapped lines are added, up to ten editable
