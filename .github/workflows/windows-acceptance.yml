@@ -106,7 +106,9 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       - run: npm ci --ignore-scripts
       - run: npm run build
-      # Diagnostic-only compiler timing: serialize owned fixtures before any native launches.
+      # Diagnostic-only explicit Windows runtime/profile comparison; product gates stay unchanged.
+      - run: node --test --test-concurrency=1 test/windows-powershell-environment-diagnostic.test.mjs
+      # Diagnostic-only compiler timing: serialize these owned fixtures separately from product gates.
       # Observations are bounded/censored and do not replace the lifecycle product gates below.
       - run: node --test --test-concurrency=1 test/command-windows-compile.test.mjs
       # Harmless owned process fixtures plus mocks. No native UI, live keys or providers.
