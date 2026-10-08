@@ -15,9 +15,10 @@ import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
 import { FileSkillStore } from './skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
-import { TerminalIO, runChatLoop, selectApprovalMode } from './terminal.js'
+import { TerminalIO, runChatLoop, selectApprovalMode, runCommandControl } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
 import type { Catalog } from './models.js'
@@ -41,6 +42,8 @@ export interface CliOptions {
   tui: boolean
   enableNotes: boolean
   enableMemory: boolean
+  /** A request for fresh interactive enrollment, never command authority itself. */
+  enableCommands: boolean
   enableSkills: boolean
   skillsDirectories: string[]
   enableTools: boolean
@@ -73,6 +76,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --enable-notes              Enable session-only revisioned notes with allow/deny prompts
   --enable-memory             Use reviewed app-wide saved context (plaintext local storage)
   --disable-memory            Override saved memory defaults for this launch
+  --enable-commands           Request fresh interactive workspace trust (off by default)
   --skills-dir PATH           Explicit read-only standard skills root (repeatable, max 8)
   --no-skills                 Disable skills for this launch
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
@@ -85,7 +89,8 @@ Streaming is display-only. Notes never access other files; piped approval is den
 Saved memory is off by default. When enabled, it is sent to the selected provider.
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
 Selected files may be sent to your provider and saved in session history.
-Workspace tools omit symlinks and private/ignored files; text writes require review, and commands are unavailable; this is not an OS sandbox.
+Workspace tools omit symlinks and private/ignored files; text writes require review; this is not an OS sandbox.
+/commands on enables separate trusted, unsandboxed commands for this launch/session. Every process requires human approval, even in Auto; piped approval is denied.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual or optional Auto review for the current conversation and selected account.
 Auto review adds API charges; only eligible current-request note/memory changes and scoped text creation/precise-edit tool calls can use it.
@@ -99,7 +104,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    approvalMode: 'manual', stream: true, tui: true, enableNotes: false, enableMemory: false, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
+    approvalMode: 'manual', stream: true, tui: true, enableNotes: false, enableMemory: false, enableCommands: false, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
     ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
@@ -136,6 +141,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--session-dir': options.sessionDirectory = value(); break
       case '--workspace': explicitWorkspace = true; options.workspace = value(); break
       case '--no-workspace': noWorkspace = true; delete options.workspace; break
+      case '--enable-commands': options.enableCommands = true; break
       case '--prompt': options.prompt = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
@@ -324,9 +330,12 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
+    const commandEnv = captureCommandEnvironment(env)
     host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
       enableTools, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
+      ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,
+        isAvailable: () => io?.canAutoReview === true && !io.isClosed } } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
       onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
       ...(io.canAutoReview === true ? { decisionReview: {
@@ -341,6 +350,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
+    if (options.enableCommands) await runCommandControl(host, io, '/commands on')
     const result = await runChatLoop(host, io, options.prompt)
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {
@@ -349,8 +359,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     else process.stderr.write(`${message}\n`)
     return 1
   } finally {
-    await host?.drainMemory().catch(() => undefined)
-    await host?.drainSkills().catch(() => undefined)
+    await host?.shutdown().catch(() => undefined)
     await release?.().catch(() => undefined)
     closeIO()
   }

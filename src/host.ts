@@ -20,9 +20,12 @@ import { AutoReviewController, reviewDigest } from './auto-review.js'
 import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice } from './auto-review.js'
 import type { JsonObject } from '@ayayaq/vivi'
 import type { PreparedActionMetadata } from '@ayayaq/vivi/decisions'
+import { createCommandExtension, COMMAND_GUIDANCE, COMMAND_TOOL_NAMES } from './commands.js'
+import type { TrustedCommandWorkspace, CommandApprovalContext } from './commands.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
+const commandToolNames = new Set<string>(COMMAND_TOOL_NAMES)
 import { createSkillsExtension, formatSkillCatalogContext } from '@ayayaq/vivi/extensions/skills'
 import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import type { CliSkillStore } from './skills.js'
@@ -78,6 +81,11 @@ export interface CliHostOptions {
   onSkillsNotice?(message: string): void
   /** Explicit launch-only scope; never recovered from a session or preferences. */
   workspace?: ReadOnlyWorkspace
+  /** Separate launch/session-only trust. Merely supplying it never enables commands. */
+  commandWorkspace?: TrustedCommandWorkspace
+  /** Dormant app factory keeps command-only environment errors out of read/chat startup. */
+  commandWorkspaceFactory?(): Promise<TrustedCommandWorkspace>
+  commandApproval?: { isAvailable(): boolean; accountRevision(): string }
   /** Trusted, explicitly imported tool packs. Registration is captured once per turn. */
   extensions?: readonly ToolExtension[]
   /** A host can omit tools when the selected model's tool support is undeclared. */
@@ -107,6 +115,11 @@ export class CliHost {
   private readonly sessionStoreRevision = randomUUID()
   private readonly workspaceScopeRevision = randomUUID()
   private toolsetRevision = 'idle'
+  private readonly commandAccount: string | undefined
+  private readonly commandLaunchId = randomUUID()
+  private shutdownStarted = false
+  private commandOpening: Promise<TrustedCommandWorkspace> | undefined
+  private commandSetupEpoch = 0
   private enabledSkills: boolean
   private lastSkillsDiagnostics = ''
   constructor(private readonly options: CliHostOptions) {
@@ -117,6 +130,7 @@ export class CliHost {
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
+    this.commandAccount = options.commandApproval?.accountRevision()
     if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
       throw new Error('Decision review must use this session’s selected provider; cross-provider review is unavailable')
     }
@@ -171,6 +185,49 @@ export class CliHost {
     await operation
   }
   get memoryEnabled(): boolean { return this.enabledMemory }
+  get commandsEnabled(): boolean { return this.options.commandWorkspace?.isEnabledFor(this.commandLaunchId, this.current.id,
+    this.options.commandApproval?.accountRevision() ?? 'unavailable') ?? false }
+  get commandDirectory(): string | undefined { return this.options.commandWorkspace?.directory ?? this.options.workspace?.directory }
+  private commandContext(runId: string, signal?: AbortSignal): CommandApprovalContext {
+    const workspace = this.options.commandWorkspace, sessionId = this.current.id, toolset = this.toolsetRevision, epoch = this.commandSetupEpoch
+    const options = this.options, account = this.commandAccount
+    return { launchId: this.commandLaunchId, sessionId, runId, get accountRevision() { return options.commandApproval?.accountRevision() ?? 'unavailable' },
+      canApprove: () => options.commandApproval?.isAvailable() === true,
+      isCurrent: () => !this.shutdownStarted && this.commandSetupEpoch === epoch && this.current.id === sessionId && options.commandWorkspace === workspace && options.enableTools !== false &&
+        options.commandApproval?.accountRevision() === account && (signal === undefined ? !this.running :
+          this.controller?.signal === signal && this.toolsetRevision === toolset),
+      approve: options.approve ?? (async () => false) }
+  }
+  async enableCommands(signal = new AbortController().signal): Promise<boolean> {
+    if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host before enabling commands')
+    if (this.running) throw new Error('Wait for the current turn before enabling trusted commands')
+    const epoch = this.commandSetupEpoch
+    if (this.options.commandApproval?.isAvailable() !== true) return false
+    if (!this.options.commandWorkspace && this.options.commandWorkspaceFactory) {
+      const opening = this.commandOpening ??= this.options.commandWorkspaceFactory()
+      let workspace: TrustedCommandWorkspace
+      try { workspace = await opening } finally { if (this.commandOpening === opening) this.commandOpening = undefined }
+      if (this.shutdownStarted || this.commandSetupEpoch !== epoch || signal.aborted || this.running) {
+        await workspace.shutdown()
+        throw new Error('Command setup is no longer active; start a fresh host or try again while idle')
+      }
+      if (this.options.commandWorkspace && this.options.commandWorkspace !== workspace) {
+        await workspace.shutdown(); throw new Error('Command capability changed during setup')
+      }
+      this.options.commandWorkspace = workspace
+    }
+    if (!this.options.commandWorkspace) throw new Error('Trusted commands require a selected workspace')
+    if (this.commandsEnabled) return true
+    return this.options.commandWorkspace.enable(this.commandContext('enrollment'), signal)
+  }
+  async disableCommands(): Promise<void> {
+    if (this.running) throw new Error('Cancel the current turn before disabling trusted commands')
+    this.commandSetupEpoch++; this.commandOpening = undefined
+    await this.options.commandWorkspace?.disable()
+  }
+  /** Cancels children before releasing a session or closing its approval surface. */
+  async shutdown(): Promise<void> { this.shutdownStarted = true; this.commandSetupEpoch++; this.commandOpening = undefined
+    this.cancel(); await this.options.commandWorkspace?.shutdown(); await this.drainMemory(); await this.drainSkills() }
   get skillsEnabled(): boolean { return this.enabledSkills }
   get skillsDiagnostics(): readonly string[] { return this.options.skills?.diagnostics ?? [] }
   setSkillsEnabled(enabled: boolean): void {
@@ -382,6 +439,7 @@ export class CliHost {
     signal, assertCurrent => this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent), revision => revision)
   }
   async send(content: string, signal?: AbortSignal): Promise<AgentResult> {
+    if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host')
     if (this.running) throw new Error('A CLI turn is already running')
     if (!content.trim() || content.length > 64 * 1024) throw new Error('Message must contain 1..65536 characters')
     const secrets = this.options.secrets ?? []
@@ -397,10 +455,13 @@ export class CliHost {
     const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets,
       (call, signal) => this.executeWorkspaceMutation(call, signal)) : undefined
     const controller = new AbortController()
-    this.controller = controller
     // The registry is captured once per turn. Its opaque identity binds capabilities
     // without imposing Decisions JSON/depth limits on unchanged trusted extensions.
     this.toolsetRevision = randomUUID()
+    const commandRunId = randomUUID()
+    const commands = enableTools && this.commandsEnabled && this.options.commandApproval?.isAvailable() === true && this.options.commandWorkspace
+      ? createCommandExtension(this.options.commandWorkspace, this.commandContext(commandRunId, controller.signal)) : undefined
+    this.controller = controller
     this.reviews.beginTurn(this.current.id, content)
     const abort = (): void => controller.abort()
     signal?.addEventListener('abort', abort, { once: true })
@@ -437,7 +498,7 @@ export class CliHost {
           return this.enabledSkills && !memoryContextContainsSecret(catalog.document(request.name), this.options.secrets ?? [])
         }
       }) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills)
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands)
       if (catalog) {
         if (!this.options.skills?.writable) {
           try { this.options.onSkillsNotice?.('Automatic skill saving is disabled on every platform. The creator can draft standard SKILL.md text for manual saving') }
@@ -457,6 +518,7 @@ export class CliHost {
           { kind: 'message', role: 'user', content: formatMemoryContext(memories.memories) })
       }
       if (workspace) prefix.push({ kind: 'message', role: 'system', content: WORKSPACE_GUIDANCE })
+      if (commands) prefix.push({ kind: 'message', role: 'system', content: COMMAND_GUIDANCE })
       // Accept the prompt and its title in one successful checkpoint. A failed
       // initial write must not leave an unsaved prompt/title in memory for a retry.
       const previous = structuredClone(this.current)
@@ -476,13 +538,13 @@ export class CliHost {
           // provider request, without silently rewriting approved context.
           const memoryToolContext: unknown[] = []
           for (const message of input.messages) {
-            if (message.kind === 'tool_result' && (memoryToolNames.has(message.name) || workspaceToolNames.has(message.name) || skillsToolNames.has(message.name))) {
+            if (message.kind === 'tool_result' && (memoryToolNames.has(message.name) || workspaceToolNames.has(message.name) || commandToolNames.has(message.name) || skillsToolNames.has(message.name))) {
               // Decode quoted/escaped content before checking, including resumed
               // canonical results that were serialized by an older host.
               try { memoryToolContext.push(JSON.parse(message.content)) }
               catch { memoryToolContext.push(message.content) }
             } else if (message.kind === 'assistant') {
-              for (const call of message.toolCalls) if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name) || skillsToolNames.has(call.name)) memoryToolContext.push(call.arguments)
+              for (const call of message.toolCalls) if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name) || commandToolNames.has(call.name) || skillsToolNames.has(call.name)) memoryToolContext.push(call.arguments)
             }
           }
           if (memoryContextContainsSecret([memoryContents, skillContents, memoryToolContext], this.options.secrets ?? [])) {
@@ -553,7 +615,7 @@ export class CliHost {
     } finally {
       // runAgent aborts uncooperative tools without awaiting their I/O. A save
       // already admitted by memory still owns its commit and lease until settled.
-      try { await this.drainMemory(); await this.drainSkills() }
+      try { await this.options.commandWorkspace?.endRun(); await this.drainMemory(); await this.drainSkills() }
       finally {
         signal?.removeEventListener('abort', abort)
         this.controller = undefined

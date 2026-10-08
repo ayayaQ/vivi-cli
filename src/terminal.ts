@@ -13,6 +13,7 @@ import type { RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { autoReviewSharingScope } from './auto-review.js'
+import { COMMAND_DISCLOSURE } from './commands.js'
 
 export interface ChatIO {
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
@@ -55,6 +56,26 @@ export interface TerminalOptions {
 }
 export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
 export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
+
+/** Only this human command surface can enroll trust; model tools cannot enable it. */
+export async function runCommandControl(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
+  const command = line.trim()
+  if (!/^\/commands(?:\s|$)/.test(command)) return false
+  const action = command.replace(/^\/commands\s*/, '') || 'status'
+  if (action === 'off') { await host.disableCommands(); io.write('Trusted commands disabled for this launch/session\n'); return true }
+  if (action === 'on') {
+    if (io.canAutoReview !== true || io.isClosed) { io.write('Trusted commands remain disabled: interactive human approval is required\n'); return true }
+    const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
+    try {
+      const enabled = await host.enableCommands(controller.signal)
+      io.write(enabled ? `Trusted commands enabled for ${JSON.stringify(host.commandDirectory)} · every process still needs human approval\n`
+        : 'Trusted command enrollment denied; commands remain disabled\n')
+    } finally { dispose() }
+    return true
+  }
+  io.write(`Trusted commands: ${host.commandsEnabled ? 'enabled' : 'disabled'}${host.commandDirectory ? ` · ${JSON.stringify(host.commandDirectory)}` : ' · no workspace selected'}\n${COMMAND_DISCLOSURE}\n/commands on · enable for this launch/session; /commands off · disable\n`)
+  return true
+}
 
 /** Disclosure is host-authored; credentials and model-generated text never identify an account. */
 export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
@@ -432,6 +453,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       continue
     }
     if (!line.trim()) continue
+    if (/^\/commands(?:\s|$)/.test(line.trim())) {
+      try { await runCommandControl(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Trusted command setup failed'}\n`) }
+      continue
+    }
     if (/^\/mode(?:\s|$)/.test(line.trim())) {
       if (line.trim() !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
       try { await selectApprovalMode(host, io) }

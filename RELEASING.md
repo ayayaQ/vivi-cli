@@ -247,3 +247,22 @@ only list/read tools are exposed, creator drafts describe manual saving, and all
 remain read-only. Prior restricted assessments stay unconditionally skipped; passing
 ordinary checks does not complete that stopped review or accept automatic skill saves.
 Actual Windows and macOS behavior is verified only when the relevant platform ran.
+
+## Trusted command checks
+
+Commands require launch/session workspace trust and fresh human approval for every
+start, including Auto. Check exact argv, immutable minimal environment, current-run
+IDs, bounded output, timeout/cancel and inherited process-tree cleanup. Windows uses
+the built-in PowerShell helper with its own fixed OS module path and exact Utility
+manifest import; the approved target environment is unchanged. No precompiled helper
+or additional persistent access is used.
+
+Run command mock/host/process tests plus actual Windows lifecycle fixtures on both
+Node 26.4 and current Node 26. The ordinary unchanged Windows PowerShell 5.1 cmdlet
+fixture uses a 50-second explicitly approved request within the existing 5-minute
+maximum because the controlled direct-host baseline also spent about 27 seconds on
+first-use module preparation. It requires exit 0, exact stdout and only completed
+first-use progress CLIXML; the 30-second default and shorter timeout/cleanup gates
+stay unchanged. Installed Node/Bun and compiled consumer tests use the same private
+canonical npm archive. These checks do not claim real-user terminal/vault behavior,
+hostile-code isolation, macOS cleanup or live-provider accuracy.

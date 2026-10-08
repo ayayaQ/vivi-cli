@@ -44,6 +44,7 @@ export const SLASH_COMMANDS = [
   { command: '/rename', description: 'Rename the current session' },
   { command: '/settings', description: 'Change future defaults' },
   { command: '/memories', description: 'Manage app-wide saved context' },
+  { command: '/commands', description: 'Manage trusted workspace commands' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
   { command: '/menu', description: 'Open the menu' },
   { command: '/help', description: 'Show commands and shortcuts' },
