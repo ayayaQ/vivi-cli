@@ -11,6 +11,20 @@ env:
   npm_config_engine_strict: 'true'
 
 jobs:
+  utility_observations:
+    # Diagnostic-only trusted built-in module comparison. Product assertions remain unchanged.
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+      # Empty fixed type and constant JSON only; no command Job Run or policy changes.
+      - run: node --test --test-concurrency=1 test/windows-helper-utility-diagnostic.test.mjs
+
   helper_discovery:
     # Build-proof artifacts only. Discovery hashes are not approved package/runtime inputs.
     runs-on: windows-latest
