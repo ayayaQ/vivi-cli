@@ -12,7 +12,7 @@ import { HelperBuildError, runBoundedWindowsTool } from '../scripts/build-window
 const modes = ['minimal-baseline', 'exact-manifest']
 const setupNames = ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR']
 const identityPrefixes = ['add-type-meta', 'json-meta']
-const phases = new Set(['helper-start', 'system-path-ready', 'baseline-skipped', 'module-path-reset', 'import-start', 'import-ready', 'import-error', 'resolve-start', 'resolve-ready', 'resolve-error', 'source-verified', 'add-type-start', 'add-type-ready', 'add-type-error', 'json-start', 'json-ready', 'json-error', 'helper-error', ...identityPrefixes.flatMap(prefix => ['module-kind-binary', 'module-kind-manifest', 'module-kind-other', 'identity-unavailable'].map(kind => `${prefix}-${kind}`))])
+const phases = new Set(['helper-start', 'language-ready', 'path-start', 'path-ready', 'system-path-ready', 'baseline-skipped', 'module-path-reset', 'import-start', 'import-ready', 'import-error', 'resolve-start', 'resolve-ready', 'resolve-error', 'source-verified', 'add-type-start', 'add-type-ready', 'add-type-error', 'json-start', 'json-ready', 'json-error', 'helper-error', ...identityPrefixes.flatMap(prefix => ['module-kind-binary', 'module-kind-manifest', 'module-kind-other', 'identity-unavailable'].map(kind => `${prefix}-${kind}`))])
 const program = String.raw`
 function Phase([string]$name) {
   [Console]::Error.WriteLine('VIVI_UTILITY_PHASE:' + $name)
@@ -37,9 +37,11 @@ $ErrorActionPreference = 'Stop'
 $operation = 'invariant'
 try {
   if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { throw 'Unsupported language mode' }
-  $home = [IO.Path]::GetFullPath([IO.Path]::Combine($env:SystemRoot, 'System32\WindowsPowerShell\v1.0'))
-  if (-not [String]::Equals($PSHOME, $home, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected PowerShell home' }
-  $modules = [IO.Path]::Combine($home, 'Modules')
+  Phase 'language-ready'
+  Phase 'path-start'
+  $expectedHome = [IO.Path]::GetFullPath([IO.Path]::Combine($env:SystemRoot, 'System32\WindowsPowerShell\v1.0'))
+  if (-not [String]::Equals($PSHOME, $expectedHome, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected PowerShell home' }
+  $modules = [IO.Path]::Combine($expectedHome, 'Modules')
   $manifest = [IO.Path]::Combine($modules, 'Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
   if (-not [IO.File]::Exists($manifest) -or ([IO.File]::GetAttributes($manifest) -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))) { throw 'Unexpected built-in manifest' }
   $parent = [IO.Path]::GetDirectoryName($manifest)
@@ -47,6 +49,7 @@ try {
     if ([IO.File]::GetAttributes($parent) -band [IO.FileAttributes]::ReparsePoint) { throw 'Unexpected built-in ancestor' }
     $parent = [IO.Path]::GetDirectoryName($parent)
   }
+  Phase 'path-ready'
   Phase 'system-path-ready'
   $mode = $env:VIVI_UTILITY_DIAGNOSTIC_MODE
   if ($mode -eq 'minimal-baseline') {
@@ -174,6 +177,12 @@ test('Utility probe uses the verified OS manifest, fixed module environment and 
   assert.equal(active.env.PSModulePath, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules')
   assert.equal(baseline.env.PSModulePath, undefined)
   assert.ok(!/ViviCommandJob|\.Run\(|ConvertTo-Json|Set-ExecutionPolicy|ExecutionPolicy|Bypass|Install-|Download|Invoke-WebRequest|GetAssemblyName|GacCategory|\.dll/.test(program))
+  const automaticAssignment = /\$(?:HOME|Host|PID|PSHOME)\b\s*(?:[+\-*/%]?=|\+\+|--)/i
+  assert.ok(!automaticAssignment.test(program))
+  for (const name of ['home', 'HoSt', 'pid', 'PSHOME']) assert.ok(automaticAssignment.test(`$${name} = 'forbidden'`))
+  assert.ok(program.indexOf("Phase 'language-ready'") < program.indexOf("Phase 'path-start'"))
+  assert.ok(program.indexOf("Phase 'path-start'") < program.indexOf('$expectedHome ='))
+  assert.ok(program.indexOf("Phase 'path-ready'") < program.indexOf('Import-Module'))
   assert.ok(program.indexOf('baseline-not-reexecuted') < program.indexOf('Import-Module'))
   assert.ok(program.indexOf("SetEnvironmentVariable('PSModulePath'") < program.indexOf('Import-Module'))
   assert.ok(program.includes("Import-Module -Name $manifest -ErrorAction Stop"))
