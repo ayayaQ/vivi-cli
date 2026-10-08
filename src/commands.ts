@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import type { JsonObject, ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
@@ -25,21 +25,32 @@ export const COMMAND_GUIDANCE = 'Trusted command tools use executable plus an ex
 const environmentNames = ['PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ'] as const
 /** Inert launch snapshot; command-only validation is deferred until trust is requested. */
 export function captureCommandEnvironment(source: NodeJS.ProcessEnv): Readonly<NodeJS.ProcessEnv> {
-  return Object.freeze(Object.fromEntries(Object.entries(source).filter(([key]) => environmentNames.some(name =>
-    process.platform === 'win32' ? key.toLowerCase() === name.toLowerCase() : key === name))))
+  return Object.freeze(Object.fromEntries(Object.keys(source).filter(key => environmentNames.some(name =>
+    process.platform === 'win32' ? key.toLowerCase() === name.toLowerCase() : key === name)).map(key => [key, source[key]])))
 }
-/** Captured host allowlist, not a blanket process.env spread or model-editable environment. */
-export function commandEnvironment(source: NodeJS.ProcessEnv, secrets: readonly string[] = []): Readonly<Record<string, string>> {
+/** Command-only validation: Windows needs a captured local absolute SystemRoot.
+ * No inherited module path or fallback is used. Platform injection is for tests. */
+export function commandEnvironment(source: NodeJS.ProcessEnv, secrets: readonly string[] = [], platform: NodeJS.Platform = process.platform): Readonly<Record<string, string>> {
   const result: Record<string, string> = Object.create(null) as Record<string, string>
-  for (const name of environmentNames) {
-    const keys = Object.keys(source).filter(key => process.platform === 'win32' ? key.toLowerCase() === name.toLowerCase() : key === name)
-    if (keys.length > 1) throw new Error('Command environment has ambiguous variable names')
-    const value = keys[0] === undefined ? undefined : source[keys[0]]
-    if (value === undefined) continue
+  const set = (name: string, value: string): void => {
     if (value.length > 32 * 1024 || value.includes('\0') || reviewContainsSecret(value, secrets)) {
       throw new Error('Command environment contains an invalid value or known credential')
     }
     result[name] = value
+  }
+  for (const name of environmentNames) {
+    const keys = Object.keys(source).filter(key => platform === 'win32' ? key.toLowerCase() === name.toLowerCase() : key === name)
+    if (keys.length > 1) throw new Error('Command environment has ambiguous variable names')
+    const value = keys[0] === undefined ? undefined : source[keys[0]]
+    if (value === undefined) continue
+    set(name, value)
+  }
+  if (platform === 'win32') {
+    const root = result.SystemRoot
+    if (!root || !win32.isAbsolute(root) || !/^[a-z]:[\\/]/i.test(root) || root.includes(';')) {
+      throw new Error('Windows command environment requires a captured local absolute SystemRoot')
+    }
+    set('PSModulePath', win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'))
   }
   return Object.freeze(result)
 }
@@ -190,6 +201,7 @@ export class TrustedCommandWorkspace {
     const preparedAction: PreparedActionMetadata = { complete: false, effects: [{ kind: 'unknown',
       resourceId: `cli-command-workspace:${this.revision}`, scope: 'unknown', review: 'manual',
       affectedData: { executable, args, cwd, timeoutMs: values.timeoutMs, environmentNames: values.environmentNames,
+        ...(this.environment.PSModulePath === undefined ? {} : { windowsModulePolicy: { source: 'fixed-SystemRoot-system-directory', PSModulePath: this.environment.PSModulePath } }),
         unsandboxed: true } }] }
     const command = Object.freeze({ ...values, args: Object.freeze(args), environmentNames: Object.freeze(values.environmentNames),
       digest: reviewDigest({ ...values, environment: this.environment, workspace: this.trustBinding }), preparedAction })
@@ -215,7 +227,7 @@ export class TrustedCommandWorkspace {
     this.starts.add(`${executionOwner}:${call.id}`)
     const command = await this.prepare(structuredClone(call.arguments)), account = context.accountRevision, binding = this.trustBinding
     const approval: ApprovalRequest = { call: structuredClone(call), currentRevision: command.digest,
-      description: `Start trusted command (shell:false).\nExecutable: ${displayJSON(command.executable)}\nArguments: ${displayJSON(command.args)}\nWorking directory: ${displayJSON(command.cwd)}\nEnvironment names: ${command.environmentNames.join(', ') || '(empty)'}\nHard timeout: ${command.timeoutMs} ms; initial output wait: ${command.yieldMs} ms\n${COMMAND_DISCLOSURE}` }
+      description: `Start trusted command (shell:false).\nExecutable: ${displayJSON(command.executable)}\nArguments: ${displayJSON(command.args)}\nWorking directory: ${displayJSON(command.cwd)}\nEnvironment names: ${command.environmentNames.join(', ') || '(empty)'}\n${this.environment.PSModulePath === undefined ? '' : `Windows initial module policy: PSModulePath=${displayJSON(this.environment.PSModulePath)} (fixed SystemRoot system directory; no inherited user/project module paths).\n`}Hard timeout: ${command.timeoutMs} ms; initial output wait: ${command.yieldMs} ms\n${COMMAND_DISCLOSURE}` }
     check(approval.description.length <= 48 * 1024, 'Command approval display exceeds its limit; use a smaller argv array')
     const approvalDigest = reviewDigest(approval), preparedDigest = reviewDigest(command)
     const assertCurrent = (): void => {

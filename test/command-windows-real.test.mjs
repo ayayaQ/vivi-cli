@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, win32 } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { test } from 'node:test'
 import { launchWindowsCommand } from '../dist/command-windows.js'
@@ -13,6 +13,7 @@ const fixture = resolve('test/fixtures/windows-command-process.mjs')
 const options = { skip: process.platform !== 'win32', timeout: 20_000 }
 const env = { SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT ?? 'C:\\Windows' }
 const powershell = join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+const powershell7 = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
 const hostProbeSource = 'process.stdout.write(JSON.stringify(Object.keys(process.env).map(name=>name.toUpperCase()).sort())+"\\n");process.stdout.write("native-phase-fixture-ready\\n");setInterval(()=>{},1000)'
 function diagnostics(t, label) {
   const started = performance.now()
@@ -45,8 +46,8 @@ test('realistic host snapshot forwards only explicit supported names and its tar
   const expectedNames = Object.keys(host).sort()
   Object.assign(host, { PSModulePath: 'hostile', OPENAI_API_KEY: 'private', ANTHROPIC_API_KEY: 'private', USERPROFILE: 'private', NODE_OPTIONS: 'private' })
   const snapshot = commandEnvironment(captureCommandEnvironment(host))
-  assert.deepEqual(Object.keys(snapshot).sort(), expectedNames)
-  assert.equal(snapshot.PSModulePath, undefined)
+  assert.deepEqual(Object.keys(snapshot).sort(), [...expectedNames, ...(process.platform === 'win32' ? ['PSModulePath'] : [])].sort())
+  assert.equal(snapshot.PSModulePath, process.platform === 'win32' ? win32.join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules') : undefined)
   assert.equal(snapshot.OPENAI_API_KEY, undefined)
   assert.equal(snapshot.NODE_OPTIONS, undefined)
   assert.ok(hostProbeSource.includes('Object.keys(process.env)'))
@@ -92,6 +93,23 @@ test('ordinary unqualified PowerShell cmdlet runs under the actual host-generate
   const out = collect(command.stdout), err = collect(command.stderr)
   assert.deepEqual(await command.completed, { exitCode: 0 })
   assert.equal((await out).toString('utf8').trim(), 'ordinary-powershell-fixture')
+  assert.equal((await err).length, 0)
+})
+for (const mode of ['ordinary', 'argv']) test(`installed PowerShell7 ${mode} compatibility under the actual generated environment`, options, async t => {
+  const info = await lstat(powershell7)
+  assert.ok(info.isFile() && !info.isSymbolicLink())
+  assert.equal((await realpath(powershell7)).toLowerCase(), powershell7.toLowerCase())
+  const targetEnv = commandEnvironment(captureCommandEnvironment(process.env))
+  const literals = ['', 'white space', 'a"b', 'ends\\', '&|<>^%PATH%', '$(Write-Output bad)', '中文🙂']
+  const args = mode === 'ordinary'
+    ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("Write-Output 'ordinary-pwsh7-fixture'", 'utf16le').toString('base64')]
+    : ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', resolve('test/fixtures/windows-command-argv.ps1'), ...literals]
+  const command = await launchWindowsCommand({ executable: powershell7, args, cwd: process.cwd(), env: targetEnv }, diagnostics(t, `PowerShell7-${mode}-host-environment`))
+  t.after(() => command.stop())
+  const out = collect(command.stdout), err = collect(command.stderr)
+  assert.deepEqual(await command.completed, { exitCode: 0 })
+  if (mode === 'ordinary') assert.equal((await out).toString('utf8').trim(), 'ordinary-pwsh7-fixture')
+  else assert.deepEqual(JSON.parse((await out).toString('utf8').trim()), literals)
   assert.equal((await err).length, 0)
 })
 
@@ -177,7 +195,7 @@ test('Windows phase diagnostic verifies stop with the supported captured host en
   const [namesLine, readyLine, trailing] = lines
   const names = JSON.parse(namesLine)
   assert.deepEqual(names, Object.keys(setup).map(name => name.toUpperCase()).sort())
-  assert.ok(!names.includes('PSMODULEPATH') && !names.some(name => name.endsWith('_API_KEY')))
+  assert.ok(names.includes('PSMODULEPATH') && !names.includes('VIVI_COMMAND_PHASES') && !names.some(name => name.endsWith('_API_KEY')))
   assert.equal(readyLine, 'native-phase-fixture-ready')
   assert.equal(trailing, '')
   assert.equal((await err).length, 0)

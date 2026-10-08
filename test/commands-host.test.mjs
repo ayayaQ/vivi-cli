@@ -116,7 +116,7 @@ test('disabled command-only environment validation cannot break ordinary chat st
     event() {}, result() {}, approve: async () => { throw new Error('No command approval expected') }, onCancel: () => () => {}, close() {} }
   let requests = 0
   const status = await main(['--model', 'fixture', '--no-tools', '--no-tui', '--session-dir', join(subject.root, 'state'), '--prompt', 'Fixture'],
-    { INTERNAL_API_TOKEN: 'fixture-private-value', PATH: '/fixture-private-value/bin' },
+    { INTERNAL_API_TOKEN: 'fixture-private-value', PATH: '/fixture-private-value/bin', SystemRoot: 'relative', PSModulePath: 'C:\\private-user-modules' },
     { io, launchDirectory: subject.root, providerFactory: () => ({ async generate({ tools }) { requests++; assert.deepEqual(tools, []); return { content: 'Done', toolCalls: [] } } }) })
   assert.equal(status, 0); assert.equal(requests, 1)
 })
