@@ -11,7 +11,7 @@ import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import type { RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
-import type { ApprovalMode } from './auto-review.js'
+import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { autoReviewSharingScope } from './auto-review.js'
 
 export interface ChatIO {
@@ -22,7 +22,7 @@ export interface ChatIO {
   readonly canAutoReview?: boolean
   setApprovalMode?(mode: ApprovalMode): void
   /** Optional safe display sink that survives canonical transcript refresh. */
-  reviewNotice?(message: string): void
+  reviewNotice?(message: string, context?: ReviewNotice): void
   /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
   runStarted?(): void
   runFinished?(outcome: RunOutcome): void

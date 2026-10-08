@@ -16,7 +16,7 @@ import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES } fr
 import type { ReadOnlyWorkspace } from './workspace.js'
 import { normalizeSessionTitle, sessionTitleFromPrompt, validSessionTitle } from './session-display.js'
 import { AutoReviewController, reviewDigest } from './auto-review.js'
-import type { ApprovalMode, AutoReviewConfiguration } from './auto-review.js'
+import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice } from './auto-review.js'
 import type { JsonObject } from '@ayayaq/vivi'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
@@ -75,7 +75,7 @@ export interface CliHostOptions {
   maxRounds?: number
   approve?(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
   decisionReview?: AutoReviewConfiguration
-  onReviewNotice?(message: string): void
+  onReviewNotice?(message: string, context?: ReviewNotice): void
   onMemoryNotice?(message: string): void
   onEvent?(event: AgentEvent): void | Promise<void>
 }

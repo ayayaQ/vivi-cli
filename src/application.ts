@@ -424,7 +424,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         onMemoryNotice: message => io.write(`${message}\n`),
-        onReviewNotice: message => io.reviewNotice ? io.reviewNotice(message) : io.write(`${message}\n`),
+        onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
         ...(io.canAutoReview === true ? { decisionReview: {
           provider: deferredDecisionProvider(session, env, input.decisionProviderFactory ?? decisionProviderForSession),
           ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,

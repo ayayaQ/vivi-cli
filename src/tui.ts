@@ -25,7 +25,8 @@ import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
 import { RunStatus } from './run-status.js'
 import type { RunClock, RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
-import type { ApprovalMode } from './auto-review.js'
+import type { ApprovalMode, ReviewNotice } from './auto-review.js'
+import { reviewNoticeSettled } from './auto-review.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
@@ -98,7 +99,15 @@ interface PendingInput {
   approvalLabels?: { deny: string; allow: string }
   finish(value: string | number | undefined, aborted?: boolean): void
 }
-interface DisplayEntry { label: string; content: string; markdown: boolean }
+interface DisplayEntry {
+  label: string
+  content: string
+  markdown: boolean
+  historyIndex?: number
+  reviewKey?: string
+  review?: ReviewNotice
+  historyStart?: number
+}
 interface SearchPicker {
   choices: readonly Choice<unknown>[]
   matches: number[]
@@ -187,6 +196,8 @@ export class OpenTuiIO implements ChatIO {
   private entries: DisplayEntry[] = []
   private resultNotices: DisplayEntry[] = []
   private reviewNotices: DisplayEntry[] = []
+  private historyLength = 0
+  private turnHistoryStart = 0
   private pending: PendingInput | undefined
   private closed = false
   private failure: Error | undefined
@@ -1066,14 +1077,14 @@ export class OpenTuiIO implements ChatIO {
   }
   runStarted(): void {
     if (this.closed) return
-    this.reviewNotices = []
-    this.entries = this.entries.filter(entry => entry.label !== 'Review')
-    this.rebuild()
+    this.settleReviews('cancelled')
+    this.turnHistoryStart = this.historyLength
     this.runStatus.start()
     this.updateStatus('Working · Escape / Ctrl+C cancels')
   }
   runFinished(outcome: RunOutcome): void {
     if (this.closed) return
+    this.settleReviews(outcome)
     this.runStatus.finish(outcome)
     this.updateStatus(outcome === 'completed' ? 'Completed' : outcome === 'cancelled' ? 'Cancelled' : 'Error')
   }
@@ -1150,12 +1161,56 @@ export class OpenTuiIO implements ChatIO {
         ? `\nTools requested: ${message.toolCalls.map((call) => call.name).join(', ')}` : ''
       const safeLabel = this.safe(label, 4096)
       const content = this.safe(message.content + tools, Math.max(0, budget - safeLabel.length))
-      entries.unshift({ label: safeLabel, content, markdown: message.kind === 'assistant' })
+      entries.unshift({ label: safeLabel, content, markdown: message.kind === 'assistant', historyIndex: index })
       budget -= safeLabel.length + content.length
     }
     if (entries.length < history.length) entries.unshift({ label: 'Display limit',
       content: 'Earlier transcript is omitted from this bounded view; saved history is unchanged', markdown: false })
     return entries
+  }
+  private transcriptEntries(history: readonly HistoryMessage[]): DisplayEntry[] {
+    const entries = this.historyEntries(history)
+    const placed = new Map<number, DisplayEntry[]>()
+    for (const entry of this.reviewNotices) {
+      const start = entry.historyStart ?? this.turnHistoryStart
+      if (start >= history.length) continue
+      let end = history.length
+      for (let index = start + 1; index < history.length; index++) {
+        const message = history[index]!
+        if (message.kind === 'message' && message.role === 'user') { end = index; break }
+      }
+      let position = end
+      if (entry.review) {
+        // Call IDs can be reused on later turns. Only match inside this run's history span.
+        const result = history.findIndex((message, index) => index >= start && index < end &&
+          message.kind === 'tool_result' && message.callId === entry.review!.callId)
+        if (result >= 0) position = result
+        else {
+          const assistant = history.findIndex((message, index) => index >= start && index < end &&
+            message.kind === 'assistant' && message.toolCalls.some(call => call.id === entry.review!.callId))
+          if (assistant >= 0) position = assistant + 1
+        }
+      } else {
+        // A separate audit warning belongs to its turn, before the final answer.
+        for (let index = end - 1; index >= start; index--) {
+          const message = history[index]!
+          if (message.kind === 'assistant' && !message.toolCalls.length) { position = index; break }
+        }
+      }
+      const group = placed.get(position) ?? []
+      group.push(entry); placed.set(position, group)
+    }
+    return entries.flatMap(entry => entry.historyIndex === undefined ? [entry]
+      : [...(placed.get(entry.historyIndex) ?? []), entry]).concat(placed.get(history.length) ?? [])
+  }
+  private settleReviews(outcome: RunOutcome): void {
+    for (const entry of [...this.reviewNotices]) {
+      if (!entry.review || reviewNoticeSettled(entry.review)) continue
+      const unknown = entry.review.state === 'saving'
+      this.reviewNotice(unknown ? 'The write outcome could not be confirmed; check the resource before retrying'
+        : outcome === 'cancelled' ? 'Review cancelled; no save was made' : 'Review ended without a confirmed save',
+      { ...entry.review, state: unknown ? 'unknown' : outcome === 'cancelled' ? 'cancelled' : 'failed' })
+    }
   }
   setDraft(provider: CliProviderName): void {
     if (this.closed) return
@@ -1167,6 +1222,8 @@ export class OpenTuiIO implements ChatIO {
     this.entries = []
     this.resultNotices = []
     this.reviewNotices = []
+    this.historyLength = 0
+    this.turnHistoryStart = 0
     this.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
     this.usageScope = 'Session'
     this.rebuild()
@@ -1186,6 +1243,7 @@ export class OpenTuiIO implements ChatIO {
       this.runStatus.reset()
       this.resultNotices = []
       this.reviewNotices = []
+      this.turnHistoryStart = 0
       this.clearStream()
       this.status = 'Ready'
     }
@@ -1194,18 +1252,36 @@ export class OpenTuiIO implements ChatIO {
     this.updateHeader()
     this.usage = { ...session.usage }
     this.usageScope = 'Session'
-    this.entries = [...this.historyEntries(session.history), ...this.reviewNotices, ...this.resultNotices]
+    this.historyLength = session.history.length
+    this.entries = [...this.transcriptEntries(session.history), ...this.resultNotices]
     this.rebuild()
     this.updateStatus()
   }
   write(text: string): void {
     if (text) this.appendEntry({ label: 'vivi', content: this.safe(text.trimEnd()), markdown: false })
   }
-  reviewNotice(message: string): void {
+  reviewNotice(message: string, context?: ReviewNotice): void {
     if (this.closed || !message) return
-    const entry: DisplayEntry = { label: 'Review', content: this.safe(message, 2048), markdown: false }
-    this.reviewNotices = [...this.reviewNotices, entry].slice(-16)
-    this.appendEntry(entry)
+    if (context && this.sessionId !== undefined && context.sessionId !== this.sessionId) return
+    const key = context ? JSON.stringify([context.sessionId, context.runId, context.callId]) : undefined
+    const previous = key === undefined ? undefined : this.reviewNotices.find(entry => entry.reviewKey === key)
+    if (previous?.review && reviewNoticeSettled(previous.review)) return
+    const content = this.safe(message, 2048)
+    if (!context && this.reviewNotices.some(entry => !entry.review && entry.historyStart === this.turnHistoryStart && entry.content === content)) return
+    const entry: DisplayEntry = { label: context ? this.safe(`Review · ${context.toolName}`, 4096) : 'Review warning',
+      content, markdown: false,
+      historyStart: previous?.historyStart ?? this.turnHistoryStart,
+      ...(context ? { review: { ...context }, reviewKey: key! } : {}) }
+    if (previous) {
+      this.reviewNotices[this.reviewNotices.indexOf(previous)] = entry
+      const index = this.entries.findIndex(item => item.reviewKey === key)
+      if (index >= 0) this.entries[index] = entry
+      else this.entries.push(entry)
+      this.rebuild()
+    } else {
+      this.reviewNotices = [...this.reviewNotices, entry].slice(-32)
+      this.appendEntry(entry)
+    }
   }
   private safeStream(final = false): string {
     const text = stripControls(this.streamed)
@@ -1270,11 +1346,13 @@ export class OpenTuiIO implements ChatIO {
     const partial = result.status !== 'completed' && (this.streamed || this.streamOverflow)
       ? this.safeStream(true) + (this.streamOverflow ? '\n[display truncated]' : '') : undefined
     this.clearStream()
-    this.entries = this.historyEntries(result.history)
+    this.settleReviews(result.status)
+    this.historyLength = result.history.length
+    this.entries = this.transcriptEntries(result.history)
     this.resultNotices = []
     if (partial !== undefined) this.resultNotices.push({ label: 'Partial display only · response was not accepted', content: partial, markdown: true })
     if (result.error) this.resultNotices.push({ label: 'Error', content: this.safe(result.error.message), markdown: false })
-    this.entries.push(...this.reviewNotices, ...this.resultNotices)
+    this.entries.push(...this.resultNotices)
     this.rebuild()
     this.usage = { ...result.usage }
     this.usageScope = 'Turn'

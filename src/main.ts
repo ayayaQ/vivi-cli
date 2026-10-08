@@ -311,7 +311,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
       enableTools, enableMemory: options.enableMemory, memory, ...(workspace ? { workspace } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
-      onReviewNotice: message => io!.reviewNotice ? io!.reviewNotice(message) : io!.write(`${message}\n`),
+      onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
       ...(io.canAutoReview === true ? { decisionReview: {
         provider: deferredDecisionProvider(session, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
         ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,

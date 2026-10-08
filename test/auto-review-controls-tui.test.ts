@@ -139,25 +139,34 @@ test('a real native surface reports Auto unavailable after close, renderer failu
   }
 })
 
-test('review progress and settled warnings stay safe and visible after canonical refresh, then clear on the next turn', async () => {
+test('review progress settles and separate audit warnings stay safe beside their completed turn', async () => {
   const f = await fixture()
+  const session = f.host.session
+  const context = { sessionId: session.id, runId: 'offline-review-run', callId: 'review-note', toolName: 'note_set', state: 'reviewing' as const }
   f.io.runStarted()
-  f.io.reviewNotice('Reviewing note_set with gpt-6-luna (up to 8s)…')
+  f.io.reviewNotice('Reviewing note_set with gpt-6-luna (up to 8s)…', context)
   f.io.reviewNotice('Committed, but audit unavailable: offline-private-key\x1b[31m')
+  f.io.reviewNotice('Approved by you; change saved', { ...context, state: 'saved', source: 'human' })
   f.io.addSecrets(['offline-private-key'])
   f.io.runFinished('completed')
+  session.history = [{ kind: 'message', role: 'user', content: 'Set note tone to concise' },
+    { kind: 'assistant', content: '', toolCalls: [{ id: 'review-note', name: 'note_set', arguments: {} }] },
+    { kind: 'tool_result', callId: 'review-note', name: 'note_set', content: 'Done' },
+    { kind: 'assistant', content: 'Done', toolCalls: [] }]
   f.io.result({ status: 'completed', content: 'Done', rounds: 1,
-    history: [{ kind: 'message', role: 'user', content: 'Set note tone to concise' },
-      { kind: 'assistant', content: 'Done', toolCalls: [] }],
+    history: session.history,
     usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } })
-  f.io.setSession(f.host.session)
+  f.io.setSession(session)
   const contents = text(f.setup.renderer.root)
-  expect(contents).toContain('Reviewing note_set with gpt-6-luna')
+  expect(contents).not.toContain('Reviewing note_set with gpt-6-luna')
+  expect(contents).toContain('Approved by you; change saved')
   expect(contents).toContain('Committed, but audit unavailable: [REDACTED]')
   expect(contents).not.toContain('offline-private-key')
   expect(contents).not.toContain('\x1b')
   f.io.runStarted()
-  expect(text(f.setup.renderer.root)).not.toContain('audit unavailable')
+  expect(text(f.setup.renderer.root)).toContain('audit unavailable')
   expect(text(f.setup.renderer.root)).not.toContain('Reviewing note_set')
   f.io.runFinished('cancelled')
+  f.io.setSession(newSession({ provider: 'openai', model: 'offline-chat' }))
+  expect(text(f.setup.renderer.root)).not.toContain('audit unavailable')
 })

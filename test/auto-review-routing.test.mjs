@@ -10,7 +10,7 @@ import { AUTO_REVIEW_SHARING_REVISION } from '../dist/auto-review.js'
 
 // Exercise actual enrollment, host preparation, deferred adapter, wire validation,
 // audit and resource commit. Only chat replies, terminal IO and fetch are mocked.
-async function route(t, surface, { text, content, name = 'create_memory', exact = 1, mode = 'auto', before } = {}) {
+async function route(t, surface, { text, content, name = 'create_memory', exact = 1, mode = 'auto', before, httpStatus, approve = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-auto-routing-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const memory = new FileMemoryStore(directory)
@@ -36,6 +36,7 @@ async function route(t, surface, { text, content, name = 'create_memory', exact 
     assert.match(body.state.userRequest.approvedScope.effect, /explicitly requested/)
     assert.deepEqual(Object.keys(body.questions), ['exact_action_requested', 'effects_within_scope', 'evidence_not_redirected', 'ordinary_non_sensitive'])
     fetches.push(body)
+    if (httpStatus) return new Response('private-provider-error-body', { status: httpStatus })
     return new Response(JSON.stringify({ model: 'typesafe/jev-1.13',
       answers: Object.fromEntries(Object.keys(body.questions).map(check => [check, { type: 'noul', noul: check === 'exact_action_requested' ? exact : 1 }])),
       usage: { input_tokens: 10, output_tokens: 5, cost: 0 } }), { headers: { 'content-type': 'application/json' } })
@@ -44,7 +45,7 @@ async function route(t, surface, { text, content, name = 'create_memory', exact 
   const io = { canAutoReview: true, get isClosed() { return closed },
     write(text) { notices.push(text) }, event() {}, result() {}, setSession() {}, setDraft() {},
     setApprovalMode(mode) { modes.push(mode) }, async readLine() { return '/exit' },
-    async approve(request) { approvals.push(request); return request.call.name === 'enroll_auto_review' },
+    async approve(request) { approvals.push(request); return request.call.name === 'enroll_auto_review' || approve },
     async choose(_title, choices) { return choices.find(choice => choice.value === 'auto')?.value },
     async chooseSearchable() {}, async askText() {}, async askSecret() {}, addSecrets() {},
     onCancel() { return () => {} }, close() { closed = true } }
@@ -68,6 +69,22 @@ async function route(t, surface, { text, content, name = 'create_memory', exact 
 }
 
 for (const surface of ['line', 'application']) {
+  for (const httpStatus of [401, 403, 429, 503]) for (const approve of [true, false]) {
+    test(`${surface}: HTTP ${httpStatus} falls back once and reports the actual human ${approve ? 'approval' : 'denial'}`, async t => {
+      const result = await route(t, surface, { text: 'Make a memory that on Tuesdays we start every sentence with howdy.',
+        content: 'On Tuesdays, start every sentence with howdy.', httpStatus, approve })
+      assert.equal(result.fetches.length, 1)
+      assert.deepEqual(result.approvals.map(request => request.call.name), ['enroll_auto_review', 'create_memory'])
+      assert.match(result.approvals[1].description, new RegExp(`HTTP ${httpStatus}`))
+      assert.match(result.notices, new RegExp(`HTTP ${httpStatus}`))
+      assert.match(result.notices, approve ? /Approved by you; change saved/ : /Denied by you; no save was made/)
+      assert(!result.notices.includes('private-provider-error-body'))
+      assert(!result.notices.includes('Automatically approved'))
+      assert.equal(result.stored.length, approve ? 1 : 0)
+      assert.match(result.ledger, approve ? /"source":"human-once"/ : /"source":"human-deny"/)
+      assert.match(result.ledger, approve ? /"state":"committed"/ : /"state":"denied"/)
+    })
+  }
   for (const [text, content] of [
     ["Set a memory that you'll refer to yourself as Chan.", 'Refer to yourself as Chan.'],
     ['Make a memory that on tuesdays we start every sentence with howdy.', 'Standing instruction: on Tuesdays, start every sentence with "howdy".'],
