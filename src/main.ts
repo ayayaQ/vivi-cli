@@ -18,7 +18,7 @@ import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
-import { TerminalIO, runChatLoop, selectApprovalMode, runCommandControl } from './terminal.js'
+import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMode, runCommandControl } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
 import type { Catalog } from './models.js'
@@ -27,6 +27,10 @@ import type { CredentialStore } from './credentials.js'
 import type { ApprovalMode } from './auto-review.js'
 import { assertReviewTransportCurrent } from './auto-review.js'
 import { FileDecisionLedger } from './decision-ledger.js'
+import { McpConfigStore } from './mcp-config.js'
+import { McpManager } from './mcp-manager.js'
+import type { McpManagerOptions } from './mcp-manager.js'
+import { manageMcp } from './mcp-controls.js'
 
 export interface CliOptions {
   /** Launch-only request to open enrollment; never a saved approval. */
@@ -95,6 +99,8 @@ Workspace tools omit symlinks and private/ignored files; text writes require rev
 /mode selects Manual or optional Auto review for the current conversation and selected account.
 Auto review adds API charges; only eligible current-request note/memory changes and scoped text creation/precise-edit tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
+/mcp configures trusted installed stdio servers for metadata only; fresh human startup approval is required.
+MCP connections start disabled each launch. Catalogs never become model tools or provider context; credentials are unsupported.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
@@ -183,7 +189,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   if (options.resume && (options.provider !== undefined || options.model !== undefined || options.reasoning !== undefined)) {
     throw new Error('Resumed sessions retain their provider, model and reasoning; omit selection flags')
   }
-  if (!options.resume && ((!options.model && !interactiveSetup) || (options.model !== undefined &&
+  const mcpPrompt = options.prompt !== undefined && isMcpCommand(options.prompt)
+  if (!options.resume && ((!options.model && !interactiveSetup && !mcpPrompt) || (options.model !== undefined &&
     (!options.model || options.model.length > 200 || options.model.trim() !== options.model)))) {
     throw new Error('A new session requires --model with a bounded model identifier')
   }
@@ -255,6 +262,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
     decisionProviderFactory?: typeof decisionProviderForSession;
     credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
+    mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
@@ -275,6 +283,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
   let host: CliHost | undefined
+  let mcp: McpManager | undefined
   const secrets = environmentSecrets(env)
   const closeIO = (): boolean => {
     const closing = io
@@ -306,6 +315,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const status = await runApplication({ io: tui, options, args, env, secrets,
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
         ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
+        ...(dependencies.mcpManagerFactory ? { mcpManagerFactory: dependencies.mcpManagerFactory } : {}),
         registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
         providerFactory: dependencies.providerFactory ?? providerForSession,
         decisionProviderFactory: dependencies.decisionProviderFactory ?? decisionProviderForSession })
@@ -314,6 +324,12 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
+    mcp = (dependencies.mcpManagerFactory ?? (options => new McpManager(options)))({
+      store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets
+    })
+    if (options.prompt !== undefined && await runMcpCommand(io, options.prompt, {
+      mcp: () => manageMcp(mcp!, io!, options.workspace)
+    })) return 0
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
@@ -351,7 +367,9 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
     if (options.enableCommands) await runCommandControl(host, io, '/commands on')
-    const result = await runChatLoop(host, io, options.prompt)
+    const result = await runChatLoop(host, io, options.prompt, {
+      mcp: () => manageMcp(mcp!, io!, options.workspace)
+    })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {
     const message = redactSecrets(error instanceof Error ? error.message : 'CLI failed', secrets)
@@ -359,9 +377,20 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     else process.stderr.write(`${message}\n`)
     return 1
   } finally {
+    let mcpCleanupFailed = false
+    try { await mcp?.close() }
+    catch (error) {
+      mcpCleanupFailed = true
+      const message = redactSecrets(error instanceof Error ? error.message : 'Owned server cleanup failed', secrets)
+      try {
+        if (io && !io.failed) io.write(`MCP cleanup failed: ${message}\n`)
+        else process.stderr.write(`MCP cleanup failed: ${message}\n`)
+      } catch { process.stderr.write('MCP cleanup failed; terminal reporting was unavailable\n') }
+    }
     await host?.shutdown().catch(() => undefined)
     await release?.().catch(() => undefined)
     closeIO()
+    if (mcpCleanupFailed) return 1
   }
 }
 

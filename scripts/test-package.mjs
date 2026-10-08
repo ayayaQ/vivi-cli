@@ -102,6 +102,11 @@ try {
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
+  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows']) {
+    for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
+      assert(paths.has(path), `Missing ${path}`)
+    }
+  }
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
@@ -131,7 +136,7 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch', '@modelcontextprotocol/client', '@modelcontextprotocol/core']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
@@ -147,6 +152,13 @@ try {
   assert.equal(installedManifest.engines.node, manifest.engines.node)
   assert.equal(installedManifest.license, 'Apache-2.0')
   assert.equal(installedManifest.dependencies[coreName], coreVersion)
+  assert.equal(installedManifest.dependencies['@modelcontextprotocol/client'], '2.3.1')
+  for (const name of ['@modelcontextprotocol/client', '@modelcontextprotocol/core']) {
+    const sdk = JSON.parse(await readFile(join(temporary, 'node_modules', name, 'package.json'), 'utf8'))
+    assert.equal(sdk.version, '2.3.1'); assert.equal(sdk.license, 'Apache-2.0')
+    assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules', name, 'LICENSE'))),
+      normalizeLicense(await readFile(join(root, 'node_modules', name, 'LICENSE'))), 'MCP SDK legal text mismatch')
+  }
   assert.equal(installedManifest.dependencies.ignore, '7.0.12')
   const ignoreManifest = JSON.parse(await readFile(join(temporary, 'node_modules/ignore/package.json'), 'utf8'))
   assert.equal(ignoreManifest.version, '7.0.12')
@@ -183,12 +195,15 @@ try {
   assert.match(run(process.execPath, [...nodeGuard, launcher, '--no-tui', '--help'], temporary), /--provider/)
   // Anchor runtime/type consumers beside the installed package: its bundled core is an
   // implementation dependency, not a promise that npm hoists that package for other consumers.
+  // The installed discovery prototype executes only this package-authored local fixture.
+  await writeFile(join(installed, 'mcp-fixture.mjs'), await readFile(join(root, 'test/fixtures/mcp-discovery-server.mjs')))
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
@@ -200,6 +215,8 @@ import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
 import { createDecisionRequest, evaluateDecision, isDecisionCurrent, createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
 import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
+import { McpConfigStore } from './dist/mcp-config.js'
+import { McpManager } from './dist/mcp-manager.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
 const cjsModels = createRequire(import.meta.url)('@ayayaq/vivi/providers/models')
 const cjsDecisions = createRequire(import.meta.url)('@ayayaq/vivi/decisions')
@@ -239,7 +256,22 @@ const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
   validateArguments() {}, execute() { return { content: 'packed extension works' } }
 }] }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
+const mcp = new McpManager({ store: new McpConfigStore(directory), env: { OPENAI_API_KEY: 'fake-provider-key' } })
 try {
+  await mcp.configure({ id: 'packed', label: 'Owned package fixture', executable: process.execPath,
+    args: [fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'normal', join(directory, 'mcp-log'), join(directory, 'mcp-pid')],
+    cwd: directory, protocol: 'legacy', environment: [] })
+  assert.equal(mcp.statuses()[0].state, 'disabled')
+  assert.equal(await mcp.connect('packed', async () => false, new AbortController().signal), false)
+  assert.equal(await mcp.connect('packed', async () => true, new AbortController().signal), true)
+  const packedMcp = mcp.statuses()[0].snapshot
+  assert.equal(packedMcp.categories.tools.state, 'ready')
+  assert.equal(packedMcp.categories.tools.entries[0].remoteKey, 'same/name')
+  assert(Object.isFrozen(packedMcp.categories.tools.entries[0].descriptor))
+  await mcp.refresh('packed', ['resources', 'resourceTemplates'], new AbortController().signal)
+  assert.equal(mcp.statuses()[0].snapshot.categories.resources.state, 'ready')
+  await mcp.disconnect('packed')
+  assert.equal(mcp.statuses()[0].state, 'disabled')
   const host = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' },
     provider: { generate: async () => ({ content: 'Packed host works', toolCalls: [],
@@ -383,7 +415,7 @@ try {
   })) })
   assert.equal((await openai.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenAI shared')
   assert.equal((await router.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenRouter shared')
-} finally { await rm(directory, { recursive: true, force: true }) }
+} finally { await mcp.close(); await rm(directory, { recursive: true, force: true }) }
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
@@ -427,6 +459,7 @@ void result; void io; void usageText; void selection; void createBuiltinToolset(
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',
     '--target', 'ES2022', '--lib', 'ES2022,DOM', '--types', 'node', '--typeRoots', typeRoots, join(installed, 'consumer.ts')], temporary)
   if (process.env.VIVI_TEST_BUN) {
+    run(process.env.VIVI_TEST_BUN, [join(installed, 'consumer.mjs')], temporary)
     await writeFile(join(installed, 'tui-consumer.ts'), `
 import assert from 'node:assert/strict'
 import { createTestRenderer } from '@opentui/core/testing'

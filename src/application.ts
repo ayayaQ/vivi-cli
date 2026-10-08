@@ -14,7 +14,7 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
@@ -24,6 +24,10 @@ import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 import { FileDecisionLedger } from './decision-ledger.js'
+import { McpConfigStore } from './mcp-config.js'
+import { McpManager } from './mcp-manager.js'
+import type { McpManagerOptions } from './mcp-manager.js'
+import { manageMcp } from './mcp-controls.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -47,6 +51,8 @@ export interface ApplicationOptions {
   registerSecret?(secret: string): void
   providerFactory(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider
   decisionProviderFactory?: typeof decisionProviderForSession
+  /** Trusted launch wiring only; never part of the host or provider context. */
+  mcpManagerFactory?(options: McpManagerOptions): McpManager
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
   reasoningCapabilities: [], stream: true, enableNotes: false, enableMemory: false, enableTools: false, maxRounds: 25 }
@@ -78,6 +84,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
 /commands on requests launch/session-only workspace trust; every unsandboxed command needs fresh human approval, even in Auto. /commands off disables it.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
+/mcp manages trusted installed server connections for metadata only; each launch starts disabled.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
@@ -87,6 +94,19 @@ Keys are masked and saved only in an available OS credential store, or used for 
 
 /** Navigation and host policy; the shared core owns conversation/tool execution. */
 export async function runApplication(input: ApplicationOptions): Promise<number> {
+  const manager = (input.mcpManagerFactory ?? (options => new McpManager(options)))({
+    store: new McpConfigStore(input.options.sessionDirectory, input.secrets), env: input.env, secrets: input.secrets
+  })
+  try {
+    if (input.options.prompt !== undefined && await runMcpCommand(input.io, input.options.prompt, {
+      mcp: () => manageMcp(manager, input.io, input.options.workspace)
+    })) return 0
+    return await runManagedApplication(input, manager)
+  }
+  finally { await manager.close() }
+}
+
+async function runManagedApplication(input: ApplicationOptions, mcp: McpManager): Promise<number> {
   const { io, options, args, providerFactory } = input
   const env = { ...input.env }
   const commandEnv = captureCommandEnvironment(input.env)
@@ -106,7 +126,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
   const register = (key: string): void => {
     if (!key || secrets.includes(key)) return
-    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); decisions.addSecrets([key]); skills.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
+    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); decisions.addSecrets([key]); skills.addSecrets([key]); mcp.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
   let savedSettings: TuiPreferences | undefined
@@ -565,6 +585,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Trusted commands', value: '/commands' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
           { name: 'Skills', value: '/skills' },
+          { name: 'MCP connections', description: 'Trusted installed servers; metadata only', value: '/mcp' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
         if (!action || action === 'continue') continue
@@ -602,6 +623,10 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
         if (command === '/skills') { await manageSkills(); continue }
+        if (isMcpCommand(command)) {
+          await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace) })
+          continue
+        }
         if (command === '/memories') { await manageMemories(); continue }
         if (/^\/commands(?:\s|$)/.test(command)) {
           if (!host) { io.write('Choose a provider and model before enabling trusted commands\n'); continue }

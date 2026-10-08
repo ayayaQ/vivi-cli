@@ -18,6 +18,9 @@ import { FileSessionStore } from '../src/session.js'
 import { CliHost } from '../src/host.js'
 import { ReadOnlyWorkspace, createWorkspaceExtension } from '../src/workspace.js'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
+import type { Transport } from '@modelcontextprotocol/client'
+import { McpConfigStore } from '../src/mcp-config.js'
+import { McpManager } from '../src/mcp-manager.js'
 import { TrustedCommandWorkspace } from '../src/commands.js'
 
 // A controlled compiled child fixture, not an interpreter dependency or live shell.
@@ -30,7 +33,37 @@ if (process.argv[2] === '--command-fixture') {
 // contribute context without storing the per-turn memory prefix in a session.
 function expectCompiledCreator(content: string | undefined): void { assert.equal(content, skillCreatorSource.content) }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-memory-'))
+const mcpMethods: string[] = []
+// Compiler/runtime acceptance uses an owned in-memory discovery peer, never a live server.
+const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, transportFactory: () => {
+  const transport: Transport = { start: async () => {}, close: async () => transport.onclose?.(),
+    send: async message => {
+      if (!('method' in message)) return
+      mcpMethods.push(message.method)
+      if (!('id' in message)) return
+      const result = message.method === 'initialize'
+        ? { resultType: 'complete', protocolVersion: '2025-11-25', capabilities: { tools: {}, resources: {} },
+          serverInfo: { name: 'Owned compiled peer', version: '1' } }
+        : message.method === 'tools/list'
+          ? { resultType: 'complete', tools: [{ name: 'compiled/name', inputSchema: { type: 'object', properties: { query: { type: 'string' } } } }] }
+          : { resultType: 'complete', resources: [{ name: 'Metadata only', uri: 'fixture:///never-read' }] }
+      const id = message.id
+      queueMicrotask(() => transport.onmessage?.({ jsonrpc: '2.0', id, result }))
+    } }
+  return transport
+} })
 try {
+  await mcp.configure({ id: 'compiled', label: 'Owned compiled fixture', executable: process.execPath,
+    args: [], cwd: directory, protocol: 'legacy', environment: [] })
+  assert.equal(mcp.statuses()[0]!.state, 'disabled')
+  assert.equal(await mcp.connect('compiled', async () => false, new AbortController().signal), false)
+  assert.equal(await mcp.connect('compiled', async () => true, new AbortController().signal), true)
+  assert.equal(mcp.statuses()[0]!.snapshot!.categories.tools.entries[0]!.state, 'available')
+  await mcp.refresh('compiled', ['resources'], new AbortController().signal)
+  assert.equal(mcp.statuses()[0]!.snapshot!.categories.resources.entries[0]!.remoteKey, 'fixture:///never-read')
+  await mcp.disconnect('compiled')
+  assert.equal(mcp.statuses()[0]!.state, 'disabled')
+  assert.deepEqual(mcpMethods, ['initialize', 'notifications/initialized', 'tools/list', 'resources/list'])
   const memory = new FileMemoryStore(directory)
   await memory.commit(await memory.prepareCreate('Prefer compiled test fixtures', 'user'))
   const host = await CliHost.create({ memory, enableMemory: true, enableTools: false,
@@ -110,7 +143,7 @@ try {
   assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'compiled new')
   assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
 
-} finally { await rm(directory, { recursive: true, force: true }) }
+} finally { await mcp.close(); await rm(directory, { recursive: true, force: true }) }
 
 const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
   reasoning: { mandatory: false, supports_max_tokens: true } }] })[0]!
@@ -153,5 +186,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution, MCP discovery and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }
