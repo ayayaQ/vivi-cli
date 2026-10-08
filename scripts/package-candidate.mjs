@@ -73,7 +73,10 @@ export function validateCandidate(candidate, bytes, manifest, filename) {
   }
   assert(Number.isSafeInteger(packed.unpackedSize) && packed.unpackedSize === unpackedSize,
     'Candidate npm unpacked size mismatch')
-  assert.deepEqual(packed.bundled, manifest.bundledDependencies, 'Candidate bundled dependencies mismatch')
+  // npm lists the exact transitive bundle closure, not just the manifest's roots.
+  // The reviewed 0.7.0 core adds the pinned YAML parser; no other bundle is allowed.
+  assert.deepEqual(manifest.bundledDependencies, ['@ayayaq/vivi'], 'Candidate bundle roots mismatch')
+  assert.deepEqual(packed.bundled, ['@ayayaq/vivi', 'yaml'], 'Candidate bundled dependencies mismatch')
   return candidate
 }
 

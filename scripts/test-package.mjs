@@ -18,8 +18,10 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.5.0'
-const coreIntegrity = 'sha512-9Y8PJF4EGKEJRfNoP1adJ3zhCe3mGebSl9bX3u6RmBPC6IOzflAo6wJyFeZV4JLsgFrfMzi0WrGMCYRbNeXPmA=='
+const coreVersion = '0.7.0'
+const coreIntegrity = 'sha512-uUsVR28nUDWIVySUCjjBMzyoopjviMHtqhAhqUM+V+W68pVDAWf8+FD9cd7wOsULuiNHzBq8PhVMQ/ew0UTUOA=='
+const yamlVersion = '2.9.1'
+const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -54,7 +56,9 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.5.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.7.0 release bytes')
+  assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
+  assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -88,6 +92,8 @@ try {
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
+    'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
+    'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
@@ -99,11 +105,16 @@ try {
     'dist/cjs/extensions/memory.js', 'dist/cjs/extensions/memory.d.ts',
     'dist/providers/models.js', 'dist/providers/models.d.ts',
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
+    'docs/DECISIONS.md', 'src/decisions.ts', 'dist/decisions.js', 'dist/decisions.d.ts',
+    'dist/cjs/decisions.js', 'dist/cjs/decisions.d.ts', 'examples/decisions.mjs',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
   }
-  assert.deepEqual(packed.bundled, [coreName], 'Shared core must remain bundled')
+  assert.deepEqual(packed.bundled.sort(), [coreName, 'yaml'].sort(), 'Shared core and its exact transitive YAML dependency must remain bundled')
+  for (const path of ['package.json', 'LICENSE', 'dist/index.js', 'browser/dist/index.js']) {
+    assert(paths.has(`node_modules/yaml/${path}`), `Missing bundled YAML ${path}`)
+  }
   assert([...paths].every((path) => !path.startsWith('vendor/')), 'Obsolete vendor snapshots must not be packed')
   assert(!paths.has('src/run-agent.ts') && !paths.has('src/providers/openai.ts'), 'CLI must not copy core or provider implementations')
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
@@ -136,22 +147,22 @@ try {
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
     normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
-  const bundledCore = join(installed, corePath)
-  async function compareDirectory(relative = '') {
-    const entries = await readdir(join(root, corePath, relative), { withFileTypes: true })
-    assert.deepEqual((await readdir(join(bundledCore, relative))).sort(), entries.map(entry => entry.name).sort(),
-      `Bundled shared core directory mismatch: ${relative}`)
+  async function compareDirectory(relative = '', dependency = corePath) {
+    const entries = await readdir(join(root, dependency, relative), { withFileTypes: true })
+    assert.deepEqual((await readdir(join(installed, dependency, relative))).sort(), entries.map(entry => entry.name).sort(),
+      `Bundled dependency directory mismatch: ${dependency}/${relative}`)
     for (const entry of entries) {
       const path = join(relative, entry.name)
-      if (entry.isDirectory()) await compareDirectory(path)
+      if (entry.isDirectory()) await compareDirectory(path, dependency)
       else {
         assert(entry.isFile(), `Unexpected shared core file type: ${path}`)
-        assert.deepEqual(await readFile(join(bundledCore, path)), await readFile(join(root, corePath, path)),
-          `Bundled shared core bytes mismatch: ${path}`)
+        assert.deepEqual(await readFile(join(installed, dependency, path)), await readFile(join(root, dependency, path)),
+          `Bundled dependency bytes mismatch: ${dependency}/${path}`)
       }
     }
   }
   await compareDirectory()
+  await compareDirectory('', 'node_modules/yaml')
   // npm exec resolves the platform's installed bin shim, including vivi.cmd on Windows.
   assert.match(runNpm(['exec', '--offline', '--', 'vivi', '--help'], temporary), /--provider/)
   const launcher = join(installed, installedManifest.bin.vivi)
@@ -172,9 +183,23 @@ import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContex
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
+import { createDecisionRequest, evaluateDecision, isDecisionCurrent, createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
 import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
 const cjsModels = createRequire(import.meta.url)('@ayayaq/vivi/providers/models')
+const cjsDecisions = createRequire(import.meta.url)('@ayayaq/vivi/decisions')
+assert.equal(createOpenAIDecisionProvider({ apiKey: 'fake' }).model, 'gpt-6-luna')
+assert.equal(createOpenRouterDecisionProvider({ apiKey: 'fake' }).model, 'typesafe/jev-1.13')
+for (const module of [{ createDecisionRequest, evaluateDecision, isDecisionCurrent }, cjsDecisions]) {
+  const snapshot = { sessionId: 'packed', runId: 'packed-run', toolCall: { id: 'packed-review', name: 'note_set', arguments: { key: 'color', value: 'blue' } },
+    userRequest: { id: 'packed-request', text: 'Set a note color to blue', approvedScope: { tool: 'note_set' } },
+    policyRevision: 'packed-v1', resourceRevisions: { noteRevision: 0 }, inputData: { before: null, after: 'blue' } }
+  const request = module.createDecisionRequest(snapshot, { provider: 'openai', checks: [{ name: 'requested', instructions: 'The exact save was requested',
+    trueDescription: 'Requested', falseDescription: 'Not requested', allowAt: 0.995, denyAt: 0.05 }] })
+  const result = await module.evaluateDecision(request, { id: 'openai', model: 'gpt-6-luna', evaluate: async () => ({ model: 'gpt-6-luna',
+    answers: [{ name: 'requested', type: 'predicate', probability: 1 }], usage: { inputTokens: 1, outputTokens: 1 } }) })
+  assert.equal(result.outcome, 'allow'); assert(module.isDecisionCurrent(result, snapshot))
+}
 const budgetModel = { id: 'vendor/budget-only', supported_parameters: ['reasoning'],
   reasoning: { mandatory: false, supports_max_tokens: true } }
 const budget = normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: budgetModel })

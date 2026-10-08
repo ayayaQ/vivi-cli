@@ -16,6 +16,8 @@ export interface ToolHost {
   readNotes(): NoteSnapshot
   commitNote(key: string, value: string, expectedRevision: number): Promise<number>
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
+  /** Prepared note writes go through host-owned review/commit, never a replacement IO judge. */
+  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | undefined>
   now?(): Date
 }
 const objectSchema = (properties: Record<string, unknown>, required: string[]): ToolDefinition['parameters'] =>
@@ -29,7 +31,7 @@ function hostTools(enableNotes = false): ToolDefinition[] {
   if (enableNotes) tools.push(
     { name: 'note_read', description: 'Read this CLI session’s host-owned notes and revision. No filesystem access.',
       parameters: objectSchema({}, []) },
-    { name: 'note_set', description: 'Set one session note after explicit human approval. Use the latest note revision.',
+    { name: 'note_set', description: 'Propose one session note change for host review. Use the latest note revision; never claim a save before its success result.',
       parameters: objectSchema({ key: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,40}$' },
         value: { type: 'string', maxLength: 4096 }, expectedRevision: { type: 'integer', minimum: 0 } },
       ['key', 'value', 'expectedRevision']) })
@@ -100,6 +102,11 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
       const before = host.readNotes()
       if (before.revision !== expectedRevision) return error('revision_conflict', 'Read the latest notes before changing them')
       if (!Object.hasOwn(before.notes, key) && Object.keys(before.notes).length >= 64) throw new Error('Session has reached its note limit')
+      if (host.reviewNote) {
+        const revision = await host.reviewNote(call, before, key, value, signal)
+        return revision === undefined ? error('approval_denied', 'This note change was not approved')
+          : { content: JSON.stringify({ success: true, key, revision }) }
+      }
       if (!await host.approve({ call, description: `Set session note ${JSON.stringify(key)} to ${JSON.stringify(value)}`,
         currentRevision: before.revision }, signal)) return error('approval_denied', 'Human denied this note change')
       if (signal.aborted) return error('cancelled', 'Cancelled before note change')

@@ -25,6 +25,7 @@ import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
 import { RunStatus } from './run-status.js'
 import type { RunClock, RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
+import type { ApprovalMode } from './auto-review.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
@@ -35,6 +36,7 @@ export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a provider' },
   { command: '/models', description: 'Choose a model' },
   { command: '/effort', description: 'Choose reasoning effort' },
+  { command: '/mode', description: 'Choose Manual or Auto review' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
   { command: '/rename', description: 'Rename the current session' },
@@ -87,7 +89,7 @@ function fitStatusColumns(text: string, columns: number, keepStart = false): str
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const HINTS = 'Enter send · Ctrl+J newline · /new /resume /memories /settings /menu /help /exit'
+const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /settings /menu /help /exit'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
@@ -183,6 +185,7 @@ export class OpenTuiIO implements ChatIO {
   private partial: MarkdownRenderable | undefined
   private entries: DisplayEntry[] = []
   private resultNotices: DisplayEntry[] = []
+  private reviewNotices: DisplayEntry[] = []
   private pending: PendingInput | undefined
   private closed = false
   private failure: Error | undefined
@@ -194,6 +197,7 @@ export class OpenTuiIO implements ChatIO {
   private workspaceStatus = false
   private sessionTitle = 'vivi · fresh conversation'
   private sessionId: string | undefined
+  private approvalMode: ApprovalMode = 'manual'
   private usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
   private usageScope: 'Session' | 'Round' | 'Turn' = 'Session'
   private streamed = ''
@@ -287,7 +291,7 @@ export class OpenTuiIO implements ChatIO {
       this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
         flexDirection: 'row', visible: false })
       for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
-        ['Memory', '/memories'], ['Settings', '/settings']] as const) {
+        ['Mode', '/mode'], ['Memory', '/memories'], ['Settings', '/settings']] as const) {
         this.actionBar.add(this.mouseButton(`vivi-action-${command.slice(1)}`, label, () => {
           const pending = this.pending
           if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish(command)
@@ -387,6 +391,10 @@ export class OpenTuiIO implements ChatIO {
 
   get failed(): boolean { return this.failure !== undefined }
   get isClosed(): boolean { return this.closed }
+  get canAutoReview(): boolean {
+    return Boolean(process.stdin.isTTY && process.stdout.isTTY && !this.closed && !this.failed && !this.renderer.isDestroyed)
+  }
+  setApprovalMode(mode: ApprovalMode): void { this.approvalMode = mode; this.updateHeader() }
 
   /** Explicit offline probe. No editable text, provider or session is opened. */
   async diagnoseInput(): Promise<InputDiagnosticReport> {
@@ -422,6 +430,7 @@ export class OpenTuiIO implements ChatIO {
       label: this.safe(entry.label, 4096), content: this.safe(entry.content) })
     this.entries = this.entries.map(redactEntry)
     this.resultNotices = this.resultNotices.map(redactEntry)
+    this.reviewNotices = this.reviewNotices.map(redactEntry)
     this.sessionTitle = this.safe(this.sessionTitle, 4096)
     this.updateHeader()
     this.composerBox.title = this.safe(this.composerBox.title ?? '', 4096)
@@ -576,7 +585,8 @@ export class OpenTuiIO implements ChatIO {
   private updateHeader(): void {
     if (this.closed) return
     this.header.content = this.sessionTitle.split('\n').map((line, index) =>
-      fitStatusColumns(line, Math.max(1, this.renderer.terminalWidth), index === 0)).join('\n')
+      fitStatusColumns(index === 0 ? `${line} · ${this.approvalMode === 'auto' ? 'Auto review' : 'Manual'}` : line,
+        Math.max(1, this.renderer.terminalWidth), index === 0)).join('\n')
   }
   private disableComposer(): void {
     this.composer?.blur()
@@ -1049,6 +1059,9 @@ export class OpenTuiIO implements ChatIO {
   }
   runStarted(): void {
     if (this.closed) return
+    this.reviewNotices = []
+    this.entries = this.entries.filter(entry => entry.label !== 'Review')
+    this.rebuild()
     this.runStatus.start()
     this.updateStatus('Working · Escape / Ctrl+C cancels')
   }
@@ -1146,6 +1159,7 @@ export class OpenTuiIO implements ChatIO {
     this.clearStream()
     this.entries = []
     this.resultNotices = []
+    this.reviewNotices = []
     this.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
     this.usageScope = 'Session'
     this.rebuild()
@@ -1164,6 +1178,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
       this.runStatus.reset()
       this.resultNotices = []
+      this.reviewNotices = []
       this.clearStream()
       this.status = 'Ready'
     }
@@ -1172,12 +1187,18 @@ export class OpenTuiIO implements ChatIO {
     this.updateHeader()
     this.usage = { ...session.usage }
     this.usageScope = 'Session'
-    this.entries = [...this.historyEntries(session.history), ...this.resultNotices]
+    this.entries = [...this.historyEntries(session.history), ...this.reviewNotices, ...this.resultNotices]
     this.rebuild()
     this.updateStatus()
   }
   write(text: string): void {
     if (text) this.appendEntry({ label: 'vivi', content: this.safe(text.trimEnd()), markdown: false })
+  }
+  reviewNotice(message: string): void {
+    if (this.closed || !message) return
+    const entry: DisplayEntry = { label: 'Review', content: this.safe(message, 2048), markdown: false }
+    this.reviewNotices = [...this.reviewNotices, entry].slice(-16)
+    this.appendEntry(entry)
   }
   private safeStream(final = false): string {
     const text = stripControls(this.streamed)
@@ -1246,7 +1267,7 @@ export class OpenTuiIO implements ChatIO {
     this.resultNotices = []
     if (partial !== undefined) this.resultNotices.push({ label: 'Partial display only · response was not accepted', content: partial, markdown: true })
     if (result.error) this.resultNotices.push({ label: 'Error', content: this.safe(result.error.message), markdown: false })
-    this.entries.push(...this.resultNotices)
+    this.entries.push(...this.reviewNotices, ...this.resultNotices)
     this.rebuild()
     this.usage = { ...result.usage }
     this.usageScope = 'Turn'
