@@ -8,7 +8,7 @@ import { OpenTuiIO } from '../src/tui.js'
 import { WindowsInputDecoder } from '../src/windows-input.js'
 import { newSession } from '../src/session.js'
 import { parseModelCatalog, documentedOpenAIModel } from '../src/models.js'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FileSkillStore } from '../src/skills.js'
@@ -52,6 +52,9 @@ try {
   const registry = createToolRegistry([createWorkspaceExtension(workspace)])
   const listing = await registry.executeTool({ id: 'compiled-list', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
   assert(!JSON.parse(listing.content).entries.some((item: { path: string }) => item.path === 'ignored.log'))
+  const glob = await registry.executeTool({ id: 'compiled-glob', name: 'workspace_glob', arguments: { pattern: '**/*.txt' } }, { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(glob.content).matches, [{ path: 'readme.txt', kind: 'file' }])
+  assert.equal(JSON.parse(glob.content).truncated, false)
   let rounds = 0
   const workspaceHost = await CliHost.create({ workspace, store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, provider: { async generate() {
@@ -61,6 +64,27 @@ try {
   const workspaceResult = await workspaceHost.send('Use selected workspace')
   assert.equal(workspaceResult.status, 'completed')
   assert.equal(JSON.parse(workspaceResult.history[2]!.content).content, 'Compiled workspace works')
+  let textRounds = 0
+  const textHost = await CliHost.create({ workspace, store: new FileSessionStore(directory),
+    approve: async request => { assert.match(request.description, /JSON-quoted lines/); return true },
+    settings: { provider: 'openai', model: 'fake' }, provider: { async generate() {
+      return ++textRounds === 1 ? { content: '', toolCalls: [{ id: 'compiled-create-text', name: 'workspace_create_text',
+        arguments: { path: 'created.txt', content: 'compiled old' } }] } : { content: 'Created', toolCalls: [] }
+    } } })
+  assert.equal((await textHost.send('Create created.txt with compiled old')).status, 'completed')
+  assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'compiled old')
+  const hash = JSON.parse((await workspace.execute('workspace_read', { path: 'created.txt' }, new AbortController().signal)).content).revision
+  let editRounds = 0
+  const editHost = await CliHost.create({ workspace, store: new FileSessionStore(directory),
+    approve: async () => true,
+    settings: { provider: 'openai', model: 'fake' }, provider: { async generate() {
+      return ++editRounds === 1 ? { content: '', toolCalls: [{ id: 'compiled-edit-text', name: 'workspace_edit_text',
+        arguments: { path: 'created.txt', expectedRevision: hash, before: 'old', after: 'new' } }] } : { content: 'Edited', toolCalls: [] }
+    } } })
+  assert.equal((await editHost.send('Replace old with new in created.txt')).status, 'completed')
+  assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'compiled new')
+  assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
+
 } finally { await rm(directory, { recursive: true, force: true }) }
 
 const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
@@ -104,5 +128,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads, skills creator/parser and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, skills creator/parser and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

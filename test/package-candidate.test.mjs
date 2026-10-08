@@ -46,7 +46,8 @@ test('candidate metadata binds private identity, size, SHA256/SHA512 and normal 
     item => { item.npm.name = '@other/cli' }, item => { item.npm.version = '0.2.0' },
     item => { item.npm.id = 'other@0.1.0' }, item => { item.npm.filename = 'other.tgz' },
     item => { item.npm.size++ }, item => { item.npm.shasum = 'a'.repeat(40) },
-    item => { item.npm.integrity = 'sha512-bad' }, item => { item.npm.bundled = [] }
+    item => { item.npm.integrity = 'sha512-bad' }, item => { item.npm.bundled = [] },
+    item => { item.npm.bundled = ['@ayayaq/vivi'] }, item => { item.npm.bundled.push('unreviewed-package') }
   ]
   for (const mutate of mutations) {
     const invalid = fixture()

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ModelProvider } from '@ayayaq/vivi'
+import { randomUUID } from 'node:crypto'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import type { CliOptions } from './main.js'
+import { decisionProviderForSession, deferredDecisionProvider } from './main.js'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
 import { FileSkillStore } from './skills.js'
@@ -11,7 +13,7 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, AUTO_REVIEW_UNAVAILABLE, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt } from './terminal.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
@@ -20,6 +22,7 @@ import type { Catalog, ModelEntry } from './models.js'
 import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
+import { FileDecisionLedger } from './decision-ledger.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -42,6 +45,7 @@ export interface ApplicationOptions {
   catalog?: Catalog
   registerSecret?(secret: string): void
   providerFactory(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider
+  decisionProviderFactory?: typeof decisionProviderForSession
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
   reasoningCapabilities: [], stream: true, enableNotes: false, enableMemory: false, enableTools: false, maxRounds: 25 }
@@ -70,7 +74,9 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
-/skills lists and inspects standard instruction-only skills, drafts a new skill with the agent, or disables skills for this launch.\n/menu opens actions; /session shows the current ID and usage; /exit quits.
+/mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
+/skills lists and inspects standard skills and prepares creator drafts for manual saving.
+/menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
@@ -87,6 +93,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const store = new FileSessionStore(options.sessionDirectory, secrets)
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
+  const decisions = new FileDecisionLedger(options.sessionDirectory, secrets)
   const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io.write(`${message}\n`) })
   let activeSkills = options.enableSkills
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
@@ -96,7 +103,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
   const register = (key: string): void => {
     if (!key || secrets.includes(key)) return
-    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); skills.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
+    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); decisions.addSecrets([key]); skills.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
   let savedSettings: TuiPreferences | undefined
@@ -132,6 +139,10 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   }
   const declaredToolTarget = { provider: settings.provider, model: settings.model }
   let host: CliHost | undefined
+  // Opaque launch-owned revisions never expose, derive from or persist credentials.
+  let accountGeneration = randomUUID()
+  let hostAccountGeneration: string | undefined
+  let launchModePending = options.approvalMode === 'auto'
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
   let selected: { resume?: string; fresh?: boolean } | undefined = options.resume ? { resume: options.resume }
@@ -224,6 +235,13 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           if (!fallback) return
         }
       } else io.write('API key is available for this launch only\n')
+      // A cancelled model picker can follow a real key replacement. Revoke
+      // enrollment immediately and prevent the old host from re-enrolling.
+      if (env[envName(provider)] !== key) {
+        host?.setApprovalMode('manual')
+        io.setApprovalMode?.('manual')
+        accountGeneration = randomUUID()
+      }
       env[envName(provider)] = key
     }
     return provider === base.provider ? { ...base } : { ...base, provider, model: '', reasoning: 'default',
@@ -386,7 +404,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         { name: activeSkills ? 'Disable for this launch' : 'Enable for this launch', description: SKILLS_DISCLOSURE, value: 'toggle' },
         ...(activeSkills ? [{ name: 'Refresh skills', description: 'Reload metadata and diagnostics', value: 'refresh' },
           ...(snapshot?.skills.length ? [{ name: 'Inspect SKILL.md', description: 'View exact source as inert text', value: 'inspect' }] : []),
-          { name: 'Create with agent', description: 'Put a draft request in the composer; every save still requires review', value: 'create' }] : [])
+          { name: 'Create with agent', description: 'Put a manual-save draft request in the composer', value: 'create' }] : [])
       ])
       if (action === undefined || action === 'back') return
       if (action === 'toggle') { activeSkills = !activeSkills; host?.setSkillsEnabled(activeSkills); continue }
@@ -460,6 +478,12 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         onMemoryNotice: message => io.write(`${message}\n`),
+        onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
+        ...(io.canAutoReview === true ? { decisionReview: {
+          provider: deferredDecisionProvider(session, env, input.decisionProviderFactory ?? decisionProviderForSession),
+          ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
+          isAvailable: () => io.canAutoReview === true && !io.isClosed
+        } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       await store.save(nextHost.session)
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
@@ -469,9 +493,11 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         enableTools: effective.enableTools, enableNotes: effective.enableNotes }
     } catch (error) { await nextRelease().catch(report); throw error }
     const previousRelease = release
-    release = nextRelease; host = nextHost
+    release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
     await previousRelease?.().catch(report)
     io.setSession(host.session)
+    io.setApprovalMode?.('manual')
+    io.write('Approval mode: Manual\n')
     // Native transcript setup clears earlier loading output. Keep stale-cache
     // disclosure visible after that rebuild and before the first provider turn.
     if (capabilityNotice) io.write(capabilityNotice)
@@ -494,10 +520,17 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         selected = undefined
       }
       if (io.isClosed) continue
+      if (launchModePending && host) {
+        launchModePending = false
+        await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+      } else if (launchModePending && io.canAutoReview !== true) {
+        launchModePending = false
+        io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
+      }
       // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
-        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
       }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
@@ -520,6 +553,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
+          { name: 'Approval mode', value: '/mode' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
           { name: 'Skills', value: '/skills' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
@@ -560,12 +594,23 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
         if (command === '/skills') { await manageSkills(); continue }
         if (command === '/memories') { await manageMemories(); continue }
+        if (/^\/mode(?:\s|$)/.test(command)) {
+          if (command !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
+          if (!host) { io.write('Choose a provider and model before selecting approval mode\n'); continue }
+          if (hostAccountGeneration !== accountGeneration) {
+            host.setApprovalMode('manual'); io.setApprovalMode?.('manual')
+            io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling Auto review again\n')
+            continue
+          }
+          await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+          continue
+        }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nApproval mode: ${host!.approvalMode === 'auto' ? 'Auto review' : 'Manual'}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
-          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\n` : 'Workspace: disabled\n')
+          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           continue
         }
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }

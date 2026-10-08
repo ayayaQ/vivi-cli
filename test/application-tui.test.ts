@@ -12,7 +12,6 @@ import type { TuiPreferences } from '../src/preferences.js'
 import { main } from '../src/main.js'
 import { PreferenceStore } from '../src/preferences.js'
 import { FileSessionStore } from '../src/session.js'
-import { FileSkillStore } from '../src/skills.js'
 import { FileMemoryStore } from '../src/memory.js'
 import type { ApprovalRequest } from '../src/tools.js'
 
@@ -169,7 +168,8 @@ test('native surface runs saved-default chat, accepted Markdown, new session and
     await setup.mockInput.typeText('/new')
     setup.mockInput.pressEnter()
     await ready(state => state.kind === 'session' && state.session.id !== ids[0])
-    await setup.waitForFrame(frame => frame.includes(ids[1]!))
+    await setup.waitForFrame(frame => frame.includes('Untitled conversation') && !frame.includes('The canonical response is visible'))
+    expect(setup.captureCharFrame()).not.toContain(ids[1]!)
     expect(setup.captureCharFrame()).not.toContain('The canonical response is visible')
     await setup.mockInput.typeText('/exit')
     setup.mockInput.pressEnter()
@@ -348,7 +348,13 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
       providerFactory: (session, options, env) => {
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
-        return { generate: async input => { const names = input.tools.map(tool => tool.name); for (const name of ['calculate', 'current_time', 'workspace_list', 'workspace_search', 'workspace_read', 'list_skills', 'read_skill']) expect(names).toContain(name); expect(names.includes('save_skill')).toBe(new FileSkillStore(join(directory, 'agent-skills')).writable); return { content: `${session.reasoning} response`, toolCalls: [] } } }
+        return { generate: async input => {
+          expect(input.tools).toHaveLength(10)
+          expect(input.tools.some(tool => tool.name === 'read_skill')).toBe(true)
+          expect(input.tools.some(tool => tool.name === 'save_skill')).toBe(false)
+          expect(input.tools.some(tool => tool.name === 'workspace_glob')).toBe(true)
+          return { content: `${session.reasoning} response`, toolCalls: [] }
+        } }
       }
     })
     await ready(state => state.kind === 'composer')
@@ -639,16 +645,16 @@ test('native CLI keeps the canonical launch workspace visible through new conver
     })
     await ready(state => state.kind === 'composer')
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
     expect(setup.captureCharFrame()).toContain('Files read by tools are sent to the selected provider')
     const next = ready.nextComposer()
     await setup.mockInput.typeText('/new'); setup.mockInput.pressEnter()
     await next; await setup.renderOnce()
     expect(sessions).toBe(2)
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
     io.setDraft('openrouter')
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
     io.addSecrets(['project'])
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain('[REDACTED]')

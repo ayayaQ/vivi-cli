@@ -4,24 +4,32 @@ import { homedir } from 'node:os'
 import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers/openrouter'
 import type { ModelProvider } from '@ayayaq/vivi'
+import { createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
+import type { DecisionProvider } from '@ayayaq/vivi/decisions'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
 import { FileSkillStore } from './skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
-import { TerminalIO, runChatLoop } from './terminal.js'
+import { TerminalIO, runChatLoop, selectApprovalMode } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
 import type { Catalog } from './models.js'
 import { documentedOpenAIModel } from './models.js'
 import type { CredentialStore } from './credentials.js'
+import type { ApprovalMode } from './auto-review.js'
+import { assertReviewTransportCurrent } from './auto-review.js'
+import { FileDecisionLedger } from './decision-ledger.js'
 
 export interface CliOptions {
+  /** Launch-only request to open enrollment; never a saved approval. */
+  approvalMode: ApprovalMode
   provider?: CliProviderName
   model?: string
   reasoning?: string
@@ -54,11 +62,12 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
-  --workspace PATH            Read-only folder for this launch (default: launch directory)
+  --workspace PATH            Folder for reads and reviewed text edits (default: launch directory)
   --no-workspace              Disable workspace files for this launch
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
+  --approval-mode MODE        manual (default) or auto; auto still needs fresh interactive enrollment
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
   --tools / --no-tools        Declare tool support / use chat only
   --enable-notes              Enable session-only revisioned notes with allow/deny prompts
@@ -76,8 +85,10 @@ Streaming is display-only. Notes never access other files; piped approval is den
 Saved memory is off by default. When enabled, it is sent to the selected provider.
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
 Selected files may be sent to your provider and saved in session history.
-Workspace tools omit symlinks, private/ignored files, writes and commands; this is not an OS sandbox.
+Workspace tools omit symlinks and private/ignored files; text writes require review, and commands are unavailable; this is not an OS sandbox.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
+/mode selects Manual or optional Auto review for the current conversation and selected account.
+Auto review adds API charges; only eligible current-request note/memory changes and scoped text creation/precise-edit tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
@@ -88,7 +99,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    stream: true, tui: true, enableNotes: false, enableMemory: false, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
+    approvalMode: 'manual', stream: true, tui: true, enableNotes: false, enableMemory: false, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
     ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
@@ -128,6 +139,12 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--prompt': options.prompt = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
+      case '--approval-mode': {
+        const mode = value()
+        if (mode !== 'manual' && mode !== 'auto') throw new Error('Approval mode must be manual or auto')
+        options.approvalMode = mode
+        break
+      }
       case '--tui': options.tui = true; break
       case '--no-tui': options.tui = false; break
       case '--enable-notes': options.enableNotes = true; break
@@ -200,9 +217,37 @@ export function providerForSession(session: CliSession, options: CliOptions, env
     requireSupportedParameters: options.enableTools || (session.reasoning !== undefined && session.reasoning !== 'default') })
 }
 
+/** Dedicated fixed-model review on the selected existing account; never discover or copy credentials. */
+export function decisionProviderForSession(session: CliSession, env: NodeJS.ProcessEnv, beforeRequest?: () => void): DecisionProvider {
+  const name = session.provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
+  const apiKey = (): string => {
+    beforeRequest?.()
+    const key = env[name]
+    if (!key) throw new Error(`The selected ${session.provider} account has no existing API key`)
+    return key
+  }
+  const guardedFetch: typeof fetch = (input, init) => { beforeRequest?.(); return globalThis.fetch(input, init) }
+  return session.provider === 'openai' ? createOpenAIDecisionProvider({ apiKey, timeoutMs: 8_000, fetch: guardedFetch })
+    : createOpenRouterDecisionProvider({ apiKey, timeoutMs: 8_000, fetch: guardedFetch })
+}
+
+/** Construct only when an enrolled eligible action actually requests review. */
+export function deferredDecisionProvider(session: CliSession, env: NodeJS.ProcessEnv,
+  factory: typeof decisionProviderForSession): DecisionProvider {
+  const model = session.provider === 'openai' ? 'gpt-6-luna' : 'typesafe/jev-1.13'
+  return { id: session.provider, model,
+    evaluate: (request, signal) => {
+      // A new request-bound closure cannot be confused with a later review after timeout.
+      const provider = factory(session, env, () => assertReviewTransportCurrent(request))
+      if (provider.id !== session.provider || provider.model !== model) throw new Error('Decision provider does not match the selected account and fixed review model')
+      return provider.evaluate(request, signal)
+    } }
+}
+
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
   dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
+    decisionProviderFactory?: typeof decisionProviderForSession;
     credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
   // This isolated path never reads credentials, preferences, workspace or sessions.
@@ -256,7 +301,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
         ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
         registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
-        providerFactory: dependencies.providerFactory ?? providerForSession })
+        providerFactory: dependencies.providerFactory ?? providerForSession,
+        decisionProviderFactory: dependencies.decisionProviderFactory ?? decisionProviderForSession })
       const cleanupFailed = closeIO()
       return cleanupFailed && status === 0 ? 1 : status
     }
@@ -277,15 +323,24 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       metadata?.tools !== 'unsupported' && (args.includes('--tools') || args.includes('--enable-notes')))
     const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
+    const accountRevision = randomUUID()
     host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
       enableTools, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
+      onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
+      ...(io.canAutoReview === true ? { decisionReview: {
+        provider: deferredDecisionProvider(session, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
+        ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
+        accountRevision: () => accountRevision, isAvailable: () => io?.canAutoReview === true && !io.isClosed
+      } } : {}),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
     await store.save(host.session)
-    io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\n`)
-    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+    io.setApprovalMode?.('manual')
+    io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
+    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+    if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
     const result = await runChatLoop(host, io, options.prompt)
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {

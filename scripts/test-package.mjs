@@ -18,8 +18,10 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.6.0'
-const coreIntegrity = 'sha512-hMj6QtpL7XmAWIanTW7iyF3PgoFHS7m1JxqOs7J+ASs5liV7T/pB/geZW0E7iI6QDoEH4AqX+y1svauiLsbvSg=='
+const coreVersion = '0.8.0'
+const coreIntegrity = 'sha512-8uyVIES42ZYSYKvmrU53WdVVFpu6TtWACBR1DVDv4p6hvvbRLkxRRHJlInT6virfrowhl4gYcIqbvSbny3Cjog=='
+const yamlVersion = '2.9.1'
+const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -54,7 +56,9 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.6.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.8.0 release bytes')
+  assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
+  assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -88,8 +92,12 @@ try {
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
+    'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
+    'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/skills.ts', 'dist/skills.js', 'dist/skills.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
+    'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
+    'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
@@ -103,12 +111,16 @@ try {
     'dist/cjs/extensions/skills.js', 'dist/cjs/extensions/skills.d.ts',
     'dist/providers/models.js', 'dist/providers/models.d.ts',
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
+    'docs/DECISIONS.md', 'src/decisions.ts', 'dist/decisions.js', 'dist/decisions.d.ts',
+    'dist/cjs/decisions.js', 'dist/cjs/decisions.d.ts', 'examples/decisions.mjs',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
   }
-  assert.deepEqual(packed.bundled, [coreName, 'yaml'], 'Shared core and its exact transitive YAML parser must remain bundled')
-  for (const path of ['node_modules/yaml/package.json', 'node_modules/yaml/LICENSE', 'node_modules/yaml/dist/index.js']) assert(paths.has(path), `Missing bundled YAML ${path}`)
+  assert.deepEqual(packed.bundled.sort(), [coreName, 'yaml'].sort(), 'Shared core and its exact transitive YAML dependency must remain bundled')
+  for (const path of ['package.json', 'LICENSE', 'dist/index.js', 'browser/dist/index.js']) {
+    assert(paths.has(`node_modules/yaml/${path}`), `Missing bundled YAML ${path}`)
+  }
   assert([...paths].every((path) => !path.startsWith('vendor/')), 'Obsolete vendor snapshots must not be packed')
   assert(!paths.has('src/run-agent.ts') && !paths.has('src/providers/openai.ts'), 'CLI must not copy core or provider implementations')
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
@@ -116,7 +128,7 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
@@ -138,38 +150,30 @@ try {
   assert.equal(ignoreManifest.license, 'MIT')
   assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/ignore/LICENSE-MIT'))),
     normalizeLicense(await readFile(join(root, 'node_modules/ignore/LICENSE-MIT'))), 'Ignore MIT legal text mismatch')
-  const bundledYaml = join(installed, 'node_modules/yaml')
-  const yamlManifest = JSON.parse(await readFile(join(bundledYaml, 'package.json'), 'utf8'))
-  assert.equal(yamlManifest.version, '2.9.1'); assert.equal(yamlManifest.license, 'ISC')
-  async function compareYaml(relative = '') {
-    const entries = await readdir(join(root, 'node_modules/yaml', relative), { withFileTypes: true })
-    assert.deepEqual((await readdir(join(bundledYaml, relative))).sort(), entries.map(entry => entry.name).sort())
-    for (const entry of entries) {
-      const path = join(relative, entry.name)
-      if (entry.isDirectory()) await compareYaml(path)
-      else { assert(entry.isFile()); assert.deepEqual(await readFile(join(bundledYaml, path)), await readFile(join(root, 'node_modules/yaml', path)), `Bundled YAML bytes mismatch: ${path}`) }
-    }
-  }
-  await compareYaml()
+  assert.equal(installedManifest.dependencies.picomatch, '4.0.7')
+  const globManifest = JSON.parse(await readFile(join(temporary, 'node_modules/picomatch/package.json'), 'utf8'))
+  assert.equal(globManifest.version, '4.0.7'); assert.equal(globManifest.license, 'MIT')
+  assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/picomatch/LICENSE'))),
+    normalizeLicense(await readFile(join(root, 'node_modules/picomatch/LICENSE'))), 'Picomatch MIT legal text mismatch')
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
     normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
-  const bundledCore = join(installed, corePath)
-  async function compareDirectory(relative = '') {
-    const entries = await readdir(join(root, corePath, relative), { withFileTypes: true })
-    assert.deepEqual((await readdir(join(bundledCore, relative))).sort(), entries.map(entry => entry.name).sort(),
-      `Bundled shared core directory mismatch: ${relative}`)
+  async function compareDirectory(relative = '', dependency = corePath) {
+    const entries = await readdir(join(root, dependency, relative), { withFileTypes: true })
+    assert.deepEqual((await readdir(join(installed, dependency, relative))).sort(), entries.map(entry => entry.name).sort(),
+      `Bundled dependency directory mismatch: ${dependency}/${relative}`)
     for (const entry of entries) {
       const path = join(relative, entry.name)
-      if (entry.isDirectory()) await compareDirectory(path)
+      if (entry.isDirectory()) await compareDirectory(path, dependency)
       else {
         assert(entry.isFile(), `Unexpected shared core file type: ${path}`)
-        assert.deepEqual(await readFile(join(bundledCore, path)), await readFile(join(root, corePath, path)),
-          `Bundled shared core bytes mismatch: ${path}`)
+        assert.deepEqual(await readFile(join(installed, dependency, path)), await readFile(join(root, dependency, path)),
+          `Bundled dependency bytes mismatch: ${dependency}/${path}`)
       }
     }
   }
   await compareDirectory()
+  await compareDirectory('', 'node_modules/yaml')
   // npm exec resolves the platform's installed bin shim, including vivi.cmd on Windows.
   assert.match(runNpm(['exec', '--offline', '--', 'vivi', '--help'], temporary), /--provider/)
   const launcher = join(installed, installedManifest.bin.vivi)
@@ -179,7 +183,7 @@ try {
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
@@ -191,9 +195,23 @@ import { parseSkillDocument, skillCreatorSource } from '@ayayaq/vivi/extensions/
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
+import { createDecisionRequest, evaluateDecision, isDecisionCurrent, createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
 import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
 const cjsModels = createRequire(import.meta.url)('@ayayaq/vivi/providers/models')
+const cjsDecisions = createRequire(import.meta.url)('@ayayaq/vivi/decisions')
+assert.equal(createOpenAIDecisionProvider({ apiKey: 'fake' }).model, 'gpt-6-luna')
+assert.equal(createOpenRouterDecisionProvider({ apiKey: 'fake' }).model, 'typesafe/jev-1.13')
+for (const module of [{ createDecisionRequest, evaluateDecision, isDecisionCurrent }, cjsDecisions]) {
+  const snapshot = { sessionId: 'packed', runId: 'packed-run', toolCall: { id: 'packed-review', name: 'note_set', arguments: { key: 'color', value: 'blue' } },
+    userRequest: { id: 'packed-request', text: 'Set a note color to blue', approvedScope: { tool: 'note_set' } },
+    policyRevision: 'packed-v1', resourceRevisions: { noteRevision: 0 }, inputData: { before: null, after: 'blue' } }
+  const request = module.createDecisionRequest(snapshot, { provider: 'openai', checks: [{ name: 'requested', instructions: 'The exact save was requested',
+    trueDescription: 'Requested', falseDescription: 'Not requested', allowAt: 0.995, denyAt: 0.05 }] })
+  const result = await module.evaluateDecision(request, { id: 'openai', model: 'gpt-6-luna', evaluate: async () => ({ model: 'gpt-6-luna',
+    answers: [{ name: 'requested', type: 'predicate', probability: 1 }], usage: { inputTokens: 1, outputTokens: 1 } }) })
+  assert.equal(result.outcome, 'allow'); assert(module.isDecisionCurrent(result, snapshot))
+}
 const budgetModel = { id: 'vendor/budget-only', supported_parameters: ['reasoning'],
   reasoning: { mandatory: false, supports_max_tokens: true } }
 const budget = normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: budgetModel })
@@ -262,6 +280,7 @@ try {
   const skillsHost = await CliHost.create({ store: new FileSessionStore(directory), skills, enableSkills: true,
     settings: { provider: 'openai', model: 'fake' }, provider: { generate: async ({ messages, tools }) => {
       assert(tools.some(tool => tool.name === 'read_skill'))
+      assert(!tools.some(tool => tool.name === 'save_skill'))
       assert(messages.some(message => message.role === 'user' && message.content.includes('skill-creator')))
       return ++skillRounds === 1 ? { content: '', toolCalls: [{ id: 'packed-skill-read', name: 'read_skill', arguments: {
         name: 'skill-creator', path: 'SKILL.md', expectedRevision: skillCatalog.document('skill-creator').revision } }] }
@@ -270,24 +289,10 @@ try {
   const skillsResult = await skillsHost.send('Use the bundled creator')
   assert.equal(skillsResult.status, 'completed')
   assert(!skillsResult.history.some(message => message.role === 'user' && message.content.startsWith('Available instruction-only skills')))
-  const draft = ['---', 'name: packed-summary', 'description: Return a concise supplied-text summary.', '---', '', 'Return three factual bullets.'].join(String.fromCharCode(10))
-  if (skills.writable) for (const allow of [false, true]) {
-    let saveRounds = 0
-    const saveHost = await CliHost.create({ store: new FileSessionStore(directory), skills, enableSkills: true,
-      settings: { provider: 'openai', model: 'fake' }, ...(allow ? { approve: async request => {
-        assert(request.description.includes(JSON.stringify(draft))); assert(request.description.includes('packed-summary'))
-        return true
-      } } : {}), provider: { generate: async () => ++saveRounds === 1
-        ? { content: '', toolCalls: [{ id: 'packed-skill-save', name: 'save_skill', arguments: { name: 'packed-summary', content: draft, expectedRevision: null } }] }
-        : { content: 'Packed save checked', toolCalls: [] }
-      } })
-    assert.equal((await saveHost.send('Create a packed skill')).status, 'completed')
-    assert.equal((await skills.snapshot()).document('packed-summary')?.content, allow ? draft : undefined)
-  }
-  if (skills.writable) assert.equal(await readFile(join(skills.directory, 'packed-summary', 'SKILL.md'), 'utf8'), draft)
-  else {
-    await assert.rejects(skills.commit({ name: 'packed-summary', expectedRevision: null, before: null, after: parseSkillDocument(draft) }), /handle-relative/)
-  }
+  assert.equal(skills.writable, false)
+  assert.equal(typeof skills.prepare, 'undefined')
+  assert.equal(typeof skills.commit, 'undefined')
+  assert(!skillsResult.history.some(message => message.name === 'save_skill'))
   await skills.drain({ close: true })
   const project = join(directory, 'project')
   await mkdir(project)
@@ -299,6 +304,9 @@ try {
   const listing = await workspaceRegistry.executeTool({ id: 'packed-workspace', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
   assert.equal(JSON.parse(listing.content).untrusted, true)
   assert(!JSON.parse(listing.content).entries.some(item => item.path === 'ignored.log'))
+  const glob = await workspaceRegistry.executeTool({ id: 'packed-glob', name: 'workspace_glob', arguments: { pattern: '**/*.txt' } }, { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(glob.content).matches, [{ path: 'readme.txt', kind: 'file' }])
+  assert.equal(JSON.parse(glob.content).truncated, false)
   assert.equal(WORKSPACE_LIMITS.maximumReadBytes, 8192)
   let workspaceRounds = 0
   const workspaceHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
@@ -309,6 +317,33 @@ try {
   assert.equal(workspaceResult.status, 'completed')
   assert.equal(JSON.parse(workspaceResult.history[2].content).content, 'Packed workspace works')
   assert.deepEqual((await new FileSessionStore(directory).load(workspaceHost.session.id)).history, workspaceResult.history)
+  let textRounds = 0
+  const textHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    approve: async request => { assert.match(request.description, /JSON-quoted lines/); return true },
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++textRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-create-text', name: 'workspace_create_text', arguments: { path: 'created.txt', content: 'packed old' } }] }
+      : { content: 'Packed text accepted', toolCalls: [] } } })
+  assert.equal((await textHost.send('Create created.txt with packed old')).status, 'completed')
+  assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed old')
+  const readRevision = JSON.parse((await workspace.execute('workspace_read', { path: 'created.txt' }, new AbortController().signal)).content).revision
+  let editRounds = 0, decisions = 0
+  const editHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    approve: async () => { throw new Error('Packed eligible edit unexpectedly needed manual review') },
+    decisionReview: { canAutoReview: true, accountRevision: () => 'packed-account', ledger: { async upsert() {} },
+      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate(request) {
+        decisions++; assert.equal(request.snapshot.preparedAction.effects[0].scope, 'workspace')
+        assert.equal(request.snapshot.inputData.before, 'old'); assert.equal(request.snapshot.inputData.after, 'new')
+        return { model: 'gpt-6-luna', answers: request.policy.checks.map(check => ({ name: check.name, type: 'predicate', probability: 1 })),
+          usage: { inputTokens: 1, outputTokens: 1 } }
+      } } },
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++editRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-edit-text', name: 'workspace_edit_text', arguments: {
+        path: 'created.txt', expectedRevision: readRevision, before: 'old', after: 'new' } }] }
+      : { content: 'Packed precise edit accepted', toolCalls: [] } } })
+  editHost.setApprovalMode('auto')
+  assert.equal((await editHost.send('Replace old with new in created.txt')).status, 'completed')
+  assert.equal(decisions, 1); assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed new')
+  assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
@@ -331,12 +366,12 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type CliSkillStore, type SkillCommitReceipt, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
-import type { SkillCatalog, SkillSaveProposal } from '@ayayaq/vivi/extensions/skills'
+import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabilities, type Capability } from '@ayayaq/vivi/providers/models'
 const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
 const selection: Capability = reasoningSelectionSupport(capabilities, { mode: 'disabled' })
@@ -348,8 +383,8 @@ const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
 const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
 const skills: CliSkillStore = new FileSkillStore('/tmp/fake-types-only/agent-skills', { readOnlyRoots: [], secrets: [] })
 const catalog: Promise<SkillCatalog> = skills.snapshot()
-const commit = (proposal: SkillSaveProposal): Promise<SkillCommitReceipt> => skills.commit(proposal)
-void catalog; void commit
+const writable: false = skills.writable
+void catalog; void writable
 const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
 const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')

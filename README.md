@@ -23,6 +23,7 @@ then choose a model.
 - `/provider` — choose OpenAI or OpenRouter and enter a key
 - `/models` — search and select a model
 - `/effort` — choose a supported reasoning effort
+- `/mode` — choose Manual or enroll optional Auto review for the current conversation
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
@@ -76,7 +77,7 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 ### Mouse controls
 
 The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Memory or Settings below the composer to open an action when the draft
+Effort, Mode, Memory or Settings below the composer to open an action when the draft
 is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
@@ -126,9 +127,60 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
 
-## Read-only workspace tools
+## Optional Auto review
 
-The CLI uses the current working directory where you launch vivi as its read-only
+Manual is always the default. `/mode` opens the current conversation’s mode
+choice. The full-screen picker defaults to Manual; choosing Auto review then
+requires a separate fresh, deny-default human confirmation of the disclosure.
+Line mode shows the same disclosure and requires fresh typed `allow` to enroll;
+`deny`, Escape, cancellation or closing keep Manual. `--approval-mode auto`
+requests this enrollment at launch, and does not bypass it. Piped, headless and
+unavailable approval surfaces stay Manual, even with that flag. Use `/mode` again
+to return to Manual. Approval mode is never stored in preferences or sessions,
+restored by `/resume`, or carried into a new conversation, provider, model or account.
+Replacing an API key revokes enrollment immediately, including if the subsequent
+model picker is cancelled; start a new conversation before enrolling again.
+
+When enrolled, only tool calls implementing the current user’s requested
+session `note_set`, app-wide memory create/edit, or selected-workspace text creation/precise edits may be automatically approved.
+The corresponding notes/memory/workspace and tool feature gates must already be enabled.
+Delete, `/memories` manager mutations, excluded actions and hard denials remain
+outside Auto review. A model recommendation never relaxes host policy or skips
+the exact proposal’s final freshness and revision checks.
+
+The review sends the exact current user request, tool arguments and prepared
+before/after changed text, workspace-relative paths and full-file hashes to the currently selected existing account: OpenAI
+`gpt-6-luna`, or OpenRouter routed to TypeSafe `typesafe/jev-1.13`. It uses only
+that account’s existing key, with no copied credential store, account discovery,
+cross-provider fallback or live model selection. The fresh in-app confirmation
+asks for consent to share this bounded request/proposal text with those named
+recipients for decision review, including eligible agent proposals you did not
+request, to assess whether you authorized the exact change. It may contain personal or sensitive information
+about you or others. Known credentials are excluded; content recognized as
+sensitive stays Manual and is not sent to the decision provider. This lexical
+filter cannot reliably identify every private detail. Keep Manual if you do not
+want potentially private text shared. A conversation or provider/account change
+invalidates the versioned consent; this product setting is not global permission
+to transmit credentials or unrelated content. The automatic-save policy remains
+ordinary non-sensitive note/memory create/edit and scoped text creation/precise edits only; the sharing consent does not expand
+which actions may execute automatically. This adds API charges. Review
+is limited to two calls per turn, an eight-second deadline and 16 KiB for the
+full decision request. Larger exact evidence stays Manual without truncation;
+there is no hard prepaid USD cost guarantee. Returned review usage and any
+reported cost are recorded separately from chat/session usage.
+
+The versioned host heuristics require every check to reach at least `0.995` for
+OpenAI or `0.999` for OpenRouter; any check at or below `0.05` recommends rejection.
+These thresholds are uncalibrated and do not establish comparable behavior
+between providers. Model estimates can be wrong and do not prove authorization.
+A model rejection may still be reviewed by a human when host policy allows it.
+Uncertain, malformed, failed, stale or over-budget reviews use the ordinary
+human approval path; cancelled reviews cannot commit. The UI reports review
+progress and settled outcomes without exposing model reasoning or credentials.
+
+## Workspace tools
+
+The CLI uses the current working directory where you launch vivi as its selected
 workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
 disable workspace access for that launch. These flags cannot be combined. Relative
 paths are resolved from the launch directory, not the installed CLI or private
@@ -146,17 +198,17 @@ node dist/launcher.js --no-tui --model YOUR_MODEL --tools --workspace ./my-proje
 bun dist/launcher.js --no-workspace
 ```
 
-The assistant can list files, read UTF-8 text, and search literal text. Reads may be
+The assistant can list files, match file paths with `workspace_glob`, read UTF-8 text, and search literal text. Reads may be
 sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
-are treated as untrusted data. No writes, shell commands, automatic execution,
-network tools, plugin discovery, or permanent folder trust are added.
+are treated as untrusted data. Text creation and precise edits require host review. Shell commands, deletion,
+renaming, network tools, plugin discovery and permanent folder trust are unavailable.
 
 The default applies to CLI launches only. Library users of `CliHost` must still
 explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
 does not grant access to the application’s working directory.
 
-Root and nested `.gitignore` files apply to all three tools, including direct reads.
+Root and nested `.gitignore` files apply to all workspace tools, including direct reads.
 Symlinks, multi-link files, repository internals, common credential locations,
 `.env`/`.env.*`, key files, `node_modules`, and `.cache` are unavailable. Ignore rules
 cannot override these exclusions. The active CLI state folder is also excluded,
@@ -164,9 +216,31 @@ including a custom `--session-dir` inside the project. Ordinary config such as `
 `tsconfig.json` remains readable. This policy cannot identify every secret: move
 sensitive files outside the selected folder or exclude them with `.gitignore`.
 
-Output is bounded: listings have at most 100 entries; literal searches at most 50
+`workspace_create_text` proposes one new UTF-8 file; it never overwrites an existing
+entry or creates parent folders. `workspace_edit_text` replaces one unique literal
+`before` target with `after`. First read the file and use its returned `revision`
+(the SHA-256 of all raw bytes) as `expectedRevision`; stale or ambiguous edits fail.
+BOM, line endings and every byte outside the replacement are preserved. Files are
+bounded at 256 KiB and the complete JSON-quoted unified review diff at 48 KiB.
+Larger diffs are refused; exact Auto requests above 16 KiB stay Manual without
+truncation. Manual shows the diff and asks each time; piped/headless writes are denied.
+
+Publication uses an exclusive temporary sibling `.vivi-stage-*.tmp`, then exclusive
+hard-link creation or replacement rename. Staging is cleaned up; no persistent
+backup is retained. Creation fails closed if the filesystem cannot create hard links.
+An uncertain outcome requires reading the file before retrying. These are ordinary
+workspace checks, not hostile-filesystem containment or compare-and-swap guarantees;
+portable Windows directory crash durability is not claimed.
+
+`workspace_glob` matches file names without reading contents. Its pattern is relative
+to its optional `path`, with forward slashes and case-sensitive matching on every OS.
+Use `*`, `?`, or standalone `**`, such as `**/*test*.ts`; escapes, double quotes,
+negation, brackets, braces, extglobs and regex are unavailable. Dotfiles follow the same exclusions.
+It defaults to depth 8 and 50 results; returned paths stay workspace-relative.
+
+Output is bounded: listings and globs have at most 100 entries; literal searches at most 50
 matches; reads return up to 8 KiB from text files no larger than 256 KiB. Traversal
-is at most 8 levels per call and stops after 1,000 entries, 200 search files, 2 MiB
+is at most 8 levels per call and stops after 1,000 entries, 200 search/glob files, 2 MiB
 of searched text, or 10 seconds. `truncated: true` means the result is incomplete,
 including deeper directories not visited. Escape/Ctrl+C cancels a running turn.
 
@@ -183,9 +257,11 @@ Memory is off by default. Use `--enable-memory` for a launch, or choose the futu
 launch default in `/settings` in the full-screen UI. `--disable-memory` overrides
 an enabled saved default. `/memories` enables or disables the current launch and
 lets you list, add, edit and delete records. Back, Escape and Cancel never submit
-a change. Each create, edit and delete shows the exact proposal and requires a
-fresh interactive approval: select Approve in the full-screen UI, or type `allow`
-in line mode. Piped input cannot approve writes.
+a change. Manager create, edit and delete actions show the exact proposal and
+require a fresh interactive approval: select Approve in the full-screen UI, or
+type `allow` in line mode. Model-requested create/edit calls use the same human
+path unless eligible under explicitly enrolled Auto review. Piped input cannot
+approve writes or enroll Auto review.
 
 Memories are stored as plaintext in `memories.json` alongside the CLI’s private
 session files, normally `~/.vivi/sessions`. When enabled, saved context is sent to
@@ -236,78 +312,22 @@ keep missing metrics unreported; no cache policy, price or savings is inferred.
 
 ## Instruction-only Agent Skills
 
-The CLI uses the verified `@ayayaq/vivi@0.6.0` optional skills extension. Skills use
-ordinary Agent Skills directories containing `SKILL.md`, with YAML `name` and
-`description` frontmatter. No vivi-specific manifest or conversion is required.
+`/skills` lists and inspects standard `<name>/SKILL.md` folders, prepares creator requests
+in the composer, and enables or disables skills for this launch. The app-wide folder is
+`<session-dir>/agent-skills`; `--skills-dir PATH` adds up to eight explicit read-only roots.
+No workspace, home, ancestor, or community discovery is performed. `--no-skills` disables
+skills. Metadata goes to the selected provider; instructions and UTF-8 text resources load
+progressively through `list_skills` and `read_skill`, without running scripts.
 
-Skills are enabled by default for each CLI launch. The app-wide owned store is
-`<session-dir>/agent-skills/<name>/SKILL.md`; it is independent of session notes
-and saved memories. The original bundled `skill-creator` is read-only. `/skills`
-opens the full-screen manager for listing metadata, viewing source in bounded
-pages, drafting a new skill with the agent, and enabling/disabling this launch.
-Creating with the agent puts a request in the composer for you to review and send.
-Line mode supports `/skills list`, `/skills inspect NAME`, `/skills create DESCRIPTION`,
-`/skills on`, and `/skills off`. `--no-skills` disables the feature for the launch.
+The bundled read-only `skill-creator` drafts SKILL.md content in chat. Save the draft
+manually as `<name>/SKILL.md`, then refresh or start a new turn. Automatic skill saving is
+disabled on Windows, macOS, and Linux. There is no skill writer, save tool, or save approval.
+All skills are read-only to the agent. Existing workspace tools cannot target the owned
+private state profile. Skill hints grant no tools, permissions, or Auto eligibility.
 
-To use an existing standard skills folder, pass `--skills-dir PATH`. This flag is
-repeatable up to eight roots, read-only, and never remembered in sessions or defaults.
-It authorizes only bounded discovery and inert text reads in those roots. The CLI
-never automatically scans workspace, home or repository skills. Extra roots overlapping the state profile are excluded with diagnostics; use a
-separate ordinary collection folder. Canonical filesystem identity handles normal
-Windows letter-case/short-path aliases without assuming a macOS volume case policy.
-Invalid documents, unsupported fields, duplicate canonical names, symlinks and
-unsafe paths are excluded with diagnostics. Original imported files/resources are
-neither rewritten nor copied. NFKC-equivalent physical directory names are read
-unchanged using canonical catalog names, but remain read-only; saves use canonical
-names only, and normalized aliases cannot be shadowed.
-
-Only compact name/description metadata is sent as ephemeral user-level context.
-The agent reads relevant instructions/resources progressively using `list_skills`
-and `read_skill`; catalog summaries never become saved user messages. Selected
-instructions and tool results are sent to your provider and may remain in the
-session transcript. Skill text is untrusted guidance and cannot change tool access,
-approvals, model capability policy or credential protections. `allowed-tools` is
-descriptive. Chat-only models receive metadata but cannot load or save via tools.
-
-**Saving is currently supported only on Linux**, where descriptor-relative file
-operations anchor the destination throughout the transaction. On Windows/macOS,
-reads and creator drafts work, but `save_skill` is omitted and direct saves fail
-closed until safe native handle-relative transactions have been implemented and
-validated. Read-only platforms never create the skill store or its lock files. Manually
-created ordinary folders and 0644 text files can be read without changing their
-permissions. Unavailable owned folders and invalid import roots produce diagnostics
-while the creator and unrelated valid imports remain available. Windows reads do
-not assert a POSIX mode or an ACL guarantee.
-
-On Linux, `save_skill` writes one `SKILL.md` only in the owned store, after exact destination,
-before/after and revision review. Deny is the default; piped/queued input cannot
-approve. Built-ins and imported roots stay read-only. Human review holds no file
-lease; the store takes a short cross-process lease afterward, rechecks the actual
-revision, backs up the validated prior source, then atomically replaces the file.
-Cancellation before replacement prevents the commit. A committed save is retained
-and reported even if cancellation races the tool result. Changes activate only on
-the next turn. Corrupt primary/backup files are preserved read-only; locks are never
-stolen automatically. After a crash, verify the owning process has stopped before
-removing a stale lock.
-
-The standard format is supported within explicit bounds: 100 skills including the
-creator, 64 KiB strict UTF-8 per document/resource, 2 MiB total documents and 24 KiB
-catalog metadata. YAML complexity and safe path limits follow the shared core.
-The CLI additionally refuses saves whose combined exact review exceeds 60 KiB of
-display text, and refuses tool reads whose serialized response exceeds the 64 KiB
-canonical transcript-message limit (the manager still supports paged source inspection).
-Unsupported YAML/frontmatter semantics are diagnosed and excluded.
-This is instruction-only compatibility: existing skills requiring shell commands,
-executable scripts, binary assets, runtimes, network tools or unavailable permissions
-cannot perform those steps. Script resources may be read as text, never executed.
-No dependency installation, command execution, workspace editing, resource creation,
-deletion or builtin editing is introduced by skills.
-
-Ordinary remediation coverage includes portable format/resource/permission/root-diagnostic
-and UI cases. Linux save cases are separate. Previously restricted/adversarial filesystem
-assessment cases are explicitly skipped and unrun; no full security certification is claimed.
-Existing private Linux owned-store reads use the short exclusive lease and may wait up to
-two seconds; a unavailable/locked owned collection is diagnosed and omitted while unrelated
-imports remain usable. Manually non-private collections are read-only, and writes never
-chmod user files. File identity/time checks are operational consistency checks, not a claim
-of complete isolation from hostile same-user mutation on every filesystem.
+Discovery uses canonical filesystem identity for ordinary Windows path aliases, preserves
+original files, and reports unavailable roots, invalid formats, and duplicate names.
+Bounds are 100 skills including the creator, 64 KiB per UTF-8 document/resource, 2 MiB total
+documents, and 24 KiB catalog metadata; serialized tool reads must also fit the session
+transcript limit. Existing credential/private-state exclusions remain. Prior restricted
+assessments stay excluded; this release does not accept automatic skill saving.

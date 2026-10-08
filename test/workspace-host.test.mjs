@@ -159,7 +159,7 @@ test('line launch selects a folder for the launch and keeps capability gating ex
         return answer()
       } }) })
     assert.equal(code, 0)
-    assert.match(io.output, /read only for this launch/)
+    assert.match(io.output, /reads and reviewed text edits for this launch/)
     assert.match(io.output, /sent to the selected provider and saved/)
     if (!declared) assert.match(io.output, /tools unavailable/)
   }

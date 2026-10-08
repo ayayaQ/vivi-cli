@@ -3,6 +3,7 @@ import type { ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
 import { createToolRegistry, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
 import { WORKSPACE_TOOL_NAMES } from './workspace.js'
+import { WORKSPACE_MUTATION_TOOL_NAMES } from './workspace-edit.js'
 export { calculate }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
@@ -16,6 +17,8 @@ export interface ToolHost {
   readNotes(): NoteSnapshot
   commitNote(key: string, value: string, expectedRevision: number): Promise<number>
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
+  /** Prepared note writes go through host-owned review/commit, never a replacement IO judge. */
+  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | undefined>
   now?(): Date
 }
 const objectSchema = (properties: Record<string, unknown>, required: string[]): ToolDefinition['parameters'] =>
@@ -29,7 +32,7 @@ function hostTools(enableNotes = false): ToolDefinition[] {
   if (enableNotes) tools.push(
     { name: 'note_read', description: 'Read this CLI session’s host-owned notes and revision. No filesystem access.',
       parameters: objectSchema({}, []) },
-    { name: 'note_set', description: 'Set one session note after explicit human approval. Use the latest note revision.',
+    { name: 'note_set', description: 'Propose one session note change for host review. Use the latest note revision; never claim a save before its success result.',
       parameters: objectSchema({ key: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,40}$' },
         value: { type: 'string', maxLength: 4096 }, expectedRevision: { type: 'integer', minimum: 0 } },
       ['key', 'value', 'expectedRevision']) })
@@ -42,13 +45,13 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
 } {
   const registry = createToolRegistry([calculatorExtension, ...extensions], {
-    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill']
+    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill']
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
   const memoryRegistry = memory ? createToolRegistry([memory]) : undefined
   const workspaceRegistry = workspace ? createToolRegistry([workspace]) : undefined
-  const skillsRegistry = skills ? createToolRegistry([skills]) : undefined
+  const skillsRegistry = skills ? createToolRegistry([skills], { reservedNames: ['save_skill'] }) : undefined
   return {
     tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? []), ...(workspaceRegistry?.tools ?? []), ...(skillsRegistry?.tools ?? [])],
     executeTool: (call, signal, host) => memoryRegistry?.has(call.name)
@@ -102,6 +105,11 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
       const before = host.readNotes()
       if (before.revision !== expectedRevision) return error('revision_conflict', 'Read the latest notes before changing them')
       if (!Object.hasOwn(before.notes, key) && Object.keys(before.notes).length >= 64) throw new Error('Session has reached its note limit')
+      if (host.reviewNote) {
+        const revision = await host.reviewNote(call, before, key, value, signal)
+        return revision === undefined ? error('approval_denied', 'This note change was not approved')
+          : { content: JSON.stringify({ success: true, key, revision }) }
+      }
       if (!await host.approve({ call, description: `Set session note ${JSON.stringify(key)} to ${JSON.stringify(value)}`,
         currentRevision: before.revision }, signal)) return error('approval_denied', 'Human denied this note change')
       if (signal.aborted) return error('cancelled', 'Cancelled before note change')

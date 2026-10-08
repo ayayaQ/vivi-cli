@@ -28,7 +28,7 @@ test('skills completion and native action button have keyboard/mouse parity with
 })
 test('creation request returns as editable composer text and requires fresh send', async () => {
   const f = await fixture()
-  const prompt = 'Use the bundled skill-creator to draft a normal SKILL.md\nSave only after exact review'
+  const prompt = 'Use the bundled skill-creator to draft a normal SKILL.md\nShow the draft for manual saving'
   f.io.setComposerDraft(prompt)
   const reading = f.io.readLine('Message'); let sent = false
   void reading.then(() => { sent = true })
@@ -40,13 +40,6 @@ test('creation request returns as editable composer text and requires fresh send
   const next = f.io.readLine('Message'); await f.frame(); expect(composer.plainText).toBe('')
   f.io.close(); expect(await next).toBeUndefined()
 })
-test('oversized skill review fails closed rather than showing an approving truncated draft', async () => {
-  const f = await fixture()
-  expect(await f.io.approve({ call: { id: 'large-save', name: 'save_skill', arguments: {} }, currentRevision: 'new skill', description: 'x'.repeat(60 * 1024 + 1) }, new AbortController().signal)).toBe(false)
-  expect(await f.frame()).toContain('exact review exceeds')
-  expect(f.setup.renderer.root.findDescendantById('vivi-picker-box')!.visible).toBe(false)
-})
-
 test('40-column footer retains compact hints rather than clipping fixed action buttons', async () => {
   const setup = await createTestRenderer({ width: 40, height: 24, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' });
@@ -57,3 +50,4 @@ test('40-column footer retains compact hints rather than clipping fixed action b
   expect(setup.captureCharFrame()).toContain('Enter send');
   io.close(); expect(await reading).toBeUndefined();
 });
+

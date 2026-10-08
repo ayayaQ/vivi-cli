@@ -69,3 +69,4 @@ test('ordinary chat remains available with manually readable skills and with an 
   }), 0);
   assert.equal(calls, 2); assert.match(output.output, /Owned skill folder unavailable/);
 });
+

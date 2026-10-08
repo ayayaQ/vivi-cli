@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createInterface, emitKeypressEvents } from 'node:readline'
+import { randomUUID } from 'node:crypto'
 import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
@@ -10,11 +11,18 @@ import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import type { RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
+import type { ApprovalMode, ReviewNotice } from './auto-review.js'
+import { autoReviewSharingScope } from './auto-review.js'
 
 export interface ChatIO {
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
+  /** Enrollment requires a real interactive approval surface; omitted means unavailable. */
+  readonly canAutoReview?: boolean
+  setApprovalMode?(mode: ApprovalMode): void
+  /** Optional safe display sink that survives canonical transcript refresh. */
+  reviewNotice?(message: string, context?: ReviewNotice): void
   /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
   runStarted?(): void
   runFinished?(outcome: RunOutcome): void
@@ -45,8 +53,52 @@ export interface TerminalOptions {
   stream?: boolean
   secrets?: readonly string[]
 }
-export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Exact review is required before each save; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
-export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires allow/deny review. Disabling retains existing records.'
+export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
+export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
+
+/** Disclosure is host-authored; credentials and model-generated text never identify an account. */
+export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
+  const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
+  return `Auto sends your current request and proposed note/memory changes and workspace text creation/precise edits (paths, before and after) to ${recipients} for approval checks, including changes you didn’t request. ` +
+    'This may share private information and incur extra API charges; only changes judged to match your request can be saved automatically.'
+}
+
+type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ApprovalMode }[], initialIndex: number) => Promise<ApprovalMode | undefined>
+
+/** Mode choices are not authority. Auto enrollment always uses the fresh deny-default approval path. */
+export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser): Promise<void> {
+  host.setApprovalMode('manual')
+  io.setApprovalMode?.('manual')
+  if (io.canAutoReview !== true || io.isClosed) { io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`); return }
+  const disclosure = autoReviewDisclosure(host.session.provider)
+  const binding = host.approvalEnrollmentBinding
+  io.write('Approval mode: Manual\n')
+  const selected = choose ? await choose('Approval mode · Manual is the default', [
+    { name: 'Manual', description: 'Human allow/deny review for every write', value: 'manual' },
+    { name: 'Auto review', description: 'Check proposed note, memory and workspace text changes through your selected provider', value: 'auto' }
+  ], 0) : 'auto'
+  if (selected !== 'auto' || io.isClosed) { io.write('Approval mode: Manual\n'); return }
+  const controller = new AbortController()
+  const dispose = io.onCancel(() => controller.abort())
+  try {
+    const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
+      mode: 'auto', provider: host.session.provider, sessionId: host.session.id,
+      reviewDataSharing: autoReviewSharingScope(host.session.provider), ...(binding ? { enrollmentBinding: binding } : {})
+    } }, currentRevision: 'fresh Auto review enrollment',
+    description: disclosure }, controller.signal)
+    if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
+      host.setApprovalMode('auto')
+      io.setApprovalMode?.('auto')
+      io.write('Approval mode: Auto review · enrolled for this conversation and selected account\n')
+    } else {
+      const changed = binding !== host.approvalEnrollmentBinding
+      host.setApprovalMode('manual')
+      io.setApprovalMode?.('manual')
+      io.write(changed ? 'Approval mode: Manual. Enrollment changed; open /mode for a fresh confirmation\n' : 'Approval mode: Manual\n')
+    }
+  } finally { dispose() }
+}
+export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Automatic skill saving is disabled on every platform; creator drafts are saved manually; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
 /memories edit ID REVISION TEXT · review an edit to the displayed revision
@@ -117,14 +169,14 @@ export async function runMemoryCommand(host: CliHost, io: ChatIO, line: string):
   } else io.write(MEMORY_COMMAND_HELP)
   return true
 }
-const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · ask the agent to draft a standard skill; every save is reviewed\n/skills on · enable for this launch; /skills off · disable without deleting\n'
+const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · ask the agent for a standard skill draft to save manually\n/skills on · enable for this launch; /skills off · disable without deleting\n'
 export function displaySkills(io: Pick<ChatIO, 'write'>, catalog: Awaited<ReturnType<CliHost['listSkills']>>, diagnostics: readonly string[] = []): void {
   io.write(`Skills (${catalog.skills.length}):\n`)
   for (const skill of catalog.skills) io.write(`${JSON.stringify(skill.name)} · ${skill.readOnly ? 'read only' : 'owned store'} · revision ${skill.revision}\n${JSON.stringify(skill.description)}\n`)
   for (const diagnostic of diagnostics) io.write(`Skill diagnostic: ${diagnostic}\n`)
 }
 export function skillCreationPrompt(description: string): string {
-  return `Use the bundled skill-creator to draft an ordinary instruction-only SKILL.md for this request: ${description}\nShow the exact draft, keep it limited to available tools, propose honest example checks, and use save_skill only after the host's exact-content review. Do not create scripts/resources, run commands, install dependencies or claim unrun evaluations.`
+  return `Use the bundled skill-creator to draft an ordinary instruction-only SKILL.md for this request: ${description}\nShow the exact draft, keep it limited to available tools, propose honest example checks, and show the draft for me to save manually. Automatic skill saving is disabled on every platform. Do not create scripts/resources, run commands, install dependencies or claim unrun evaluations.`
 }
 export async function runSkillsCommand(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
   if (!/^\/skills(?:\s|$)/.test(line.trim())) return false
@@ -173,6 +225,9 @@ export class TerminalIO implements ChatIO {
   private streamOverflow = false
   private readonly keyHandler: (_text: string, key: { name?: string }) => void
   private readonly signalHandler: () => void
+  get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
+    !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
+  get isClosed(): boolean { return this.disposed || this.ended }
   constructor(options: TerminalOptions = {}) {
     this.input = options.input ?? process.stdin
     this.output = options.output ?? process.stdout
@@ -188,6 +243,11 @@ export class TerminalIO implements ChatIO {
     })
     this.readline.on('close', () => {
       this.ended = true
+      // Interactive EOF revokes an enrolled run. Preserve ordinary piped read-only
+      // completion: a closed pipe was never an Auto review authority surface.
+      if (this.input.isTTY && this.output.isTTY) for (const callback of [...this.cancelCallbacks]) {
+        try { callback() } catch { /* Closing must still settle every input waiter. */ }
+      }
       for (const waiter of this.waiters.splice(0)) waiter.resolve(undefined)
     })
     const cancel = (): void => {
@@ -362,16 +422,22 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /memories manages saved context, /skills manages skills\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /skills manages skills\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
     if (line.trim() === '/session') {
       const session = host.session
-      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nApproval mode: ${host.approvalMode === 'auto' ? 'Auto review' : 'Manual'}\nSession tokens: ${formatUsage(session.usage)}\n`)
       continue
     }
     if (!line.trim()) continue
+    if (/^\/mode(?:\s|$)/.test(line.trim())) {
+      if (line.trim() !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
+      try { await selectApprovalMode(host, io) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
+      continue
+    }
     if (/^\/rename(?:\s|$)/.test(line.trim())) {
       const name = line.trim().replace(/^\/rename(?:\s+|$)/, '')
       if (!name) io.write('Use /rename NAME to name this session\n')

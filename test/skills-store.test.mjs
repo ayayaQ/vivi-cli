@@ -10,7 +10,6 @@ import { parseSkillDocument, SKILL_LIMITS } from '@ayayaq/vivi/extensions/skills
 import { FileSkillStore } from '../dist/skills.js';
 
 const test = (name, fn) => nodeTest(name, { timeout: 20_000 }, fn);
-const linuxSaveTest = (name, fn) => nodeTest(name, { timeout: 20_000, skip: process.platform !== 'linux' ? 'Linux-only save capability; read-only cases run separately on every platform' : false }, fn);
 // Deliberately excluded from this ordinary remediation. No environment flag or
 // test-name selection can enable the prior restricted/adversarial assessment here.
 const excludedAssessment = (name, fn) => nodeTest(name, { skip: 'Restricted/adversarial filesystem assessment excluded and unrun' }, fn);
@@ -71,39 +70,6 @@ test('construction is lazy; fresh catalog includes the immutable creator and no 
   assert.ok(Object.isFrozen(catalog.skills));
 });
 
-linuxSaveTest('save review freezes exact standard source, destination and before/after; catalogs stay per-turn', async t => {
-  const { store, directory } = await fixture(t);
-  const empty = await store.snapshot();
-  const raw = source('concise-summary', ' Preserve spacing exactly. \r\n');
-  const input = proposal(raw);
-  const prepared = await store.prepare(input);
-  assert.equal(prepared.destination, join(directory, input.name, 'SKILL.md'));
-  assert.equal(prepared.before, null);
-  assert.equal(prepared.after.content, raw);
-  assert.ok(Object.isFrozen(prepared));
-  assert.ok(Object.isFrozen(prepared.proposal.after.metadata));
-  input.after = parseSkillDocument(source('concise-summary', 'Changed after preparation'));
-  const receipt = await store.commit(prepared.proposal);
-  assert.deepEqual(receipt, { committed: true, futureTurn: true, name: 'concise-summary', revision: prepared.after.revision });
-  assert.equal(await readFile(prepared.destination, 'utf8'), raw);
-  assert.equal(empty.document('concise-summary'), undefined);
-  const next = await store.snapshot();
-  assert.equal(next.document('concise-summary').content, raw);
-  const revised = source('concise-summary', 'Use five bullets.');
-  await save(store, revised, next.document('concise-summary'));
-  assert.equal(next.document('concise-summary').content, raw);
-  assert.equal(await readFile(join(directory, 'concise-summary', 'SKILL.md.bak'), 'utf8'), raw);
-  assert.equal(new FileSkillStore(directory).directory, store.directory);
-  assert.equal((await new FileSkillStore(directory).snapshot()).document('concise-summary').content, revised);
-  if (process.platform !== 'win32') {
-    assert.equal((await lstat(prepared.destination)).mode & 0o777, 0o600);
-    assert.equal((await lstat(join(directory, input.name))).mode & 0o777, 0o700);
-  }
-  assert.equal(store.receipts.length, 2);
-  assert.equal(store.takeReceipts().length, 2);
-  assert.equal(store.receipts.length, 0);
-});
-
 test('extra roots are explicit and read-only; built-ins and external names cannot be overwritten or shadowed', async t => {
   const { directory, external } = await fixture(t);
   await put(external, 'external-guide');
@@ -112,8 +78,8 @@ test('extra roots are explicit and read-only; built-ins and external names canno
   const store = new FileSkillStore(directory, { readOnlyRoots: [external] });
   const catalog = await store.snapshot();
   assert.equal(catalog.skills.find(item => item.name === 'external-guide').readOnly, true);
-  await assert.rejects(store.prepare(proposal(source('external-guide'))), /read-only|handle-relative/);
-  await assert.rejects(store.commit(proposal(source('skill-creator'))), /read-only|handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
   for (const root of [join(directory, '..'), directory]) {
     const overlap = new FileSkillStore(directory, { readOnlyRoots: [root] });
     assert((await overlap.snapshot()).document('skill-creator'));
@@ -134,7 +100,7 @@ test('unknown frontmatter, invalid sources and duplicate canonical names are dia
   assert.ok(store.diagnostics.some(message => /unsupported frontmatter/i.test(message)));
   assert.ok(store.diagnostics.some(message => /directory name/.test(message)));
   assert.ok(store.diagnostics.some(message => /Duplicate/.test(message)));
-  await assert.rejects(store.prepare(proposal(source('unknown-semantics', 'Text', 'new-field: value\n'))), /Unsupported|handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
 });
 
 test('strict UTF-8, byte, catalog-count and summary bounds are enforced without replacing originals', async t => {
@@ -279,27 +245,6 @@ excludedAssessment('hard-linked documents and resources cannot alias data beyond
   await assert.rejects(store.prepare(proposal(source('hard-link-guide'))), /bounded regular/);
 });
 
-linuxSaveTest('prepare and post-approval commit enforce fresh count, document and summary capacity', async t => {
-  const { directory, store } = await fixture(t);
-  const draft = proposal(source('new-guide'));
-  const approved = await store.prepare(draft);
-  for (let index = 0; index < 99; index++) await put(directory, `count-${index}`);
-  await assert.rejects(store.prepare(draft), /capacity/);
-  await assert.rejects(store.commit(approved.proposal), /capacity/);
-  await assert.rejects(lstat(join(directory, 'new-guide')), { code: 'ENOENT' });
-  const before = (await store.snapshot()).document('count-0');
-  await save(store, source('count-0', 'Replacement occupies the existing slot'), before);
-  for (const name of await readdir(directory)) await rm(join(directory, name), { recursive: true, force: true });
-  for (let index = 0; index < 34; index++) await put(directory, `large-${index}`, source(`large-${index}`, 'x'.repeat(60_000)));
-  await assert.rejects(store.prepare(proposal(source('large-proposal', 'x'.repeat(60_000)))), /capacity|bounded regular file/);
-  for (const name of await readdir(directory)) await rm(join(directory, name), { recursive: true, force: true });
-  for (let index = 0; index < 24; index++) {
-    const name = `description-${index}`;
-    await put(directory, name, source(name).replace('Summarize supplied text when requested.', 'd'.repeat(1_000)));
-  }
-  await assert.rejects(store.prepare(draft), /capacity/);
-});
-
 test('known credentials are excluded from source, parsed metadata, resources, diagnostics and late reads', async t => {
   const { directory, store } = await fixture(t, { secrets: ['known-secret'] });
   await put(directory, 'source-secret', source('source-secret', 'known-secret'));
@@ -311,7 +256,7 @@ test('known credentials are excluded from source, parsed metadata, resources, di
   assert.equal(catalog.document('metadata-secret'), undefined);
   assert.ok(!JSON.stringify(store.diagnostics).includes('known-secret'));
   await assert.rejects(catalog.read({ name: 'safe-guide', path: 'notes.txt', expectedRevision: catalog.document('safe-guide').revision }, { signal: signal() }), /known credentials/);
-  await assert.rejects(store.prepare(proposal(source('new-guide', 'known-secret'))), /known credentials|handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
   store.addSecrets(['Summarize supplied text when requested.']);
   assert.throws(() => catalog.document('safe-guide'), /known credentials/);
   assert.throws(() => catalog.skills, /known credentials/);
@@ -346,86 +291,6 @@ excludedAssessment('proposal getters, unsupported data, forged revisions and sta
   assert.equal(await readFile(join(directory, 'cas-guide', 'SKILL.md'), 'utf8'), source('cas-guide', 'another process change'));
 });
 
-linuxSaveTest('corrupt primary/backup and unexpected recovery evidence stay read-only and untouched', async t => {
-  const { directory, store } = await fixture(t);
-  const raw = source('corruption-guide');
-  await save(store, raw);
-  const before = (await store.snapshot()).document('corruption-guide');
-  const target = join(directory, 'corruption-guide', 'SKILL.md');
-  const backup = `${target}.bak`;
-  await writeFile(backup, '{broken YAML', { mode: 0o600 });
-  await assert.rejects(store.prepare(proposal(source('corruption-guide', 'change'), before)), /frontmatter/);
-  assert.equal(await readFile(target, 'utf8'), raw);
-  assert.equal(await readFile(backup, 'utf8'), '{broken YAML');
-  await writeFile(backup, raw, { mode: 0o600 }); await unlink(target);
-  await assert.rejects(store.commit(proposal(source('corruption-guide'))), /read-only.*recovery/);
-  await writeFile(target, Buffer.from([0xff]), { mode: 0o600 });
-  await assert.rejects(store.commit(proposal(source('corruption-guide'))), /read-only.*UTF-8/);
-  assert.deepEqual(await readFile(target), Buffer.from([0xff]));
-});
-
-linuxSaveTest('cancellation after primary rename retains the committed receipt', async t => {
-  const { directory, store } = await fixture(t);
-  const raw = source('cancel-guide');
-  await save(store, raw);
-  const before = (await store.snapshot()).document('cancel-guide');
-  store.takeReceipts();
-  const controller = new AbortController();
-  const originalRename = fs.rename;
-  mockFs(t, 'rename', async (from, to) => {
-    await originalRename(from, to);
-    if (String(to).endsWith('/SKILL.md')) controller.abort(new Error('Cancelled after commit'));
-  });
-  const revised = source('cancel-guide', 'Committed replacement');
-  const result = await store.commit(proposal(revised, before), { signal: controller.signal });
-  assert.equal(result.committed, true);
-  assert.equal(await readFile(join(directory, 'cancel-guide', 'SKILL.md'), 'utf8'), revised);
-  assert.equal(store.receipts.length, 1);
-  const aborted = new AbortController(); aborted.abort();
-  await assert.rejects(store.commit(proposal(source('never-created')), { signal: aborted.signal }), { name: 'AbortError' });
-  await assert.rejects(lstat(join(directory, 'never-created', 'SKILL.md')), { code: 'ENOENT' });
-});
-
-linuxSaveTest('abort during backup rename prevents primary replacement and keeps the last valid backup', async t => {
-  const { directory, store } = await fixture(t);
-  const raw = source('abort-guide');
-  await save(store, raw);
-  const before = (await store.snapshot()).document('abort-guide');
-  store.takeReceipts();
-  const controller = new AbortController();
-  const originalRename = fs.rename;
-  mockFs(t, 'rename', async (from, to) => {
-    await originalRename(from, to);
-    if (String(to).endsWith('/SKILL.md.bak')) controller.abort(new Error('Cancelled before primary rename'));
-  });
-  await assert.rejects(store.commit(proposal(source('abort-guide', 'Never committed'), before), { signal: controller.signal }), /Cancelled before/);
-  const target = join(directory, 'abort-guide', 'SKILL.md');
-  assert.equal(await readFile(target, 'utf8'), raw);
-  assert.equal(await readFile(`${target}.bak`, 'utf8'), raw);
-  assert.equal(store.receipts.length, 0);
-  assert.deepEqual((await readdir(join(directory, 'abort-guide'))).sort(), ['SKILL.md', 'SKILL.md.bak']);
-});
-
-linuxSaveTest('secrets registered across cleanup withhold unsafe results but retain a safe committed receipt', async t => {
-  const { directory, store } = await fixture(t);
-  const originalUnlink = fs.unlink;
-  let committed = false;
-  const originalRename = fs.rename;
-  mockFs(t, 'rename', async (from, to) => {
-    await originalRename(from, to);
-    if (String(to).endsWith('/SKILL.md')) { committed = true; store.addSecrets(['safe-guide']); }
-  });
-  mockFs(t, 'unlink', async path => {
-    if (committed && String(path).endsWith('/.skills.lock')) store.addSecrets(['late-secret']);
-    return originalUnlink(path);
-  });
-  const receipt = await store.commit(proposal(source('safe-guide', 'late-secret')));
-  assert.deepEqual(receipt, { committed: true, futureTurn: true, contentWithheld: true });
-  assert.deepEqual(store.receipts, [receipt]);
-  assert.equal(await readFile(join(directory, 'safe-guide', 'SKILL.md'), 'utf8'), source('safe-guide', 'late-secret'));
-  assert.deepEqual((await store.snapshot()).skills.map(item => item.name), ['skill-creator']);
-});
-
 excludedAssessment('cross-process compare-and-swap permits one creator and never steals stale leases', async t => {
   const { directory, store } = await fixture(t);
   const module = new URL('../dist/skills.js', import.meta.url).href;
@@ -441,51 +306,6 @@ catch(error) { console.log(error.message.includes('stale') ? 'stale' : error.mes
   assert.equal(await readFile(join(directory, '.skills.lock'), 'utf8'), 'old lease');
 });
 
-linuxSaveTest('drain waits for admitted commit and closes future admission', async t => {
-  const notices = [];
-  const { directory, store } = await fixture(t, { notice: message => notices.push(message) });
-  const ready = deferred(); const proceed = deferred();
-  const originalRename = fs.rename;
-  mockFs(t, 'rename', async (from, to) => {
-    if (String(to).endsWith('/SKILL.md')) { ready.resolve(); await proceed.promise; }
-    return originalRename(from, to);
-  });
-  const commit = store.commit(proposal(source('drain-guide')));
-  await ready.promise;
-  let drained = false;
-  const drain = store.drain({ close: true }).then(() => { drained = true; });
-  await assert.rejects(store.snapshot(), /closing/);
-  await new Promise(done => setTimeout(done, 20)); assert.equal(drained, false);
-  proceed.resolve();
-  assert.equal((await commit).committed, true);
-  await drain;
-  assert.equal(await readFile(join(directory, 'drain-guide', 'SKILL.md'), 'utf8'), source('drain-guide'));
-  assert.equal(store.receipts.length, 1);
-  assert.deepEqual(notices, []);
-});
-
-linuxSaveTest('post-commit directory durability failure becomes a safe notice and drain retries it', async t => {
-  const notices = [];
-  const { store } = await fixture(t, { notice: message => notices.push(message) });
-  const originalOpen = fs.open;
-  let failed = false;
-  mockFs(t, 'open', async (path, ...args) => {
-    const handle = await originalOpen(path, ...args);
-    const info = await handle.stat();
-    if (info.isDirectory() && String(path).endsWith('/durability-guide')) {
-      const originalSync = handle.sync.bind(handle);
-      handle.sync = async () => { if (!failed) { failed = true; throw new Error('secret-looking untrusted OS error'); } return originalSync(); };
-    }
-    return handle;
-  });
-  const receipt = await store.commit(proposal(source('durability-guide')));
-  assert.equal(receipt.committed, true);
-  assert.ok(notices.some(message => /durability could not be confirmed/.test(message)));
-  assert.ok(!JSON.stringify(notices).includes('secret-looking'));
-  await store.drain();
-  assert.equal(store.receipts.length, 1);
-});
-
 test('NFKC-equivalent physical directories stay unchanged, read-only and revision-bound', async t => {
   const { directory, external } = await fixture(t);
   const name = 'ｓｕｍｍａｒｙ';
@@ -498,12 +318,12 @@ test('NFKC-equivalent physical directories stay unchanged, read-only and revisio
   assert.equal(catalog.skills.find(item => item.name === 'summary').readOnly, true);
   assert.equal(catalog.document('summary').content, content);
   assert.equal(await catalog.read({ name: 'summary', path: 'references/guide.md', expectedRevision: catalog.document('summary').revision }, { signal: signal() }), 'Read the original resource inertly.');
-  await assert.rejects(store.prepare(proposal(source('summary'))), /normalized-alias.*read-only|handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
   assert.equal(await readFile(join(physical, 'SKILL.md'), 'utf8'), content);
   const externalPhysical = await put(external, 'ｅｘｔｅｒｎａｌ', source('ｅｘｔｅｒｎａｌ'));
   const imported = new FileSkillStore(directory, { readOnlyRoots: [external] });
   assert.equal((await imported.snapshot()).document('external').metadata.name, 'external');
-  await assert.rejects(imported.prepare(proposal(source('external'))), /read-only.*shadowed|handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
   assert.equal(await readFile(join(externalPhysical, 'SKILL.md'), 'utf8'), source('ｅｘｔｅｒｎａｌ'));
 });
 
@@ -522,16 +342,15 @@ nodeTest('read-only capability lists/reads without creating state and refuses ev
   const physical = await put(external, 'external-summary');
   await mkdir(join(physical, 'references'), { mode: 0o700 });
   await writeFile(join(physical, 'references', 'guide.md'), 'Imported inert text', { mode: 0o600 });
-  class ReadOnlySkillStore extends FileSkillStore { get writable() { return false; } }
-  const store = new ReadOnlySkillStore(root, { readOnlyRoots: [external] });
+  const store = new FileSkillStore(root, { readOnlyRoots: [external] });
   assert.equal(store.writable, false);
   const catalog = await store.snapshot();
   assert(catalog.document('skill-creator'));
   const document = catalog.document('external-summary');
   assert(document); assert.equal(catalog.skills.find(item => item.name === 'external-summary').readOnly, true);
   assert.equal(await catalog.read({ name: 'external-summary', path: 'references/guide.md', expectedRevision: document.revision }, { signal: signal() }), 'Imported inert text');
-  await assert.rejects(store.prepare(proposal(source('new-summary'))), /handle-relative/);
-  await assert.rejects(store.commit(proposal(source('new-summary'))), /handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
   await assert.rejects(lstat(root), { code: 'ENOENT' });
   assert.equal(await readFile(join(physical, 'SKILL.md'), 'utf8'), source('external-summary'));
   await store.drain({ close: true });
@@ -556,7 +375,7 @@ test('ordinary manual folders and 0644 documents/resources are read-only without
   const skill = catalog.document('manual-guide'); assert(skill);
   assert.equal(catalog.skills.find(item => item.name === 'manual-guide').readOnly, true);
   assert.equal(await catalog.read({ name: 'manual-guide', path: 'references/guide.md', expectedRevision: skill.revision }, { signal: signal() }), 'Ordinary manual reference text');
-  await assert.rejects(store.commit(proposal(source('new-guide'))), /handle-relative/);
+  assert.equal(typeof store.prepare, 'undefined'); assert.equal(typeof store.commit, 'undefined');
   assert.deepEqual({ root: (await lstat(directory)).mode, folder: (await lstat(folder)).mode, document: (await lstat(document)).mode, reference: (await lstat(reference)).mode }, before);
   await assert.rejects(lstat(join(directory, '.skills.lock')), { code: 'ENOENT' });
   assert.equal(await readFile(document, 'utf8'), source('manual-guide'));
@@ -593,3 +412,4 @@ test('diagnostic errors escape C1 text controls without filesystem mutation', as
   assert.equal(text, 'Ordinary\\u0085diagnostic\\u009btext');
   assert(!/[\u0000-\u001f\u007f-\u009f]/u.test(text));
 });
+
