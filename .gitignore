@@ -10,3 +10,6 @@ dist/
 .vivi/
 
 build/
+
+# Verified local native build artifacts, never source-controlled
+.vivi-build/
