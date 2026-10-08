@@ -22,7 +22,7 @@ function fixture(extra = {}) {
   let spawnCall
   let killed = 0
   child.kill = () => { killed++; child.emit('close', null, 'SIGKILL'); return true }
-  const runtime = { hostEnv: { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp', OPENAI_API_KEY: 'provider-key', ANTHROPIC_API_KEY: 'another-key', NODE_OPTIONS: '--require bad', PATH: 'host-path' }, spawn(executable, args, options) { spawnCall = { executable, args, options }; return child }, ...extra }
+  const runtime = { hostEnv: { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp', PSModulePath: 'C:\\hostile-user-modules', OPENAI_API_KEY: 'provider-key', ANTHROPIC_API_KEY: 'another-key', NODE_OPTIONS: '--require bad', PATH: 'host-path' }, spawn(executable, args, options) { spawnCall = { executable, args, options }; return child }, ...extra }
   return { child, runtime, writes, call: () => spawnCall, killed: () => killed }
 }
 const frame = value => JSON.stringify(value) + '\r\n'
@@ -36,12 +36,26 @@ test('Windows wrapper source is fixed, short enough, and request argv only trave
   assert.equal(call.executable, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
   assert.equal(call.options.shell, false)
   assert.equal(call.options.windowsHide, true)
-  assert.deepEqual(call.options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp' })
+  assert.deepEqual(call.options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp', PSModulePath: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules' })
   assert.equal(call.args.at(-2), '-EncodedCommand')
   assert.ok(call.args.at(-1).length + call.executable.length + 200 < 32767)
   const script = Buffer.from(call.args.at(-1), 'base64').toString('utf16le')
   assert.ok(!script.includes(input.args[5]))
   assert.ok(!script.includes('provider-key'))
+  assert.ok(!script.includes('hostile-user-modules'))
+  assert.ok(script.includes("$ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'"))
+  assert.ok(script.includes('[String]::Equals($PSHOME, $expectedHome, [StringComparison]::OrdinalIgnoreCase)'))
+  assert.ok(script.includes("[IO.Path]::Combine($moduleDirectory, 'Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1')"))
+  assert.ok(script.includes('[IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint'))
+  assert.ok(script.includes('[IO.File]::GetAttributes($ancestor) -band [IO.FileAttributes]::ReparsePoint'))
+  assert.ok(script.indexOf("Write-Phase 'module-start'") < script.indexOf('$expectedHome ='))
+  assert.ok(script.indexOf("SetEnvironmentVariable('PSModulePath'") < script.indexOf('Import-Module -Name $manifest'))
+  assert.ok(script.indexOf('Import-Module -Name $manifest') < script.indexOf("Write-Phase 'module-ready'"))
+  assert.ok(script.indexOf("Write-Phase 'module-ready'") < script.indexOf('Microsoft.PowerShell.Utility\\Add-Type -TypeDefinition'))
+  assert.ok(script.includes('Microsoft.PowerShell.Utility\\ConvertFrom-Json -InputObject $line'))
+  assert.ok(script.includes("Microsoft.PowerShell.Utility\\New-Object 'System.Collections.Generic.Dictionary[string,string]'"))
+  assert.ok(!/\$(?:HOME|Host|PID|PSHOME)\b\s*(?:[+\-*/%]?=|\+\+|--)/i.test(script))
+  assert.ok(!/^\s*\/\//m.test(script))
   const compressed = script.match(/\$compressed = '([^']+)'/)[1]
   const native = gunzipSync(Buffer.from(compressed, 'base64')).toString('utf8')
   assert.match(native, /JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE/)
@@ -50,7 +64,7 @@ test('Windows wrapper source is fixed, short enough, and request argv only trave
   assert.ok(native.indexOf('"Atomic job assignment') < native.indexOf('Check(CreateProcessW('))
   assert.ok(native.indexOf('Check(CreateProcessW(') < native.indexOf('if (ResumeThread('))
   assert.match(native, /WaitForEmptyJob\(job\)/)
-  assert.deepEqual(JSON.parse(Buffer.concat(fake.writes).toString('utf8')), input)
+  assert.equal(Buffer.concat(fake.writes).toString('utf8'), JSON.stringify(input) + '\n')
   fake.child.stdout.write(frame({ type: 'exit', exitCode: 0, stopped: false }))
   fake.child.emit('close', 0, null)
   assert.deepEqual(await command.completed, { exitCode: 0 })
@@ -153,9 +167,12 @@ test('helper startup receives identical fixed source across distinct approved re
 
 test('the frozen approved environment supplies only minimal helper setup variables', async () => {
   const fake = fixture()
-  const approved = { ...input, env: Object.freeze({ SystemRoot: 'C:\\FrozenWindows', TEMP: 'C:\\frozen-temp', TMPDIR: 'C:\\frozen-tmpdir', USERPROFILE: 'private-profile', LOCALAPPDATA: 'private-data', OPENAI_API_KEY: 'secret' }) }
+  const approved = { ...input, env: Object.freeze({ SystemRoot: 'C:\\FrozenWindows', TEMP: 'C:\\frozen-temp', TMPDIR: 'C:\\frozen-tmpdir', PSModulePath: 'C:\\approved-target-modules', USERPROFILE: 'private-profile', LOCALAPPDATA: 'private-data', OPENAI_API_KEY: 'secret' }) }
   const command = await launchWindowsCommand(approved, { spawn: fake.runtime.spawn })
-  assert.deepEqual(fake.call().options.env, { SystemRoot: 'C:\\FrozenWindows', TEMP: 'C:\\frozen-temp', TMPDIR: 'C:\\frozen-tmpdir' })
+  assert.deepEqual(fake.call().options.env, { SystemRoot: 'C:\\FrozenWindows', TEMP: 'C:\\frozen-temp', TMPDIR: 'C:\\frozen-tmpdir', PSModulePath: 'C:\\FrozenWindows\\System32\\WindowsPowerShell\\v1.0\\Modules' })
+  assert.equal(Buffer.concat(fake.writes).toString('utf8'), JSON.stringify(approved) + '\n')
+  assert.equal(approved.env.PSModulePath, 'C:\\approved-target-modules')
+  assert.equal(input.env.PSModulePath, undefined)
   assert.ok(fake.call().executable.startsWith('C:\\FrozenWindows\\'))
   fake.child.emit('close', null, null)
   await command.completed
@@ -270,13 +287,15 @@ test('optional diagnostic phases are fixed, deduplicated, and never become appro
   const fake = fixture({ onPhase: phase => { phases.push(phase) } })
   const command = await launchWindowsCommand(input, fake.runtime)
   const out = collect(command.stdout), err = collect(command.stderr)
-  assert.deepEqual(fake.call().options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp', VIVI_COMMAND_PHASES: '1' })
+  assert.deepEqual(fake.call().options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp', PSModulePath: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules', VIVI_COMMAND_PHASES: '1' })
   assert.equal(JSON.parse(Buffer.concat(fake.writes).toString()).env.VIVI_COMMAND_PHASES, undefined)
-  fake.child.stdout.write(frame({ type: 'phase', phase: 'helper-start' }).repeat(50) + frame({ type: 'phase', phase: 'job-empty' }))
+  fake.child.stdout.write(frame({ type: 'phase', phase: 'helper-start' }).repeat(50) + frame({ type: 'phase', phase: 'module-start' }).repeat(50) + frame({ type: 'phase', phase: 'module-ready' }) + frame({ type: 'phase', phase: 'job-empty' }))
   fake.child.stdout.write(frame({ type: 'exit', exitCode: 0, stopped: false }))
   fake.child.emit('close', 0, null)
   assert.deepEqual(await command.completed, { exitCode: 0 })
   assert.equal(phases.filter(phase => phase === 'helper-start').length, 1)
+  assert.equal(phases.filter(phase => phase === 'module-start').length, 1)
+  assert.ok(phases.includes('module-ready'))
   assert.ok(phases.includes('job-empty'))
   assert.ok(phases.includes('terminal-frame'))
   assert.ok(phases.includes('helper-close'))

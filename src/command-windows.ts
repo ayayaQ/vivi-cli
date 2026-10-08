@@ -32,7 +32,7 @@ export interface WindowsCommandProcess {
 
 /** Injection is for deterministic tests; callers should use the default runtime. */
 const windowsCommandPhases = [
-  'helper-start', 'compile-start', 'compile-ready', 'request-read-start', 'request-read-done',
+  'helper-start', 'module-start', 'module-ready', 'compile-start', 'compile-ready', 'request-read-start', 'request-read-done',
   'native-run-start', 'job-created', 'job-ready', 'control-read-start', 'control-eof', 'control-read-error',
   'process-created', 'process-resumed', 'stdout-pump-start', 'stderr-pump-start',
   'stdout-pump-eof', 'stderr-pump-eof', 'root-exit', 'job-terminate-start', 'job-empty',
@@ -324,6 +324,23 @@ function Write-Phase([string]$phase) {
 }
 try {
   Write-Phase 'helper-start'
+  Write-Phase 'module-start'
+  if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { throw 'Windows command helper requires FullLanguage' }
+  $expectedHome = [IO.Path]::GetFullPath([IO.Path]::Combine($env:SystemRoot, 'System32\WindowsPowerShell\v1.0'))
+  if (-not [String]::Equals($PSHOME, $expectedHome, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected system PowerShell installation' }
+  $moduleDirectory = [IO.Path]::Combine($expectedHome, 'Modules')
+  $manifest = [IO.Path]::Combine($moduleDirectory, 'Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
+  if (-not [IO.File]::Exists($manifest) -or ([IO.File]::GetAttributes($manifest) -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))) { throw 'Unexpected built-in Utility manifest' }
+  $ancestor = [IO.Path]::GetDirectoryName($manifest)
+  while (-not [String]::IsNullOrEmpty($ancestor)) {
+    if ([IO.File]::GetAttributes($ancestor) -band [IO.FileAttributes]::ReparsePoint) { throw 'Unexpected built-in Utility ancestor' }
+    $ancestor = [IO.Path]::GetDirectoryName($ancestor)
+  }
+  # Windows PowerShell can add default module directories during startup.
+  # Restore the fixed OS-only lookup path before loading the exact component.
+  [Environment]::SetEnvironmentVariable('PSModulePath', $moduleDirectory)
+  Import-Module -Name $manifest -ErrorAction Stop
+  Write-Phase 'module-ready'
   $compressed = '${compressedNative}'
   $memory = [IO.MemoryStream]::new([Convert]::FromBase64String($compressed))
   $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Decompress)
@@ -331,15 +348,15 @@ try {
   $source = $reader.ReadToEnd()
   $reader.Dispose()
   Write-Phase 'compile-start'
-  Add-Type -TypeDefinition $source -ErrorAction Stop
+  Microsoft.PowerShell.Utility\Add-Type -TypeDefinition $source -ErrorAction Stop
   [ViviCommandJob]::Diagnostics = $diagnostics
   Write-Phase 'compile-ready'
   Write-Phase 'request-read-start'
   $line = [Console]::ReadLine()
   Write-Phase 'request-read-done'
   if ($null -eq $line) { exit 0 }
-  $request = ConvertFrom-Json -InputObject $line -ErrorAction Stop
-  $environment = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+  $request = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $line -ErrorAction Stop
+  $environment = Microsoft.PowerShell.Utility\New-Object 'System.Collections.Generic.Dictionary[string,string]'
   foreach ($property in $request.env.PSObject.Properties) {
     $environment.Add($property.Name, [string]$property.Value)
   }
@@ -391,6 +408,8 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   // A package-owned diagnostic switch affects only the helper, never the target.
   if (runtime.onPhase) env.VIVI_COMMAND_PHASES = '1'
   const executable = win32.join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  // Helper setup only. The approved target environment remains request data.
+  env.PSModulePath = win32.join(win32.dirname(executable), 'Modules')
   const stdout = new PassThrough({ highWaterMark: 16_384 })
   const stderr = new PassThrough({ highWaterMark: 16_384 })
   let resolveCompleted!: (value: WindowsCommandResult) => void
