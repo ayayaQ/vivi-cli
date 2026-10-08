@@ -12,6 +12,17 @@ const sourceNames = ['ViviCommandJob.cs', 'ViviCommandJob.AssemblyInfo.cs']
 const specName = 'windows-command-helper.spec.json'
 const referenceNames = ['mscorlib.dll', 'System.dll', 'System.Core.dll']
 const hostNames = ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR']
+const metadataPhases = ['helper-start', 'file-version-start', 'file-version-ready', 'json-start', 'json-ready', 'output-written', 'helper-error']
+const buildPhases = new Set([
+  'source-check-start', 'source-check-ready', 'os-tools-check-start', 'os-tools-check-ready',
+  'locator-file-check-start', 'locator-file-check-ready', 'locator-metadata-start', 'locator-metadata-ready',
+  'vswhere-start', 'vswhere-ready', 'compiler-file-check-start', 'compiler-file-check-ready',
+  'compiler-metadata-start', 'compiler-metadata-ready', 'toolchain-snapshot-start', 'toolchain-snapshot-ready',
+  'references-check-start', 'references-check-ready', 'artifact-reserve-start', 'artifact-reserve-ready',
+  'compile-a-start', 'compile-a-ready', 'compile-b-start', 'compile-b-ready',
+  'post-build-check-start', 'post-build-check-ready', 'publish-start', 'publish-ready',
+  ...['locator-metadata', 'compiler-metadata'].flatMap(prefix => metadataPhases.map(phase => `${prefix}-${phase}`)),
+])
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 const toolLimit = 256 * 1024
 const fileLimit = 64 * 1024 * 1024
@@ -27,12 +38,29 @@ const buildEnvironment = {
   referencePackVersion: 'v4.6.2',
 }
 const metadataProgram = String.raw`
+[Console]::Error.WriteLine('VIVI_BUILD_PHASE:helper-start')
+[Console]::Error.Flush()
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 try {
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:file-version-start')
+  [Console]::Error.Flush()
   $file = [Diagnostics.FileVersionInfo]::GetVersionInfo([Environment]::GetEnvironmentVariable('VIVI_BUILD_INSPECT_FILE'))
-  [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @{ company = $file.CompanyName; fileVersion = $file.FileVersion; productVersion = $file.ProductVersion }))
-} catch { exit 1 }
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:file-version-ready')
+  [Console]::Error.Flush()
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:json-start')
+  [Console]::Error.Flush()
+  $json = ConvertTo-Json -Compress -InputObject @{ company = $file.CompanyName; fileVersion = $file.FileVersion; productVersion = $file.ProductVersion }
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:json-ready')
+  [Console]::Error.Flush()
+  [Console]::Out.WriteLine($json)
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:output-written')
+  [Console]::Error.Flush()
+} catch {
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:helper-error')
+  [Console]::Error.Flush()
+  exit 1
+}
 `
 
 const metadataCommand = Buffer.from(metadataProgram, 'utf16le').toString('base64')
@@ -89,6 +117,39 @@ async function existingAncestor(directory) {
 }
 function abortError() { return new HelperBuildError('Build proof cancelled') }
 function checkAbort(signal) { if (signal?.aborted) throw abortError() }
+function notifyPhase(observer, name) {
+  // Observers do not participate in supervision. Observe async rejection too.
+  try { Promise.resolve(observer?.(name)).catch(() => {}) } catch { /* diagnostic-only */ }
+}
+function phaseEmitter(onPhase) {
+  const seen = new Set()
+  return name => {
+    if (!buildPhases.has(name) || seen.has(name)) return
+    seen.add(name)
+    // Diagnostics cannot change tool execution, cleanup or proof eligibility.
+    notifyPhase(onPhase, name)
+  }
+}
+function metadataPhaseReader(onPhase) {
+  const allowed = new Map(metadataPhases.map(phase => [`VIVI_BUILD_PHASE:${phase}`, phase]))
+  const seen = new Set()
+  let line = '', discard = false
+  return bytes => {
+    for (const byte of bytes) {
+      if (byte === 10) {
+        const phase = !discard && allowed.get(line.replace(/\r$/, ''))
+        if (phase && !seen.has(phase)) {
+          seen.add(phase)
+          notifyPhase(onPhase, phase)
+        }
+        line = ''; discard = false
+      } else if (!discard) {
+        if (line.length >= 96) { line = ''; discard = true }
+        else line += String.fromCharCode(byte)
+      }
+    }
+  }
+}
 
 /** Bounded read-only/tool subprocess; taskkill is only allowed before root exit. */
 export async function runBoundedWindowsTool(executable, args, options, runtime = {}) {
@@ -102,6 +163,7 @@ export async function runBoundedWindowsTool(executable, args, options, runtime =
   catch { throw new HelperBuildError('Tool could not be started') }
   let rootExited = false, closeSeen = false, spawnFailed = false, failure, cleanupPromise
   let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), received = 0
+  const readMetadataPhases = options.onMetadataPhase ? metadataPhaseReader(options.onMetadataPhase) : () => {}
   let resolveClosed, resolveFailure
   const failed = new Promise(resolve => { resolveFailure = resolve })
   const closed = new Promise(resolve => { resolveClosed = resolve })
@@ -144,7 +206,7 @@ export async function runBoundedWindowsTool(executable, args, options, runtime =
     received += bytes.length
     if (received > maxOutputBytes) { fail('Tool output exceeded its bounded limit'); return }
     if (destination === 'stdout') stdout = Buffer.concat([stdout, bytes])
-    else stderr = Buffer.concat([stderr, bytes])
+    else { stderr = Buffer.concat([stderr, bytes]); readMetadataPhases(bytes) }
   }
   child.stdout?.on('data', collect('stdout'))
   child.stderr?.on('data', collect('stderr'))
@@ -242,14 +304,17 @@ async function fingerprint(directory, runtime, signal) {
 function run(runtime, executable, args, options) {
   return (runtime.runTool ?? ((exe, argv, config) => runBoundedWindowsTool(exe, argv, config, runtime)))(executable, args, options)
 }
-async function metadata(file, powershell, env, taskkill, signal, runtime) {
+async function metadata(file, powershell, env, taskkill, signal, runtime, label, phase) {
+  phase(`${label}-start`)
   const result = await run(runtime, powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', metadataCommand], {
     env: { ...env, VIVI_BUILD_INSPECT_FILE: file }, taskkill, signal, timeoutMs: 20_000, maxOutputBytes: 16_384,
+    onMetadataPhase: name => phase(`${label}-${name}`),
   })
   let record
   try { record = JSON.parse(result.stdout.toString('utf8').replace(/^\uFEFF/, '').trim()) }
   catch { throw new HelperBuildError('Installed tool version metadata is invalid') }
   if (!record || typeof record.company !== 'string' || record.company.length > 256 || typeof record.fileVersion !== 'string' || !record.fileVersion || record.fileVersion.length > 256 || typeof record.productVersion !== 'string' || record.productVersion.length > 256) throw new HelperBuildError('Installed tool version metadata is invalid')
+  phase(`${label}-ready`)
   return { company: record.company, fileVersion: record.fileVersion, productVersion: record.productVersion, versionResourcesInformationalOnly: true }
 
 }
@@ -332,6 +397,7 @@ export function inspectManagedAnyCpuImage(bytes) {
 
 /** Creates discovery-only proof in a fresh owned artifact directory. Never ships it. */
 export async function buildWindowsCommandHelper(options, runtime = {}) {
+  const phase = phaseEmitter(options.onPhase)
   if ((runtime.platform ?? process.platform) !== 'win32') throw new HelperBuildError('Build proof requires an existing Windows CI environment')
   const sourceRoot = await fs.realpath(path.resolve(options.sourceRoot ?? repositoryRoot))
   if (process.platform === 'win32' && !windowsPath(sourceRoot)) throw new HelperBuildError('Build sources must be on a local drive in the controlled image')
@@ -342,7 +408,9 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
   if (within(sourceRoot, artifactDirectory) && !within(reserved, artifactDirectory)) throw new HelperBuildError('Artifacts must be external to Git or within reserved .vivi-build')
   if (physicalWindows(artifactDirectory).includes(`${path.win32.sep}dist${path.win32.sep}`) || artifactDirectory === path.join(sourceRoot, 'dist')) throw new HelperBuildError('Artifacts cannot be staged inside dist')
   if (options.sourceRevision !== undefined && !/^[a-f0-9]{40}$/.test(options.sourceRevision)) throw new HelperBuildError('Source revision must be a declared 40-hex commit')
+  phase('source-check-start')
   const input = await sources(sourceRoot)
+  phase('source-check-ready')
   checkAbort(options.signal)
   const host = runtime.hostEnv ?? process.env
   if (hostValue(host, 'GITHUB_ACTIONS') !== 'true' || hostValue(host, 'RUNNER_OS') !== 'Windows' || hostValue(host, 'RUNNER_ENVIRONMENT') !== 'github-hosted') throw new HelperBuildError('Build proof is restricted to the declared controlled GitHub-hosted Windows environment')
@@ -351,12 +419,18 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
   if (!windowsPath(env.SystemRoot) || !windowsPath(programFiles) || !windowsPath(programFiles64)) throw new HelperBuildError('Installed Windows/Visual Studio roots are unavailable')
   const powershell = path.win32.join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const taskkill = path.win32.join(env.SystemRoot, 'System32', 'taskkill.exe')
+  phase('os-tools-check-start')
   const windowsTools = { powershell: await checkedFile(powershell, path.win32.join(env.SystemRoot, 'System32'), runtime), taskkill: await checkedFile(taskkill, path.win32.join(env.SystemRoot, 'System32'), runtime) }
+  phase('os-tools-check-ready')
   const installer = path.win32.join(programFiles, 'Microsoft Visual Studio', 'Installer')
   const vswhere = path.win32.join(installer, 'vswhere.exe')
+  phase('locator-file-check-start')
   const locator = await checkedFile(vswhere, installer, runtime)
-  const locatorMetadata = await metadata(locator.path, powershell, env, taskkill, options.signal, runtime)
+  phase('locator-file-check-ready')
+  const locatorMetadata = await metadata(locator.path, powershell, env, taskkill, options.signal, runtime, 'locator-metadata', phase)
+  phase('vswhere-start')
   const discovered = await run(runtime, locator.path, ['-version', '[18.10.12217.157,18.10.12217.158)', '-products', buildEnvironment.productId, '-requires', 'Microsoft.VisualStudio.Component.Roslyn.Compiler', 'Microsoft.Net.Component.4.6.2.TargetingPack', '-format', 'json', '-utf8'], { env, taskkill, signal: options.signal, timeoutMs: 20_000 })
+  phase('vswhere-ready')
   let installations
   try { installations = JSON.parse(discovered.stdout.toString('utf8').replace(/^\uFEFF/, '').trim()) }
   catch { throw new HelperBuildError('Installed Visual Studio discovery returned invalid data') }
@@ -366,15 +440,22 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
   const expectedInstallation = path.win32.join(programFiles64, 'Microsoft Visual Studio', '18', 'Enterprise')
   if (installation.installationVersion !== buildEnvironment.installationVersion || installation.productId !== buildEnvironment.productId || physicalWindows(installation.installationPath) !== physicalWindows(expectedInstallation)) throw new HelperBuildError('Installed Visual Studio version/location differs from the declared SDK')
   const roslyn = path.win32.join(installation.installationPath, 'MSBuild', 'Current', 'Bin', 'Roslyn')
+  phase('compiler-file-check-start')
   const compiler = await checkedFile(path.win32.join(roslyn, 'csc.exe'), installation.installationPath, runtime)
-  const compilerMetadata = await metadata(compiler.path, powershell, env, taskkill, options.signal, runtime)
+  phase('compiler-file-check-ready')
+  const compilerMetadata = await metadata(compiler.path, powershell, env, taskkill, options.signal, runtime, 'compiler-metadata', phase)
+  phase('toolchain-snapshot-start')
   const toolsBefore = await fingerprint(roslyn, runtime, options.signal)
   if (!toolsBefore.some(record => record.path.toLowerCase() === 'csc.exe' && record.sha256 === compiler.sha256)) throw new HelperBuildError('Compiler identity differs from its toolchain snapshot')
+  phase('toolchain-snapshot-ready')
   const referenceRoot = path.win32.join(programFiles, 'Reference Assemblies', 'Microsoft', 'Framework', '.NETFramework', 'v4.6.2')
   const references = []
+  phase('references-check-start')
   for (const name of referenceNames) references.push({ name, ...await checkedFile(path.win32.join(referenceRoot, name), referenceRoot, runtime) })
+  phase('references-check-ready')
   checkAbort(options.signal)
   // Reserve a fresh artifact directory. Refuse pre-existing output/stale DLLs.
+  phase('artifact-reserve-start')
   await noReparseAncestors(await existingAncestor(path.dirname(artifactDirectory)))
   await fs.mkdir(path.dirname(artifactDirectory), { recursive: true })
   await noReparseAncestors(path.dirname(artifactDirectory))
@@ -382,6 +463,7 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
   const physicalOutput = path.join(physicalParent, path.basename(artifactDirectory))
   if (within(sourceRoot, physicalOutput) && !within(reserved, physicalOutput)) throw new HelperBuildError('Artifact parent reparse target escaped the reserved directory')
   await fs.mkdir(artifactDirectory, { mode: 0o700 })
+  phase('artifact-reserve-ready')
   let owned = true, quarantined = false
   try {
     const compileDirectories = []
@@ -396,7 +478,9 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
       for (const record of references) await fs.writeFile(path.join(directory, 'references', record.name), record.bytes, { flag: 'wx', mode: 0o600 })
       const output = path.join(directory, 'ViviCommandJob.dll')
       const args = ['/nologo', '/noconfig', '/nostdlib+', '/target:library', '/platform:anycpu', '/deterministic+', '/optimize+', '/debug-', '/langversion:5', '/warn:4', '/codepage:65001', '/utf8output', '/preferreduilang:en-US', `/pathmap:${directory}=/_vivi_native`, `/out:${output}`, ...references.map(record => `/reference:${path.join(directory, 'references', record.name)}`), ...input.records.map(record => path.join(directory, record.name))]
+      phase(`compile-${label}-start`)
       const result = await run(runtime, compiler.path, args, { cwd: directory, env, taskkill, signal: options.signal, timeoutMs: 120_000 })
+      phase(`compile-${label}-ready`)
       checkAbort(options.signal)
       for (const record of input.records) if (sha256(await fs.readFile(path.join(directory, record.name))) !== record.sha256) throw new HelperBuildError('Compiler source snapshot changed during compilation')
       for (const record of references) if (sha256(await fs.readFile(path.join(directory, 'references', record.name))) !== record.sha256) throw new HelperBuildError('Compiler reference snapshot changed during compilation')
@@ -407,6 +491,7 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
       dllBytes.push(bytes)
       buildEvidence.push({ index: label, assemblySha256: sha256(bytes), assemblySize: bytes.length, managedImage, stdoutSha256: sha256(result.stdout), stderrSha256: sha256(result.stderr), stdoutBytes: result.stdout.length, stderrBytes: result.stderr.length })
     }
+    phase('post-build-check-start')
     if (!dllBytes[0].equals(dllBytes[1])) throw new HelperBuildError('Two clean compiler builds were not byte-for-byte deterministic')
     const inputAfter = await sources(sourceRoot)
     if (inputAfter.specSha256 !== input.specSha256) throw new HelperBuildError('Source spec changed during compilation')
@@ -416,6 +501,7 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
     for (const [name, original] of Object.entries(windowsTools)) if ((await checkedFile(name === 'powershell' ? powershell : taskkill, path.win32.join(env.SystemRoot, 'System32'), runtime)).sha256 !== original.sha256) throw new HelperBuildError('Installed OS tool changed during compilation')
     for (const record of references) if ((await checkedFile(path.win32.join(referenceRoot, record.name), referenceRoot, runtime)).sha256 !== record.sha256) throw new HelperBuildError('Installed reference pack changed during compilation')
     checkAbort(options.signal)
+    phase('post-build-check-ready')
     // No process remains running here: each runner settled only after pipe close.
     for (const directory of compileDirectories) await fs.rm(directory, { recursive: true, force: true })
     const manifest = {
@@ -431,11 +517,13 @@ export async function buildWindowsCommandHelper(options, runtime = {}) {
       assembly: { filename: 'ViviCommandJob.dll', sha256: sha256(dllBytes[0]), size: dllBytes[0].length, managedImage: inspectManagedAnyCpuImage(dllBytes[0]), abiVerification: 'source-anchored; loaded-method-signature-review-pending' }, builds: buildEvidence,
       reviewRequired: ['compiler-and-reference-pins', 'runtime-loader-integration', 'native-product-fixtures'],
     }
+    phase('publish-start')
     await fs.writeFile(path.join(artifactDirectory, 'ViviCommandJob.dll'), dllBytes[0], { flag: 'wx', mode: 0o600 })
     for (const record of input.records) await fs.writeFile(path.join(artifactDirectory, record.name), record.bytes, { flag: 'wx', mode: 0o600 })
     await fs.writeFile(path.join(artifactDirectory, specName), input.specBytes, { flag: 'wx', mode: 0o600 })
     await fs.writeFile(path.join(artifactDirectory, 'discovery-proof.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
     await runtime.beforePublish?.()
+    phase('publish-ready')
     checkAbort(options.signal)
     owned = false
     return { artifactDirectory, manifest, files: ['ViviCommandJob.dll', ...sourceNames, specName, 'discovery-proof.json'] }
@@ -468,7 +556,8 @@ async function main() {
   const cancel = () => controller.abort()
   process.once('SIGINT', cancel); process.once('SIGTERM', cancel)
   try {
-    const result = await buildWindowsCommandHelper({ ...options, signal: controller.signal })
+    const started = performance.now()
+    const result = await buildWindowsCommandHelper({ ...options, signal: controller.signal, onPhase: name => console.error(`[windows-helper-build] ${name} ${Math.floor(performance.now() - started)}ms`) })
     console.log(JSON.stringify({ artifactDirectory: result.artifactDirectory, files: result.files, approvalState: 'unapproved-discovery', canonical: false, runtimeEligible: false }))
   } finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel) }
 }

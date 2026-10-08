@@ -343,3 +343,113 @@ test('a declared self-hosted environment is rejected before SDK discovery', asyn
   await assert.rejects(buildWindowsCommandHelper(subject.options, subject.runtime), /controlled GitHub-hosted/)
   assert.equal(subject.calls.length, 0)
 })
+
+test('fixed pipeline phases distinguish metadata operations and vswhere without changing proof or tool bounds', async t => {
+  const subject = await fixture(t)
+  const originalRun = subject.runtime.runTool
+  subject.runtime.runTool = async (exe, args, options) => {
+    if (exe.endsWith('powershell.exe')) {
+      assert.equal(options.timeoutMs, 20_000)
+      assert.equal(options.maxOutputBytes, 16_384)
+      const program = Buffer.from(args.at(-1), 'base64').toString('utf16le')
+      let previous = -1
+      for (const marker of ['helper-start', 'file-version-start', 'file-version-ready', 'json-start', 'json-ready', 'output-written']) {
+        const index = program.indexOf(`VIVI_BUILD_PHASE:${marker}`)
+        assert.ok(index > previous)
+        previous = index
+        options.onMetadataPhase(marker)
+        options.onMetadataPhase(marker) // repeat notifications cannot grow logs
+      }
+      assert.ok(program.indexOf('GetVersionInfo') > program.indexOf('VIVI_BUILD_PHASE:file-version-start'))
+      assert.ok(program.indexOf('GetVersionInfo') < program.indexOf('VIVI_BUILD_PHASE:file-version-ready'))
+      assert.ok(program.indexOf('ConvertTo-Json') > program.indexOf('VIVI_BUILD_PHASE:json-start'))
+      assert.ok(program.indexOf('ConvertTo-Json') < program.indexOf('VIVI_BUILD_PHASE:json-ready'))
+      assert.ok(!program.includes(subject.sourceRoot))
+      options.onMetadataPhase('unapproved-provider-value')
+    }
+    if (exe.endsWith('vswhere.exe')) assert.equal(options.timeoutMs, 20_000)
+    return originalRun(exe, args, options)
+  }
+  const phases = []
+  const result = await buildWindowsCommandHelper({ ...subject.options, onPhase: phase => phases.push(phase) }, subject.runtime)
+  assert.equal(new Set(phases).size, phases.length)
+  assert.deepEqual(phases.slice(6, 15), ['locator-metadata-start', 'locator-metadata-helper-start', 'locator-metadata-file-version-start', 'locator-metadata-file-version-ready', 'locator-metadata-json-start', 'locator-metadata-json-ready', 'locator-metadata-output-written', 'locator-metadata-ready', 'vswhere-start'])
+  assert.equal(phases.at(-1), 'publish-ready')
+  assert.equal(phases.length, 40)
+  assert.ok(phases.every(phase => /^[a-z-]+$/.test(phase)))
+  assert.ok(!phases.includes('locator-metadata-unapproved-provider-value'))
+  assert.equal(result.manifest.approvalState, 'unapproved-discovery')
+  assert.equal(result.manifest.runtimeEligible, false)
+  assert.ok(!JSON.stringify(result.manifest).includes('VIVI_BUILD_PHASE'))
+})
+
+test('live metadata markers are exact, chunk-safe, deduplicated and bounded independently of raw stderr', async () => {
+  const fake = processFixture(), phases = []
+  const promise = runBoundedWindowsTool('C:\\Windows\\powershell.exe', [], { ...toolOptions, timeoutMs: 1000, maxOutputBytes: 4096, onMetadataPhase: phase => phases.push(phase) }, fake.runtime)
+  const bytes = Buffer.from('private fixture data\nVIVI_BUILD_PHASE:helper-start\r\nVIVI_BUILD_PHASE:file-version-start\nVIVI_BUILD_PHASE:file-version-ready\nVIVI_BUILD_PHASE:json-start\n')
+  for (const byte of bytes) fake.child.stderr.write(Buffer.from([byte]))
+  // These observations happen before helper exit/close, including on timeout.
+  assert.deepEqual(phases, ['helper-start', 'file-version-start', 'file-version-ready', 'json-start'])
+  fake.child.stderr.write('VIVI_BUILD_PHASE:helper-start\nVIVI_BUILD_PHASE:credential-value\n')
+  fake.child.stderr.write('x'.repeat(1024) + 'VIVI_BUILD_PHASE:json-ready\n')
+  fake.child.stderr.write('VIVI_BUILD_PHASE:json-ready\nVIVI_BUILD_PHASE:output-written\nVIVI_BUILD_PHASE:helper-error\n')
+  assert.deepEqual(phases, ['helper-start', 'file-version-start', 'file-version-ready', 'json-start', 'json-ready', 'output-written', 'helper-error'])
+  fake.child.stdout.write('{"company":"fixture"}')
+  fake.child.emit('exit', 0, null); fake.child.emit('close', 0, null)
+  const result = await promise
+  assert.equal(result.stdout.toString(), '{"company":"fixture"}')
+  assert.ok(result.stderr.includes('private fixture data')) // kept bounded, never passed to the observer
+  assert.ok(!JSON.stringify(phases).includes('private') && !JSON.stringify(phases).includes('credential'))
+})
+
+test('timeout preserves the last fixed metadata phase and retains live-root cleanup semantics', async () => {
+  const fake = processFixture(), phases = []
+  fake.setKill(() => setImmediate(() => { fake.child.emit('exit', 1, null); fake.child.emit('close', 1, null); fake.killer.emit('close', 0, null) }))
+  const promise = runBoundedWindowsTool('C:\\Windows\\powershell.exe', [], { ...toolOptions, timeoutMs: 5, maxOutputBytes: 512, onMetadataPhase: phase => phases.push(phase) }, fake.runtime)
+  fake.child.stderr.write('VIVI_BUILD_PHASE:helper-start\nVIVI_BUILD_PHASE:json-start\n')
+  await assert.rejects(promise, error => error.cleanupVerified === true && /bounded timeout/.test(error.message))
+  assert.deepEqual(phases, ['helper-start', 'json-start'])
+  assert.deepEqual(fake.calls[1].args, ['/PID', '111', '/T', '/F'])
+})
+
+test('diagnostic observers cannot approve proof or bypass cleanup and late cancellation checks', async t => {
+  for (const onPhase of [() => { throw new Error('observer-only') }, async () => { throw new Error('observer-only') }]) {
+    const throwing = await fixture(t)
+    const result = await buildWindowsCommandHelper({ ...throwing.options, onPhase }, throwing.runtime)
+    assert.equal(result.manifest.runtimeEligible, false)
+  }
+  const subject = await fixture(t), controller = new AbortController()
+  await assert.rejects(buildWindowsCommandHelper({ ...subject.options, signal: controller.signal, onPhase: phase => { if (phase === 'publish-ready') controller.abort() } }, subject.runtime), /cancelled/)
+  await assert.rejects(fs.access(subject.artifactDir), { code: 'ENOENT' })
+  for (const onMetadataPhase of [() => { throw new Error('observer-only') }, async () => { throw new Error('observer-only') }]) {
+    const fake = processFixture()
+    const promise = runBoundedWindowsTool('C:\\Windows\\powershell.exe', [], { ...toolOptions, onMetadataPhase }, fake.runtime)
+    assert.doesNotThrow(() => fake.child.stderr.write('VIVI_BUILD_PHASE:json-start\n'))
+    await tick() // rejection must be observed while the tool is still active
+    fake.child.emit('exit', 0, null); fake.child.emit('close', 0, null)
+    await promise
+  }
+})
+
+test('failure labels identify locator metadata versus vswhere without assuming the timed-out tool', async t => {
+  for (const tool of ['metadata', 'vswhere']) {
+    const subject = await fixture(t), originalRun = subject.runtime.runTool, phases = []
+    subject.runtime.runTool = async (exe, args, options) => {
+      if ((tool === 'metadata' && exe.endsWith('powershell.exe')) || (tool === 'vswhere' && exe.endsWith('vswhere.exe'))) {
+        options.onMetadataPhase?.('helper-start')
+        throw new HelperBuildError('Tool exceeded its bounded timeout')
+      }
+      return originalRun(exe, args, options)
+    }
+    await assert.rejects(buildWindowsCommandHelper({ ...subject.options, onPhase: phase => phases.push(phase) }, subject.runtime), /bounded timeout/)
+    if (tool === 'metadata') {
+      assert.equal(phases.at(-1), 'locator-metadata-helper-start')
+      assert.ok(!phases.includes('vswhere-start'))
+    } else {
+      assert.equal(phases.at(-1), 'vswhere-start')
+      assert.ok(phases.includes('locator-metadata-ready'))
+    }
+    assert.equal(subject.calls.filter(call => call.executable.endsWith('csc.exe')).length, 0)
+    await assert.rejects(fs.access(subject.artifactDir), { code: 'ENOENT' })
+  }
+})
