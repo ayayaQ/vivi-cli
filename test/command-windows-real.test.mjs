@@ -7,11 +7,13 @@ import { join, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { test } from 'node:test'
 import { launchWindowsCommand } from '../dist/command-windows.js'
+import { captureCommandEnvironment, commandEnvironment } from '../dist/commands.js'
 
 const fixture = resolve('test/fixtures/windows-command-process.mjs')
 const options = { skip: process.platform !== 'win32', timeout: 20_000 }
 const env = { SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT ?? 'C:\\Windows' }
 const powershell = join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+const hostProbeSource = 'process.stdout.write(JSON.stringify(Object.keys(process.env).map(name=>name.toUpperCase()).sort())+"\\n");process.stdout.write("native-phase-fixture-ready\\n");setInterval(()=>{},1000)'
 function diagnostics(t, label) {
   const started = performance.now()
   return { onPhase: phase => t.diagnostic(`${label}:${phase}:${Math.round(performance.now() - started)}ms`) }
@@ -29,6 +31,27 @@ async function records(file) {
 function assertGone(entries) {
   for (const { pid } of entries) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `fixture process ${pid} remained alive`)
 }
+
+test('owned PowerShell argv fixture uses BCL encoding and the exact built-in JSON formatter', async () => {
+  const source = await readFile(resolve('test/fixtures/windows-command-argv.ps1'), 'utf8')
+  assert.ok(source.includes('[Text.UTF8Encoding]::new($false)'))
+  assert.ok(source.includes("[IO.Path]::Combine($PSHOME, 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1')"))
+  assert.ok(source.includes('Import-Module -Name $manifest -ErrorAction Stop'))
+  assert.ok(source.indexOf('Import-Module') < source.indexOf('Microsoft.PowerShell.Utility\\ConvertTo-Json'))
+  assert.ok(!/New-Object|\$(?:HOME|Host|PID|PSHOME)\b\s*=/i.test(source))
+})
+test('realistic host snapshot forwards only explicit supported names and its target reports no values', () => {
+  const host = { PATH: 'fixed-path', SystemRoot: env.SystemRoot, WINDIR: 'fixed-windir', TEMP: 'fixed-temp', TMP: 'fixed-tmp', TMPDIR: 'fixed-tmpdir', LANG: 'fixed-lang', LC_ALL: 'fixed-lc-all', LC_CTYPE: 'fixed-lc-ctype', TZ: 'fixed-tz' }
+  const expectedNames = Object.keys(host).sort()
+  Object.assign(host, { PSModulePath: 'hostile', OPENAI_API_KEY: 'private', ANTHROPIC_API_KEY: 'private', USERPROFILE: 'private', NODE_OPTIONS: 'private' })
+  const snapshot = commandEnvironment(captureCommandEnvironment(host))
+  assert.deepEqual(Object.keys(snapshot).sort(), expectedNames)
+  assert.equal(snapshot.PSModulePath, undefined)
+  assert.equal(snapshot.OPENAI_API_KEY, undefined)
+  assert.equal(snapshot.NODE_OPTIONS, undefined)
+  assert.ok(hostProbeSource.includes('Object.keys(process.env)'))
+  assert.ok(!/Object\.(?:values|entries)\(process\.env\)/.test(hostProbeSource))
+})
 
 test('Windows native backend preserves exact argv and raw binary output', options, async t => {
   const args = ['', 'white space', 'a"b', '\\', 'ends\\', '\\"', '&|<>^%PATH%', '$(Write-Output bad)', '中文🙂', 'line\nline']
@@ -58,6 +81,17 @@ test('Windows explicit PowerShell -EncodedCommand runs only the supplied fixed s
   const out = collect(command.stdout), err = collect(command.stderr)
   assert.deepEqual(await command.completed, { exitCode: 0 })
   assert.equal((await out).toString('utf8').trim(), 'fixed-powershell-fixture')
+  assert.equal((await err).length, 0)
+})
+test('ordinary unqualified PowerShell cmdlet runs under the actual host-generated target environment', options, async t => {
+  const targetEnv = commandEnvironment(captureCommandEnvironment(process.env))
+  const encoded = Buffer.from("Write-Output 'ordinary-powershell-fixture'", 'utf16le').toString('base64')
+  const command = await launchWindowsCommand({ executable: powershell,
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], cwd: process.cwd(), env: targetEnv }, diagnostics(t, 'ordinary-PowerShell-host-environment'))
+  t.after(() => command.stop())
+  const out = collect(command.stdout), err = collect(command.stderr)
+  assert.deepEqual(await command.completed, { exitCode: 0 })
+  assert.equal((await out).toString('utf8').trim(), 'ordinary-powershell-fixture')
   assert.equal((await err).length, 0)
 })
 
@@ -111,17 +145,13 @@ test('Windows kill-on-close cleans descendants when the PowerShell helper is for
 })
 
 
-// One bounded harmless CI probe compares the failing stop path with temp setup
-// present. Output contains only package constants; diagnostics log no paths/args.
-test('Windows phase diagnostic verifies stop with SystemRoot and captured temp setup', options, async t => {
-  const setup = { ...env }
-  for (const name of ['WINDIR', 'TEMP', 'TMP', 'TMPDIR']) {
-    const entry = Object.entries(process.env).find(([key, value]) => key.toUpperCase() === name && value !== undefined)
-    if (entry?.[1] !== undefined) setup[name] = entry[1]
-  }
+// The realistic host snapshot is distinct from helper setup. Target output
+// contains only environment names and a constant, never any environment value.
+test('Windows phase diagnostic verifies stop with the supported captured host environment', options, async t => {
+  const setup = commandEnvironment(captureCommandEnvironment(process.env))
   const command = await launchWindowsCommand({ executable: process.execPath,
-    args: ['-e', 'process.stdout.write("native-phase-fixture-ready\\n");setInterval(()=>{},1000)'],
-    cwd: process.cwd(), env: setup }, diagnostics(t, 'stop-SystemRoot-with-temp'))
+    args: ['-e', hostProbeSource],
+    cwd: process.cwd(), env: setup }, diagnostics(t, 'stop-host-allowlist'))
   t.after(() => command.stop())
   let text = '', ready
   const received = new Promise(resolve => { ready = resolve })
@@ -136,12 +166,19 @@ test('Windows phase diagnostic verifies stop with SystemRoot and captured temp s
       timer = setTimeout(() => reject(new Error('Native phase fixture did not become ready within 5000ms')), 5000)
     })])
   } finally { clearTimeout(timer) }
-  t.diagnostic('stop-SystemRoot-with-temp:fixture-ready')
+  t.diagnostic('stop-host-allowlist:fixture-ready')
   await command.stop()
   const result = await command.completed
-  t.diagnostic(result.error ? 'stop-SystemRoot-with-temp:fixture-error' : 'stop-SystemRoot-with-temp:fixture-stopped')
+  t.diagnostic(result.error ? 'stop-host-allowlist:fixture-error' : 'stop-host-allowlist:fixture-stopped')
   assert.equal(result.error, undefined)
   assert.equal(result.signal, 'SIGTERM')
-  assert.equal(text, 'native-phase-fixture-ready\n')
+  const lines = text.split('\n')
+  assert.equal(lines.length, 3)
+  const [namesLine, readyLine, trailing] = lines
+  const names = JSON.parse(namesLine)
+  assert.deepEqual(names, Object.keys(setup).map(name => name.toUpperCase()).sort())
+  assert.ok(!names.includes('PSMODULEPATH') && !names.some(name => name.endsWith('_API_KEY')))
+  assert.equal(readyLine, 'native-phase-fixture-ready')
+  assert.equal(trailing, '')
   assert.equal((await err).length, 0)
 })
