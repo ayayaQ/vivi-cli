@@ -181,7 +181,8 @@ public static class ViviCommandJob {
     IntPtr job = IntPtr.Zero, outRead = IntPtr.Zero, outWrite = IntPtr.Zero;
     IntPtr errRead = IntPtr.Zero, errWrite = IntPtr.Zero, inRead = IntPtr.Zero, inWrite = IntPtr.Zero;
     IntPtr attributes = IntPtr.Zero, handleMemory = IntPtr.Zero, jobMemory = IntPtr.Zero, environment = IntPtr.Zero;
-    bool attributesReady = false; PROCESS_INFORMATION process = new PROCESS_INFORMATION();
+    bool attributesReady = false, prelaunchCancelled = false, cleanupVerified = false;
+    PROCESS_INFORMATION process = new PROCESS_INFORMATION();
     Thread outPump = null, errPump = null; uint exitCode = 1; Exception failure = null;
     try {
       job = CreateJobObjectW(IntPtr.Zero, null);
@@ -236,13 +237,16 @@ public static class ViviCommandJob {
       if (WaitForSingleObject(process.process, UInt32.MaxValue) != WAIT_OBJECT_0)
         throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject");
       Check(GetExitCodeProcess(process.process, out exitCode), "GetExitCodeProcess");
-    } catch (Exception error) { failure = error; }
+    } catch (Exception error) {
+      prelaunchCancelled = error is OperationCanceledException && process.process == IntPtr.Zero && cancelled;
+      failure = error;
+    }
     finally {
       // Root exit does not imply tree exit. Always terminate the job, verify no
       // remaining members, then drain the now-closed pipes before reporting done.
       if (job != IntPtr.Zero) {
-        try { Check(TerminateJobObject(job, 1), "TerminateJobObject"); WaitForEmptyJob(job); }
-        catch (Exception error) { if (failure == null) failure = error; }
+        try { Check(TerminateJobObject(job, 1), "TerminateJobObject"); WaitForEmptyJob(job); cleanupVerified = true; }
+        catch (Exception error) { failure = error; }
       }
       Close(ref inRead); Close(ref inWrite); Close(ref outWrite); Close(ref errWrite);
       if (outPump != null) outPump.Join(); if (errPump != null) errPump.Join();
@@ -255,9 +259,13 @@ public static class ViviCommandJob {
       if (jobMemory != IntPtr.Zero) Marshal.FreeHGlobal(jobMemory);
       if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment);
     }
+    // Cancellation before creation is a stopped command only after verifying
+    // the job is empty. Never hide a cleanup or output-pump error as cancellation.
+    if (prelaunchCancelled && cleanupVerified && failure is OperationCanceledException && pumpError == null) failure = null;
     if (failure != null) { EmitError(failure); return; }
+    string reportedExitCode = prelaunchCancelled ? "null" : exitCode.ToString(System.Globalization.CultureInfo.InvariantCulture);
     lock (outputLock) {
-      Console.Out.WriteLine("{\"type\":\"exit\",\"exitCode\":" + exitCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ",\"stopped\":" + (cancelled ? "true" : "false") + "}");
+      Console.Out.WriteLine("{\"type\":\"exit\",\"exitCode\":" + reportedExitCode + ",\"stopped\":" + (cancelled ? "true" : "false") + "}");
       Console.Out.Flush();
     }
   }
@@ -344,23 +352,31 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   let wrapperDiagnostics = ''
   let settled = false
   let stopping = false
+  let terminalReceived = false
   let closed = false
   let invalidProtocol = false
   let blocked: PassThrough | undefined
   let stopTimer: ReturnType<typeof setTimeout> | undefined
+  const closeControl = (): void => {
+    if (settled) return
+    if (!child.stdin?.writableEnded) child.stdin?.end()
+    if (settled || stopTimer !== undefined) return
+    stopTimer = setTimeout(() => {
+      // Last-handle close still enforces termination if the helper is unhealthy.
+      // A terminal frame verifies tree cleanup, but a wedged helper is still an
+      // infrastructure failure rather than a successful command lifecycle.
+      if (terminalReceived && result?.error === undefined) result = { exitCode: null, error: 'Windows command helper did not close after its terminal result' }
+      child.kill('SIGKILL')
+    }, runtime.cleanupTimeoutMs ?? 10_000)
+    stopTimer.unref()
+  }
   const requestStop = (): void => {
     if (settled || stopping) return
     stopping = true
     // Cancellation must not deadlock behind output a caller has stopped reading.
     // Flowing streams still deliver to existing listeners; unread output is drained.
     stdout.resume(); stderr.resume()
-    child.stdin?.end()
-    stopTimer = setTimeout(() => {
-      // Last-handle close still enforces termination if the helper is unhealthy,
-      // but missing exit metadata is reported as unverified cleanup, not success.
-      child.kill('SIGKILL')
-    }, runtime.cleanupTimeoutMs ?? 10_000)
-    stopTimer.unref()
+    closeControl()
   }
   const failProtocol = (message: string): void => {
     result = { exitCode: null, error: message }
@@ -375,16 +391,27 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
       const value: unknown = JSON.parse(line)
       if (!value || typeof value !== 'object') throw new Error('frame')
       const record = value as Record<string, unknown>
+      if (terminalReceived) throw new Error('frame after terminal result')
       if (record.type === 'stdout' || record.type === 'stderr' || record.type === 'error') {
         if (typeof record.data !== 'string' || record.data.length > protocolLineLimit || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(record.data)) throw new Error('data')
         const bytes = Buffer.from(record.data, 'base64')
         if (record.type === 'stdout' || record.type === 'stderr') {
           const output = record.type === 'stdout' ? stdout : stderr
           if (!output.write(bytes)) { blocked = output; child.stdout?.pause() }
-        } else result = { exitCode: null, error: bytes.toString('utf8') }
+        } else {
+          result = { exitCode: null, error: bytes.toString('utf8') }
+          terminalReceived = true
+          closeControl()
+        }
       } else if (record.type === 'exit') {
-        if (!Number.isInteger(record.exitCode) || (record.exitCode as number) < 0 || (record.exitCode as number) > 0xffffffff || typeof record.stopped !== 'boolean' || result !== undefined) throw new Error('exit')
-        result = record.stopped ? { exitCode: record.exitCode as number, signal: 'SIGTERM' } : { exitCode: record.exitCode as number }
+        const validCode = Number.isInteger(record.exitCode) && (record.exitCode as number) >= 0 && (record.exitCode as number) <= 0xffffffff
+        if (typeof record.stopped !== 'boolean' || (!validCode && !(record.exitCode === null && record.stopped)) || result !== undefined) throw new Error('exit')
+        const exitCode = record.exitCode as number | null
+        result = record.stopped ? { exitCode, signal: 'SIGTERM' } : { exitCode }
+        terminalReceived = true
+        // Release the helper's blocked Console.In control reader after its final
+        // metadata. This is a shutdown handshake, not a command stop request.
+        closeControl()
       } else throw new Error('type')
     } catch { failProtocol('Invalid Windows command helper protocol') }
   }

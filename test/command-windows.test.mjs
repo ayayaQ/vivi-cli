@@ -186,3 +186,81 @@ test('Windows custom command-string parsers are rejected before helper spawn', a
   }
   assert.equal(fake.call(), undefined)
 })
+
+test('terminal command metadata closes helper stdin without turning normal exit into cancellation', { timeout: 1000 }, async () => {
+  const fake = fixture()
+  fake.child.stdin.on('finish', () => fake.child.emit('close', 0, null))
+  const command = await launchWindowsCommand(input, fake.runtime)
+  const out = collect(command.stdout), err = collect(command.stderr)
+  fake.child.stdout.write(dataFrame('stdout', 'complete output') + dataFrame('stderr', 'complete diagnostic') + frame({ type: 'exit', exitCode: 7, stopped: false }))
+  assert.equal(fake.child.stdin.writableEnded, true)
+  assert.deepEqual(await command.completed, { exitCode: 7 })
+  assert.equal(out().toString(), 'complete output')
+  assert.equal(err().toString(), 'complete diagnostic')
+  assert.equal(fake.killed(), 0)
+})
+
+test('terminal native errors release a helper waiting for its control pipe EOF', { timeout: 1000 }, async () => {
+  const fake = fixture()
+  fake.child.stdin.on('finish', () => fake.child.emit('close', 1, null))
+  const command = await launchWindowsCommand(input, fake.runtime)
+  fake.child.stdout.write(dataFrame('error', 'CreateProcessW failed'))
+  assert.equal(fake.child.stdin.writableEnded, true)
+  assert.deepEqual(await command.completed, { exitCode: null, error: 'CreateProcessW failed' })
+  assert.equal(fake.killed(), 0)
+})
+
+test('verified cancellation before executable creation has no invented exit code or error', async () => {
+  const fake = fixture()
+  const command = await launchWindowsCommand(input, fake.runtime)
+  const stopped = command.stop()
+  fake.child.stdout.write(frame({ type: 'exit', exitCode: null, stopped: true }))
+  fake.child.emit('close', 0, null)
+  await stopped
+  assert.deepEqual(await command.completed, { exitCode: null, signal: 'SIGTERM' })
+  const script = Buffer.from(fake.call().args.at(-1), 'base64').toString('utf16le')
+  const compressed = script.match(/\$compressed = '([^']+)'/)[1]
+  const native = gunzipSync(Buffer.from(compressed, 'base64')).toString('utf8')
+  assert.match(native, /prelaunchCancelled = error is OperationCanceledException && process\.process == IntPtr\.Zero && cancelled/)
+  assert.match(native, /WaitForEmptyJob\(job\); cleanupVerified = true/)
+  assert.match(native, /if \(prelaunchCancelled && cleanupVerified && failure is OperationCanceledException && pumpError == null\) failure = null/)
+  assert.match(native, /string reportedExitCode = prelaunchCancelled \? "null"/)
+})
+
+test('null exit metadata cannot claim a normal successful exit', async () => {
+  const fake = fixture()
+  const command = await launchWindowsCommand(input, fake.runtime)
+  fake.child.stdout.write(frame({ type: 'exit', exitCode: null, stopped: false }))
+  fake.child.emit('close', 0, null)
+  assert.deepEqual(await command.completed, { exitCode: null, error: 'Invalid Windows command helper protocol' })
+})
+
+test('failed cleanup remains an error even when cancellation was requested before launch', async () => {
+  const fake = fixture()
+  const command = await launchWindowsCommand(input, fake.runtime)
+  const stopped = command.stop()
+  fake.child.stdout.write(dataFrame('error', 'QueryInformationJobObject failed'))
+  fake.child.emit('close', 1, null)
+  await stopped
+  assert.deepEqual(await command.completed, { exitCode: null, error: 'QueryInformationJobObject failed' })
+})
+
+test('terminal metadata cannot leave an unresponsive helper alive indefinitely', async () => {
+  const fake = fixture({ cleanupTimeoutMs: 5 })
+  const command = await launchWindowsCommand(input, fake.runtime)
+  fake.child.stdout.write(frame({ type: 'exit', exitCode: 0, stopped: false }))
+  assert.equal(fake.child.stdin.writableEnded, true)
+  await new Promise(resolve => setTimeout(resolve, 15))
+  assert.deepEqual(await command.completed, { exitCode: null, error: 'Windows command helper did not close after its terminal result' })
+  assert.equal(fake.killed(), 1)
+})
+
+test('protocol frames after a terminal result fail closed', async () => {
+  const fake = fixture()
+  const command = await launchWindowsCommand(input, fake.runtime)
+  const out = collect(command.stdout)
+  fake.child.stdout.write(frame({ type: 'exit', exitCode: 0, stopped: false }) + dataFrame('stdout', 'unexpected late data'))
+  fake.child.emit('close', 0, null)
+  assert.deepEqual(await command.completed, { exitCode: null, error: 'Invalid Windows command helper protocol' })
+  assert.equal(out().length, 0)
+})

@@ -76,7 +76,7 @@ test('every new command is human-reviewed with resolved executable, argv, cwd, e
   assert.equal(subject.state.approvals.length, 3)
   const approval = subject.state.approvals[1]
   for (const label of ['Executable:', 'Arguments:', 'Working directory:', 'Environment names:', 'Hard timeout:', 'shell:false']) assert(approval.description.includes(label))
-  assert(approval.description.includes(subject.root)); assert(approval.description.includes('fixture-output'))
+  assert(approval.description.includes(JSON.stringify(subject.workspace.directory))); assert(approval.description.includes('fixture-output'))
 })
 test('denial cannot launch, duplicate proposals cannot launch, and IDs are scoped to the current run', async t => {
   const subject = await fixture(t); await enable(subject); subject.state.approved = false
