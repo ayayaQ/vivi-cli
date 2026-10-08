@@ -18,6 +18,7 @@ import { normalizeSessionTitle, sessionTitleFromPrompt, validSessionTitle } from
 import { AutoReviewController, reviewDigest } from './auto-review.js'
 import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice } from './auto-review.js'
 import type { JsonObject } from '@ayayaq/vivi'
+import type { PreparedActionMetadata } from '@ayayaq/vivi/decisions'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>(WORKSPACE_TOOL_NAMES)
@@ -92,6 +93,8 @@ export class CliHost {
   private persistence: Promise<void> = Promise.resolve()
   private enabledMemory: boolean
   private readonly reviews: AutoReviewController
+  private readonly memoryStoreRevision = randomUUID()
+  private readonly sessionStoreRevision = randomUUID()
   private toolsetRevision = 'idle'
   constructor(private readonly options: CliHostOptions) {
     this.enabledMemory = options.enableMemory ?? false
@@ -180,11 +183,13 @@ export class CliHost {
     return this.options.memory.prepareDelete(request.id, request.expectedRevision, signal)
   }
   private async reviewMemory(request: MemoryChangeRequest, actor: MemoryActor, call: ToolCall, signal: AbortSignal): Promise<MemoryCommitResult | undefined> {
+    const memory = this.options.memory
     const capturedCall = structuredClone(call)
     const mutation = await this.prepareMemory(request, actor, signal)
     if (reviewDigest(call) !== reviewDigest(capturedCall)) throw new Error('Tool arguments changed during memory preparation; request a fresh review')
     const prepared = structuredClone(mutation)
     signal.throwIfAborted()
+    if (!memory || this.options.memory !== memory) throw new Error('Persistent memory capability changed during preparation')
     const action = mutation.kind === 'create' ? 'Create' : mutation.kind === 'update' ? 'Edit' : 'Delete'
     const approval: ApprovalRequest = { call,
       currentRevision: mutation.kind === 'create' ? 'new memory' : mutation.expectedRevision,
@@ -192,19 +197,29 @@ export class CliHost {
     }
     // Human review holds no file lease. Commit loads again and checks the exact
     // reviewed revision, so another session cannot be silently overwritten.
-    const revisions = (): JsonObject => ({ memoryEnabled: this.enabledMemory, toolsEnabled: this.options.enableTools !== false,
+    const resourceId = `cli-memory:${prepared.before?.id ?? prepared.after!.id}`
+    const affectedData = { before: prepared.before?.content ?? null, after: prepared.after?.content ?? null }
+    const preparedAction = (): PreparedActionMetadata => ({ complete: true, effects: [{
+      kind: 'write', resourceId, scope: 'outside-workspace', affectedData,
+      review: actor === 'agent' && prepared.kind !== 'delete' && this.enabledMemory && this.options.enableTools !== false
+        ? 'model-review' : 'manual'
+    }] })
+    const revisions = (): JsonObject => ({ [resourceId]: prepared.kind === 'create' ? 'new memory' : prepared.expectedRevision,
+      memoryStoreRevision: this.memoryStoreRevision, memoryStoreCurrent: this.options.memory === memory,
+      memoryEnabled: this.enabledMemory, toolsEnabled: this.options.enableTools !== false,
       toolsetRevision: this.toolsetRevision, proposalDigest: createHash('sha256').update(JSON.stringify(prepared)).digest('hex'),
       rawCallDigest: reviewDigest(call), capturedCallDigest: reviewDigest(capturedCall),
       baseRevision: prepared.kind === 'create' ? 'new memory' : prepared.expectedRevision })
     return this.reviews.execute({ approval, eligible: actor === 'agent' && prepared.kind !== 'delete',
-      inputData: { before: prepared.before?.content ?? null, after: prepared.after?.content ?? null },
+      inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
       resourceRevisions: revisions(), currentResourceRevisions: revisions,
       isActive: () => actor === 'agent' ? this.controller?.signal === signal && this.enabledMemory
-        && this.options.enableTools !== false : !this.running && this.enabledMemory }, signal, async assertCurrent => {
+        && this.options.enableTools !== false && this.options.memory === memory
+        : !this.running && this.enabledMemory && this.options.memory === memory }, signal, async assertCurrent => {
       assertCurrent()
-      if (!this.enabledMemory || !this.options.memory) throw new Error('Persistent memory is disabled')
-      this.options.memory.addSecrets(this.options.secrets ?? [])
-      return this.options.memory.commit(prepared, { signal, assertCurrent })
+      if (!this.enabledMemory || !memory || this.options.memory !== memory) throw new Error('Persistent memory capability changed')
+      memory.addSecrets(this.options.secrets ?? [])
+      return memory.commit(prepared, { signal, assertCurrent })
     }, result => result.memories.find(memory => memory.id === prepared.after?.id)?.revision)
   }
   /** Explicit manager action still uses the same review and fresh commit policy. */
@@ -263,12 +278,20 @@ export class CliHost {
   }
   private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | undefined> {
     const capturedBefore = structuredClone(before)
-    const revisions = (): JsonObject => ({ noteRevision: this.current.noteRevision, notesEnabled: this.options.enableNotes ?? false,
+    const store = this.options.store
+    const resourceId = (): string => `cli-session:${this.current.id}:note:${key}`
+    const affectedData = { before: capturedBefore.notes[key] ?? null, after: value }
+    const preparedAction = (): PreparedActionMetadata => ({ complete: true, effects: [{ kind: 'write', resourceId: resourceId(),
+      scope: 'outside-workspace', affectedData, review: (this.options.enableNotes ?? false) && this.options.enableTools !== false
+        ? 'model-review' : 'manual' }] })
+    const revisions = (): JsonObject => ({ [resourceId()]: this.current.noteRevision,
+      sessionStoreRevision: this.sessionStoreRevision, sessionStoreCurrent: this.options.store === store,
+      noteRevision: this.current.noteRevision, notesEnabled: this.options.enableNotes ?? false,
       toolsEnabled: this.options.enableTools !== false, toolsetRevision: this.toolsetRevision,
       beforeDigest: reviewDigest(capturedBefore), proposalDigest: reviewDigest({ key, value, expectedRevision: before.revision }) })
     return this.reviews.execute({ approval: { call, currentRevision: before.revision,
       description: `Set session note ${JSON.stringify(key)}.\nBefore: ${Object.hasOwn(capturedBefore.notes, key) ? JSON.stringify(capturedBefore.notes[key]) : '(new note)'}\nAfter: ${JSON.stringify(value)}` },
-      eligible: true, inputData: { before: capturedBefore.notes[key] ?? null, after: value },
+      eligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
       resourceRevisions: revisions(), currentResourceRevisions: revisions,
       isActive: () => this.controller?.signal === signal && (this.options.enableNotes ?? false) && this.options.enableTools !== false },
     signal, assertCurrent => this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent), revision => revision)

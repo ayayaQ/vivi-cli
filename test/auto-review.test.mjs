@@ -43,7 +43,9 @@ function fixture(options = {}) {
   const proposal = { approval: { call: { id: 'call-1', name: options.toolName ?? 'note_set',
     arguments: options.arguments ?? { key: 'color', value: 'blue', expectedRevision: 1 } },
   currentRevision: 1, description: 'Before: none\nAfter: blue' }, inputData: options.inputData ?? { before: null, after: 'blue' },
-  resourceRevisions: { revision: state.revision }, currentResourceRevisions: () => ({ revision: state.revision }),
+  resourceRevisions: { 'fixture-note:color': state.revision }, currentResourceRevisions: () => ({ 'fixture-note:color': state.revision }),
+  preparedAction: { complete: true, effects: [{ kind: 'write', resourceId: 'fixture-note:color',
+    scope: 'outside-workspace', affectedData: options.inputData ?? { before: null, after: 'blue' }, review: 'model-review' }] },
   isActive: () => state.active, eligible: options.eligible ?? true }
   const execute = () => controller.execute(proposal, options.signal ?? new AbortController().signal, async guard => {
     await options.onCommit?.(state)
@@ -579,4 +581,71 @@ test('interactive line EOF during an abort-ignoring judge cancels without a save
     assert.equal(calls.length, 1); assert.equal(io.isClosed, true); assert.equal(io.canAutoReview, false)
     assert.equal(subject.running, false)
   } finally { io.close() }
+})
+
+for (const classification of ['missing', 'incomplete', 'unknown', 'manual', 'ordinary-read', 'missing-resource']) {
+  test(`prepared ${classification} metadata cannot fall through the old eligibility boolean`, async () => {
+    const subject = fixture()
+    const effect = subject.proposal.preparedAction.effects[0]
+    if (classification === 'missing') delete subject.proposal.preparedAction
+    if (classification === 'incomplete') subject.proposal.preparedAction.complete = false
+    if (classification === 'unknown') effect.kind = 'unknown'
+    if (classification === 'manual') effect.review = 'manual'
+    if (classification === 'ordinary-read') { effect.kind = 'read'; effect.scope = 'workspace'; effect.review = 'ordinary-read' }
+    if (classification === 'missing-resource') effect.resourceId = 'absent-literal-resource'
+    assert.equal(await subject.execute(), undefined)
+    assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 1); assert.equal(subject.state.commits, 0)
+    assert.match(subject.state.humanRequest.description, /Host preparation requires manual/)
+  })
+}
+test('a blocked effect remains blocked even when a human callback would approve', async () => {
+  for (const mode of ['manual', 'auto']) {
+    const subject = fixture({ mode, approved: true })
+    subject.proposal.preparedAction.effects[0].review = 'blocked'
+    assert.equal(await subject.execute(), undefined)
+    assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 0); assert.equal(subject.state.commits, 0)
+  }
+})
+for (const change of ['prepared-content', 'prepared-identity', 'classification', 'input-data', 'eligibility', 'current-classification']) {
+  test(`changed ${change} at review completion invalidates the entire prepared action`, async () => {
+    let subject
+    subject = fixture({ onEvaluate() {
+      if (change === 'prepared-content') subject.proposal.preparedAction.effects[0].affectedData.after = 'red'
+      if (change === 'prepared-identity') subject.proposal.preparedAction.effects[0].resourceId = 'another-note'
+      if (change === 'classification') subject.proposal.preparedAction.effects[0].scope = 'external'
+      if (change === 'input-data') subject.proposal.inputData.after = 'red'
+      if (change === 'eligibility') subject.proposal.eligible = false
+      if (change === 'current-classification') subject.proposal.currentPreparedAction = () => ({ complete: false, effects: [] })
+    } })
+    await assert.rejects(subject.execute(), /stale/)
+    assert.equal(subject.state.calls, 1); assert.equal(subject.state.human, 0); assert.equal(subject.state.commits, 0)
+  })
+}
+test('the exact prepared metadata reaches the frozen shared decision request', async () => {
+  const subject = fixture()
+  assert.equal(await subject.execute(), 2)
+  const snapshot = subject.state.requests[0].snapshot
+  assert.equal(reviewDigest(snapshot.preparedAction), reviewDigest(subject.proposal.preparedAction))
+  assert(Object.isFrozen(snapshot.preparedAction.effects[0].affectedData))
+  assert(Object.hasOwn(snapshot.resourceRevisions, snapshot.preparedAction.effects[0].resourceId))
+  assert.equal(snapshot.policyRevision, 'vivi-cli-auto-v3-openai')
+})
+
+
+test('sensitive prepared effect evidence stays manual even when inputData is ordinary', async () => {
+  const subject = fixture()
+  subject.proposal.preparedAction.effects[0].affectedData = { before: null, after: 'My medication is aspirin' }
+  assert.equal(await subject.execute(), undefined)
+  assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 1); assert.equal(subject.state.commits, 0)
+  assert.equal(subject.state.records[0].reasonCode, 'privacy')
+})
+test('a credential newly known during audit invalidates prepared effect evidence before admission', async () => {
+  const subject = fixture({ onAudit(state, record) {
+    if (record.state === 'commit_started') state.secrets.push('late-known-effect-data')
+  } })
+  subject.proposal.preparedAction.effects[0].affectedData = { before: null, after: 'late-known-effect-data' }
+  await assert.rejects(subject.execute(), /newly registered credential/)
+  assert.equal(subject.state.calls, 1); assert.equal(subject.state.human, 0); assert.equal(subject.state.commits, 0)
+  assert.equal(subject.state.records.at(-1).state, 'failed')
+  await assert.rejects(subject.execute(), /already been reviewed/)
 })
