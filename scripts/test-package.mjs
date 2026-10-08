@@ -95,6 +95,7 @@ try {
     'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
     'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
+    'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
@@ -122,7 +123,7 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
@@ -144,6 +145,11 @@ try {
   assert.equal(ignoreManifest.license, 'MIT')
   assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/ignore/LICENSE-MIT'))),
     normalizeLicense(await readFile(join(root, 'node_modules/ignore/LICENSE-MIT'))), 'Ignore MIT legal text mismatch')
+  assert.equal(installedManifest.dependencies.picomatch, '4.0.7')
+  const globManifest = JSON.parse(await readFile(join(temporary, 'node_modules/picomatch/package.json'), 'utf8'))
+  assert.equal(globManifest.version, '4.0.7'); assert.equal(globManifest.license, 'MIT')
+  assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/picomatch/LICENSE'))),
+    normalizeLicense(await readFile(join(root, 'node_modules/picomatch/LICENSE'))), 'Picomatch MIT legal text mismatch')
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
     normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
@@ -268,6 +274,9 @@ try {
   const listing = await workspaceRegistry.executeTool({ id: 'packed-workspace', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
   assert.equal(JSON.parse(listing.content).untrusted, true)
   assert(!JSON.parse(listing.content).entries.some(item => item.path === 'ignored.log'))
+  const glob = await workspaceRegistry.executeTool({ id: 'packed-glob', name: 'workspace_glob', arguments: { pattern: '**/*.txt' } }, { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(glob.content).matches, [{ path: 'readme.txt', kind: 'file' }])
+  assert.equal(JSON.parse(glob.content).truncated, false)
   assert.equal(WORKSPACE_LIMITS.maximumReadBytes, 8192)
   let workspaceRounds = 0
   const workspaceHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,

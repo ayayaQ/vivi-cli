@@ -43,6 +43,9 @@ try {
   const registry = createToolRegistry([createWorkspaceExtension(workspace)])
   const listing = await registry.executeTool({ id: 'compiled-list', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
   assert(!JSON.parse(listing.content).entries.some((item: { path: string }) => item.path === 'ignored.log'))
+  const glob = await registry.executeTool({ id: 'compiled-glob', name: 'workspace_glob', arguments: { pattern: '**/*.txt' } }, { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(glob.content).matches, [{ path: 'readme.txt', kind: 'file' }])
+  assert.equal(JSON.parse(glob.content).truncated, false)
   let rounds = 0
   const workspaceHost = await CliHost.create({ workspace, store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, provider: { async generate() {

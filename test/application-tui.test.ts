@@ -348,7 +348,11 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
       providerFactory: (session, options, env) => {
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
-        return { generate: async input => { expect(input.tools).toHaveLength(5); return { content: `${session.reasoning} response`, toolCalls: [] } } }
+        return { generate: async input => {
+          expect(input.tools).toHaveLength(6)
+          expect(input.tools.some(tool => tool.name === 'workspace_glob')).toBe(true)
+          return { content: `${session.reasoning} response`, toolCalls: [] }
+        } }
       }
     })
     await ready(state => state.kind === 'composer')

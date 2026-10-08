@@ -198,7 +198,7 @@ node dist/launcher.js --no-tui --model YOUR_MODEL --tools --workspace ./my-proje
 bun dist/launcher.js --no-workspace
 ```
 
-The assistant can list files, read UTF-8 text, and search literal text. Reads may be
+The assistant can list files, match file paths with `workspace_glob`, read UTF-8 text, and search literal text. Reads may be
 sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
 are treated as untrusted data. No writes, shell commands, automatic execution,
@@ -208,7 +208,7 @@ The default applies to CLI launches only. Library users of `CliHost` must still
 explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
 does not grant access to the application’s working directory.
 
-Root and nested `.gitignore` files apply to all three tools, including direct reads.
+Root and nested `.gitignore` files apply to all workspace tools, including direct reads.
 Symlinks, multi-link files, repository internals, common credential locations,
 `.env`/`.env.*`, key files, `node_modules`, and `.cache` are unavailable. Ignore rules
 cannot override these exclusions. The active CLI state folder is also excluded,
@@ -216,9 +216,15 @@ including a custom `--session-dir` inside the project. Ordinary config such as `
 `tsconfig.json` remains readable. This policy cannot identify every secret: move
 sensitive files outside the selected folder or exclude them with `.gitignore`.
 
-Output is bounded: listings have at most 100 entries; literal searches at most 50
+`workspace_glob` matches file names without reading contents. Its pattern is relative
+to its optional `path`, with forward slashes and case-sensitive matching on every OS.
+Use `*`, `?`, or standalone `**`, such as `**/*test*.ts`; escapes, double quotes,
+negation, brackets, braces, extglobs and regex are unavailable. Dotfiles follow the same exclusions.
+It defaults to depth 8 and 50 results; returned paths stay workspace-relative.
+
+Output is bounded: listings and globs have at most 100 entries; literal searches at most 50
 matches; reads return up to 8 KiB from text files no larger than 256 KiB. Traversal
-is at most 8 levels per call and stops after 1,000 entries, 200 search files, 2 MiB
+is at most 8 levels per call and stops after 1,000 entries, 200 search/glob files, 2 MiB
 of searched text, or 10 seconds. `truncated: true` means the result is incomplete,
 including deeper directories not visited. Escape/Ctrl+C cancels a running turn.
 
