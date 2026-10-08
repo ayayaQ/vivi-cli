@@ -349,7 +349,7 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
         return { generate: async input => {
-          expect(input.tools).toHaveLength(6)
+          expect(input.tools).toHaveLength(8)
           expect(input.tools.some(tool => tool.name === 'workspace_glob')).toBe(true)
           return { content: `${session.reasoning} response`, toolCalls: [] }
         } }
@@ -636,16 +636,16 @@ test('native CLI keeps the canonical launch workspace visible through new conver
     })
     await ready(state => state.kind === 'composer')
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
     expect(setup.captureCharFrame()).toContain('Files read by tools are sent to the selected provider')
     const next = ready.nextComposer()
     await setup.mockInput.typeText('/new'); setup.mockInput.pressEnter()
     await next; await setup.renderOnce()
     expect(sessions).toBe(2)
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
     io.setDraft('openrouter')
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · read only`)
+    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
     io.addSecrets(['project'])
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain('[REDACTED]')

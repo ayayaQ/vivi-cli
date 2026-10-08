@@ -531,7 +531,7 @@ export class OpenTuiIO implements ChatIO {
     const width = stacked ? columns : Math.max(1, columns - controls)
     this.workspaceLine.width = width
     const folder = this.workspaceDirectory === undefined ? 'disabled' :
-      `${fitStatusColumns(this.safe(JSON.stringify(this.workspaceDirectory)), Math.max(0, width - 23))} · read only`
+      `${fitStatusColumns(this.safe(JSON.stringify(this.workspaceDirectory)), Math.max(0, width - 23))} · reviewed text edits`
     this.workspaceLine.content = fitStatusColumns(`Workspace: ${folder}`, width)
   }
   private updateChoiceLayout(): void {

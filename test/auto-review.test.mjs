@@ -628,7 +628,7 @@ test('the exact prepared metadata reaches the frozen shared decision request', a
   assert.equal(reviewDigest(snapshot.preparedAction), reviewDigest(subject.proposal.preparedAction))
   assert(Object.isFrozen(snapshot.preparedAction.effects[0].affectedData))
   assert(Object.hasOwn(snapshot.resourceRevisions, snapshot.preparedAction.effects[0].resourceId))
-  assert.equal(snapshot.policyRevision, 'vivi-cli-auto-v3-openai')
+  assert.equal(snapshot.policyRevision, 'vivi-cli-auto-v4-openai')
 })
 
 

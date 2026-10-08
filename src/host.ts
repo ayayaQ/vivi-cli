@@ -12,8 +12,9 @@ import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
-import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES } from './workspace.js'
+import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES, WorkspaceError } from './workspace.js'
 import type { ReadOnlyWorkspace } from './workspace.js'
+import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
 import { normalizeSessionTitle, sessionTitleFromPrompt, validSessionTitle } from './session-display.js'
 import { AutoReviewController, reviewDigest } from './auto-review.js'
 import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice } from './auto-review.js'
@@ -21,7 +22,7 @@ import type { JsonObject } from '@ayayaq/vivi'
 import type { PreparedActionMetadata } from '@ayayaq/vivi/decisions'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
-const workspaceToolNames = new Set<string>(WORKSPACE_TOOL_NAMES)
+const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
 
 function memoryContextContainsSecret(value: unknown, secrets: readonly string[]): boolean {
   const pending = [value]
@@ -66,7 +67,7 @@ export interface CliHostOptions {
   /** Opt-in, app-wide state, independent of session-only notes. */
   enableMemory?: boolean
   memory?: CliMemoryStore
-  /** Explicit launch-only read capability; never recovered from a session or preferences. */
+  /** Explicit launch-only scope; never recovered from a session or preferences. */
   workspace?: ReadOnlyWorkspace
   /** Trusted, explicitly imported tool packs. Registration is captured once per turn. */
   extensions?: readonly ToolExtension[]
@@ -95,6 +96,7 @@ export class CliHost {
   private readonly reviews: AutoReviewController
   private readonly memoryStoreRevision = randomUUID()
   private readonly sessionStoreRevision = randomUUID()
+  private readonly workspaceScopeRevision = randomUUID()
   private toolsetRevision = 'idle'
   constructor(private readonly options: CliHostOptions) {
     this.enabledMemory = options.enableMemory ?? false
@@ -173,7 +175,55 @@ export class CliHost {
     this.options.memory.addSecrets(this.options.secrets ?? [])
     return this.options.memory.list(signal)
   }
-  async drainMemory(): Promise<void> { await this.options.memory?.drain(); await this.reviews.drain() }
+  async drainMemory(): Promise<void> {
+    await this.options.memory?.drain(); await this.options.workspace?.drainMutations(); await this.reviews.drain()
+  }
+  private async executeWorkspaceMutation(call: ToolCall, signal: AbortSignal): Promise<ToolResult> {
+    const workspace = this.options.workspace, capturedCall = structuredClone(call)
+    try {
+      signal.throwIfAborted()
+      if (!workspace || this.options.enableTools === false) throw new WorkspaceError('Workspace tools are unavailable for this turn')
+      workspace.addSecrets(this.options.secrets ?? [])
+      const prepared = await workspace.prepareMutation(call.name, capturedCall.arguments, signal)
+      if (reviewDigest(call) !== reviewDigest(capturedCall)) throw new WorkspaceError('Tool arguments changed during workspace preparation; request a fresh review')
+      const resourceId = `cli-workspace:${this.workspaceScopeRevision}:${prepared.path}`
+      // Only the changed literal/hunk leaves preparation. Full hashes bind the
+      // entire reviewed file; commit preserves every byte outside this change.
+      const affectedData = { path: prepared.path, before: prepared.beforeChange, after: prepared.afterChange,
+        beforeRevision: prepared.expectedRevision, afterRevision: prepared.revision, diff: prepared.diff }
+      const preparedAction = (): PreparedActionMetadata => ({ complete: true, effects: [{
+        kind: 'write', resourceId, scope: 'workspace', affectedData,
+        review: this.options.workspace === workspace && this.options.enableTools !== false ? 'model-review' : 'manual'
+      }] })
+      const revisions = (): JsonObject => ({ [resourceId]: prepared.expectedRevision,
+        workspaceScopeRevision: this.workspaceScopeRevision, workspaceCurrent: this.options.workspace === workspace,
+        toolsEnabled: this.options.enableTools !== false, toolsetRevision: this.toolsetRevision,
+        rawCallDigest: reviewDigest(call), capturedCallDigest: reviewDigest(capturedCall),
+        proposalDigest: reviewDigest(prepared), resultRevision: prepared.revision })
+      const result = await this.reviews.execute({ approval: { call, currentRevision: prepared.expectedRevision,
+        description: `${prepared.kind === 'create' ? 'Create' : 'Precisely edit'} workspace text file ${JSON.stringify(prepared.path)}.\n` +
+          'The complete diff below uses JSON-quoted lines, including exact newline/control escapes. A temporary sibling .vivi-stage-*.tmp file is used and removed; no backup copy is retained.\n' +
+          `Before SHA-256: ${prepared.expectedRevision}\nAfter SHA-256: ${prepared.revision}\n${prepared.diff}` },
+        eligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
+        resourceRevisions: revisions(), currentResourceRevisions: revisions,
+        isActive: () => this.controller?.signal === signal && this.options.workspace === workspace && this.options.enableTools !== false
+      }, signal, assertCurrent => {
+        workspace.addSecrets(this.options.secrets ?? [])
+        return workspace.commitMutation(prepared, signal, () => {
+          workspace.addSecrets(this.options.secrets ?? []); assertCurrent()
+        })
+      }, result => result.revision)
+      return result ? { content: JSON.stringify({ success: true, source: 'selected_workspace', untrusted: true, ...result }) }
+        : { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'This workspace change was not approved' } }), isError: true }
+    } catch (error) {
+      if (error instanceof WorkspaceCommitError) return { content: JSON.stringify({ success: true,
+        source: 'selected_workspace', untrusted: true, ...error.result, durabilityUnconfirmed: true,
+        warning: error.message }) }
+      return { content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'workspace_change_failed',
+        message: error instanceof WorkspaceError ? redactSecrets(error.message, this.options.secrets ?? [])
+          : 'Workspace change could not be confirmed. Read the file before retrying; filesystem details are withheld' } }), isError: true }
+    }
+  }
   private async prepareMemory(request: MemoryChangeRequest, actor: MemoryActor, signal: AbortSignal): Promise<MemoryMutation> {
     signal.throwIfAborted()
     if (!this.enabledMemory || !this.options.memory) throw new Error('Persistent memory is disabled')
@@ -309,7 +359,8 @@ export class CliHost {
       listMemories: async ({ signal }) => memoryToolResult(await this.listMemories(signal)),
       executeMutation: (call, { signal }) => this.executeMemory(call, signal)
     }) : undefined
-    const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets) : undefined
+    const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets,
+      (call, signal) => this.executeWorkspaceMutation(call, signal)) : undefined
     const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace)
     const controller = new AbortController()
     this.controller = controller

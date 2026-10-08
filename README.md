@@ -142,14 +142,14 @@ Replacing an API key revokes enrollment immediately, including if the subsequent
 model picker is cancelled; start a new conversation before enrolling again.
 
 When enrolled, only tool calls implementing the current user’s requested
-session `note_set` or app-wide memory create/edit may be automatically approved.
-The corresponding notes/memory and tool feature gates must already be enabled.
+session `note_set`, app-wide memory create/edit, or selected-workspace text creation/precise edits may be automatically approved.
+The corresponding notes/memory/workspace and tool feature gates must already be enabled.
 Delete, `/memories` manager mutations, excluded actions and hard denials remain
 outside Auto review. A model recommendation never relaxes host policy or skips
 the exact proposal’s final freshness and revision checks.
 
 The review sends the exact current user request, tool arguments and prepared
-before/after content to the currently selected existing account: OpenAI
+before/after changed text, workspace-relative paths and full-file hashes to the currently selected existing account: OpenAI
 `gpt-6-luna`, or OpenRouter routed to TypeSafe `typesafe/jev-1.13`. It uses only
 that account’s existing key, with no copied credential store, account discovery,
 cross-provider fallback or live model selection. The fresh in-app confirmation
@@ -162,7 +162,7 @@ filter cannot reliably identify every private detail. Keep Manual if you do not
 want potentially private text shared. A conversation or provider/account change
 invalidates the versioned consent; this product setting is not global permission
 to transmit credentials or unrelated content. The automatic-save policy remains
-ordinary non-sensitive local create/edit only; the sharing consent does not expand
+ordinary non-sensitive note/memory create/edit and scoped text creation/precise edits only; the sharing consent does not expand
 which actions may execute automatically. This adds API charges. Review
 is limited to two calls per turn, an eight-second deadline and 16 KiB for the
 full decision request. Larger exact evidence stays Manual without truncation;
@@ -178,9 +178,9 @@ Uncertain, malformed, failed, stale or over-budget reviews use the ordinary
 human approval path; cancelled reviews cannot commit. The UI reports review
 progress and settled outcomes without exposing model reasoning or credentials.
 
-## Read-only workspace tools
+## Workspace tools
 
-The CLI uses the current working directory where you launch vivi as its read-only
+The CLI uses the current working directory where you launch vivi as its selected
 workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
 disable workspace access for that launch. These flags cannot be combined. Relative
 paths are resolved from the launch directory, not the installed CLI or private
@@ -201,8 +201,8 @@ bun dist/launcher.js --no-workspace
 The assistant can list files, match file paths with `workspace_glob`, read UTF-8 text, and search literal text. Reads may be
 sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
-are treated as untrusted data. No writes, shell commands, automatic execution,
-network tools, plugin discovery, or permanent folder trust are added.
+are treated as untrusted data. Text creation and precise edits require host review. Shell commands, deletion,
+renaming, network tools, plugin discovery and permanent folder trust are unavailable.
 
 The default applies to CLI launches only. Library users of `CliHost` must still
 explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
@@ -215,6 +215,22 @@ cannot override these exclusions. The active CLI state folder is also excluded,
 including a custom `--session-dir` inside the project. Ordinary config such as `package.json` and
 `tsconfig.json` remains readable. This policy cannot identify every secret: move
 sensitive files outside the selected folder or exclude them with `.gitignore`.
+
+`workspace_create_text` proposes one new UTF-8 file; it never overwrites an existing
+entry or creates parent folders. `workspace_edit_text` replaces one unique literal
+`before` target with `after`. First read the file and use its returned `revision`
+(the SHA-256 of all raw bytes) as `expectedRevision`; stale or ambiguous edits fail.
+BOM, line endings and every byte outside the replacement are preserved. Files are
+bounded at 256 KiB and the complete JSON-quoted unified review diff at 48 KiB.
+Larger diffs are refused; exact Auto requests above 16 KiB stay Manual without
+truncation. Manual shows the diff and asks each time; piped/headless writes are denied.
+
+Publication uses an exclusive temporary sibling `.vivi-stage-*.tmp`, then exclusive
+hard-link creation or replacement rename. Staging is cleaned up; no persistent
+backup is retained. Creation fails closed if the filesystem cannot create hard links.
+An uncertain outcome requires reading the file before retrying. These are ordinary
+workspace checks, not hostile-filesystem containment or compare-and-swap guarantees;
+portable Windows directory crash durability is not claimed.
 
 `workspace_glob` matches file names without reading contents. Its pattern is relative
 to its optional `path`, with forward slashes and case-sensitive matching on every OS.
