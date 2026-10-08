@@ -12,7 +12,7 @@ import { candidateOptions, createCandidate, exportCandidate, normalizeLicense, r
 import { packageAcceptanceEvidence } from '../scripts/platform-acceptance.mjs'
 
 const manifest = { name: '@ayayaq/vivi-cli', version: '0.1.0-dev.0', private: true,
-  bundledDependencies: ['@ayayaq/vivi'] }
+  bundledDependencies: ['@ayayaq/vivi'], dependencies: { '@ayayaq/vivi': '0.6.0' } }
 const filename = 'ayayaq-vivi-cli-0.1.0-dev.0.tgz'
 const bytes = Buffer.from('exact private candidate bytes')
 const packed = { id: `${manifest.name}@${manifest.version}`, name: manifest.name, version: manifest.version,

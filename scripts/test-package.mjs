@@ -94,6 +94,7 @@ try {
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
     'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
     'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
+    'src/skills.ts', 'dist/skills.js', 'dist/skills.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
     'src/commands.ts', 'dist/commands.js', 'dist/commands.d.ts',
@@ -108,6 +109,9 @@ try {
     'CAPABILITIES.md', 'examples/model-capabilities.mjs', 'src/providers/models.ts',
     'examples/memory.mjs', 'src/extensions/memory.ts', 'dist/extensions/memory.js', 'dist/extensions/memory.d.ts',
     'dist/cjs/extensions/memory.js', 'dist/cjs/extensions/memory.d.ts',
+    'docs/SKILLS.md', 'examples/skills.mjs', 'skills/skill-creator/SKILL.md',
+    'src/extensions/skills.ts', 'dist/extensions/skills.js', 'dist/extensions/skills.d.ts',
+    'dist/cjs/extensions/skills.js', 'dist/cjs/extensions/skills.d.ts',
     'dist/providers/models.js', 'dist/providers/models.d.ts',
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
     'docs/DECISIONS.md', 'src/decisions.ts', 'dist/decisions.js', 'dist/decisions.d.ts',
@@ -185,11 +189,12 @@ import { createRequire } from 'node:module'
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
 import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContext } from '@ayayaq/vivi/extensions/memory'
+import { parseSkillDocument, skillCreatorSource } from '@ayayaq/vivi/extensions/skills'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
@@ -268,6 +273,30 @@ try {
   assert.equal(cjsMemory.encodeMemories(cjsMemory.decodeMemories('{"version":1,"memories":[]}')), encodeMemories(decodeMemories('{"version":1,"memories":[]}')))
   assert.equal(cjsMemory.formatMemoryContext([]), formatMemoryContext([]))
   assert.equal(typeof createMemoryService, 'function')
+  const skills = new FileSkillStore(join(directory, 'agent-skills'))
+  const skillCatalog = await skills.snapshot()
+  assert.equal(skillCatalog.skills.find(item => item.name === 'skill-creator').readOnly, true)
+  assert.equal(skillCatalog.document('skill-creator').content, skillCreatorSource.content)
+  const cjsSkills = createRequire(import.meta.url)('@ayayaq/vivi/extensions/skills')
+  assert.deepEqual(cjsSkills.parseSkillDocument(skillCreatorSource.content), parseSkillDocument(skillCreatorSource.content))
+  let skillRounds = 0
+  const skillsHost = await CliHost.create({ store: new FileSessionStore(directory), skills, enableSkills: true,
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async ({ messages, tools }) => {
+      assert(tools.some(tool => tool.name === 'read_skill'))
+      assert(!tools.some(tool => tool.name === 'save_skill'))
+      assert(messages.some(message => message.role === 'user' && message.content.includes('skill-creator')))
+      return ++skillRounds === 1 ? { content: '', toolCalls: [{ id: 'packed-skill-read', name: 'read_skill', arguments: {
+        name: 'skill-creator', path: 'SKILL.md', expectedRevision: skillCatalog.document('skill-creator').revision } }] }
+        : { content: 'Packed skills work', toolCalls: [] }
+    } } })
+  const skillsResult = await skillsHost.send('Use the bundled creator')
+  assert.equal(skillsResult.status, 'completed')
+  assert(!skillsResult.history.some(message => message.role === 'user' && message.content.startsWith('Available instruction-only skills')))
+  assert.equal(skills.writable, false)
+  assert.equal(typeof skills.prepare, 'undefined')
+  assert.equal(typeof skills.commit, 'undefined')
+  assert(!skillsResult.history.some(message => message.name === 'save_skill'))
+  await skills.drain({ close: true })
   const project = join(directory, 'project')
   await mkdir(project)
   await writeFile(join(project, 'readme.txt'), 'Packed workspace works')
@@ -358,11 +387,12 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
+import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabilities, type Capability } from '@ayayaq/vivi/providers/models'
 const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
 const selection: Capability = reasoningSelectionSupport(capabilities, { mode: 'disabled' })
@@ -372,6 +402,10 @@ session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTo
 const usageText: string = formatUsage(aggregateUsage([session.usage, undefined]))
 const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
 const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
+const skills: CliSkillStore = new FileSkillStore('/tmp/fake-types-only/agent-skills', { readOnlyRoots: [], secrets: [] })
+const catalog: Promise<SkillCatalog> = skills.snapshot()
+const writable: false = skills.writable
+void catalog; void writable
 const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
 const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')
@@ -382,7 +416,7 @@ const commandContext: CommandApprovalContext = { launchId: 'types', sessionId: '
 let preparedCommand: PreparedCommand | undefined
 void commandWorkspace; void commandContext; void preparedCommand
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
-const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
+const options: CliHostOptions = { provider, session, store, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')

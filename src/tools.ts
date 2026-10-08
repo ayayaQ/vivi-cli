@@ -41,24 +41,26 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 }
 
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
-export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, commands?: ToolExtension): {
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension): {
   tools: ToolDefinition[]
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
 } {
   const registry = createToolRegistry([calculatorExtension, ...extensions], {
-    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, ...COMMAND_TOOL_NAMES]
+    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
   const memoryRegistry = memory ? createToolRegistry([memory]) : undefined
   const workspaceRegistry = workspace ? createToolRegistry([workspace]) : undefined
+  const skillsRegistry = skills ? createToolRegistry([skills], { reservedNames: ['save_skill'] }) : undefined
   const commandRegistry = commands ? createToolRegistry([commands]) : undefined
   return {
-    tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? []), ...(workspaceRegistry?.tools ?? []), ...(commandRegistry?.tools ?? [])],
+    tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? []), ...(workspaceRegistry?.tools ?? []), ...(skillsRegistry?.tools ?? []), ...(commandRegistry?.tools ?? [])],
     executeTool: (call, signal, host) => memoryRegistry?.has(call.name)
       ? memoryRegistry.executeTool(call, { signal }) : workspaceRegistry?.has(call.name)
-        ? workspaceRegistry.executeTool(call, { signal }) : commandRegistry?.has(call.name)
-          ? commandRegistry.executeTool(call, { signal }) : executeHostTool(call, signal, host, registry)
+        ? workspaceRegistry.executeTool(call, { signal }) : skillsRegistry?.has(call.name)
+          ? skillsRegistry.executeTool(call, { signal }) : commandRegistry?.has(call.name)
+            ? commandRegistry.executeTool(call, { signal }) : executeHostTool(call, signal, host, registry)
   }
 }
 
