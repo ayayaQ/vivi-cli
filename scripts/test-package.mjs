@@ -96,6 +96,9 @@ try {
     'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
+    'src/commands.ts', 'dist/commands.js', 'dist/commands.d.ts',
+    'src/command-process.ts', 'dist/command-process.js', 'dist/command-process.d.ts',
+    'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
@@ -182,7 +185,7 @@ import { createRequire } from 'node:module'
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
@@ -288,6 +291,24 @@ try {
   assert.equal(workspaceResult.status, 'completed')
   assert.equal(JSON.parse(workspaceResult.history[2].content).content, 'Packed workspace works')
   assert.deepEqual((await new FileSessionStore(directory).load(workspaceHost.session.id)).history, workspaceResult.history)
+  const commands = await TrustedCommandWorkspace.open(project, process.env)
+  try {
+    let approvals = 0
+    const context = { launchId: 'packed-launch', sessionId: 'packed-session', runId: 'packed-run', accountRevision: 'packed-account',
+      canApprove: () => true, isCurrent: () => true, async approve() { approvals++; return true } }
+    const signal = new AbortController().signal
+    assert.equal(await commands.enable(context, signal), true)
+    const argv = ['spaces here', 'quote' + String.fromCharCode(34, 92), '😀']
+    let result = JSON.parse((await commands.start({ id: 'packed-command', name: 'command_start', arguments: {
+      executable: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)))', ...argv], yieldMs: 1000 } }, context, signal)).content)
+    let output = result.output
+    while (result.state === 'running') {
+      result = JSON.parse((await commands.poll(result.executionId, 'packed-launch:packed-session:packed-run', 2000)).content)
+      output += result.output
+    }
+    assert.equal(result.state, 'exited'); assert.equal(result.exitCode, 0)
+    assert.deepEqual(JSON.parse(output), argv); assert.equal(approvals, 2)
+  } finally { await commands.shutdown() }
   let textRounds = 0
   const textHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
     approve: async request => { assert.match(request.description, /JSON-quoted lines/); return true },
@@ -337,7 +358,7 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
   type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
@@ -355,6 +376,11 @@ const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
 const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')
 void workspace; void createWorkspaceExtension; void WORKSPACE_LIMITS
+const commandWorkspace: Promise<TrustedCommandWorkspace> = TrustedCommandWorkspace.open('/tmp/fake-types-only', {})
+const commandContext: CommandApprovalContext = { launchId: 'types', sessionId: 'types', runId: 'types', accountRevision: 'types',
+  canApprove: () => false, isCurrent: () => false, approve: async () => false }
+let preparedCommand: PreparedCommand | undefined
+void commandWorkspace; void commandContext; void preparedCommand
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
 const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }

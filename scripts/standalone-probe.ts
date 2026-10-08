@@ -16,6 +16,13 @@ import { FileSessionStore } from '../src/session.js'
 import { CliHost } from '../src/host.js'
 import { ReadOnlyWorkspace, createWorkspaceExtension } from '../src/workspace.js'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
+import { TrustedCommandWorkspace } from '../src/commands.js'
+
+// A controlled compiled child fixture, not an interpreter dependency or live shell.
+if (process.argv[2] === '--command-fixture') {
+  console.log(JSON.stringify({ args: process.argv.slice(3), credentialPresent: Object.keys(process.env).some(name => /API_KEY|TOKEN/.test(name)) }))
+  process.exit(0)
+}
 
 // The optional pack must survive a compiled consumer, remain host-owned, and
 // contribute context without storing the per-turn memory prefix in a session.
@@ -55,6 +62,24 @@ try {
   const workspaceResult = await workspaceHost.send('Use selected workspace')
   assert.equal(workspaceResult.status, 'completed')
   assert.equal(JSON.parse(workspaceResult.history[2]!.content).content, 'Compiled workspace works')
+  const commands = await TrustedCommandWorkspace.open(project, process.env)
+  try {
+    let approvals = 0
+    const context = { launchId: 'compiled-launch', sessionId: 'compiled-session', runId: 'compiled-run', accountRevision: 'compiled-account',
+      canApprove: () => true, isCurrent: () => true, async approve() { approvals++; return true } }
+    const signal = new AbortController().signal
+    assert.equal(await commands.enable(context, signal), true)
+    const argv = ['spaces here', 'quote"and\\slash', '😀']
+    let command = JSON.parse((await commands.start({ id: 'compiled-command', name: 'command_start',
+      arguments: { executable: process.execPath, args: ['--command-fixture', ...argv], yieldMs: 1000 } }, context, signal)).content)
+    let output = command.output
+    while (command.state === 'running') {
+      command = JSON.parse((await commands.poll(command.executionId, 'compiled-launch:compiled-session:compiled-run', 2000)).content)
+      output += command.output
+    }
+    assert.equal(command.state, 'exited'); assert.equal(command.exitCode, 0)
+    assert.deepEqual(JSON.parse(output), { args: argv, credentialPresent: false }); assert.equal(approvals, 2)
+  } finally { await commands.shutdown() }
   let textRounds = 0
   const textHost = await CliHost.create({ workspace, store: new FileSessionStore(directory),
     approve: async request => { assert.match(request.description, /JSON-quoted lines/); return true },
@@ -119,5 +144,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, trusted command execution and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

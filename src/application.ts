@@ -7,11 +7,12 @@ import { decisionProviderForSession, deferredDecisionProvider } from './main.js'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
 import { ReadOnlyWorkspace } from './workspace.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, AUTO_REVIEW_UNAVAILABLE } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl } from './terminal.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
@@ -72,6 +73,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
+/commands on requests launch/session-only workspace trust; every unsandboxed command needs fresh human approval, even in Auto. /commands off disables it.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
@@ -83,6 +85,7 @@ Keys are masked and saved only in an available OS credential store, or used for 
 export async function runApplication(input: ApplicationOptions): Promise<number> {
   const { io, options, args, providerFactory } = input
   const env = { ...input.env }
+  const commandEnv = captureCommandEnvironment(input.env)
   const secrets = [...input.secrets]
   const credentials = input.credentials ?? createCredentialStore()
   const catalog = input.catalog ?? new ModelCatalog()
@@ -137,6 +140,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   let accountGeneration = randomUUID()
   let hostAccountGeneration: string | undefined
   let launchModePending = options.approvalMode === 'auto'
+  let launchCommandsPending = options.enableCommands
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
   let selected: { resume?: string; fresh?: boolean } | undefined = options.resume ? { resume: options.resume }
@@ -423,6 +427,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       if (io.isClosed) { await nextRelease(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
+        ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
+          isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),
         onMemoryNotice: message => io.write(`${message}\n`),
         onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
         ...(io.canAutoReview === true ? { decisionReview: {
@@ -438,7 +444,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         reasoning: session.reasoning ?? 'default', reasoningCapabilities: [...capabilities],
         enableTools: effective.enableTools, enableNotes: effective.enableNotes }
     } catch (error) { await nextRelease().catch(report); throw error }
-    const previousRelease = release
+    const previousRelease = release, previousHost = host
+    await previousHost?.shutdown()
     release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
     await previousRelease?.().catch(report)
     io.setSession(host.session)
@@ -472,6 +479,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         launchModePending = false
         io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
       }
+      if (launchCommandsPending && host) { launchCommandsPending = false; await runCommandControl(host, io, '/commands on') }
       // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
@@ -499,6 +507,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
           { name: 'Approval mode', value: '/mode' },
+          { name: 'Trusted commands', value: '/commands' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
@@ -537,6 +546,10 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
         if (command === '/memories') { await manageMemories(); continue }
+        if (/^\/commands(?:\s|$)/.test(command)) {
+          if (!host) { io.write('Choose a provider and model before enabling trusted commands\n'); continue }
+          await runCommandControl(host, io, command); continue
+        }
         if (/^\/mode(?:\s|$)/.test(command)) {
           if (command !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
           if (!host) { io.write('Choose a provider and model before selecting approval mode\n'); continue }
@@ -565,5 +578,5 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         finally { dispose() }
       } catch (error) { report(error) }
     }
-  } finally { try { await host?.drainMemory() } finally { await release?.() } }
+  } finally { try { await host?.shutdown() } finally { await release?.() } }
 }

@@ -201,8 +201,9 @@ bun dist/launcher.js --no-workspace
 The assistant can list files, match file paths with `workspace_glob`, read UTF-8 text, and search literal text. Reads may be
 sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
-are treated as untrusted data. Text creation and precise edits require host review. Shell commands, deletion,
-renaming, network tools, plugin discovery and permanent folder trust are unavailable.
+are treated as untrusted data. Text creation and precise edits require host review.
+Commands need separate trust as described below. Workspace file tools do not grant
+deletion, renaming, network tools, plugin discovery or permanent folder trust.
 
 The default applies to CLI launches only. Library users of `CliHost` must still
 explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
@@ -250,6 +251,31 @@ canonical paths and file identities and withholds results when it detects concur
 changes. This is not an OS sandbox against hostile programs changing the tree;
 use a project folder you control. Exact policy and verification limits are in
 [RELEASING.md](RELEASING.md#read-only-workspace-policy).
+
+## Trusted commands (optional)
+
+Use `/commands on`, or `--enable-commands`, to request a fresh interactive
+confirmation for the selected workspace and current launch/session. Commands are
+off by default; trust is never saved or restored from history. `/commands off`
+disables the capability. Every `command_start` needs a separate human approval,
+even in Auto. Piped/headless input cannot approve it.
+
+The approval shows the resolved executable, exact argv array, resolved working
+directory, environment variable names, and hard timeout. Execution uses
+`shell:false`; to use shell syntax, explicitly request a shell executable and its
+arguments. `command_poll` reads bounded output; `command_stop` halts that run’s
+process tree. IDs expire at the end of the agent run, which also stops any running
+processes. Output is untrusted and may be sent to your provider and saved in history.
+
+This is **unsandboxed**: commands have your OS account’s file and network access,
+including outside cwd. The fixed minimal environment excludes saved provider keys,
+but it does not prevent reading credential files. Only approve commands you trust.
+Cleanup covers inherited POSIX process groups and Windows Job Object descendants;
+commands deliberately escaping those boundaries or using external services remain
+outside that guarantee. Windows needs Windows 10+/Server 2016+ and built-in
+PowerShell FullLanguage; unsupported or locked-down native setup fails before execution.
+Windows argv uses standard C-runtime/managed parsing. `cmd.exe`, `command.com`,
+and `.bat`/`.cmd` files are unsupported; explicit PowerShell is supported.
 
 ## Persistent memory
 
