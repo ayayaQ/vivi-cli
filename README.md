@@ -23,6 +23,7 @@ then choose a model.
 - `/provider` — choose OpenAI or OpenRouter and enter a key
 - `/models` — search and select a model
 - `/effort` — choose a supported reasoning effort
+- `/mode` — choose Manual or enroll optional Auto review for the current conversation
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
@@ -76,7 +77,7 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 ### Mouse controls
 
 The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Memory or Settings below the composer to open an action when the draft
+Effort, Mode, Memory or Settings below the composer to open an action when the draft
 is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
@@ -125,6 +126,56 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
+
+## Optional Auto review
+
+Manual is always the default. `/mode` opens the current conversation’s mode
+choice. The full-screen picker defaults to Manual; choosing Auto review then
+requires a separate fresh, deny-default human confirmation of the disclosure.
+Line mode shows the same disclosure and requires fresh typed `allow` to enroll;
+`deny`, Escape, cancellation or closing keep Manual. `--approval-mode auto`
+requests this enrollment at launch, and does not bypass it. Piped, headless and
+unavailable approval surfaces stay Manual, even with that flag. Use `/mode` again
+to return to Manual. Approval mode is never stored in preferences or sessions,
+restored by `/resume`, or carried into a new conversation, provider, model or account.
+Replacing an API key revokes enrollment immediately, including if the subsequent
+model picker is cancelled; start a new conversation before enrolling again.
+
+When enrolled, only tool calls implementing the current user’s requested
+session `note_set` or app-wide memory create/edit may be automatically approved.
+The corresponding notes/memory and tool feature gates must already be enabled.
+Delete, `/memories` manager mutations, excluded actions and hard denials remain
+outside Auto review. A model recommendation never relaxes host policy or skips
+the exact proposal’s final freshness and revision checks.
+
+The review sends the exact current user request, tool arguments and prepared
+before/after content to the currently selected existing account: OpenAI
+`gpt-6-luna`, or OpenRouter routed to TypeSafe `typesafe/jev-1.13`. It uses only
+that account’s existing key, with no copied credential store, account discovery,
+cross-provider fallback or live model selection. The fresh in-app confirmation
+asks for consent to share this bounded request/proposal text with those named
+recipients for decision review. It may contain personal or sensitive information
+about you or others. Known credentials are excluded; content recognized as
+sensitive stays Manual and is not sent to the decision provider. This lexical
+filter cannot reliably identify every private detail. Keep Manual if you do not
+want potentially private text shared. A conversation or provider/account change
+invalidates the versioned consent; this product setting is not global permission
+to transmit credentials or unrelated content. The automatic-save policy remains
+ordinary non-sensitive local create/edit only; the sharing consent does not expand
+which actions may execute automatically. This adds API charges. Review
+is limited to two calls per turn, an eight-second deadline and 16 KiB for the
+full decision request. Larger exact evidence stays Manual without truncation;
+there is no hard prepaid USD cost guarantee. Returned review usage and any
+reported cost are recorded separately from chat/session usage.
+
+The versioned host heuristics require every check to reach at least `0.995` for
+OpenAI or `0.999` for OpenRouter; any check at or below `0.05` recommends rejection.
+These thresholds are uncalibrated and do not establish comparable behavior
+between providers. Model estimates can be wrong and do not prove authorization.
+A model rejection may still be reviewed by a human when host policy allows it.
+Uncertain, malformed, failed, stale or over-budget reviews use the ordinary
+human approval path; cancelled reviews cannot commit. The UI reports review
+progress and settled outcomes without exposing model reasoning or credentials.
 
 ## Read-only workspace tools
 
@@ -183,9 +234,11 @@ Memory is off by default. Use `--enable-memory` for a launch, or choose the futu
 launch default in `/settings` in the full-screen UI. `--disable-memory` overrides
 an enabled saved default. `/memories` enables or disables the current launch and
 lets you list, add, edit and delete records. Back, Escape and Cancel never submit
-a change. Each create, edit and delete shows the exact proposal and requires a
-fresh interactive approval: select Approve in the full-screen UI, or type `allow`
-in line mode. Piped input cannot approve writes.
+a change. Manager create, edit and delete actions show the exact proposal and
+require a fresh interactive approval: select Approve in the full-screen UI, or
+type `allow` in line mode. Model-requested create/edit calls use the same human
+path unless eligible under explicitly enrolled Auto review. Piped input cannot
+approve writes or enroll Auto review.
 
 Memories are stored as plaintext in `memories.json` alongside the CLI’s private
 session files, normally `~/.vivi/sessions`. When enabled, saved context is sent to

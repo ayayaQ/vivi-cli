@@ -18,7 +18,7 @@ const bytes = Buffer.from('exact private candidate bytes')
 const packed = { id: `${manifest.name}@${manifest.version}`, name: manifest.name, version: manifest.version,
   size: bytes.length, unpackedSize: 123, shasum: createHash('sha1').update(bytes).digest('hex'),
   integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}`, filename,
-  files: [{ path: 'package.json', size: 123, mode: 0o644 }], entryCount: 1, bundled: ['@ayayaq/vivi'] }
+  files: [{ path: 'package.json', size: 123, mode: 0o644 }], entryCount: 1, bundled: ['@ayayaq/vivi', 'yaml'] }
 const fixture = () => createCandidate(structuredClone(packed), bytes, manifest)
 const evidenceFor = candidate => packageAcceptanceEvidence({ filename, sha256: candidate.artifact.sha256,
   integrity: candidate.npm.integrity, size: bytes.length, cliVersion: manifest.version, node: 'v26.4.0', bun: '1.4.2' })
@@ -46,7 +46,8 @@ test('candidate metadata binds private identity, size, SHA256/SHA512 and normal 
     item => { item.npm.name = '@other/cli' }, item => { item.npm.version = '0.2.0' },
     item => { item.npm.id = 'other@0.1.0' }, item => { item.npm.filename = 'other.tgz' },
     item => { item.npm.size++ }, item => { item.npm.shasum = 'a'.repeat(40) },
-    item => { item.npm.integrity = 'sha512-bad' }, item => { item.npm.bundled = [] }
+    item => { item.npm.integrity = 'sha512-bad' }, item => { item.npm.bundled = [] },
+    item => { item.npm.bundled = ['@ayayaq/vivi'] }, item => { item.npm.bundled.push('unreviewed-package') }
   ]
   for (const mutate of mutations) {
     const invalid = fixture()

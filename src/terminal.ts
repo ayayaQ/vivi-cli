@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createInterface, emitKeypressEvents } from 'node:readline'
+import { randomUUID } from 'node:crypto'
 import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
@@ -10,11 +11,18 @@ import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import type { RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
+import type { ApprovalMode } from './auto-review.js'
+import { autoReviewSharingScope } from './auto-review.js'
 
 export interface ChatIO {
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
+  /** Enrollment requires a real interactive approval surface; omitted means unavailable. */
+  readonly canAutoReview?: boolean
+  setApprovalMode?(mode: ApprovalMode): void
+  /** Optional safe display sink that survives canonical transcript refresh. */
+  reviewNotice?(message: string): void
   /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
   runStarted?(): void
   runFinished?(outcome: RunOutcome): void
@@ -45,7 +53,58 @@ export interface TerminalOptions {
   stream?: boolean
   secrets?: readonly string[]
 }
-export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires allow/deny review. Disabling retains existing records.'
+export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
+export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
+
+/** Disclosure is host-authored; credentials and model-generated text never identify an account. */
+export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
+  const account = provider === 'openai' ? 'the currently selected OpenAI account, using gpt-6-luna'
+    : 'the currently selected OpenRouter account, routed to TypeSafe using typesafe/jev-1.13'
+  const threshold = provider === 'openai' ? '0.995' : '0.999'
+  return `Auto review for this conversation sends the exact current user request, proposed tool arguments and prepared before/after content to ${account}, using its existing API key. No other account or provider is used.\n` +
+    'By approving this enrollment, you consent to sending that request and proposal text to these named recipients for decision review. It may include personal or sensitive information about you or others. Known credentials are excluded, and content recognized as sensitive stays Manual without being sent to the decision provider. The filter cannot reliably identify every private detail. Do not enroll if you do not want potentially private text shared.\n' +
+    'Only ordinary non-sensitive current user-requested session note_set and app-wide memory create/edit tool calls are eligible, with their features enabled. Deletion, /memories manager changes and excluded writes remain human-reviewed.\n' +
+    `Every required model estimate must meet this provider’s ${threshold} host heuristic. These versioned thresholds are uncalibrated; model estimates can be wrong and do not prove authorization. A model rejection still offers manual review when host policy permits.\n` +
+    'This adds API charges: at most 2 review calls per turn, with an 8-second deadline and a 16 KiB limit for the full decision request. Larger exact evidence uses Manual, without truncation. Returned usage and any reported cost are tracked separately; there is no hard prepaid USD spending guarantee. Uncertain, invalid, stale, failed or over-budget reviews fall back to Manual.\n' +
+    'Manual is the default. Enrollment is only for this conversation and selected account, never saved or restored. Changing conversation, provider, model or account requires fresh enrollment. Select Auto review and then explicitly approve this enrollment only if you accept these disclosures.'
+}
+
+type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ApprovalMode }[], initialIndex: number) => Promise<ApprovalMode | undefined>
+
+/** Mode choices are not authority. Auto enrollment always uses the fresh deny-default approval path. */
+export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser): Promise<void> {
+  host.setApprovalMode('manual')
+  io.setApprovalMode?.('manual')
+  if (io.canAutoReview !== true || io.isClosed) { io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`); return }
+  const disclosure = autoReviewDisclosure(host.session.provider)
+  const binding = host.approvalEnrollmentBinding
+  io.write(`Approval mode: Manual\n${disclosure}\n`)
+  const selected = choose ? await choose('Approval mode · Manual is the default', [
+    { name: 'Manual', description: 'Human allow/deny review for every write', value: 'manual' },
+    { name: 'Auto review', description: 'Enroll only after a fresh confirmation of named recipients, possible private-text sharing, scope and extra API cost above', value: 'auto' }
+  ], 0) : 'auto'
+  if (selected !== 'auto' || io.isClosed) { io.write('Approval mode: Manual\n'); return }
+  const controller = new AbortController()
+  const dispose = io.onCancel(() => controller.abort())
+  const recipients = host.session.provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
+  try {
+    const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
+      mode: 'auto', provider: host.session.provider, sessionId: host.session.id,
+      reviewDataSharing: autoReviewSharingScope(host.session.provider), ...(binding ? { enrollmentBinding: binding } : {})
+    } }, currentRevision: 'fresh Auto review enrollment',
+    description: `Enable Auto review for this conversation and selected account?\n${disclosure}\nDeny keeps Manual. Approve consents to send this conversation’s exact current request and proposed note/memory text, including possible personal or sensitive details, to ${recipients} for decision review, and enables bounded Auto review. Known credentials remain excluded; private-detail detection is incomplete.` }, controller.signal)
+    if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
+      host.setApprovalMode('auto')
+      io.setApprovalMode?.('auto')
+      io.write('Approval mode: Auto review · enrolled for this conversation and selected account\n')
+    } else {
+      const changed = binding !== host.approvalEnrollmentBinding
+      host.setApprovalMode('manual')
+      io.setApprovalMode?.('manual')
+      io.write(changed ? 'Approval mode: Manual. Enrollment changed; open /mode for a fresh confirmation\n' : 'Approval mode: Manual\n')
+    }
+  } finally { dispose() }
+}
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
 /memories edit ID REVISION TEXT · review an edit to the displayed revision
@@ -141,6 +200,9 @@ export class TerminalIO implements ChatIO {
   private streamOverflow = false
   private readonly keyHandler: (_text: string, key: { name?: string }) => void
   private readonly signalHandler: () => void
+  get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
+    !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
+  get isClosed(): boolean { return this.disposed || this.ended }
   constructor(options: TerminalOptions = {}) {
     this.input = options.input ?? process.stdin
     this.output = options.output ?? process.stdout
@@ -156,6 +218,11 @@ export class TerminalIO implements ChatIO {
     })
     this.readline.on('close', () => {
       this.ended = true
+      // Interactive EOF revokes an enrolled run. Preserve ordinary piped read-only
+      // completion: a closed pipe was never an Auto review authority surface.
+      if (this.input.isTTY && this.output.isTTY) for (const callback of [...this.cancelCallbacks]) {
+        try { callback() } catch { /* Closing must still settle every input waiter. */ }
+      }
       for (const waiter of this.waiters.splice(0)) waiter.resolve(undefined)
     })
     const cancel = (): void => {
@@ -329,16 +396,22 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /memories manages saved context\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
     if (line.trim() === '/session') {
       const session = host.session
-      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nApproval mode: ${host.approvalMode === 'auto' ? 'Auto review' : 'Manual'}\nSession tokens: ${formatUsage(session.usage)}\n`)
       continue
     }
     if (!line.trim()) continue
+    if (/^\/mode(?:\s|$)/.test(line.trim())) {
+      if (line.trim() !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
+      try { await selectApprovalMode(host, io) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
+      continue
+    }
     if (/^\/rename(?:\s|$)/.test(line.trim())) {
       const name = line.trim().replace(/^\/rename(?:\s+|$)/, '')
       if (!name) io.write('Use /rename NAME to name this session\n')

@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.5.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.7.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE and attribution records, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,10 +12,29 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.5.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.7.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
+The verified registry tarball is 182,588 bytes (206 files), SHA-256
+`bc1f4426f2a4de8706a751caffec8db09d52ad856e26f49ae94dc0e8b27a7225`.
+The new optional Decisions module is consumed from the registry; no archived or
+vendored replacement is used. Its exact `yaml@2.9.1` dependency and unchanged
+reviewed integrity are bundled transitively and checked alongside the core.
+
+Auto review is a separate host opt-in with Manual as the launch/session default.
+Its fixed-provider numeric gates are initial host heuristics, not calibrated model
+accuracy or equivalent cross-provider probabilities. Offline adversarial fixtures
+verify binding, cancellation, privacy vetoes, manual fallbacks and persistence;
+they do not establish real-model accuracy. Provider-specific labeled evaluation
+is needed before any broader rollout or scope expansion. There are no live API
+calls or credentials in the automated tests. See README for enrollment and limits.
+The fresh Auto confirmation names OpenAI, or OpenRouter plus TypeSafe, and asks
+for bounded sharing consent for the exact request/proposal text, which can contain
+personal or sensitive details. Known credentials are excluded and recognized
+sensitive content stays Manual. Lexical detection is incomplete; the disclosure
+does not claim a privacy guarantee. Consent is versioned and bound to the current
+conversation/account; a changed or cancelled enrollment cannot authorize a save.
 
 The optional shared `providers/models` module normalizes capability facts for OpenAI
 Responses and OpenRouter Chat Completions. The CLI retains its 52 documented OpenAI
@@ -126,9 +145,11 @@ canonical session history, so edits/deletes do not leave obsolete saved snapshot
 The shared `extensions/memory` API supplies v1 codecs, limits, revisions, prepared
 mutations and static tools. The CLI owns fresh disk loads, an app-wide commit lease,
 backup/evidence recovery, atomic durability, explicit review and shutdown draining.
-Every create/edit/delete requires a fresh human approval (select Approve in the
-full-screen UI, or type allow in line mode); pipe, EOF and cancellation
-default to denial. Memory context remains available in chat-only mode, but memory
+Every create/edit/delete requires host review. Manual is the default; explicitly
+enrolled eligible agent create/edit may use Auto review. Manager changes and
+deletion always require fresh human approval (select Approve in the full-screen
+UI, or type allow in line mode); pipe, EOF and cancellation default to denial.
+Memory context remains available in chat-only mode, but memory
 tools are omitted when tools are disabled or their support is unverified. Records
 are retained when the feature is disabled. No notes migration, embeddings or
 automatic summarization is added.

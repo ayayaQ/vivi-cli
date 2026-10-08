@@ -231,7 +231,7 @@ test('command completion clicks fill a draft without submitting and toolbar acti
   await f.input.typeText('/m')
   await f.frame()
   const list = f.node('vivi-completion-list')
-  await f.mouse.click(list.x + 4, list.y + 1)
+  await f.mouse.click(list.x + 4, list.y + 2)
   await pending()
   expect((f.node('vivi-composer') as TextareaRenderable).plainText).toBe('/memories')
   f.input.pressEnter()
