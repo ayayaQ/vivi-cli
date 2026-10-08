@@ -173,7 +173,11 @@ test('terminal audit outcomes can never be changed into reviewed approvals or re
   }
 });
 
-test('retention stays within both row and serialized byte bounds and retains the latest update', async t => {
+// This fixture intentionally performs 517 real durable writes. Windows hosted
+// filesystem latency is not a production review deadline; retain all iterations
+// and assertions while allowing this one stress case a bounded platform budget.
+nodeTest('retention stays within both row and serialized byte bounds and retains the latest update',
+  { timeout: process.platform === 'win32' ? 90_000 : 20_000 }, async t => {
   const { store, primary } = await fixture(t);
   for (let index = 0; index < MAX_DECISION_LEDGER_ROWS + 4; index++) await store.upsert(record({ callId: `call-${index}` }));
   let rows = await store.list(); assert.equal(rows.length, MAX_DECISION_LEDGER_ROWS);
