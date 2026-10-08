@@ -48,10 +48,10 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/settings', '/memories', '/commands', '/skills', '/menu', '/help', '/session', '/exit'
+    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/settings', '/memories', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
-  expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/menu'])
+  expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
   expect(getSlashCommandCompletions('/provider').map(({ command }) => command)).toEqual(['/provider'])
   expect(getSlashCommandCompletions('/commands').map(({ command }) => command)).toEqual(['/commands'])
   for (const input of ['', 'message', ' /m', 'message /m', '/m ', '/models argument', '/m\n', '/unknown']) {
@@ -75,6 +75,7 @@ test('autocomplete renders above composer, arrows cycle and Tab accepts without 
   expect(await frame()).toContain('› /menu')
   input.pressArrow('down')
   expect(await frame()).toContain('› /models')
+  input.pressArrow('down')
   input.pressArrow('down')
   input.pressArrow('down')
   input.pressArrow('down')
@@ -422,7 +423,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   expect(output).toContain('A heading')
   expect(output).toContain('Tool calculate')
   expect(output).toContain('9 in / 8 out / 17 total')
-  expect(output).toContain('/new /resume /mode /memories /skills /settings /menu /help /exit')
+  expect(output).toContain('/new /resume /mode /memories /skills /mcp /settings /menu /help /exit')
 })
 
 test('native status labels round, turn and session cache telemetry without inventing zero', async () => {

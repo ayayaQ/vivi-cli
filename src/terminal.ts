@@ -432,10 +432,25 @@ export class TerminalIO implements ChatIO {
   }
 }
 
-export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): Promise<AgentResult | undefined> {
+/** These controls are supplied by the launch owner, never exposed as model tools. */
+interface UserChatControls { mcp?(): Promise<void> }
+
+export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.test(line.trim()) }
+
+export async function runMcpCommand(io: ChatIO, line: string, controls: UserChatControls): Promise<boolean> {
+  if (!isMcpCommand(line)) return false
+  if (line.trim() !== '/mcp') io.write('Use /mcp by itself to manage metadata-only connections\n')
+  else if (controls.mcp) await controls.mcp()
+  else io.write('MCP connection management is unavailable in this chat surface\n')
+  return true
+}
+
+export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
+  controls: UserChatControls = {}): Promise<AgentResult | undefined> {
   if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (prompt !== undefined) {
+    if (await runMcpCommand(io, prompt, controls)) return
     const dispose = io.onCancel(() => host.cancel())
     try {
       const result = await sendChatTurn(host, io, prompt)
@@ -443,7 +458,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /skills manages skills\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /skills manages skills, /mcp manages metadata-only connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
@@ -453,6 +468,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       continue
     }
     if (!line.trim()) continue
+    if (isMcpCommand(line)) {
+      try { await runMcpCommand(io, line, controls) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'MCP connection management failed'}\n`) }
+      continue
+    }
     if (/^\/commands(?:\s|$)/.test(line.trim())) {
       try { await runCommandControl(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Trusted command setup failed'}\n`) }

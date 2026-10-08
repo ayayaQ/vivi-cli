@@ -29,6 +29,7 @@ then choose a model.
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
 - `/settings` — change defaults for future conversations
 - `/memories` — manage this launch’s app-wide saved context
+- `/mcp` — configure and explicitly connect trusted installed stdio servers for metadata discovery
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -126,6 +127,28 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
+
+## Optional MCP discovery
+
+Use `/mcp` in full-screen or line mode to add an already installed executable,
+its separate arguments, working directory and explicit legacy or pinned modern
+protocol. Entries start disabled every launch. Enable requires fresh human
+approval showing that exact launch; Disable closes the owned process tree.
+For Bun servers, use `--no-install` followed by an absolute installed JS/TS
+script path and its separate arguments. Inline code and package commands are unsupported.
+Windows Node servers should explicitly allow `SYSTEMROOT` (included in the minimal
+profile/temp option); an empty environment can prevent Node 26.4 from starting.
+For account-independent line management, run
+`node dist/launcher.js --no-tui --prompt /mcp`; no model or provider key is needed.
+
+Starting a trusted server runs its code with your OS permissions before any
+tool-call approval. It can access files and network; this is not a sandbox.
+Catalogs show bounded tool names, resource URIs and templates only. They are
+never model tools or provider context. Unsupported schemas are quarantined.
+There are no resource reads, OAuth, HTTP, credential environment values,
+repository auto-discovery, package installation or automatic reconnects.
+Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
+FullLanguage for owned Job Object cleanup.
 
 ## Optional Auto review
 

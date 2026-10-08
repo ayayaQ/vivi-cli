@@ -46,6 +46,7 @@ export const SLASH_COMMANDS = [
   { command: '/memories', description: 'Manage app-wide saved context' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
+  { command: '/mcp', description: 'Manage trusted server metadata connections' },
   { command: '/menu', description: 'Open the menu' },
   { command: '/help', description: 'Show commands and shortcuts' },
   { command: '/session', description: 'Show the current session' },
@@ -96,7 +97,7 @@ function fitStatusColumns(text: string, columns: number, keepStart = false): str
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /settings /menu /help /exit'
+const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /settings /menu /help /exit'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
@@ -570,7 +571,7 @@ export class OpenTuiIO implements ChatIO {
     button.onMouse = (event) => {
       const pending = this.pending
       this.mouseActivation.handle(event, button, id, pending, this.ready(pending) &&
-        (!this.cancelCallbacks.size || pending?.kind === 'approval') &&
+        (!this.cancelCallbacks.size || pending?.kind !== 'chat') &&
         (id !== 'vivi-approve' || performance.now() >= this.approvalMouseNotBefore), activate)
     }
     return button
@@ -854,7 +855,7 @@ export class OpenTuiIO implements ChatIO {
     this.consume(event)
     if (this.diagnosticKey) return
     if (!this.pending?.armed || this.closed || this.pending.kind === 'choice') return
-    if (this.cancelCallbacks.size && this.pending.kind !== 'approval') return
+    if (this.cancelCallbacks.size && this.pending.kind === 'chat') return
     if (this.pending.kind === 'approval') {
       this.clearInput()
       this.approvalIndex = 0
@@ -911,7 +912,7 @@ export class OpenTuiIO implements ChatIO {
     }
     const pending = this.pending
     if (!pending?.armed) { this.consume(key); return }
-    if (this.cancelCallbacks.size && pending.kind !== 'approval') { this.consume(key); return }
+    if (this.cancelCallbacks.size && pending.kind === 'chat') { this.consume(key); return }
     if (pending.kind === 'secret') { this.handleSecretKey(key); return }
     // Legacy terminals encode Ctrl+J as LF and may encode Shift+Enter exactly
     // like Enter (CR). Only chat/text editors use LF as a newline fallback;
@@ -945,7 +946,9 @@ export class OpenTuiIO implements ChatIO {
   }
   private cancelOrClose(escape = false): void {
     if (this.closed) return
-    if (this.pending?.kind === 'approval') this.pending.finish(undefined)
+    // Launch-owned managers may keep cancellation armed while a modal is open.
+    // Settle that modal too, so Ctrl-C cannot leave a cancelled picker hanging.
+    if (this.pending && this.pending.kind !== 'chat') this.pending.finish(undefined)
     this.clearInput()
     if (this.cancelCallbacks.size) {
       this.runStatus.setPhase('cancelling')
@@ -957,6 +960,8 @@ export class OpenTuiIO implements ChatIO {
   private submit(): void {
     const pending = this.pending
     if (!pending?.armed || pending.kind === 'choice' || this.closed) return
+    // Native onSubmit and stale editor events must obey the same turn lock as keys.
+    if (this.cancelCallbacks.size && pending.kind === 'chat') return
     if (pending.kind === 'search') {
       this.inputChanged()
       const index = this.searchPicker?.matches[this.picker?.getSelectedIndex() ?? -1]
@@ -1203,7 +1208,12 @@ export class OpenTuiIO implements ChatIO {
     this.clearInput()
     this.disableComposer()
     this.updateStatus('Running · Escape / Ctrl+C cancels')
-    return () => { this.cancelCallbacks.delete(callback); this.updateActionBar() }
+    return () => {
+      this.cancelCallbacks.delete(callback)
+      this.updateActionBar()
+      if (!this.closed && !this.cancelCallbacks.size && !this.runStatus.running &&
+        (this.status === 'Running · Escape / Ctrl+C cancels' || this.status === 'Cancelling…')) this.updateStatus('Ready')
+    }
   }
 
   private markdown(content: string, streaming = false): MarkdownRenderable {
