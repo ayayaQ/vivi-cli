@@ -59,7 +59,7 @@ test('native mode picker defaults Manual, shows selected-account disclosure, and
   expect(picker.getSelectedIndex()).toBe(0)
   expect(picker.options.map(option => option.name)).toEqual(['Manual', 'Auto review'])
   const contents = text(f.setup.renderer.root)
-  expect(contents).toContain('Check proposed note and memory changes through your selected provider')
+  expect(contents).toContain('Check proposed note, memory and workspace text changes through your selected provider')
   expect(contents).not.toContain('Auto sends your current request')
   f.input.pressEnter()
   await selecting
@@ -169,4 +169,20 @@ test('review progress settles and separate audit warnings stay safe beside their
   f.io.runFinished('cancelled')
   f.io.setSession(newSession({ provider: 'openai', model: 'offline-chat' }))
   expect(text(f.setup.renderer.root)).not.toContain('audit unavailable')
+})
+
+test('native workspace diff is shown exactly with terminal controls escaped and deny selected', async () => {
+  const f = await fixture(), abort = new AbortController()
+  const diff = '--- "file.txt"\n+++ "file.txt"\n@@ -1,1 +1,1 @@ (JSON-quoted lines)\n-"old\\r\\n"\n+"new\\u001b[31m\\r\\n"'
+  const pending = f.io.approve({ call: { id: 'workspace-diff', name: 'workspace_edit_text', arguments: {} },
+    currentRevision: 'a'.repeat(64), description: `Precisely edit workspace text file "file.txt".\n${diff}` }, abort.signal)
+  await tick(); await f.frame()
+  const contents = text(f.setup.renderer.root)
+  expect(contents).toContain(diff)
+  expect(contents).not.toContain('[display truncated]')
+  expect(await f.frame()).toContain('› Deny')
+  await f.input.pasteBracketedText('allow')
+  await tick(); await f.frame()
+  f.input.pressEnter()
+  expect(await pending).toBe(false)
 })

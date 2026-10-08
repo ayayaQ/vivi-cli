@@ -4,6 +4,8 @@ export type { CliHostOptions, MemoryChangeRequest } from './host.js'
 export { FileMemoryStore, MAX_MEMORY_STORE_BYTES } from './memory.js'
 export type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 export { ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS } from './workspace.js'
+export { WORKSPACE_MUTATION_TOOL_NAMES, WORKSPACE_MUTATION_LIMITS, WorkspaceCommitError } from './workspace-edit.js'
+export type { WorkspaceMutation, WorkspaceCommitResult } from './workspace-edit.js'
 export { FileSessionStore, newSession, validateSession, environmentSecrets, redactSecrets, SessionCommitError,
   MAX_SESSION_BYTES, MAX_HISTORY_MESSAGES } from './session.js'
 export type { CliSession, CliProviderName, SessionPersistence } from './session.js'

@@ -96,6 +96,7 @@ try {
     'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
+    'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
@@ -178,7 +179,7 @@ try {
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
@@ -287,6 +288,33 @@ try {
   assert.equal(workspaceResult.status, 'completed')
   assert.equal(JSON.parse(workspaceResult.history[2].content).content, 'Packed workspace works')
   assert.deepEqual((await new FileSessionStore(directory).load(workspaceHost.session.id)).history, workspaceResult.history)
+  let textRounds = 0
+  const textHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    approve: async request => { assert.match(request.description, /JSON-quoted lines/); return true },
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++textRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-create-text', name: 'workspace_create_text', arguments: { path: 'created.txt', content: 'packed old' } }] }
+      : { content: 'Packed text accepted', toolCalls: [] } } })
+  assert.equal((await textHost.send('Create created.txt with packed old')).status, 'completed')
+  assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed old')
+  const readRevision = JSON.parse((await workspace.execute('workspace_read', { path: 'created.txt' }, new AbortController().signal)).content).revision
+  let editRounds = 0, decisions = 0
+  const editHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    approve: async () => { throw new Error('Packed eligible edit unexpectedly needed manual review') },
+    decisionReview: { canAutoReview: true, accountRevision: () => 'packed-account', ledger: { async upsert() {} },
+      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate(request) {
+        decisions++; assert.equal(request.snapshot.preparedAction.effects[0].scope, 'workspace')
+        assert.equal(request.snapshot.inputData.before, 'old'); assert.equal(request.snapshot.inputData.after, 'new')
+        return { model: 'gpt-6-luna', answers: request.policy.checks.map(check => ({ name: check.name, type: 'predicate', probability: 1 })),
+          usage: { inputTokens: 1, outputTokens: 1 } }
+      } } },
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++editRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-edit-text', name: 'workspace_edit_text', arguments: {
+        path: 'created.txt', expectedRevision: readRevision, before: 'old', after: 'new' } }] }
+      : { content: 'Packed precise edit accepted', toolCalls: [] } } })
+  editHost.setApprovalMode('auto')
+  assert.equal((await editHost.send('Replace old with new in created.txt')).status, 'completed')
+  assert.equal(decisions, 1); assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed new')
+  assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],

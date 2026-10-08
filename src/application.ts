@@ -475,7 +475,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
-        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
       }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
@@ -553,7 +553,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           const session = host?.session
           io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nApproval mode: ${host!.approvalMode === 'auto' ? 'Auto review' : 'Manual'}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
-          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\n` : 'Workspace: disabled\n')
+          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           continue
         }
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }

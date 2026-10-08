@@ -59,7 +59,7 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
-  --workspace PATH            Read-only folder for this launch (default: launch directory)
+  --workspace PATH            Folder for reads and reviewed text edits (default: launch directory)
   --no-workspace              Disable workspace files for this launch
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
   --prompt TEXT               Run one turn and exit
@@ -80,10 +80,10 @@ Streaming is display-only. Notes never access other files; piped approval is den
 Saved memory is off by default. When enabled, it is sent to the selected provider.
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
 Selected files may be sent to your provider and saved in session history.
-Workspace tools omit symlinks, private/ignored files, writes and commands; this is not an OS sandbox.
+Workspace tools omit symlinks and private/ignored files; text writes require review, and commands are unavailable; this is not an OS sandbox.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual or optional Auto review for the current conversation and selected account.
-Auto review adds API charges; only eligible current-request note/memory create/edit tool calls can use it.
+Auto review adds API charges; only eligible current-request note/memory changes and scoped text creation/precise-edit tool calls can use it.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 /** Only CLI callers supplying their captured launch directory get a default workspace. */
@@ -322,7 +322,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     await store.save(host.session)
     io.setApprovalMode?.('manual')
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
-    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
     const result = await runChatLoop(host, io, options.prompt)
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0

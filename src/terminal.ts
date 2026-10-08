@@ -59,7 +59,7 @@ export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive term
 /** Disclosure is host-authored; credentials and model-generated text never identify an account. */
 export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
   const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
-  return `Auto sends your current request and proposed note/memory changes (before and after) to ${recipients} for approval checks, including changes you didn’t request. ` +
+  return `Auto sends your current request and proposed note/memory changes and workspace text creation/precise edits (paths, before and after) to ${recipients} for approval checks, including changes you didn’t request. ` +
     'This may share private information and incur extra API charges; only changes judged to match your request can be saved automatically.'
 }
 
@@ -75,7 +75,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   io.write('Approval mode: Manual\n')
   const selected = choose ? await choose('Approval mode · Manual is the default', [
     { name: 'Manual', description: 'Human allow/deny review for every write', value: 'manual' },
-    { name: 'Auto review', description: 'Check proposed note and memory changes through your selected provider', value: 'auto' }
+    { name: 'Auto review', description: 'Check proposed note, memory and workspace text changes through your selected provider', value: 'auto' }
   ], 0) : 'auto'
   if (selected !== 'auto' || io.isClosed) { io.write('Approval mode: Manual\n'); return }
   const controller = new AbortController()

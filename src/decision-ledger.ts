@@ -13,7 +13,7 @@ const LOCK_RETRY_MS = 25
 const PRIMARY = 'decision-ledger.json'
 const LOCK = `${PRIMARY}.lock`
 
-export type DecisionLedgerToolName = 'note_set' | 'create_memory' | 'edit_memory' | 'delete_memory'
+export type DecisionLedgerToolName = 'note_set' | 'create_memory' | 'edit_memory' | 'delete_memory' | 'workspace_create_text' | 'workspace_edit_text'
 export type DecisionLedgerSource = 'automatic' | 'human-once' | 'human-deny'
 export type DecisionLedgerState = 'reviewed' | 'commit_started' | 'committed' | 'denied' | 'cancelled' | 'failed' | 'unknown'
 export type DecisionLedgerReasonCode = 'requirements_met' | 'provider_recommended_reject' | 'uncertain' |
@@ -76,7 +76,7 @@ export class DecisionLedgerCommitError extends DecisionLedgerError {
   }
 }
 
-const toolNames: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'delete_memory']
+const toolNames: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'workspace_create_text', 'workspace_edit_text']
 const sources: readonly string[] = ['automatic', 'human-once', 'human-deny']
 const states: readonly string[] = ['reviewed', 'commit_started', 'committed', 'denied', 'cancelled', 'failed', 'unknown']
 const reasons: readonly string[] = ['requirements_met', 'provider_recommended_reject', 'uncertain', 'refusal',
