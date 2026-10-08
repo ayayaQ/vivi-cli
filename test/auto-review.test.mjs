@@ -8,7 +8,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AutoReviewController, AUTO_REVIEW_THRESHOLDS, autoReviewPolicy,
-  reviewContainsSecret, reviewDigest, reviewIsSensitive, AUTO_REVIEW_SHARING_REVISION } from '../dist/auto-review.js'
+  reviewContainsSecret, reviewDigest, reviewIsSensitive, reviewFallbackDescription, AUTO_REVIEW_SHARING_REVISION } from '../dist/auto-review.js'
 import { CliHost } from '../dist/host.js'
 import { FileMemoryStore } from '../dist/memory.js'
 import { FileSessionStore, newSession, SessionCommitError } from '../dist/session.js'
@@ -18,7 +18,7 @@ import { PassThrough } from 'node:stream'
 
 function fixture(options = {}) {
   const state = { calls: 0, human: 0, commits: 0, account: 'account-v1', revision: 1, active: true,
-    requests: [], records: [], notices: [], secrets: [], ...options.state }
+    requests: [], records: [], notices: [], reviewStates: [], secrets: [], ...options.state }
   const providerId = options.providerId ?? 'openai'
   const model = providerId === 'openai' ? 'gpt-6-luna' : 'typesafe/jev-1.13'
   const provider = { id: providerId, model, async evaluate(request, signal) {
@@ -37,7 +37,7 @@ function fixture(options = {}) {
     state.human++; state.humanRequest = request
     await options.onHuman?.(state, request)
     return options.approved ?? false
-  }, message => { state.notices.push(message); options.onNotice?.(state, message) })
+  }, (message, context) => { state.notices.push(message); if (context) state.reviewStates.push(context); options.onNotice?.(state, message) })
   controller.beginTurn(randomUUID(), options.text ?? 'Set a note named color to blue')
   if (options.mode !== 'manual') controller.setMode('auto')
   const proposal = { approval: { call: { id: 'call-1', name: options.toolName ?? 'note_set',
@@ -118,6 +118,93 @@ test('model rejection can be approved once only by the existing human path', asy
   assert.equal(await subject.execute(), 2)
   assert.equal(subject.state.human, 1); assert.equal(subject.state.records.at(-1).source, 'human-once')
   await assert.rejects(subject.execute(), /already been reviewed/)
+})
+test('review lifecycle identifies each call and records the real human or automatic source', async () => {
+  for (const [probability, approved, expected, source] of [[1, false, ['reviewing', 'saving', 'saved'], 'automatic'],
+    [0.5, true, ['reviewing', 'needs_review', 'saving', 'saved'], 'human'],
+    [0.5, false, ['reviewing', 'needs_review', 'denied'], 'human']]) {
+    const subject = fixture({ probability, approved })
+    await subject.execute()
+    assert.deepEqual(subject.state.reviewStates.map(notice => notice.state), expected)
+    const terminal = subject.state.reviewStates.at(-1)
+    assert.equal(terminal.source, source)
+    assert(subject.state.reviewStates.every(notice => notice.sessionId === terminal.sessionId &&
+      notice.runId === terminal.runId && notice.callId === 'call-1' && notice.toolName === 'note_set'))
+    assert.match(subject.state.notices.at(-1), source === 'automatic' ? /Automatically approved/ : /(?:Approved|Denied) by you/)
+  }
+})
+test('review cancellation and uncertain writes always settle progress without claiming a save', async () => {
+  const abort = new AbortController()
+  const subject = fixture({ signal: abort.signal, onEvaluate() { abort.abort() } })
+  await assert.rejects(subject.execute())
+  assert.equal(subject.state.reviewStates.at(-1).state, 'cancelled')
+  assert.equal(subject.state.commits, 0)
+  const uncertain = fixture({ onCommit() { throw new Error('private write failure') } })
+  await assert.rejects(uncertain.execute())
+  assert.equal(uncertain.state.reviewStates.at(-1).state, 'unknown')
+  assert(!uncertain.state.notices.some(message => message.includes('private write failure')))
+})
+test('cancellation or staleness on the saving notice remains a definite no-effect terminal outcome', async () => {
+  for (const cause of ['cancel', 'stale']) {
+    const abort = new AbortController()
+    const subject = fixture({ signal: abort.signal, onNotice(state, message) {
+      if (!message.includes('saving the reviewed change')) return
+      if (cause === 'cancel') abort.abort()
+      else state.account = 'changed-account'
+    } })
+    await assert.rejects(subject.execute())
+    assert.equal(subject.state.commits, 0)
+    assert.equal(subject.state.records.at(-1).state, cause === 'cancel' ? 'cancelled' : 'failed')
+    assert.equal(subject.state.reviewStates.at(-1).state, cause === 'cancel' ? 'cancelled' : 'failed')
+    assert(!subject.state.notices.some(message => /write outcome could not be confirmed/.test(message)))
+  }
+})
+test('stale tool-call mutation cannot change the lifecycle key during terminal reporting', async () => {
+  const subject = fixture({ onNotice(_state, message) {
+    if (!message.startsWith('Reviewing')) return
+    subject.proposal.approval.call.id = 'changed-id'
+    subject.proposal.approval.call.name = 'changed-name'
+  } })
+  await assert.rejects(subject.execute())
+  assert.equal(subject.state.reviewStates.at(-1).state, 'failed')
+  assert(subject.state.reviewStates.every(notice => notice.callId === 'call-1' && notice.toolName === 'note_set'))
+  assert.equal(subject.state.calls, 0)
+  assert.equal(subject.state.commits, 0)
+})
+test('fallback descriptions use closed friendly categories and bounded numeric HTTP statuses', () => {
+  assert.equal(reviewFallbackDescription('http', 403), 'the review service returned HTTP 403')
+  for (const invalid of [0, 600, 401.5, Infinity, '401', 'private-provider-body']) {
+    assert.equal(reviewFallbackDescription('http', invalid), 'the review service returned an HTTP error')
+  }
+  assert.match(reviewFallbackDescription('rate_limit', 429), /rate limited.*HTTP 429/)
+  assert.match(reviewFallbackDescription('timeout'), /timed out/)
+  assert.match(reviewFallbackDescription('transport'), /could not be reached/)
+  assert.match(reviewFallbackDescription('privacy'), /sensitive.*human/)
+  assert(!reviewFallbackDescription('unexpected-private-reason').includes('unexpected-private-reason'))
+  assert.equal(reviewFallbackDescription('constructor'), 'this change requires human review')
+})
+test('uncertain reviews summarize only known incomplete estimates without rounding them into approval', () => {
+  const checks = [{ name: 'exact_action_requested', probability: 0.99899999, reasonCode: 'between_thresholds' },
+    { name: 'effects_within_scope', probability: 0.999, reasonCode: 'allow_threshold_met' },
+    { name: 'evidence_not_redirected', probability: 0.999, reasonCode: 'allow_threshold_met' },
+    { name: 'ordinary_non_sensitive', probability: 1, reasonCode: 'allow_threshold_met' }]
+  assert.equal(reviewFallbackDescription('uncertain', undefined, checks, 'openrouter'),
+    'request match model estimate 99.8999% is below the 99.9% cutoff')
+  assert.match(reviewFallbackDescription('uncertain', undefined, [...checks,
+    { name: 'effects_within_scope', probability: 0.9, reasonCode: 'between_thresholds' }], 'openrouter'),
+  /save scope model estimate 90%.*1 other check is also below/)
+  assert.equal(reviewFallbackDescription('uncertain', undefined,
+    [{ name: 'private-provider-text', probability: 0.5, reasonCode: 'between_thresholds' }], 'openrouter'),
+  'the automatic checks were inconclusive')
+  for (const probability of [undefined, NaN, Infinity, -1, 2, 0.999]) {
+    assert.equal(reviewFallbackDescription('uncertain', undefined,
+      [{ name: 'exact_action_requested', probability, reasonCode: 'between_thresholds' }], 'openrouter'),
+    'the automatic checks were inconclusive')
+  }
+  assert.equal(reviewFallbackDescription('uncertain', undefined, [], 'openrouter'), 'the automatic checks were inconclusive')
+  assert.equal(reviewFallbackDescription('uncertain', undefined,
+    [{ name: 'exact_action_requested', probability: 0.99499999, reasonCode: 'between_thresholds' }], 'openai'),
+  'request match model estimate 99.4999% is below the 99.5% cutoff')
 })
 test('ineligible proposals never call a judge and explain the hard scope boundary', async () => {
   for (const options of [{ eligible: false }, { toolName: 'delete_memory' }, { toolName: 'unrelated_extension' }]) {

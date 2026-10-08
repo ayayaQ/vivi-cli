@@ -8,6 +8,52 @@ import type { DecisionLedger, DecisionLedgerRecord } from './decision-ledger.js'
 import { SessionCommitError } from './session.js'
 
 export type ApprovalMode = 'manual' | 'auto'
+/** Display metadata only. Neither a status nor an audit record grants authority. */
+export interface ReviewNotice {
+  readonly sessionId: string
+  readonly runId: string
+  readonly callId: string
+  readonly toolName: string
+  readonly state: 'reviewing' | 'needs_review' | 'saving' | 'saved' | 'denied' | 'cancelled' | 'failed' | 'unknown'
+  readonly source?: 'automatic' | 'human'
+}
+export function reviewNoticeSettled(notice: ReviewNotice): boolean {
+  return !['reviewing', 'needs_review', 'saving'].includes(notice.state)
+}
+/** Closed host-authored explanations. Never show provider bodies or thrown errors. */
+export function reviewFallbackDescription(reason: DecisionLedgerRecord['reasonCode'], httpStatus?: number,
+  checks?: DecisionResult['checks'], provider?: 'openai' | 'openrouter'): string {
+  const status = Number.isInteger(httpStatus) && httpStatus! >= 100 && httpStatus! <= 599 ? httpStatus : undefined
+  if (reason === 'http') return status === undefined ? 'the review service returned an HTTP error' : `the review service returned HTTP ${status}`
+  if (reason === 'rate_limit') return `the review service is rate limited${status === undefined ? '' : ` (HTTP ${status})`}`
+  if (reason === 'uncertain' && provider && checks) {
+    const names: Record<string, string> = { exact_action_requested: 'request match', effects_within_scope: 'save scope',
+      evidence_not_redirected: 'instruction source', ordinary_non_sensitive: 'non-sensitive content' }
+    const cutoff = AUTO_REVIEW_THRESHOLDS[provider].allowAt
+    const incomplete = checks.filter(check => Object.hasOwn(names, check.name) && check.reasonCode === 'between_thresholds' &&
+      Number.isFinite(check.probability) && check.probability >= 0 && check.probability < cutoff)
+      .slice(0, 4).sort((left, right) => left.probability - right.probability)
+    if (incomplete.length) {
+      const check = incomplete[0]!
+      // Truncate, rather than round an estimate up to the displayed admission cutoff.
+      const percent = Math.floor(check.probability * 1_000_000) / 10_000
+      return `${names[check.name]} model estimate ${percent}% is below the ${cutoff * 100}% cutoff` +
+        (incomplete.length > 1 ? `; ${incomplete.length - 1} other ${incomplete.length === 2 ? 'check is' : 'checks are'} also below` : '')
+    }
+  }
+  const descriptions: Partial<Record<DecisionLedgerRecord['reasonCode'], string>> = {
+    timeout: 'the automatic review timed out', transport: 'the review service could not be reached',
+    uncertain: 'the automatic checks were inconclusive', refusal: 'the review service declined to evaluate this change',
+    invalid_request: 'the review request could not be validated', invalid_response: 'the review service returned an invalid response',
+    unsupported_model: 'the automatic review model is unavailable', provider_mismatch: 'the review provider did not match',
+    configuration: 'automatic review is unavailable', privacy: 'private or sensitive content requires human review',
+    budget: 'this turn reached its automatic review limit', audit_unavailable: 'the review audit is unavailable',
+    ineligible: 'this action is outside Auto review’s note/memory create/edit scope',
+    stale: 'the proposal changed and needs a fresh review', manual: 'human review is selected',
+    provider_recommended_reject: 'AI recommends rejecting this change'
+  }
+  return Object.hasOwn(descriptions, reason) ? descriptions[reason]! : 'this change requires human review'
+}
 export const AUTO_REVIEW_TIMEOUT_MS = 8_000
 export const AUTO_REVIEW_MAX_CALLS = 2
 export const AUTO_REVIEW_MAX_INPUT_BYTES = 16 * 1024
@@ -157,7 +203,7 @@ export class AutoReviewController {
   private suspended = false
   constructor(private readonly config: AutoReviewConfiguration | undefined,
     private readonly secrets: readonly string[], private readonly human: (request: ApprovalRequest, signal: AbortSignal) => Promise<boolean>,
-    private readonly notice?: (message: string) => void) {}
+    private readonly notice?: (message: string, context?: ReviewNotice) => void) {}
   get mode(): ApprovalMode {
     if (this.selectedMode === 'auto' && this.config?.accountRevision() !== this.enrolledAccount) this.setMode('manual')
     return this.selectedMode
@@ -182,10 +228,31 @@ export class AutoReviewController {
     try { await this.config?.ledger.drain?.() }
     catch { this.suspended = true; this.report('Review audit durability could not be confirmed. Automatic saves are suspended; the existing manual path remains available') }
   }
-  private report(message: string): void { try { this.notice?.(message) } catch { /* Display is never execution authority. */ } }
+  private report(message: string, context?: ReviewNotice): void { try { this.notice?.(message, context) } catch { /* Display is never execution authority. */ } }
 
   async execute<T>(proposal: ReviewProposal, signal: AbortSignal,
     commit: (assertCurrent: () => void) => Promise<T>, resultRevision?: (result: T) => string | number | undefined): Promise<T | undefined> {
+    const turn = this.turn
+    const { id: callId, name: toolName } = proposal.approval.call
+    let latest: ReviewNotice | undefined
+    const report = (message: string, state: ReviewNotice['state'], source?: ReviewNotice['source']): void => {
+      if (!turn) { this.report(message); return }
+      latest = { sessionId: turn.sessionId, runId: turn.runId, callId,
+        toolName, state, ...(source ? { source } : {}) }
+      this.report(message, latest)
+    }
+    try { return await this.executeProposal(proposal, signal, commit, resultRevision, report) }
+    catch (error) {
+      if (latest && !reviewNoticeSettled(latest)) {
+        if (latest.state === 'saving') report('The write outcome could not be confirmed; check the resource before retrying', 'unknown', latest.source)
+        else report(signal.aborted ? 'Review cancelled; no save was made' : 'Review failed; no save was made', signal.aborted ? 'cancelled' : 'failed')
+      }
+      throw error
+    }
+  }
+  private async executeProposal<T>(proposal: ReviewProposal, signal: AbortSignal,
+    commit: (assertCurrent: () => void) => Promise<T>, resultRevision: ((result: T) => string | number | undefined) | undefined,
+    report: (message: string, state: ReviewNotice['state'], source?: ReviewNotice['source']) => void): Promise<T | undefined> {
     signal.throwIfAborted()
     const callReference = proposal.approval.call
     const callDigest = reviewDigest(callReference)
@@ -215,12 +282,18 @@ export class AutoReviewController {
       if (this.config && mode === 'auto') {
         const reason = !eligible ? 'This action is outside Auto review’s note/memory create/edit scope'
           : 'Auto review requires an active current user request'
-        this.report(`${reason}; manual review is required`)
+        report(`${reason}; manual review is required`, 'needs_review')
         manualApproval = { ...approval, description: `${reason}; manual review is required.\n${approval.description}` }
       }
-      if (!await this.human(manualApproval, signal)) return undefined
+      if (!await this.human(manualApproval, signal)) {
+        if (mode === 'auto') report(signal.aborted ? 'Review cancelled; no save was made' : 'Denied by you; no save was made', signal.aborted ? 'cancelled' : 'denied', 'human')
+        return undefined
+      }
       assertCurrent()
-      return commit(assertCurrent)
+      if (mode === 'auto') report('Approved by you; saving this change', 'saving', 'human')
+      const value = await commit(assertCurrent)
+      if (mode === 'auto') report('Approved by you; change saved', 'saved', 'human')
+      return value
     }
     if (turn.seen.has(call.id)) throw new Error('This tool proposal has already been reviewed')
     turn.seen.add(call.id)
@@ -251,7 +324,7 @@ export class AutoReviewController {
         if (reviewContainsSecret(request, this.secrets) || reviewIsSensitive([turn.text, call, request.snapshot.inputData])) reason = 'privacy'
         else {
           turn.calls++
-          this.report(`Reviewing ${call.name} with ${this.config.provider.model} (up to 8s)…`)
+          report(`Reviewing ${call.name} with ${this.config.provider.model} (up to 8s)…`, 'reviewing')
           const guard = (): void => {
             assertCurrent()
             if (reviewContainsSecret(request, this.secrets)) throw new Error('Decision review contains a newly known credential')
@@ -299,24 +372,28 @@ export class AutoReviewController {
       if (automatic && !await persist()) { automatic = false; autoAuthorized = false; reason = 'audit_unavailable' }
       assertCurrent()
       if (!automatic) {
-        this.report(result?.outcome === 'deny' ? 'AI recommends rejecting this change. You may review and approve this exact change once' : `Needs your review: ${reason}`)
+        const explanation = reviewFallbackDescription(reason, result?.httpStatus, result?.checks, policy.provider)
+        report(result?.outcome === 'deny' ? 'AI recommends rejecting this change. You may review and approve this exact change once' : `Needs your review: ${explanation}`, 'needs_review')
         const approved = await this.human({ ...approval,
-          description: `${result?.outcome === 'deny' ? 'AI recommends rejecting' : 'Manual review required'} (${reason}).\n${approval.description}` }, signal)
+          description: `${result?.outcome === 'deny' ? 'AI recommends rejecting this change' : `Manual review required: ${explanation}`}\n${approval.description}` }, signal)
         assertCurrent()
         record = { ...record, source: approved ? 'human-once' : 'human-deny', reasonCode: reason,
           state: approved ? 'commit_started' : 'denied', updatedAt: new Date().toISOString() }
         // Human review preserves the existing write path even if the separate audit is unavailable.
         await persist()
         assertCurrent()
-        if (!approved) { this.report('Change denied; no save was made'); return undefined }
-      } else this.report(`Automatically approved by ${this.config.provider.model}; saving the reviewed change`)
+        if (!approved) { report(`Denied by you; no save was made\nAuto review: ${explanation}`, 'denied', 'human'); return undefined }
+        report('Approved by you; saving this change', 'saving', 'human')
+      } else report(`Automatically approved by ${this.config.provider.model}; saving the reviewed change`, 'saving', 'automatic')
       assertCurrent()
       resourceAdmitted = true
       const value = await commit(assertCurrent)
       record = { ...record, state: 'committed', updatedAt: new Date().toISOString(),
         ...(resultRevision?.(value) === undefined ? {} : { resultRevision: resultRevision!(value)! }) }
-      if (!await persist()) this.report('The change committed, but its final audit could not be confirmed. Do not retry the save')
-      else this.report('Reviewed change saved')
+      const saved = automatic ? `Automatically approved by ${this.config.provider.model}; change saved` : 'Approved by you; change saved'
+      const fallback = automatic ? '' : `\nAuto review: ${reviewFallbackDescription(reason, result?.httpStatus, result?.checks, policy.provider)}`
+      if (!await persist()) report(`${saved}${fallback}\nThe change committed, but its final audit could not be confirmed. Do not retry the save`, 'saved', automatic ? 'automatic' : 'human')
+      else report(saved + fallback, 'saved', automatic ? 'automatic' : 'human')
       return value
     } catch (error) {
       // Before the resource callback, cancellation/staleness definitely had no effect.
@@ -328,9 +405,10 @@ export class AutoReviewController {
         if (error instanceof SessionCommitError) {
           record = { ...record, state: 'committed',
             ...(call.name === 'note_set' && typeof approval.currentRevision === 'number' ? { resultRevision: approval.currentRevision + 1 } : {}) }
-          this.report('The session note was saved, but its durable persistence could not be confirmed. Automatic saves are suspended; do not retry this save')
-        } else this.report('The write outcome could not be confirmed. Automatic saves are suspended; check the resource before retrying')
-      }
+          report('The session note was saved, but its durable persistence could not be confirmed. Automatic saves are suspended; do not retry this save', 'saved', automatic ? 'automatic' : 'human')
+        } else report('The write outcome could not be confirmed. Automatic saves are suspended; check the resource before retrying', 'unknown', automatic ? 'automatic' : 'human')
+      } else report(signal.aborted ? 'Review cancelled; no save was made' : 'Review failed; no save was made',
+        signal.aborted ? 'cancelled' : 'failed')
       await persist()
       throw error
     }
