@@ -10,9 +10,8 @@ import { createBuiltinToolset } from '../dist/tools.js'
 
 async function fixture(t, { secrets = [], available = true, approved = true, approval } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'vivi-command-fixture-'))
-  t.after(() => rm(root, { recursive: true, force: true }))
   const workspace = await TrustedCommandWorkspace.open(root, process.env, secrets)
-  t.after(() => workspace.shutdown())
+  t.after(async () => { await workspace.shutdown(); await rm(root, { recursive: true, force: true }) })
   const state = { available, approved, active: true, account: 'fixture-account', approvals: [] }
   const context = { launchId: 'fixture-launch', sessionId: 'fixture-session', runId: 'fixture-run', get accountRevision() { return state.account },
     canApprove: () => state.available, isCurrent: () => state.active,

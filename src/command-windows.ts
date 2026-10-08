@@ -31,10 +31,24 @@ export interface WindowsCommandProcess {
 }
 
 /** Injection is for deterministic tests; callers should use the default runtime. */
+const windowsCommandPhases = [
+  'helper-start', 'compile-start', 'compile-ready', 'request-read-start', 'request-read-done',
+  'native-run-start', 'job-created', 'job-ready', 'control-read-start', 'control-eof', 'control-read-error',
+  'process-created', 'process-resumed', 'stdout-pump-start', 'stderr-pump-start',
+  'stdout-pump-eof', 'stderr-pump-eof', 'root-exit', 'job-terminate-start', 'job-empty',
+  'pumps-join-start', 'pumps-finished', 'native-cleanup-finished', 'terminal-frame',
+  'control-close-start', 'control-write-finished', 'helper-close', 'helper-force-close',
+  'protocol-paused', 'protocol-resumed',
+] as const
+export type WindowsCommandPhase = typeof windowsCommandPhases[number]
+const allowedPhases = new Set<string>(windowsCommandPhases)
+
 export interface WindowsCommandRuntime {
   readonly spawn?: (executable: string, args: readonly string[], options: SpawnOptions) => ChildProcess
   readonly hostEnv?: Readonly<NodeJS.ProcessEnv>
   readonly cleanupTimeoutMs?: number
+  /** Diagnostic hook receives only fixed phase names, never request data. */
+  readonly onPhase?: (phase: WindowsCommandPhase) => void
 }
 
 // Every byte of this program is package-authored. Request data is read from stdin,
@@ -64,6 +78,7 @@ public static class ViviCommandJob {
   static IntPtr activeJob = IntPtr.Zero;
   static bool cancelled = false;
   static Exception pumpError;
+  public static bool Diagnostics = false;
 
   [StructLayout(LayoutKind.Sequential)] struct SECURITY_ATTRIBUTES {
     public int length; public IntPtr descriptor; [MarshalAs(UnmanagedType.Bool)] public bool inherit;
@@ -134,16 +149,27 @@ public static class ViviCommandJob {
       Console.Out.Flush();
     }
   }
+  static void Phase(string phase) {
+    if (!Diagnostics) return;
+    try {
+      lock (outputLock) {
+        Console.Out.WriteLine("{\"type\":\"phase\",\"phase\":\"" + phase + "\"}");
+        Console.Out.Flush();
+      }
+    } catch (Exception) { /* Diagnostic failure must never skip job cleanup. */ }
+  }
   static void EmitError(Exception error) {
     byte[] bytes = Encoding.UTF8.GetBytes(error.Message); Emit("error", bytes, bytes.Length);
   }
   static Thread Pump(IntPtr read, string type) {
     Thread thread = new Thread(delegate() {
       try {
+        Phase(type == "stdout" ? "stdout-pump-start" : "stderr-pump-start");
         using (FileStream stream = new FileStream(new SafeFileHandle(read, true), FileAccess.Read, 4096, false)) {
           byte[] bytes = new byte[4096]; int count;
           while ((count = stream.Read(bytes, 0, bytes.Length)) > 0) Emit(type, bytes, count);
         }
+        Phase(type == "stdout" ? "stdout-pump-eof" : "stderr-pump-eof");
       } catch (Exception error) { lock (outputLock) { if (pumpError == null) pumpError = error; } }
     });
     thread.IsBackground = true; thread.Start(); return thread;
@@ -161,8 +187,9 @@ public static class ViviCommandJob {
     result.Append('\\', slashes * 2); result.Append('"'); return result.ToString();
   }
   static void StopOnInputEnd() {
-    try { while (Console.In.ReadLine() != null) {} }
-    catch (IOException) {}
+    Phase("control-read-start");
+    try { while (Console.In.ReadLine() != null) {} Phase("control-eof"); }
+    catch (IOException) { Phase("control-read-error"); }
     lock (jobLock) {
       cancelled = true;
       if (activeJob != IntPtr.Zero) TerminateJobObject(activeJob, 1);
@@ -184,12 +211,15 @@ public static class ViviCommandJob {
     bool attributesReady = false, prelaunchCancelled = false, cleanupVerified = false;
     PROCESS_INFORMATION process = new PROCESS_INFORMATION();
     Thread outPump = null, errPump = null; uint exitCode = 1; Exception failure = null;
+    Phase("native-run-start");
     try {
       job = CreateJobObjectW(IntPtr.Zero, null);
       if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObjectW");
+      Phase("job-created");
       EXTENDED_LIMITS limits = new EXTENDED_LIMITS(); limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
       Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(EXTENDED_LIMITS))), "SetInformationJobObject");
       lock (jobLock) { activeJob = job; }
+      Phase("job-ready");
       Thread control = new Thread(StopOnInputEnd); control.IsBackground = true; control.Start();
 
       SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES(); security.length = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)); security.inherit = true;
@@ -229,13 +259,16 @@ public static class ViviCommandJob {
         Check(CreateProcessW(executable, command, IntPtr.Zero, IntPtr.Zero, true,
           CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
           environment, cwd, ref startup, out process), "CreateProcessW");
+        Phase("process-created");
         if (ResumeThread(process.thread) == UInt32.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread");
+        Phase("process-resumed");
       }
       Close(ref inRead); Close(ref outWrite); Close(ref errWrite); Close(ref process.thread);
       outPump = Pump(outRead, "stdout"); outRead = IntPtr.Zero;
       errPump = Pump(errRead, "stderr"); errRead = IntPtr.Zero;
       if (WaitForSingleObject(process.process, UInt32.MaxValue) != WAIT_OBJECT_0)
         throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject");
+      Phase("root-exit");
       Check(GetExitCodeProcess(process.process, out exitCode), "GetExitCodeProcess");
     } catch (Exception error) {
       prelaunchCancelled = error is OperationCanceledException && process.process == IntPtr.Zero && cancelled;
@@ -245,11 +278,13 @@ public static class ViviCommandJob {
       // Root exit does not imply tree exit. Always terminate the job, verify no
       // remaining members, then drain the now-closed pipes before reporting done.
       if (job != IntPtr.Zero) {
-        try { Check(TerminateJobObject(job, 1), "TerminateJobObject"); WaitForEmptyJob(job); cleanupVerified = true; }
+        try { Phase("job-terminate-start"); Check(TerminateJobObject(job, 1), "TerminateJobObject"); WaitForEmptyJob(job); cleanupVerified = true; Phase("job-empty"); }
         catch (Exception error) { failure = error; }
       }
       Close(ref inRead); Close(ref inWrite); Close(ref outWrite); Close(ref errWrite);
+      Phase("pumps-join-start");
       if (outPump != null) outPump.Join(); if (errPump != null) errPump.Join();
+      Phase("pumps-finished");
       if (failure == null && pumpError != null) failure = pumpError;
       Close(ref outRead); Close(ref errRead); Close(ref process.thread); Close(ref process.process);
       lock (jobLock) { activeJob = IntPtr.Zero; Close(ref job); }
@@ -259,6 +294,7 @@ public static class ViviCommandJob {
       if (jobMemory != IntPtr.Zero) Marshal.FreeHGlobal(jobMemory);
       if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment);
     }
+    Phase("native-cleanup-finished");
     // Cancellation before creation is a stopped command only after verifying
     // the job is empty. Never hide a cleanup or output-pump error as cancellation.
     if (prelaunchCancelled && cleanupVerified && failure is OperationCanceledException && pumpError == null) failure = null;
@@ -279,15 +315,28 @@ const wrapperSource = String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$diagnostics = [Environment]::GetEnvironmentVariable('VIVI_COMMAND_PHASES') -eq '1'
+function Write-Phase([string]$phase) {
+  if ($diagnostics) {
+    [Console]::Out.WriteLine('{"type":"phase","phase":"' + $phase + '"}')
+    [Console]::Out.Flush()
+  }
+}
 try {
+  Write-Phase 'helper-start'
   $compressed = '${compressedNative}'
   $memory = [IO.MemoryStream]::new([Convert]::FromBase64String($compressed))
   $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Decompress)
   $reader = [IO.StreamReader]::new($gzip, [Text.Encoding]::UTF8)
   $source = $reader.ReadToEnd()
   $reader.Dispose()
+  Write-Phase 'compile-start'
   Add-Type -TypeDefinition $source -ErrorAction Stop
+  [ViviCommandJob]::Diagnostics = $diagnostics
+  Write-Phase 'compile-ready'
+  Write-Phase 'request-read-start'
   $line = [Console]::ReadLine()
+  Write-Phase 'request-read-done'
   if ($null -eq $line) { exit 0 }
   $request = ConvertFrom-Json -InputObject $line -ErrorAction Stop
   $environment = New-Object 'System.Collections.Generic.Dictionary[string,string]'
@@ -339,6 +388,8 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   validateInput(input)
   const env = helperEnvironment(runtime.hostEnv ?? input.env)
   if (!env.SystemRoot || !fullyQualified(env.SystemRoot)) throw new Error('Windows SystemRoot is unavailable')
+  // A package-owned diagnostic switch affects only the helper, never the target.
+  if (runtime.onPhase) env.VIVI_COMMAND_PHASES = '1'
   const executable = win32.join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const stdout = new PassThrough({ highWaterMark: 16_384 })
   const stderr = new PassThrough({ highWaterMark: 16_384 })
@@ -347,6 +398,13 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   const child = (runtime.spawn ?? nodeSpawn)(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encodedWrapper], {
     shell: false, windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'],
   })
+  // At most one callback per allowlisted phase: diagnostics remain bounded.
+  const observedPhases = new Set<WindowsCommandPhase>()
+  const reportPhase = (phase: WindowsCommandPhase): void => {
+    if (observedPhases.has(phase)) return
+    observedPhases.add(phase)
+    try { runtime.onPhase?.(phase) } catch { /* diagnostics cannot control execution */ }
+  }
   let result: WindowsCommandResult | undefined
   let pending = ''
   let wrapperDiagnostics = ''
@@ -359,6 +417,7 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   let stopTimer: ReturnType<typeof setTimeout> | undefined
   const closeControl = (): void => {
     if (settled) return
+    reportPhase('control-close-start')
     if (!child.stdin?.writableEnded) child.stdin?.end()
     if (settled || stopTimer !== undefined) return
     stopTimer = setTimeout(() => {
@@ -366,6 +425,7 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
       // A terminal frame verifies tree cleanup, but a wedged helper is still an
       // infrastructure failure rather than a successful command lifecycle.
       if (terminalReceived && result?.error === undefined) result = { exitCode: null, error: 'Windows command helper did not close after its terminal result' }
+      reportPhase('helper-force-close')
       child.kill('SIGKILL')
     }, runtime.cleanupTimeoutMs ?? 10_000)
     stopTimer.unref()
@@ -391,16 +451,22 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
       const value: unknown = JSON.parse(line)
       if (!value || typeof value !== 'object') throw new Error('frame')
       const record = value as Record<string, unknown>
+      if (record.type === 'phase') {
+        if (typeof record.phase !== 'string' || !allowedPhases.has(record.phase)) throw new Error('phase')
+        reportPhase(record.phase as WindowsCommandPhase)
+        return
+      }
       if (terminalReceived) throw new Error('frame after terminal result')
       if (record.type === 'stdout' || record.type === 'stderr' || record.type === 'error') {
         if (typeof record.data !== 'string' || record.data.length > protocolLineLimit || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(record.data)) throw new Error('data')
         const bytes = Buffer.from(record.data, 'base64')
         if (record.type === 'stdout' || record.type === 'stderr') {
           const output = record.type === 'stdout' ? stdout : stderr
-          if (!output.write(bytes)) { blocked = output; child.stdout?.pause() }
+          if (!output.write(bytes)) { blocked = output; reportPhase('protocol-paused'); child.stdout?.pause() }
         } else {
           result = { exitCode: null, error: bytes.toString('utf8') }
           terminalReceived = true
+          reportPhase('terminal-frame')
           closeControl()
         }
       } else if (record.type === 'exit') {
@@ -409,6 +475,7 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
         const exitCode = record.exitCode as number | null
         result = record.stopped ? { exitCode, signal: 'SIGTERM' } : { exitCode }
         terminalReceived = true
+        reportPhase('terminal-frame')
         // Release the helper's blocked Console.In control reader after its final
         // metadata. This is a shutdown handshake, not a command stop request.
         closeControl()
@@ -440,6 +507,7 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   for (const stream of [stdout, stderr]) stream.on('drain', () => {
     if (blocked !== stream) return
     blocked = undefined
+    reportPhase('protocol-resumed')
     processProtocol()
     if (!blocked) child.stdout?.resume()
   })
@@ -452,9 +520,10 @@ export async function launchWindowsCommand(input: WindowsCommandInput, runtime: 
   child.stderr?.on('data', (chunk: Buffer) => {
     wrapperDiagnostics = (wrapperDiagnostics + chunk.toString('utf8')).slice(0, 4096)
   })
+  child.stdin?.once('finish', () => { reportPhase('control-write-finished') })
   child.stdin?.on('error', () => { /* close/error produces the authoritative lifecycle result */ })
   child.on('error', (error: Error) => { result = { exitCode: null, error: error.message } })
-  child.on('close', () => { closed = true; finish() })
+  child.on('close', () => { reportPhase('helper-close'); closed = true; finish() })
   // No provider credentials or model-controlled text appear in helper argv/env.
   child.stdin?.write(JSON.stringify(input) + '\n', 'utf8')
   return { stdout, stderr, completed, async stop() { requestStop(); await completed } }

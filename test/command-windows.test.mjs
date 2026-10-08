@@ -264,3 +264,40 @@ test('protocol frames after a terminal result fail closed', async () => {
   assert.deepEqual(await command.completed, { exitCode: null, error: 'Invalid Windows command helper protocol' })
   assert.equal(out().length, 0)
 })
+
+test('optional diagnostic phases are fixed, deduplicated, and never become approved output', async () => {
+  const phases = []
+  const fake = fixture({ onPhase: phase => { phases.push(phase) } })
+  const command = await launchWindowsCommand(input, fake.runtime)
+  const out = collect(command.stdout), err = collect(command.stderr)
+  assert.deepEqual(fake.call().options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\temp', VIVI_COMMAND_PHASES: '1' })
+  assert.equal(JSON.parse(Buffer.concat(fake.writes).toString()).env.VIVI_COMMAND_PHASES, undefined)
+  fake.child.stdout.write(frame({ type: 'phase', phase: 'helper-start' }).repeat(50) + frame({ type: 'phase', phase: 'job-empty' }))
+  fake.child.stdout.write(frame({ type: 'exit', exitCode: 0, stopped: false }))
+  fake.child.emit('close', 0, null)
+  assert.deepEqual(await command.completed, { exitCode: 0 })
+  assert.equal(phases.filter(phase => phase === 'helper-start').length, 1)
+  assert.ok(phases.includes('job-empty'))
+  assert.ok(phases.includes('terminal-frame'))
+  assert.ok(phases.includes('helper-close'))
+  assert.equal(out().length, 0)
+  assert.equal(err().length, 0)
+})
+
+test('diagnostic callbacks cannot change command execution or completion', async () => {
+  const fake = fixture({ onPhase() { throw new Error('diagnostic callback failure') } })
+  const command = await launchWindowsCommand(input, fake.runtime)
+  fake.child.stdout.write(frame({ type: 'phase', phase: 'root-exit' }) + frame({ type: 'exit', exitCode: 0, stopped: false }))
+  fake.child.emit('close', 0, null)
+  assert.deepEqual(await command.completed, { exitCode: 0 })
+})
+
+test('unrecognized diagnostic phase text is rejected rather than surfaced to logs', async () => {
+  const phases = []
+  const fake = fixture({ onPhase: phase => { phases.push(phase) } })
+  const command = await launchWindowsCommand(input, fake.runtime)
+  fake.child.stdout.write(frame({ type: 'phase', phase: 'unapproved private command data' }))
+  fake.child.emit('close', 0, null)
+  assert.deepEqual(await command.completed, { exitCode: null, error: 'Invalid Windows command helper protocol' })
+  assert.ok(!phases.includes('unapproved private command data'))
+})

@@ -13,7 +13,6 @@ import { ReadOnlyWorkspace } from '../dist/workspace.js'
 
 async function fixture(t, input = {}) {
   const root = await mkdtemp(join(tmpdir(), 'vivi-command-host-'))
-  t.after(() => rm(root, { recursive: true, force: true }))
   const commandWorkspace = await TrustedCommandWorkspace.open(root, process.env)
   const approvals = [], state = { available: true, account: 'fixture-account', judges: 0, rounds: 0 }
   const options = { session: newSession({ provider: 'openai', model: 'fixture' }), store: { async save() {} }, commandWorkspace,
@@ -27,7 +26,8 @@ async function fixture(t, input = {}) {
       if (input.generate) return input.generate({ tools, messages, state })
       return { content: 'Fixture done', toolCalls: [] }
     } }, ...input.options }
-  const host = new CliHost(options); t.after(() => host.shutdown())
+  const host = new CliHost(options)
+  t.after(async () => { await host.shutdown(); await rm(root, { recursive: true, force: true }) })
   return { root, host, options, commandWorkspace, state, approvals }
 }
 test('host command capability stays absent until separately enrolled and cannot be enabled by a model tool', async t => {
