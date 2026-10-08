@@ -124,6 +124,8 @@ public static class ViviMcpJob {
   [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool WriteFile(SafeFileHandle handle, byte[] bytes, uint count, out uint written, IntPtr overlapped);
 
   static void Check(bool ok, string operation) {
     if (!ok) throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
@@ -181,8 +183,17 @@ public static class ViviMcpJob {
   static Thread InputPump(IntPtr writer) {
     Thread thread = new Thread(delegate() {
       try {
-        using (FileStream stream = new FileStream(new SafeFileHandle(writer, true), FileAccess.Write, 4096, false)) {
-          foreach (byte[] bytes in inputQueue.GetConsumingEnumerable()) { stream.Write(bytes, 0, bytes.Length); stream.Flush(); }
+        using (SafeFileHandle handle = new SafeFileHandle(writer, true)) {
+          foreach (byte[] bytes in inputQueue.GetConsumingEnumerable()) {
+            if (bytes.Length == 0) continue;
+            uint written;
+            if (!WriteFile(handle, bytes, (uint)bytes.Length, out written, IntPtr.Zero)) {
+              int code = Marshal.GetLastWin32Error();
+              throw new Win32Exception(code, "MCP stdin WriteFile failed (Win32 " +
+                code.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")");
+            }
+            if (written != (uint)bytes.Length) throw new IOException("MCP stdin WriteFile was incomplete");
+          }
         }
       } catch (Exception error) {
         lock (outputLock) { if (!cancelled && pumpError == null) pumpError = error; }

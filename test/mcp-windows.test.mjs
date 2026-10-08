@@ -299,11 +299,19 @@ test('a late control-pipe error preserves already verified terminal metadata', a
   await assert.rejects(owned.write(Buffer.from('late')), /unavailable/)
 })
 
-test('native input-pump failure terminates the owned job before final cleanup', async () => {
+test('native input-pump checks synchronous pipe writes and terminates the owned job on failure', async () => {
   const fake = fixture(), owned = await launchWindowsMcp(input, fake.runtime)
   const script = Buffer.from(fake.call().args.at(-1), 'base64').toString('utf16le')
   const native = gunzipSync(Buffer.from(script.match(/\$compressed = '([^']+)'/)[1], 'base64')).toString('utf8')
   const pump = native.slice(native.indexOf('static Thread InputPump'), native.indexOf('static void WaitForEmptyJob'))
+  assert.match(native, /\[DllImport\("kernel32\.dll", SetLastError=true\)\]\s+static extern bool WriteFile\(SafeFileHandle handle, byte\[\] bytes, uint count, out uint written, IntPtr overlapped\)/)
+  assert.match(pump, /using \(SafeFileHandle handle = new SafeFileHandle\(writer, true\)\)/)
+  assert.match(pump, /if \(bytes\.Length == 0\) continue/)
+  assert.match(pump, /if \(!WriteFile\(handle, bytes, \(uint\)bytes\.Length, out written, IntPtr\.Zero\)\)/)
+  assert.match(pump, /int code = Marshal\.GetLastWin32Error\(\)/)
+  assert.match(pump, /throw new Win32Exception\(code, "MCP stdin WriteFile failed \(Win32 "/)
+  assert.match(pump, /if \(written != \(uint\)bytes\.Length\) throw new IOException/)
+  assert.doesNotMatch(pump, /FileStream|\.Flush\(/)
   assert.match(pump, /catch \(Exception error\)/)
   assert.match(pump, /inputQueue\.CompleteAdding\(\)/)
   assert.match(pump, /TerminateJobObject\(activeJob, 1\)/)

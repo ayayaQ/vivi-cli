@@ -218,6 +218,7 @@ nativeTest('closed target stdin reports failure and cleans up without a manual s
   const result = await bounded(owned.completed, 'closed stdin cleanup')
   assert.equal(result.exitCode, null)
   assert.ok(result.error)
+  t.diagnostic(JSON.stringify({ event: 'owned-closed-input', error: result.error.slice(0, 256) }))
   await subject.assertDead()
 })
 
@@ -261,13 +262,14 @@ for (const protocol of ['legacy', '2026-07-28']) nativeTest(`initialize, lists, 
 })
 
 nativeTest('natural root exit kills detached descendants before verified completion', async t => {
-  const subject = await sandbox(t), { owned, stdout } = await subject.launch('native-detached-exit')
+  const subject = await sandbox(t), { owned, stdout, stderr } = await subject.launch('native-detached-exit')
   const requests = [
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'Owned fixture', version: '1' } } },
     { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
   ]
   await bounded(owned.write(Buffer.from(requests.map(message => JSON.stringify(message) + '\n').join(''))), 'natural-exit discovery input')
-  assert.deepEqual(await bounded(owned.completed, 'natural root exit'), { exitCode: 0 })
+  assert.deepEqual(await bounded(owned.completed, 'natural root exit'), { exitCode: 0 },
+    stderr().subarray(0, 4096).toString('utf8'))
   const pids = await subject.pids()
   assert.equal(pids.length, 2)
   assert.ok(pids.every(dead), 'verified completion left an owned root or detached descendant alive')
