@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtemp, mkdir, rename, rm, writeFile, chmod } from 'node:fs/promises'
-import { join, basename, win32 } from 'node:path'
+import { join, basename } from 'node:path'
 import { tmpdir } from 'node:os'
 import { TrustedCommandWorkspace, captureCommandEnvironment, commandEnvironment, COMMAND_LIMITS, COMMAND_DISCLOSURE } from '../dist/commands.js'
 import { routePreparedAction } from '@ayayaq/vivi/decisions'
@@ -39,24 +39,24 @@ test('command environment is a fixed allowlist and never forwards provider keys,
   assert.throws(() => commandEnvironment({ PATH: '/fixture/key-value' }, ['key-value']), /known credential/)
   assert.match(COMMAND_DISCLOSURE, /unsandboxed/); assert.match(COMMAND_DISCLOSURE, /credential files/)
 })
-test('Windows target module path is derived only from captured SystemRoot and validated before freezing', () => {
+test('command launch snapshot is frozen and never reads excluded host values', () => {
   const host = { SystemRoot: 'C:\\Windows', PATH: 'C:\\fixed-bin' }
-  Object.defineProperty(host, 'PSModulePath', { enumerable: true, get() { throw new Error('Inherited module paths must never be read') } })
+  for (const name of ['PSModulePath', 'OPENAI_API_KEY', 'USERPROFILE', 'NODE_OPTIONS']) {
+    Object.defineProperty(host, name, { enumerable: true, get() { throw new Error('Excluded value must not be read') } })
+  }
   const captured = captureCommandEnvironment(host)
-  assert.equal(captured.PSModulePath, undefined); assert(Object.isFrozen(captured))
+  assert(Object.isFrozen(captured))
   host.SystemRoot = 'C:\\changed-live-host'
   const environment = commandEnvironment(captured, [], 'win32')
-  assert.deepEqual({ ...environment }, { SystemRoot: 'C:\\Windows', PATH: 'C:\\fixed-bin', PSModulePath: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules' })
+  assert.deepEqual({ ...environment }, { SystemRoot: 'C:\\Windows', PATH: 'C:\\fixed-bin' })
   assert(Object.isFrozen(environment))
-  assert.throws(() => { environment.PSModulePath = 'C:\\project-modules' }, TypeError)
-  assert.equal(commandEnvironment({ sYsTeMrOoT: 'D:\\Windows', PSModulePath: 'C:\\user-modules' }, [], 'win32').PSModulePath, 'D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules')
-  for (const root of [undefined, '', 'Windows', '\\Windows', 'C:Windows', '\\\\server\\share', '\\\\?\\C:\\Windows', 'C:\\Windows;C:\\user']) assert.throws(() => commandEnvironment(root === undefined ? { PSModulePath: 'C:\\user' } : { SystemRoot: root, PSModulePath: 'C:\\user' }, [], 'win32'), /captured local absolute SystemRoot/)
+  assert.throws(() => { environment.PATH = 'changed' }, TypeError)
+  assert.deepEqual({ ...commandEnvironment({ sYsTeMrOoT: 'D:\\Windows', PSModulePath: 'C:\\user-modules' }, [], 'win32') }, { SystemRoot: 'D:\\Windows' })
+  for (const root of [undefined, '', 'Windows', '\\Windows', 'C:Windows', '\\\\server\\share', '\\\\?\\C:\\Windows', 'C:\\Windows;C:\\user']) assert.throws(() => commandEnvironment(root === undefined ? {} : { SystemRoot: root }, [], 'win32'), /captured local absolute SystemRoot/)
   assert.throws(() => commandEnvironment({ SystemRoot: 'C:\\bad\0root' }, [], 'win32'), /invalid value/)
-  assert.throws(() => commandEnvironment({ SystemRoot: 'C:\\' + 'x'.repeat(32 * 1024 - 3) }, [], 'win32'), /invalid value/)
-  assert.throws(() => commandEnvironment({ SystemRoot: 'C:\\Windows' }, ['WindowsPowerShell'], 'win32'), /known credential/)
+  assert.throws(() => commandEnvironment({ SystemRoot: 'C:\\' + 'x'.repeat(32 * 1024) }, [], 'win32'), /invalid value/)
+  assert.throws(() => commandEnvironment({ SystemRoot: 'C:\\Windows' }, ['Windows'], 'win32'), /known credential/)
   assert.deepEqual({ ...commandEnvironment({ PSModulePath: 'C:\\user' }, [], 'linux') }, {})
-  // Capturing invalid command-only setup is inert; validation is deferred.
-  assert.deepEqual({ ...captureCommandEnvironment({ SystemRoot: 'relative', PSModulePath: 'C:\\user' }) }, { SystemRoot: 'relative' })
 })
 test('commands are off by default, and unavailable approval surfaces cannot enable them', async t => {
   const subject = await fixture(t, { available: false })
@@ -86,11 +86,6 @@ test('every new command is human-reviewed with resolved executable, argv, cwd, e
   assert.equal(routePreparedAction({ sessionId: 'fixture', runId: 'fixture', toolCall: call(),
     userRequest: { id: 'fixture', text: 'fixture', approvedScope: {} }, policyRevision: 'fixture',
     resourceRevisions: { [metadata.effects[0].resourceId]: 'fixture' }, inputData: {}, preparedAction: metadata }).route, 'manual')
-  if (process.platform === 'win32') {
-    const path = commandEnvironment(captureCommandEnvironment(process.env)).PSModulePath
-    assert(prepared.environmentNames.includes('PSModulePath'))
-    assert.deepEqual(metadata.effects[0].affectedData.windowsModulePolicy, { source: 'fixed-SystemRoot-system-directory', PSModulePath: path })
-  }
   for (const id of ['one', 'two']) {
     const result = await terminal(subject, await subject.workspace.start(call({}, id), subject.context, subject.signal))
     assert.equal(result.state, 'exited'); assert.equal(result.exitCode, 0); assert.match(result.output, /fixture-output/)
@@ -100,27 +95,23 @@ test('every new command is human-reviewed with resolved executable, argv, cwd, e
   const approval = subject.state.approvals[1]
   for (const label of ['Executable:', 'Arguments:', 'Working directory:', 'Environment names:', 'Hard timeout:', 'shell:false']) assert(approval.description.includes(label))
   assert(approval.description.includes(JSON.stringify(subject.workspace.directory))); assert(approval.description.includes('fixture-output'))
-  if (process.platform === 'win32') assert(approval.description.includes(`Windows initial module policy: PSModulePath=${JSON.stringify(commandEnvironment(captureCommandEnvironment(process.env)).PSModulePath)}`))
 })
-test('Windows derived environment is bound before approval and cannot drift with the live host', { skip: process.platform !== 'win32' }, async t => {
+test('captured target environment binds preparation and cannot drift with the live host', async t => {
   const subject = await fixture(t)
-  const source = { ...captureCommandEnvironment(process.env) }
+  const source = { ...captureCommandEnvironment(process.env), LANG: 'fixed-fixture' }
   const workspace = await TrustedCommandWorkspace.open(subject.root, source)
   t.after(() => workspace.shutdown())
-  const captured = commandEnvironment(source), expected = captured.PSModulePath
-  const rootKey = Object.keys(source).find(key => key.toLowerCase() === 'systemroot')
   const before = await workspace.prepare(call().arguments)
-  source[rootKey] = 'C:\\changed-host'; source.PSModulePath = 'C:\\project-modules'
+  source.LANG = 'changed-live-host'
+  source.PSModulePath = 'private-user-modules'
   const after = await workspace.prepare(call().arguments)
   assert.equal(before.digest, after.digest)
-  assert.equal(after.preparedAction.effects[0].affectedData.windowsModulePolicy.PSModulePath, expected)
+  assert(!after.environmentNames.includes('PSModulePath'))
   assert.equal(await workspace.enable(subject.context, subject.signal), true)
-  subject.context.approve = async request => {
-    assert(request.description.includes(JSON.stringify(expected)))
-    request.description = request.description.replace(JSON.stringify(expected), JSON.stringify(win32.join('C:\\changed-host', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')))
-    return true
-  }
-  await assert.rejects(workspace.start(call(), subject.context, subject.signal), /changed/)
+  const result = await terminal({ ...subject, workspace }, await workspace.start(call({ args: ['-e', 'console.log(process.env.LANG)'] }), subject.context, subject.signal))
+  assert.equal(result.state, 'exited')
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.output.trim(), 'fixed-fixture')
 })
 test('denial cannot launch, duplicate proposals cannot launch, and IDs are scoped to the current run', async t => {
   const subject = await fixture(t); await enable(subject); subject.state.approved = false

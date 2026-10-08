@@ -276,6 +276,9 @@ outside that guarantee. Windows needs Windows 10+/Server 2016+ and built-in
 PowerShell FullLanguage; unsupported or locked-down native setup fails before execution.
 Windows argv uses standard C-runtime/managed parsing. `cmd.exe`, `command.com`,
 and `.bat`/`.cmd` files are unsupported; explicit PowerShell is supported.
+Windows PowerShell 5.1 may take tens of seconds preparing built-in modules on first
+use and emit progress on stderr. That output is preserved; request an explicit
+`timeoutMs` when needed (30 seconds by default, maximum 5 minutes).
 
 ## Persistent memory
 

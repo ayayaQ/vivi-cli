@@ -28,8 +28,7 @@ export function captureCommandEnvironment(source: NodeJS.ProcessEnv): Readonly<N
   return Object.freeze(Object.fromEntries(Object.keys(source).filter(key => environmentNames.some(name =>
     process.platform === 'win32' ? key.toLowerCase() === name.toLowerCase() : key === name)).map(key => [key, source[key]])))
 }
-/** Command-only validation: Windows needs a captured local absolute SystemRoot.
- * No inherited module path or fallback is used. Platform injection is for tests. */
+/** Captured host allowlist, not a blanket process.env spread or model-editable environment. */
 export function commandEnvironment(source: NodeJS.ProcessEnv, secrets: readonly string[] = [], platform: NodeJS.Platform = process.platform): Readonly<Record<string, string>> {
   const result: Record<string, string> = Object.create(null) as Record<string, string>
   const set = (name: string, value: string): void => {
@@ -50,7 +49,6 @@ export function commandEnvironment(source: NodeJS.ProcessEnv, secrets: readonly 
     if (!root || !win32.isAbsolute(root) || !/^[a-z]:[\\/]/i.test(root) || root.includes(';')) {
       throw new Error('Windows command environment requires a captured local absolute SystemRoot')
     }
-    set('PSModulePath', win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'))
   }
   return Object.freeze(result)
 }
@@ -201,7 +199,6 @@ export class TrustedCommandWorkspace {
     const preparedAction: PreparedActionMetadata = { complete: false, effects: [{ kind: 'unknown',
       resourceId: `cli-command-workspace:${this.revision}`, scope: 'unknown', review: 'manual',
       affectedData: { executable, args, cwd, timeoutMs: values.timeoutMs, environmentNames: values.environmentNames,
-        ...(this.environment.PSModulePath === undefined ? {} : { windowsModulePolicy: { source: 'fixed-SystemRoot-system-directory', PSModulePath: this.environment.PSModulePath } }),
         unsandboxed: true } }] }
     const command = Object.freeze({ ...values, args: Object.freeze(args), environmentNames: Object.freeze(values.environmentNames),
       digest: reviewDigest({ ...values, environment: this.environment, workspace: this.trustBinding }), preparedAction })
@@ -227,7 +224,7 @@ export class TrustedCommandWorkspace {
     this.starts.add(`${executionOwner}:${call.id}`)
     const command = await this.prepare(structuredClone(call.arguments)), account = context.accountRevision, binding = this.trustBinding
     const approval: ApprovalRequest = { call: structuredClone(call), currentRevision: command.digest,
-      description: `Start trusted command (shell:false).\nExecutable: ${displayJSON(command.executable)}\nArguments: ${displayJSON(command.args)}\nWorking directory: ${displayJSON(command.cwd)}\nEnvironment names: ${command.environmentNames.join(', ') || '(empty)'}\n${this.environment.PSModulePath === undefined ? '' : `Windows initial module policy: PSModulePath=${displayJSON(this.environment.PSModulePath)} (fixed SystemRoot system directory; no inherited user/project module paths).\n`}Hard timeout: ${command.timeoutMs} ms; initial output wait: ${command.yieldMs} ms\n${COMMAND_DISCLOSURE}` }
+      description: `Start trusted command (shell:false).\nExecutable: ${displayJSON(command.executable)}\nArguments: ${displayJSON(command.args)}\nWorking directory: ${displayJSON(command.cwd)}\nEnvironment names: ${command.environmentNames.join(', ') || '(empty)'}\nHard timeout: ${command.timeoutMs} ms; initial output wait: ${command.yieldMs} ms\n${COMMAND_DISCLOSURE}` }
     check(approval.description.length <= 48 * 1024, 'Command approval display exceeds its limit; use a smaller argv array')
     const approvalDigest = reviewDigest(approval), preparedDigest = reviewDigest(command)
     const assertCurrent = (): void => {

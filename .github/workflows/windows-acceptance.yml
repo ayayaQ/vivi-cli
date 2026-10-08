@@ -11,48 +11,6 @@ env:
   npm_config_engine_strict: 'true'
 
 jobs:
-  utility_observations:
-    # Diagnostic-only trusted built-in module comparison. Product assertions remain unchanged.
-    runs-on: windows-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '26.4.0'
-      # Empty fixed type and constant JSON only; no command Job Run or policy changes.
-      - run: node --test --test-concurrency=1 test/windows-helper-utility-diagnostic.test.mjs
-
-  helper_discovery:
-    # Build-proof artifacts only. Discovery hashes are not approved package/runtime inputs.
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '26.4.0'
-      # Installed official SDK components only; no restore, installer, or runtime execution.
-      - run: node scripts/build-windows-command-helper.mjs --artifact-dir $env:VIVI_HELPER_PROOF_DIR --source-revision $env:VIVI_HELPER_SOURCE_REVISION
-        env:
-          VIVI_HELPER_PROOF_DIR: ${{ runner.temp }}/windows-command-helper-discovery
-          VIVI_HELPER_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
-      # Explicit nonsecret success allowlist; failed/quarantined work is never uploaded.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-command-helper-discovery-only
-          path: |
-            ${{ runner.temp }}/windows-command-helper-discovery/ViviCommandJob.dll
-            ${{ runner.temp }}/windows-command-helper-discovery/ViviCommandJob.cs
-            ${{ runner.temp }}/windows-command-helper-discovery/ViviCommandJob.AssemblyInfo.cs
-            ${{ runner.temp }}/windows-command-helper-discovery/windows-command-helper.spec.json
-            ${{ runner.temp }}/windows-command-helper-discovery/discovery-proof.json
-          if-no-files-found: error
-
   candidate:
     # Produce one private npm archive. Both Windows runtimes consume these exact bytes.
     runs-on: ubuntu-latest
@@ -106,11 +64,6 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       - run: npm ci --ignore-scripts
       - run: npm run build
-      # Diagnostic-only explicit Windows runtime/profile comparison; product gates stay unchanged.
-      - run: node --test --test-concurrency=1 test/windows-powershell-environment-diagnostic.test.mjs
-      # Diagnostic-only compiler timing: serialize these owned fixtures separately from product gates.
-      # Observations are bounded/censored and do not replace the lifecycle product gates below.
-      - run: node --test --test-concurrency=1 test/command-windows-compile.test.mjs
       # Harmless owned process fixtures plus mocks. No native UI, live keys or providers.
       - run: node --test test/commands.test.mjs test/commands-host.test.mjs test/command-process.test.mjs test/command-windows.test.mjs test/command-windows-real.test.mjs
       # Fake runners only: no native credential store, live keys, model calls or TTY automation.

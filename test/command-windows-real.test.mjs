@@ -3,11 +3,11 @@ import assert from 'node:assert/strict'
 import { lstat, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join, resolve, win32 } from 'node:path'
+import { join, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { test } from 'node:test'
 import { launchWindowsCommand } from '../dist/command-windows.js'
-import { captureCommandEnvironment, commandEnvironment } from '../dist/commands.js'
+import { TrustedCommandWorkspace, COMMAND_LIMITS, captureCommandEnvironment, commandEnvironment } from '../dist/commands.js'
 
 const fixture = resolve('test/fixtures/windows-command-process.mjs')
 const options = { skip: process.platform !== 'win32', timeout: 20_000 }
@@ -46,8 +46,8 @@ test('realistic host snapshot forwards only explicit supported names and its tar
   const expectedNames = Object.keys(host).sort()
   Object.assign(host, { PSModulePath: 'hostile', OPENAI_API_KEY: 'private', ANTHROPIC_API_KEY: 'private', USERPROFILE: 'private', NODE_OPTIONS: 'private' })
   const snapshot = commandEnvironment(captureCommandEnvironment(host))
-  assert.deepEqual(Object.keys(snapshot).sort(), [...expectedNames, ...(process.platform === 'win32' ? ['PSModulePath'] : [])].sort())
-  assert.equal(snapshot.PSModulePath, process.platform === 'win32' ? win32.join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules') : undefined)
+  assert.deepEqual(Object.keys(snapshot).sort(), expectedNames)
+  assert.equal(snapshot.PSModulePath, undefined)
   assert.equal(snapshot.OPENAI_API_KEY, undefined)
   assert.equal(snapshot.NODE_OPTIONS, undefined)
   assert.ok(hostProbeSource.includes('Object.keys(process.env)'))
@@ -84,16 +84,82 @@ test('Windows explicit PowerShell -EncodedCommand runs only the supplied fixed s
   assert.equal((await out).toString('utf8').trim(), 'fixed-powershell-fixture')
   assert.equal((await err).length, 0)
 })
-test('ordinary unqualified PowerShell cmdlet runs under the actual host-generated target environment', options, async t => {
-  const targetEnv = commandEnvironment(captureCommandEnvironment(process.env))
+// Windows PowerShell 5.1 can serialize first-use module progress to stderr,
+// including on a direct launch. Accept only that complete fixed record grammar;
+// error/warning streams, arbitrary XML/text and extra output remain failures.
+const progressNumber = '-?[0-9]{1,10}'
+const progressType = '(?:<TN RefId="[0-9]{1,10}"><T>System\\.Management\\.Automation\\.PSCustomObject</T><T>System\\.Object</T></TN>|<TNRef RefId="[0-9]{1,10}" ?/>)'
+const progressRecord = '<Obj S="progress" RefId="[0-9]{1,10}">' + progressType +
+  '<MS><I64 N="SourceId">[0-9]{1,10}</I64><PR N="Record"><AV>Preparing modules for first use\\.</AV>' +
+  '<AI>' + progressNumber + '</AI><Nil ?/><PI>' + progressNumber + '</PI><PC>' + progressNumber + '</PC>' +
+  '<T>Completed</T><SR>' + progressNumber + '</SR><SD> *</SD></PR></MS></Obj>'
+const progressEnvelope = new RegExp('^(?:#< CLIXML\\r?\\n<Objs Version="1\\.1\\.0\\.1" xmlns="http://schemas\\.microsoft\\.com/powershell/2004/04">(?:' + progressRecord + '){1,16}</Objs>\\r?\\n?){1,16}$')
+function ordinaryPowerShellOutput(output) {
+  const expected = 'ordinary-powershell-fixture\r\n'
+  if (Buffer.byteLength(output) > 16_384 || output.split(expected).length !== 2) return false
+  const remainder = output.replace(expected, '')
+  return remainder === '' || ((remainder.match(/<Obj /g)?.length ?? 0) <= 16 && progressEnvelope.test(remainder))
+}
+test('ordinary PowerShell output accepts only the exact stdout and completed first-use progress', () => {
+  const record = '<Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj>'
+  const expected = 'ordinary-powershell-fixture\r\n'
+  const envelope = '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">' + record + '</Objs>'
+  assert(ordinaryPowerShellOutput(expected))
+  assert(ordinaryPowerShellOutput(envelope + expected))
+  assert(ordinaryPowerShellOutput(expected + envelope))
+  assert(ordinaryPowerShellOutput(expected + envelope.replace(record, record + record.replace('RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN>', 'RefId="1"><TNRef RefId="0" />'))))
+  for (const output of [envelope, expected.repeat(2), 'other' + expected, expected + 'other', expected + envelope.repeat(17),
+    expected + envelope.replace('S="progress"', 'S="error"'), expected + envelope.replace('S="progress"', 'S="warning"'),
+    expected + envelope.replace('S="progress"', 'S="unknown"'), expected + envelope.replace('<T>Completed</T>', ''), expected + envelope.replace('<AI>0</AI>', ''),
+    expected + envelope.replace('<Nil />', ''), expected + envelope.replace('<PI>-1</PI>', ''), expected + envelope.replace('<SD> </SD>', ''),
+    expected + envelope.replace('Preparing modules for first use.', 'Different activity'), expected + envelope.replace('<SR>-1</SR>', '<Unknown />'),
+    expected + envelope.replace('<SD> </SD>', '<SD>&amp;</SD>'), expected + '<!DOCTYPE Objs>' + envelope,
+    expected + envelope.replace('</Objs>', '<S S="Error">unexpected</S></Objs>'), expected + 'x'.repeat(16_384)]) {
+    assert.equal(ordinaryPowerShellOutput(output), false)
+  }
+})
+test('ordinary unqualified PowerShell completes an explicitly approved bounded workspace request', { ...options, timeout: 80_000 }, async t => {
+  // The direct-host baseline took 27s on the same Windows CI image. This
+  // representative request chooses 50s within the existing public maximum;
+  // the 30s product default and all short-timeout/lifecycle gates stay fixed.
+  const timeoutMs = 50_000
+  assert.equal(COMMAND_LIMITS.defaultTimeoutMs, 30_000)
+  assert.ok(timeoutMs <= COMMAND_LIMITS.maximumTimeoutMs)
+  const workspace = await TrustedCommandWorkspace.open(process.cwd(), captureCommandEnvironment(process.env))
+  t.after(() => workspace.shutdown())
   const encoded = Buffer.from("Write-Output 'ordinary-powershell-fixture'", 'utf16le').toString('base64')
-  const command = await launchWindowsCommand({ executable: powershell,
-    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], cwd: process.cwd(), env: targetEnv }, diagnostics(t, 'ordinary-PowerShell-host-environment'))
-  t.after(() => command.stop())
-  const out = collect(command.stdout), err = collect(command.stderr)
-  assert.deepEqual(await command.completed, { exitCode: 0 })
-  assert.equal((await out).toString('utf8').trim(), 'ordinary-powershell-fixture')
-  assert.equal((await err).length, 0)
+  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
+  const approvals = []
+  const context = { launchId: 'native-fixture-launch', sessionId: 'native-fixture-session', runId: 'native-fixture-run', accountRevision: 'native-fixture-account',
+    canApprove: () => true, isCurrent: () => true, async approve(request) {
+      approvals.push(request)
+      if (request.call.name === 'command_start') {
+        assert.deepEqual(request.call.arguments.args, args)
+        assert.equal(request.call.arguments.timeoutMs, timeoutMs)
+        assert.ok(request.description.includes('Hard timeout: 50000 ms'))
+        assert.ok(request.description.includes('unsandboxed'))
+      }
+      return true
+    } }
+  const signal = new AbortController().signal
+  assert.equal(await workspace.enable(context, signal), true)
+  const owner = 'native-fixture-launch:native-fixture-session:native-fixture-run'
+  let result = JSON.parse((await workspace.start({ id: 'native-ordinary-start', name: 'command_start',
+    arguments: { executable: powershell, args, timeoutMs, yieldMs: 0 } }, context, signal)).content)
+  let output = result.output
+  while (result.state === 'running') {
+    result = JSON.parse((await workspace.poll(result.executionId, owner, 2000)).content)
+    output += result.output
+  }
+  assert.equal(approvals.length, 2)
+  assert.equal(result.state, 'exited')
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.truncated, false)
+  if (!ordinaryPowerShellOutput(output)) {
+    const known = new Set(['Objs', 'Obj', 'TN', 'TNRef', 'T', 'MS', 'I64', 'PR', 'AV', 'AI', 'Nil', 'PI', 'PC', 'SR', 'SD'])
+    t.diagnostic('first-use-progress-tag-shape:' + [...output.matchAll(/<([a-z0-9]+)\b/gi)].slice(0, 80).map(match => known.has(match[1]) ? match[1] : 'unknown').join(','))
+  }
+  assert.ok(ordinaryPowerShellOutput(output), 'Expected exact stdout and only completed first-use module progress')
 })
 for (const mode of ['ordinary', 'argv']) test(`installed PowerShell7 ${mode} compatibility under the actual generated environment`, options, async t => {
   const info = await lstat(powershell7)
@@ -195,7 +261,7 @@ test('Windows phase diagnostic verifies stop with the supported captured host en
   const [namesLine, readyLine, trailing] = lines
   const names = JSON.parse(namesLine)
   assert.deepEqual(names, Object.keys(setup).map(name => name.toUpperCase()).sort())
-  assert.ok(names.includes('PSMODULEPATH') && !names.includes('VIVI_COMMAND_PHASES') && !names.some(name => name.endsWith('_API_KEY')))
+  assert.ok(!names.includes('PSMODULEPATH') && !names.includes('VIVI_COMMAND_PHASES') && !names.some(name => name.endsWith('_API_KEY')))
   assert.equal(readyLine, 'native-phase-fixture-ready')
   assert.equal(trailing, '')
   assert.equal((await err).length, 0)
