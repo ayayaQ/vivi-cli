@@ -64,6 +64,9 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       - run: npm ci --ignore-scripts
       - run: npm run build
+      # Diagnostic-only compiler timing: serialize owned fixtures before any native launches.
+      # Observations are bounded/censored and do not replace the lifecycle product gates below.
+      - run: node --test --test-concurrency=1 test/command-windows-compile.test.mjs
       # Harmless owned process fixtures plus mocks. No native UI, live keys or providers.
       - run: node --test test/commands.test.mjs test/commands-host.test.mjs test/command-process.test.mjs test/command-windows.test.mjs test/command-windows-real.test.mjs
       # Fake runners only: no native credential store, live keys, model calls or TTY automation.
