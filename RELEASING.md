@@ -82,7 +82,7 @@ provider construction; there is no fallback to the install or profile directory.
 Library `CliHost` construction remains explicit-only and gets no ambient cwd access.
 The shared core
 does not load extensions or own filesystem policy. The CLI reserves `workspace_list`,
-`workspace_read` and `workspace_search` even when disabled, and advertises/executed
+`workspace_read`, `workspace_search` and `workspace_glob` even when disabled, and advertises/executed
 tools share a fixed registry. Tool support gating remains unchanged: selecting a
 folder alone does not declare unknown model support. Chat-only turns neither expose
 workspace tools nor add their guidance. Folder roots are not in preferences or
@@ -120,9 +120,24 @@ results, and host checks reject known credentials before each provider request,
 including decoded workspace results from resumed history. This does not detect all
 unknown credentials or other sensitive data.
 
+`workspace_glob` uses exact MIT registry dependency `picomatch@4.0.7` only for
+matching names after the existing read-policy checks. It matches files, not
+directories or contents, so binary and oversized file names can match without
+granting text-read access. Patterns are relative to the optional `path`; results
+are workspace-relative. Matching is case-sensitive and forward-slash-only on
+every OS, including dotfiles permitted by the read policy. Patterns are bounded
+to 200 characters; `*` stays inside one component, `?` matches one UTF-16 code unit,
+and standalone `**` spans zero or more components. Escapes, double quotes, negation,
+brackets, braces, extglobs and regex are refused. Glob defaults are depth 8 and 50 results.
+One worker per operation runs fixed matcher code with the compiled expression
+and one permitted name at a time. The operation deadline or cancellation terminates
+the worker and discards partial results; every completion/failure closes it. This
+is a responsiveness bound, not a filesystem sandbox. The dependency's MIT license
+remains in its registry installation and local standalone notices.
+
 Hard limits: 8 traversal levels per operation, 1,000 examined directory entries,
-200 search files, 256 KiB per file, 2 MiB searched bytes, 8 KiB read output, 56 KiB
-serialized result output, 100 list entries, 50 matched search lines, 200 requested
+200 search/glob files, 256 KiB per text file, 2 MiB searched bytes, 8 KiB read output, 56 KiB
+serialized result output, 100 list/glob entries, 50 matched search lines, 200 requested
 read lines and 10 seconds. Budgets are checked between bounded filesystem calls;
 cancellation cannot interrupt an OS filesystem call already in progress, but its
 late result is discarded and handles are closed. There are no writes or replays.
