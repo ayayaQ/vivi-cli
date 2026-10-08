@@ -154,7 +154,8 @@ before/after content to the currently selected existing account: OpenAI
 that account’s existing key, with no copied credential store, account discovery,
 cross-provider fallback or live model selection. The fresh in-app confirmation
 asks for consent to share this bounded request/proposal text with those named
-recipients for decision review. It may contain personal or sensitive information
+recipients for decision review, including eligible agent proposals you did not
+request, to assess whether you authorized the exact change. It may contain personal or sensitive information
 about you or others. Known credentials are excluded; content recognized as
 sensitive stays Manual and is not sent to the decision provider. This lexical
 filter cannot reliably identify every private detail. Keep Manual if you do not

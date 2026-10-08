@@ -95,6 +95,7 @@ interface PendingInput {
   kind: InputKind
   armed: boolean
   openedFrame: number
+  approvalLabels?: { deny: string; allow: string }
   finish(value: string | number | undefined, aborted?: boolean): void
 }
 interface DisplayEntry { label: string; content: string; markdown: boolean }
@@ -507,8 +508,9 @@ export class OpenTuiIO implements ChatIO {
       this.dialogActions!.add(this.mouseButton(id, label, activate))
     }
     if (pending.kind === 'approval') {
-      add('vivi-deny', this.approvalIndex === 0 ? '› Deny' : '  Deny', () => pending.finish('deny'))
-      add('vivi-approve', this.approvalIndex === 1 ? '› Approve' : '  Approve', () => {
+      const labels = pending.approvalLabels ?? { deny: 'Deny', allow: 'Approve' }
+      add('vivi-deny', `${this.approvalIndex === 0 ? '›' : ' '} ${labels.deny}`, () => pending.finish('deny'))
+      add('vivi-approve', `${this.approvalIndex === 1 ? '›' : ' '} ${labels.allow}`, () => {
         // Mouse protocols have no cross-dialog click identity. Treat a rapid second
         // click as part of the first gesture, never approval of the next proposal.
         this.approvalMouseNotBefore = performance.now() + APPROVAL_REPEAT_WINDOW_MS
@@ -751,7 +753,8 @@ export class OpenTuiIO implements ChatIO {
       this.clearInput()
       this.approvalIndex = 0
       this.renderDialogActions()
-      this.updateStatus('Select Deny or Approve; pasted approvals are ignored')
+      const labels = this.pending.approvalLabels ?? { deny: 'Deny', allow: 'Approve' }
+      this.updateStatus(`Select ${labels.deny} or ${labels.allow}; pasted approvals are ignored`)
       return
     }
     if (this.pending.kind === 'secret') { this.insertSecret(decodePasteBytes(event.bytes)); return }
@@ -868,7 +871,8 @@ export class OpenTuiIO implements ChatIO {
     }
     pending.finish(text)
   }
-  private openInput(kind: InputKind, title: string, initial = '', signal?: AbortSignal): Promise<string | number | undefined> {
+  private openInput(kind: InputKind, title: string, initial = '', signal?: AbortSignal,
+    approvalLabels?: { deny: string; allow: string }): Promise<string | number | undefined> {
     if (this.failure) return Promise.reject(this.failure)
     if (this.closed) return Promise.resolve(undefined)
     if (signal?.aborted) return kind === 'chat' ? Promise.reject(new Error('Input cancelled')) : Promise.resolve(undefined)
@@ -896,7 +900,7 @@ export class OpenTuiIO implements ChatIO {
     this.secretMask.visible = kind === 'secret'
     this.composerBox.title = this.safe(title, 4096)
     this.hintLine.content = kind === 'chat' ? HINTS : kind === 'approval'
-      ? '←/→ or Tab select · Enter confirm · Click Deny / Approve · Escape denies'
+      ? `←/→ or Tab select · Enter confirm · Click ${approvalLabels?.deny ?? 'Deny'} / ${approvalLabels?.allow ?? 'Approve'} · Escape cancels`
       : kind === 'search' ? 'Type to search · ↑/↓ select · PgUp/PgDn · Home/End'
       : kind === 'choice' ? '↑/↓ select · Enter or click choose · Escape back'
       : kind === 'secret' ? 'Input hidden · Enter confirm · Escape back · Ctrl+U clear'
@@ -905,7 +909,8 @@ export class OpenTuiIO implements ChatIO {
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const abort = (): void => pending.finish(undefined, true)
-      const pending: PendingInput = { kind, armed: kind !== 'approval', openedFrame: this.renderer.frameId, finish: (value, aborted = false): void => {
+      const pending: PendingInput = { kind, armed: kind !== 'approval', openedFrame: this.renderer.frameId,
+        ...(approvalLabels ? { approvalLabels } : {}), finish: (value, aborted = false): void => {
         if (this.pending !== pending) return
         this.pending = undefined
         this.mouseActivation.clear()
@@ -1040,12 +1045,14 @@ export class OpenTuiIO implements ChatIO {
   }
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
+    const enrollment = request.call.name === 'enroll_auto_review'
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
-    this.appendEntry({ label: `Approval required · ${scope}`,
+    this.appendEntry({ label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false })
-    this.updateStatus(`Approval required · ${scope} · denial is the default`)
-    const answer = this.openInput('approval', 'Review this change (default: deny)', '', signal)
-    this.pickerBox.title = 'Review this change (default: deny)'
+    const title = enrollment ? 'Enable Auto review? (default: cancel)' : 'Review this change (default: deny)'
+    this.updateStatus(enrollment ? 'Enable Auto review? · Cancel is the default' : `Approval required · ${scope} · denial is the default`)
+    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Auto' } : undefined)
+    this.pickerBox.title = title
     this.pickerBox.height = 3
     this.pickerBox.visible = true
     this.runStatus.setPhase('waiting_approval')

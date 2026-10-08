@@ -90,13 +90,16 @@ test('deferred review never constructs before use and refuses another provider o
   assert.equal(factories, 1); assert.equal(evaluations, 0)
 })
 
-test('disclosure identifies each selected account, narrow scope, heuristic limits and additional API cost', () => {
+test('minimal disclosure identifies recipients, review data, unrequested proposals and additional API cost', () => {
   const openai = autoReviewDisclosure('openai'), router = autoReviewDisclosure('openrouter')
-  assert.match(openai, /selected OpenAI account, using gpt-6-luna/)
-  assert.match(router, /selected OpenRouter account, routed to TypeSafe using typesafe\/jev-1\.13/)
+  assert.match(openai, /to OpenAI for approval checks/)
+  assert.match(router, /to OpenRouter and TypeSafe for approval checks/)
   for (const disclosure of [openai, router]) {
-    for (const text of ['exact current user request', 'before/after', 'non-sensitive', 'Deletion', '/memories manager', '2 review calls', '8-second', 'uncalibrated', 'can be wrong', 'API charges', 'no hard prepaid USD', 'never saved or restored',
-      'you consent', 'personal or sensitive information about you or others', 'Known credentials are excluded', 'recognized as sensitive stays Manual', 'cannot reliably identify every private detail']) assert(disclosure.includes(text), text)
+    for (const text of ['current request', 'proposed note/memory changes', 'before and after',
+      'including changes you didn’t request', 'private information', 'extra API charges',
+      'only changes judged to match your request']) assert(disclosure.includes(text), text)
+    assert(disclosure.length < 400)
+    assert.equal(disclosure.split('. ').length, 2)
   }
 })
 test('fresh confirmation binds possible private-text sharing to named recipients and the displayed revision', async () => {
@@ -109,10 +112,13 @@ test('fresh confirmation binds possible private-text sharing to named recipients
     assert.equal(host.approvalMode, 'auto')
     assert.deepEqual(request.call.arguments.reviewDataSharing, autoReviewSharingScope(provider))
     assert.equal(request.call.arguments.reviewDataSharing.revision, AUTO_REVIEW_SHARING_REVISION)
+    assert.equal(request.call.arguments.reviewDataSharing.includesUnrequestedProposals, true)
     assert.deepEqual(request.call.arguments.reviewDataSharing.recipients, provider === 'openai' ? ['OpenAI'] : ['OpenRouter', 'TypeSafe'])
-    assert.match(request.description, /Approve consents to send/)
-    assert.match(request.description, /including possible personal or sensitive details/)
-    assert.match(request.description, provider === 'openai' ? /to OpenAI for decision review/ : /to OpenRouter and TypeSafe for decision review/)
+    assert.equal(request.description, autoReviewDisclosure(provider))
+    assert.match(request.description, /including changes you didn’t request/)
+    assert.match(request.description, /private information/)
+    assert.match(request.description, provider === 'openai' ? /to OpenAI for approval checks/ : /to OpenRouter and TypeSafe for approval checks/)
+    assert.equal(io.output.includes(request.description), false)
   }
 })
 test('account or policy enrollment changes while confirmation is open cannot grant stale sharing consent', async () => {

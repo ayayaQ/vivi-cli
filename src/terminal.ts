@@ -58,15 +58,9 @@ export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive term
 
 /** Disclosure is host-authored; credentials and model-generated text never identify an account. */
 export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
-  const account = provider === 'openai' ? 'the currently selected OpenAI account, using gpt-6-luna'
-    : 'the currently selected OpenRouter account, routed to TypeSafe using typesafe/jev-1.13'
-  const threshold = provider === 'openai' ? '0.995' : '0.999'
-  return `Auto review for this conversation sends the exact current user request, proposed tool arguments and prepared before/after content to ${account}, using its existing API key. No other account or provider is used.\n` +
-    'By approving this enrollment, you consent to sending that request and proposal text to these named recipients for decision review. It may include personal or sensitive information about you or others. Known credentials are excluded, and content recognized as sensitive stays Manual without being sent to the decision provider. The filter cannot reliably identify every private detail. Do not enroll if you do not want potentially private text shared.\n' +
-    'Only ordinary non-sensitive current user-requested session note_set and app-wide memory create/edit tool calls are eligible, with their features enabled. Deletion, /memories manager changes and excluded writes remain human-reviewed.\n' +
-    `Every required model estimate must meet this provider’s ${threshold} host heuristic. These versioned thresholds are uncalibrated; model estimates can be wrong and do not prove authorization. A model rejection still offers manual review when host policy permits.\n` +
-    'This adds API charges: at most 2 review calls per turn, with an 8-second deadline and a 16 KiB limit for the full decision request. Larger exact evidence uses Manual, without truncation. Returned usage and any reported cost are tracked separately; there is no hard prepaid USD spending guarantee. Uncertain, invalid, stale, failed or over-budget reviews fall back to Manual.\n' +
-    'Manual is the default. Enrollment is only for this conversation and selected account, never saved or restored. Changing conversation, provider, model or account requires fresh enrollment. Select Auto review and then explicitly approve this enrollment only if you accept these disclosures.'
+  const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
+  return `Auto sends your current request and proposed note/memory changes (before and after) to ${recipients} for approval checks, including changes you didn’t request. ` +
+    'This may share private information and incur extra API charges; only changes judged to match your request can be saved automatically.'
 }
 
 type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ApprovalMode }[], initialIndex: number) => Promise<ApprovalMode | undefined>
@@ -78,21 +72,20 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   if (io.canAutoReview !== true || io.isClosed) { io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`); return }
   const disclosure = autoReviewDisclosure(host.session.provider)
   const binding = host.approvalEnrollmentBinding
-  io.write(`Approval mode: Manual\n${disclosure}\n`)
+  io.write('Approval mode: Manual\n')
   const selected = choose ? await choose('Approval mode · Manual is the default', [
     { name: 'Manual', description: 'Human allow/deny review for every write', value: 'manual' },
-    { name: 'Auto review', description: 'Enroll only after a fresh confirmation of named recipients, possible private-text sharing, scope and extra API cost above', value: 'auto' }
+    { name: 'Auto review', description: 'Check proposed note and memory changes through your selected provider', value: 'auto' }
   ], 0) : 'auto'
   if (selected !== 'auto' || io.isClosed) { io.write('Approval mode: Manual\n'); return }
   const controller = new AbortController()
   const dispose = io.onCancel(() => controller.abort())
-  const recipients = host.session.provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
   try {
     const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
       mode: 'auto', provider: host.session.provider, sessionId: host.session.id,
       reviewDataSharing: autoReviewSharingScope(host.session.provider), ...(binding ? { enrollmentBinding: binding } : {})
     } }, currentRevision: 'fresh Auto review enrollment',
-    description: `Enable Auto review for this conversation and selected account?\n${disclosure}\nDeny keeps Manual. Approve consents to send this conversation’s exact current request and proposed note/memory text, including possible personal or sensitive details, to ${recipients} for decision review, and enables bounded Auto review. Known credentials remain excluded; private-detail detection is incomplete.` }, controller.signal)
+    description: disclosure }, controller.signal)
     if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
       host.setApprovalMode('auto')
       io.setApprovalMode?.('auto')
