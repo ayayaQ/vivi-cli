@@ -30,7 +30,9 @@ they do not establish real-model accuracy. Provider-specific labeled evaluation
 is needed before any broader rollout or scope expansion. There are no live API
 calls or credentials in the automated tests. See README for enrollment and limits.
 The fresh Auto confirmation names OpenAI, or OpenRouter plus TypeSafe, and asks
-for bounded sharing consent for the exact request/proposal text, which can contain
+for bounded sharing consent for the exact request/proposal text, including eligible
+agent proposals the user did not request, to assess whether they authorized the exact
+change. This text can contain
 personal or sensitive details. Known credentials are excluded and recognized
 sensitive content stays Manual. Lexical detection is incomplete; the disclosure
 does not claim a privacy guarantee. Consent is versioned and bound to the current
