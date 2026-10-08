@@ -44,6 +44,7 @@ export const SLASH_COMMANDS = [
   { command: '/rename', description: 'Rename the current session' },
   { command: '/settings', description: 'Change future defaults' },
   { command: '/memories', description: 'Manage app-wide saved context' },
+  { command: '/skills', description: 'List, inspect and draft standard skills' },
   { command: '/menu', description: 'Open the menu' },
   { command: '/help', description: 'Show commands and shortcuts' },
   { command: '/session', description: 'Show the current session' },
@@ -94,7 +95,7 @@ function fitStatusColumns(text: string, columns: number, keepStart = false): str
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /settings /menu /help /exit'
+const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /settings /menu /help /exit'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
 interface PendingInput {
   kind: InputKind
@@ -331,7 +332,7 @@ export class OpenTuiIO implements ChatIO {
       this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
         flexDirection: 'row', visible: false })
       for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
-        ['Mode', '/mode'], ['Memory', '/memories'], ['Settings', '/settings']] as const) {
+        ['Mode', '/mode'], ['Memory', '/memories'], ['Skills', '/skills'], ['Settings', '/settings']] as const) {
         this.actionBar.add(this.mouseButton(`vivi-action-${command.slice(1)}`, label, () => {
           const pending = this.pending
           if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish(command)
@@ -503,7 +504,7 @@ export class OpenTuiIO implements ChatIO {
   private updateActionBar(): void {
     if (this.closed) return
     if (this.actionBar) this.actionBar.visible = this.pending?.kind === 'chat' &&
-      !this.cancelCallbacks.size && !this.completions.length && this.renderer.terminalWidth >= 40 && this.renderer.terminalHeight >= 14
+      !this.cancelCallbacks.size && !this.completions.length && this.renderer.terminalWidth >= 48 && this.renderer.terminalHeight >= 14
     // Chat controls and workspace share a row where they fit. Modal shortcuts
     // remain separate so a right-aligned path can never cover an action hitbox.
     this.updateFooter()
@@ -1064,8 +1065,16 @@ export class OpenTuiIO implements ChatIO {
       }
     })
   }
+  private nextComposerDraft = ''
+  setComposerDraft(content: string): void {
+    if (this.closed) return
+    if (content.length > 65536) throw new Error('Skill draft request exceeds composer limit')
+    this.nextComposerDraft = this.safe(content)
+  }
   async readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined> {
-    const value = await this.openInput('chat', prompt, '', signal)
+    const initial = this.nextComposerDraft
+    this.nextComposerDraft = ''
+    const value = await this.openInput('chat', prompt, initial, signal)
     return typeof value === 'string' ? value : undefined
   }
   async askText(title: string, initial = ''): Promise<string | undefined> {
@@ -1151,6 +1160,7 @@ export class OpenTuiIO implements ChatIO {
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
     const enrollment = request.call.name === 'enroll_auto_review'
+    if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     this.appendEntry({ category: 'activity', attention: true, label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false })

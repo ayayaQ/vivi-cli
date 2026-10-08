@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 export { CliHost } from './host.js'
 export type { CliHostOptions, MemoryChangeRequest } from './host.js'
+export { FileSkillStore } from './skills.js'
+export type { CliSkillStore, SkillStoreOptions } from './skills.js'
 export { FileMemoryStore, MAX_MEMORY_STORE_BYTES } from './memory.js'
 export type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 export { ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS } from './workspace.js'

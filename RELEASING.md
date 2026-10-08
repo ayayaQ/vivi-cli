@@ -4,15 +4,15 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.7.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.8.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
-dependency, including its source, LICENSE, NOTICE and attribution records, so the shared core needs no separate registry request. OpenTUI and its native platform
+dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
 dependencies remain registry dependencies; offline installs need a populated npm cache.
 
 ## Shared registry dependency
 
-The published shared vivi `0.7.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.8.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
@@ -237,3 +237,13 @@ notice collection is an aid, not a substitute for that release review. No binari
 or native archives are vendored into Git, and no executable publishing workflow is
 enabled. npm publication, GitHub publication and binary release remain separately
 authorized operations.
+
+## Agent Skills adoption checks
+
+Skills use the pinned vivi 0.8.0 extension without changes to its shared agent loop.
+Run ordinary skills store, host, manager, native headless UI, package, and standalone checks
+with the current main checks. Automatic saving is disabled on every platform. Confirm
+only list/read tools are exposed, creator drafts describe manual saving, and all sources
+remain read-only. Prior restricted assessments stay unconditionally skipped; passing
+ordinary checks does not complete that stopped review or accept automatic skill saves.
+Actual Windows and macOS behavior is verified only when the relevant platform ran.

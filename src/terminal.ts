@@ -98,6 +98,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
     }
   } finally { dispose() }
 }
+export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Automatic skill saving is disabled on every platform; creator drafts are saved manually; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
 /memories edit ID REVISION TEXT · review an edit to the displayed revision
@@ -166,6 +167,37 @@ export async function runMemoryCommand(host: CliHost, io: ChatIO, line: string):
       ? { kind: 'update', id: fields[1]!, expectedRevision: fields[2]!, content: fields[3]! }
       : { kind: 'delete', id: fields[1]!, expectedRevision: fields[2]! })
   } else io.write(MEMORY_COMMAND_HELP)
+  return true
+}
+const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · ask the agent for a standard skill draft to save manually\n/skills on · enable for this launch; /skills off · disable without deleting\n'
+export function displaySkills(io: Pick<ChatIO, 'write'>, catalog: Awaited<ReturnType<CliHost['listSkills']>>, diagnostics: readonly string[] = []): void {
+  io.write(`Skills (${catalog.skills.length}):\n`)
+  for (const skill of catalog.skills) io.write(`${JSON.stringify(skill.name)} · ${skill.readOnly ? 'read only' : 'owned store'} · revision ${skill.revision}\n${JSON.stringify(skill.description)}\n`)
+  for (const diagnostic of diagnostics) io.write(`Skill diagnostic: ${diagnostic}\n`)
+}
+export function skillCreationPrompt(description: string): string {
+  return `Use the bundled skill-creator to draft an ordinary instruction-only SKILL.md for this request: ${description}\nShow the exact draft, keep it limited to available tools, propose honest example checks, and show the draft for me to save manually. Automatic skill saving is disabled on every platform. Do not create scripts/resources, run commands, install dependencies or claim unrun evaluations.`
+}
+export async function runSkillsCommand(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
+  if (!/^\/skills(?:\s|$)/.test(line.trim())) return false
+  const match = /^\/skills(?:\s+(\S+))?(?:\s+([\s\S]*))?$/.exec(line.trim())!
+  const action = match[1] ?? 'list'
+  const input = match[2] ?? ''
+  if ((action === 'on' || action === 'off') && !input) {
+    host.setSkillsEnabled(action === 'on')
+    io.write(`Skills ${host.skillsEnabled ? 'enabled' : 'disabled'} for this launch\n`)
+  } else if (action === 'help') io.write(`${SKILLS_DISCLOSURE}\n${SKILLS_COMMAND_HELP}`)
+  else if (!host.skillsEnabled) io.write('Skills are disabled. Use /skills on to enable them\n')
+  else if (action === 'list' && !input) {
+    io.write(`${SKILLS_DISCLOSURE}\n`)
+    displaySkills(io, await host.listSkills(), host.skillsDiagnostics)
+    io.write(SKILLS_COMMAND_HELP)
+  } else if (action === 'inspect' && input && !/\s/.test(input)) {
+    io.write(`SKILL.md ${JSON.stringify(input)} (exact source, inert text):\n${JSON.stringify(await host.readSkill(input))}\n`)
+  } else if (action === 'create' && input) {
+    const dispose = io.onCancel(() => host.cancel())
+    try { io.result(await sendChatTurn(host, io, skillCreationPrompt(input))) } finally { dispose() }
+  } else io.write(SKILLS_COMMAND_HELP)
   return true
 }
 type TtyReadable = Readable & { isTTY?: boolean }
@@ -380,6 +412,7 @@ export class TerminalIO implements ChatIO {
 }
 
 export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): Promise<AgentResult | undefined> {
+  if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (prompt !== undefined) {
     const dispose = io.onCancel(() => host.cancel())
@@ -389,7 +422,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /skills manages skills\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
@@ -410,6 +443,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       if (!name) io.write('Use /rename NAME to name this session\n')
       else try { await host.renameSession(name, host.session.titleRevision ?? 0); io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Session rename failed'}\n`) }
+      continue
+    }
+    if (/^\/skills(?:\s|$)/.test(line.trim())) {
+      try { await runSkillsCommand(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Skill management failed'}\n`) }
       continue
     }
     if (/^\/memories(?:\s|$)/.test(line.trim())) {

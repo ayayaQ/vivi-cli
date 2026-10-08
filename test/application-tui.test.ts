@@ -349,7 +349,9 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
         return { generate: async input => {
-          expect(input.tools).toHaveLength(8)
+          expect(input.tools).toHaveLength(10)
+          expect(input.tools.some(tool => tool.name === 'read_skill')).toBe(true)
+          expect(input.tools.some(tool => tool.name === 'save_skill')).toBe(false)
           expect(input.tools.some(tool => tool.name === 'workspace_glob')).toBe(true)
           return { content: `${session.reasoning} response`, toolCalls: [] }
         } }
@@ -409,7 +411,14 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
     setup.mockInput.pressEnter()
     expect(await running).toBe(0)
     const { readFile } = await import('node:fs/promises')
-    for (const file of await readdir(directory)) expect(await readFile(join(directory, file), 'utf8')).not.toContain(key)
+    const inspectFiles = async (path: string): Promise<void> => {
+      for (const entry of await readdir(path, { withFileTypes: true })) {
+        const file = join(path, entry.name)
+        if (entry.isDirectory()) await inspectFiles(file)
+        else expect(await readFile(file, 'utf8')).not.toContain(key)
+      }
+    }
+    await inspectFiles(directory)
     expect(JSON.parse(await readFile(join(directory, 'preferences.json'), 'utf8')).reasoning).toBe('high')
   } finally { io.close(); await running; setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
 }, 15000)

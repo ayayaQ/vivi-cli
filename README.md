@@ -309,3 +309,25 @@ included in input and total counts. A missing cache count is shown as `unreporte
 while an explicitly reported zero is shown as `0`. Each session cache count is
 complete only if every accepted provider round reported that field. Old sessions
 keep missing metrics unreported; no cache policy, price or savings is inferred.
+
+## Instruction-only Agent Skills
+
+`/skills` lists and inspects standard `<name>/SKILL.md` folders, prepares creator requests
+in the composer, and enables or disables skills for this launch. The app-wide folder is
+`<session-dir>/agent-skills`; `--skills-dir PATH` adds up to eight explicit read-only roots.
+No workspace, home, ancestor, or community discovery is performed. `--no-skills` disables
+skills. Metadata goes to the selected provider; instructions and UTF-8 text resources load
+progressively through `list_skills` and `read_skill`, without running scripts.
+
+The bundled read-only `skill-creator` drafts SKILL.md content in chat. Save the draft
+manually as `<name>/SKILL.md`, then refresh or start a new turn. Automatic skill saving is
+disabled on Windows, macOS, and Linux. There is no skill writer, save tool, or save approval.
+All skills are read-only to the agent. Existing workspace tools cannot target the owned
+private state profile. Skill hints grant no tools, permissions, or Auto eligibility.
+
+Discovery uses canonical filesystem identity for ordinary Windows path aliases, preserves
+original files, and reports unavailable roots, invalid formats, and duplicate names.
+Bounds are 100 skills including the creator, 64 KiB per UTF-8 document/resource, 2 MiB total
+documents, and 24 KiB catalog metadata; serialized tool reads must also fit the session
+transcript limit. Existing credential/private-state exclusions remain. Prior restricted
+assessments stay excluded; this release does not accept automatic skill saving.
