@@ -6,13 +6,16 @@ import fs from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { TextDecoder } from 'node:util'
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url))
 const sourceNames = ['ViviCommandJob.cs', 'ViviCommandJob.AssemblyInfo.cs']
 const specName = 'windows-command-helper.spec.json'
 const referenceNames = ['mscorlib.dll', 'System.dll', 'System.Core.dll']
 const hostNames = ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR']
-const metadataPhases = ['helper-start', 'file-version-start', 'file-version-ready', 'json-start', 'json-ready', 'output-written', 'helper-error']
+const metadataHeader = 'VIVI_BUILD_METADATA_V1'
+const metadataFields = ['company', 'fileVersion', 'productVersion']
+const metadataPhases = ['helper-start', 'file-version-start', 'file-version-ready', 'encoding-start', 'encoding-ready', 'output-written', 'helper-error']
 const buildPhases = new Set([
   'source-check-start', 'source-check-ready', 'os-tools-check-start', 'os-tools-check-ready',
   'locator-file-check-start', 'locator-file-check-ready', 'locator-metadata-start', 'locator-metadata-ready',
@@ -48,12 +51,20 @@ try {
   $file = [Diagnostics.FileVersionInfo]::GetVersionInfo([Environment]::GetEnvironmentVariable('VIVI_BUILD_INSPECT_FILE'))
   [Console]::Error.WriteLine('VIVI_BUILD_PHASE:file-version-ready')
   [Console]::Error.Flush()
-  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:json-start')
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:encoding-start')
   [Console]::Error.Flush()
-  $json = ConvertTo-Json -Compress -InputObject @{ company = $file.CompanyName; fileVersion = $file.FileVersion; productVersion = $file.ProductVersion }
-  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:json-ready')
+  $fields = @($file.CompanyName, $file.FileVersion, $file.ProductVersion)
+  $utf8 = [Text.UTF8Encoding]::new($false, $true)
+  $encoded = @()
+  foreach ($value in $fields) {
+    if ($null -eq $value -or $value -isnot [string] -or $value.Length -gt 256) { throw 'Invalid metadata field' }
+    $encoded += [Convert]::ToBase64String($utf8.GetBytes($value))
+  }
+  if ($fields[1].Length -eq 0) { throw 'Invalid metadata field' }
+  [Console]::Error.WriteLine('VIVI_BUILD_PHASE:encoding-ready')
   [Console]::Error.Flush()
-  [Console]::Out.WriteLine($json)
+  [Console]::Out.WriteLine('VIVI_BUILD_METADATA_V1')
+  foreach ($value in $encoded) { [Console]::Out.WriteLine($value) }
   [Console]::Error.WriteLine('VIVI_BUILD_PHASE:output-written')
   [Console]::Error.Flush()
 } catch {
@@ -311,9 +322,27 @@ async function metadata(file, powershell, env, taskkill, signal, runtime, label,
     onMetadataPhase: name => phase(`${label}-${name}`),
   })
   let record
-  try { record = JSON.parse(result.stdout.toString('utf8').replace(/^\uFEFF/, '').trim()) }
-  catch { throw new HelperBuildError('Installed tool version metadata is invalid') }
-  if (!record || typeof record.company !== 'string' || record.company.length > 256 || typeof record.fileVersion !== 'string' || !record.fileVersion || record.fileVersion.length > 256 || typeof record.productVersion !== 'string' || record.productVersion.length > 256) throw new HelperBuildError('Installed tool version metadata is invalid')
+  try {
+    // Exactly a versioned ASCII header and three positional, canonical base64
+    // lines. UTF8 decoding is fatal, and BOMs inside fields remain field data.
+    const bytes = result.stdout
+    if (!Buffer.isBuffer(bytes) || bytes.length > metadataHeader.length + 8 + 3 * 1024 || bytes.some(byte => byte > 127)) throw new Error()
+    const lines = bytes.toString('ascii').split('\n')
+    if (lines.length !== 5 || lines.pop() !== '') throw new Error()
+    const fields = lines.map(line => line.replace(/\r$/, ''))
+    if (fields.shift() !== metadataHeader) throw new Error()
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+    const values = fields.map(encoded => {
+      if (encoded.length > 1024 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new Error()
+      const decoded = Buffer.from(encoded, 'base64')
+      if (decoded.length > 768 || decoded.toString('base64') !== encoded) throw new Error()
+      const value = decoder.decode(decoded)
+      if (value.length > 256) throw new Error()
+      return value
+    })
+    if (!values[1]) throw new Error()
+    record = Object.fromEntries(metadataFields.map((name, index) => [name, values[index]]))
+  } catch { throw new HelperBuildError('Installed tool version metadata is invalid') }
   phase(`${label}-ready`)
   return { company: record.company, fileVersion: record.fileVersion, productVersion: record.productVersion, versionResourcesInformationalOnly: true }
 
