@@ -64,8 +64,20 @@ export function validateMcpServer(value: unknown, secrets: readonly string[] = [
   const server: McpServerConfig = { id: value.id, label: value.label, executable: value.executable,
     args: [...value.args], cwd: value.cwd, protocol: value.protocol as McpServerConfig['protocol'], environment: [...value.environment] }
   if (server.args.some(arg => /^(?:--?)(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|secret|credential|authorization)(?:=|$)/i.test(arg))) fail()
-  if (/^(?:node|bun|python(?:\d+(?:\.\d+)*)?|perl|ruby)(?:\.exe)?$/i.test(basename(server.executable)) &&
-    server.args.some(arg => /^(?:-e|-p|-c|--eval|--print)(?:=|$)/.test(arg))) fail()
+  const runtime = basename(server.executable).replace(/\.exe$/i, '').toLowerCase()
+  if (/^(?:node|bun|python(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(runtime)) {
+    if (server.args.some(arg => /^(?:-e|-p|-c|--eval|--print)(?:=|$)/.test(arg) ||
+      /^(?:data:|--[^=]+=data:)/i.test(arg))) fail()
+    // Recognize each runtime's inline switches and conservative short-switch bundles, not option-value text.
+    if (server.args.some(arg => runtime === 'node' ? /^-[ep]+(?:=|$)/.test(arg)
+      : runtime.startsWith('python') ? /^-[bBdEhiIOPqRsSuvVx]*c/.test(arg)
+      : runtime === 'perl' ? /^-[0-9acCdfhlnpsStTuUvVwWxX]*[eE]/.test(arg)
+      : runtime === 'ruby' ? /^-[0-9acdhlnpsSuvUwWy]*e/.test(arg) : /^-[ep]/.test(arg))) fail()
+    // Bun's default dispatcher can install packages. Permit only an explicit local script with installation disabled.
+    if (runtime === 'bun' && (server.args[0] !== '--no-install' || !server.args[1] || !isAbsolute(server.args[1]) ||
+      !/\.(?:[cm]?[jt]s|[jt]sx)$/i.test(server.args[1]) || process.platform === 'win32' && !/^[a-z]:[\\/]/i.test(server.args[1]) ||
+      server.args.slice(1).some(arg => /^(?:--(?:no-)?install|--shell|-i)(?:=|$)/.test(arg)))) fail()
+  }
   const encoded = JSON.stringify(server)
   if (/\b(?:sk-(?:proj-|or-v1-)?[A-Za-z0-9_-]{16,}|Bearer\s+[^\s"\\]{12,})/.test(encoded)) fail()
   if (Buffer.byteLength(encoded) > 16 * 1024 || secrets.some(secret => secret && encoded.includes(secret))) fail()
@@ -161,6 +173,12 @@ export async function prepareMcpLaunch(server: McpServerConfig, configRevision: 
   const executable = await realpath(checked.executable), cwd = await realpath(checked.cwd)
   const info = await lstat(executable), folder = await lstat(cwd)
   if (!info.isFile() || !folder.isDirectory() || info.size > 256 * 1024 * 1024) throw new Error('MCP launch requires an installed executable and an existing working directory')
+  const canonical = validateMcpServer({ ...checked, executable, cwd }, knownSecrets)
+  if ([checked.executable, executable].some(path => /^bun(?:\.exe)?$/i.test(basename(path)))) {
+    const script = await realpath(checked.args[1] ?? '')
+    if (!(await lstat(script)).isFile()) throw new Error('Bun MCP launch requires an already installed script')
+    await access(script, constants.R_OK)
+  }
   if (process.platform !== 'win32' && (Number(info.mode) & 0o6000) !== 0) throw new Error('MCP requires an unprivileged installed executable')
   await access(executable, process.platform === 'win32' ? constants.F_OK : constants.X_OK)
   if (process.platform === 'win32' && !/\.exe$/i.test(executable)) throw new Error('MCP launch requires a native installed .exe on Windows')
@@ -181,7 +199,6 @@ export async function prepareMcpLaunch(server: McpServerConfig, configRevision: 
       /\b(?:sk-(?:proj-|or-v1-)?[A-Za-z0-9_-]{16,}|Bearer\s+[^\s"\\]{12,})/.test(value)) throw new Error('MCP environment value is unavailable or unsafe')
     environment[name] = value
   }
-  const canonical = validateMcpServer({ ...checked, executable, cwd }, knownSecrets)
   const body = { server: canonical, configRevision, executableRevision: hash.digest('hex'),
     workingDirectoryRevision: mcpDigest({ dev: String(folder.dev), ino: String(folder.ino) }), environment }
   return mcpFreeze({ ...body, digest: mcpDigest(body) })

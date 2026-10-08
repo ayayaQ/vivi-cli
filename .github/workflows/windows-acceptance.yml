@@ -65,7 +65,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       # Owned local MCP fixtures only: no credentials, providers or third-party servers.
-      - run: node --test test/mcp-controls.test.mjs test/mcp-discovery.test.mjs test/mcp-lifecycle.test.mjs test/mcp-integration.test.mjs test/mcp-windows.test.mjs test/mcp-windows-real.test.mjs
+      - run: node --test test/mcp-config.test.mjs test/mcp-transport.test.mjs test/mcp-controls.test.mjs test/mcp-discovery.test.mjs test/mcp-lifecycle.test.mjs test/mcp-integration.test.mjs test/mcp-windows.test.mjs test/mcp-windows-real.test.mjs
       # Harmless owned process fixtures plus mocks. No native UI, live keys or providers.
       - run: node --test test/commands.test.mjs test/commands-host.test.mjs test/command-process.test.mjs test/command-windows.test.mjs test/command-windows-real.test.mjs
       # Fake runners only: no native credential store, live keys, model calls or TTY automation.

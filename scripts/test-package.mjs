@@ -259,7 +259,7 @@ const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
 const mcp = new McpManager({ store: new McpConfigStore(directory), env: { OPENAI_API_KEY: 'fake-provider-key' } })
 try {
   await mcp.configure({ id: 'packed', label: 'Owned package fixture', executable: process.execPath,
-    args: [fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'normal', join(directory, 'mcp-log'), join(directory, 'mcp-pid')],
+    args: [...(process.versions.bun ? ['--no-install'] : []), fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'normal', join(directory, 'mcp-log'), join(directory, 'mcp-pid')],
     cwd: directory, protocol: 'legacy', environment: [] })
   assert.equal(mcp.statuses()[0].state, 'disabled')
   assert.equal(await mcp.connect('packed', async () => false, new AbortController().signal), false)

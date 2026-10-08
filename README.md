@@ -134,6 +134,8 @@ Use `/mcp` in full-screen or line mode to add an already installed executable,
 its separate arguments, working directory and explicit legacy or pinned modern
 protocol. Entries start disabled every launch. Enable requires fresh human
 approval showing that exact launch; Disable closes the owned process tree.
+For Bun servers, use `--no-install` followed by an absolute installed JS/TS
+script path and its separate arguments. Inline code and package commands are unsupported.
 For account-independent line management, run
 `node dist/launcher.js --no-tui --prompt /mcp`; no model or provider key is needed.
 

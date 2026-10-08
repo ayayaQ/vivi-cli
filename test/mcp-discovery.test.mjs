@@ -12,11 +12,12 @@ import { CliHost } from '../dist/host.js'
 import { newSession } from '../dist/session.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
 const signal = () => new AbortController().signal
 async function fixture(t, mode = 'normal', protocol = 'legacy') {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-discovery-'))
   const store = new McpConfigStore(directory, ['fixture-secret'])
-  const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: [fixtureFile, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory, protocol, environment: [] }
+  const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory, protocol, environment: [] }
   let starts = 0
   const manager = new McpManager({ store, env: { OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--invalid', PATH: '/unexpected' }, secrets: ['fixture-secret'], transportFactory: launch => { starts++; return new McpStdioTransport(launch) } })
   t.after(async () => { await manager.close(); await rm(directory, { recursive: true, force: true }) })
@@ -39,7 +40,7 @@ test('configuration is app-private, bounded and loads disabled without startup',
   assert.equal(replacement.statuses()[0].state, 'disabled'); await replacement.close()
 })
 test('invalid configuration rejects remote/shell/package runners and secret environment or arguments', () => {
-  const base = { id: 'docs', label: 'Docs', executable: process.execPath, args: [], cwd: tmpdir(), protocol: 'legacy', environment: [] }
+  const base = { id: 'docs', label: 'Docs', executable: process.execPath, args: scriptArgs, cwd: tmpdir(), protocol: 'legacy', environment: [] }
   for (const invalid of [{ ...base, id: 'BAD' }, { ...base, executable: 'node' }, { ...base, executable: '/usr/bin/npx' }, { ...base, executable: '/bin/sh' },
     { ...base, transport: 'http' }, { ...base, environment: ['OPENAI_API_KEY'] }, { ...base, args: ['fixture-secret'] }, { ...base, label: '\x1b[2J' }, { ...base, protocol: 'auto' }, { ...base, protocol: ['legacy'] }, { ...base, protocol: ['2026-07-28'] }, { ...base, args: ['--token', 'unknown-private-value'] }, { ...base, args: ['sk-proj-' + 'a'.repeat(40)] }, { ...base, args: ['--eval', 'setInterval(()=>{},1000)'] }])
     assert.throws(() => validateMcpServer(invalid, ['fixture-secret']))

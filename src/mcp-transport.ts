@@ -19,6 +19,8 @@ export class McpStdioTransport implements Transport {
   private windows: WindowsMcpProcess | undefined
   private closing: Promise<void> | undefined
   private closed = false
+  private closeNotified = false
+  private posixCleanupAttempted = false
   private started = false
   private starting: Promise<void> | undefined
   private readonly buffer = new ReadBuffer({ maxBufferSize: 1024 * 1024 })
@@ -83,7 +85,13 @@ export class McpStdioTransport implements Transport {
       void this.close().catch(() => this.onerror?.(new Error('MCP process cleanup could not be verified')))
     }
   }
-  close(): Promise<void> { return this.closing ??= this.dispose() }
+  close(): Promise<void> {
+    if (this.closing) return this.closing
+    const closing = this.dispose()
+    this.closing = closing
+    void closing.catch(() => { if (this.closing === closing) this.closing = undefined })
+    return closing
+  }
   private async dispose(): Promise<void> {
     this.closed = true
     await this.starting?.catch(() => undefined)
@@ -96,17 +104,21 @@ export class McpStdioTransport implements Transport {
       }
       if (pid) {
         // A trusted server can still escape a process group. This is lifecycle ownership, not an OS sandbox.
-        try { process.kill(-pid, 'SIGTERM') } catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw new Error('MCP process cleanup could not be verified') }
-        const exited = child?.exitCode !== null || child?.signalCode !== null ? Promise.resolve() : new Promise<void>(resolve => child?.once('exit', () => resolve()))
-        await Promise.race([exited, wait(250)])
-        try { process.kill(-pid, 'SIGKILL') } catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw new Error('MCP process cleanup could not be verified') }
-        await Promise.race([exited, wait(1000)])
+        if (!this.posixCleanupAttempted) {
+          this.posixCleanupAttempted = true
+          try { process.kill(-pid, 'SIGTERM') } catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw new Error('MCP process cleanup could not be verified') }
+          const exited = child?.exitCode !== null || child?.signalCode !== null ? Promise.resolve() : new Promise<void>(resolve => child?.once('exit', () => resolve()))
+          await Promise.race([exited, wait(250)])
+          try { process.kill(-pid, 'SIGKILL') } catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw new Error('MCP process cleanup could not be verified') }
+          await Promise.race([exited, wait(1000)])
+        }
         if (child?.exitCode === null && child.signalCode === null) throw new Error('MCP process cleanup timed out')
+        // POSIX retries only verify death: cached numeric group IDs may have been reused.
         await verifyMcpGroupDead(pid)
       }
     } finally {
       child?.stdin.destroy(); child?.stdout.destroy(); child?.stderr.destroy(); this.buffer.clear()
-      this.onclose?.()
+      if (!this.closeNotified) { this.closeNotified = true; this.onclose?.() }
     }
   }
 }

@@ -108,7 +108,8 @@ export class McpManager {
     const current = await prepareMcpLaunch(server, revision, this.options.env, this.secrets)
     if (current.digest !== launch.digest) throw new Error('MCP executable, working directory or environment changed; request fresh approval')
     if ((await this.loadConfiguration()).revision !== revision) throw new Error('MCP configuration changed; request fresh approval')
-    signal.throwIfAborted()
+    signal.throwIfAborted(); this.assertOpen()
+    if (this.configuration.revision !== revision || this.connections.has(id)) throw new Error('MCP launch changed; request fresh connection approval')
     const client = new Client({ name: 'vivi-cli-discovery', version: '0.1.0-dev.0' }, { capabilities: {},
       inputRequired: { autoFulfill: false }, enforceStrictCapabilities: true,
       versionNegotiation: { mode: server.protocol === 'legacy' ? 'legacy' : { pin: server.protocol } } })

@@ -311,18 +311,19 @@ test('native input-pump failure terminates the owned job before final cleanup', 
   await owned.completed
 })
 
-test('closed-input fixture closes and verifies the original Windows handle using the fixed OS Utility bootstrap', () => {
-  const source = readFileSync(new URL('./fixtures/mcp-windows-closed-input.ps1', import.meta.url), 'utf8')
-  assert.match(source, /LanguageMode -ne 'FullLanguage'/)
-  assert.match(source, /\[String\]::Equals\(\$PSHOME, \$expectedHome, \[StringComparison\]::OrdinalIgnoreCase\)/)
-  assert.match(source, /Microsoft\.PowerShell\.Utility\\Microsoft\.PowerShell\.Utility\.psd1/)
-  assert.match(source, /GetAttributes\(\$ancestor\) -band \[IO\.FileAttributes\]::ReparsePoint/)
-  assert.ok(source.indexOf('Import-Module -Name $manifest') < source.indexOf('Microsoft.PowerShell.Utility\\Add-Type'))
+test('closed-input console fixture closes and verifies the original Windows handle before other I/O', () => {
+  const source = readFileSync(new URL('./fixtures/mcp-windows-closed-input.cs', import.meta.url), 'utf8')
+  assert.match(source, /public static void Main\(string\[\] args\)/)
   assert.match(source, /IntPtr input = GetStdHandle\(-10\)/)
   assert.match(source, /if \(!CloseHandle\(input\)\)/)
   assert.match(source, /if \(GetHandleInformation\(input, out flags\)\)/)
   assert.match(source, /Marshal\.GetLastWin32Error\(\) != 6/)
-  assert.match(source, /Console\.Error\.Write\("native-stdin-closed\\n"\)/)
-  assert.ok(source.indexOf('GetHandleInformation(input, out flags)') < source.indexOf('Console.Error.Write("native-stdin-closed\\n")'))
+  assert.match(source, /IntPtr errorOutput = GetStdHandle\(-12\)/)
+  assert.match(source, /Encoding\.ASCII\.GetBytes\("native-stdin-closed\\n"\)/)
+  assert.match(source, /if \(!WriteFile\(errorOutput, marker, \(uint\)marker\.Length, out written, IntPtr\.Zero\)\)/)
+  assert.match(source, /if \(written != \(uint\)marker\.Length\)/)
+  assert.ok(source.indexOf('GetHandleInformation(input, out flags)') < source.indexOf('File.WriteAllText'))
+  assert.ok(source.indexOf('GetHandleInformation(input, out flags)') < source.indexOf('IntPtr errorOutput = GetStdHandle(-12)'))
+  assert.doesNotMatch(source, /Console\.|OpenStandardInput|DuplicateHandle/)
   assert.match(source, /Thread\.Sleep\(Timeout\.Infinite\)/)
 })

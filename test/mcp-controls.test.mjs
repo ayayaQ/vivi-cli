@@ -4,9 +4,11 @@ import { test } from 'node:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { McpConfigStore } from '../dist/mcp-config.js'
 import { McpManager } from '../dist/mcp-manager.js'
 import { manageMcp } from '../dist/mcp-controls.js'
+const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))]
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-ui-'))
   const store = new McpConfigStore(directory)
@@ -24,7 +26,7 @@ function ioFixture(selections = [], texts = []) {
 }
 test('plain configuration controls save only a disabled entry and do not start a server', async t=>{
   const subject=await fixture(t)
-  const io=ioFixture([1,0,0,1,0],['docs','My docs',process.execPath,subject.directory,'0'])
+  const io=ioFixture([1,0,0,1,0],['docs','My docs',process.execPath,subject.directory,String(scriptArgs.length),...scriptArgs])
   await manageMcp(subject.manager,io)
   assert.equal(subject.starts(),0);assert.equal(io.approvals.length,0)
   const saved=await subject.store.load();assert.equal(saved.servers.length,1);assert.equal(saved.servers[0].id,'docs')
@@ -39,7 +41,7 @@ for (const stop of [0,1,2,3,4]) test(`cancelled server configuration at field ${
 })
 test('startup uses fresh deny-default human approval and never Auto review',async t=>{
   const subject=await fixture(t)
-  await subject.manager.configure({id:'docs',label:'Docs',executable:process.execPath,args:[],cwd:subject.directory,protocol:'legacy',environment:[]})
+  await subject.manager.configure({id:'docs',label:'Docs',executable:process.execPath,args:scriptArgs,cwd:subject.directory,protocol:'legacy',environment:[]})
   const io=ioFixture([2,1,0])
   await manageMcp(subject.manager,io)
   assert.equal(subject.starts(),0);assert.equal(io.approvals.length,1)
@@ -51,7 +53,7 @@ test('startup uses fresh deny-default human approval and never Auto review',asyn
 })
 test('locally assigned IDs matching menu labels remain selectable without aliasing commands',async t=>{
   const subject=await fixture(t)
-  await subject.manager.configure({id:'add',label:'Menu-like ID',executable:process.execPath,args:[],cwd:subject.directory,protocol:'legacy',environment:[]})
+  await subject.manager.configure({id:'add',label:'Menu-like ID',executable:process.execPath,args:scriptArgs,cwd:subject.directory,protocol:'legacy',environment:[]})
   const io=ioFixture([2,1,0])
   await manageMcp(subject.manager,io)
   assert.equal(io.approvals.length,1);assert.equal(io.approvals[0].call.arguments.serverId,'add')
@@ -88,7 +90,7 @@ async function retainedPeer(t) {
   } })
   t.after(async () => { blocked = false; await manager.close(); await rm(directory, { recursive: true, force: true }) })
   await manager.configure({ id: 'docs', label: 'Private peer', executable: process.execPath,
-    args: [], cwd: directory, protocol: 'legacy', environment: [] })
+    args: scriptArgs, cwd: directory, protocol: 'legacy', environment: [] })
   assert.equal(await manager.connect('docs', async () => true, new AbortController().signal), true)
   assert(manager.statuses()[0].snapshot)
   const invalid = '{owned-invalid-configuration', file = join(directory, 'mcp-servers.json')

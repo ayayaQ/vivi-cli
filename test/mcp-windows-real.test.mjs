@@ -2,19 +2,21 @@
 // Native Windows acceptance uses only this repository's harmless local fixture.
 // No credential store, providers, live servers, command permission modes or CUA.
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { execFile, spawn } from 'node:child_process'
+import { lstat, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, win32 } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { McpConfigStore, prepareMcpLaunch } from '../dist/mcp-config.js'
 import { McpManager } from '../dist/mcp-manager.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 import { launchWindowsMcp } from '../dist/mcp-windows.js'
 
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
-const closedInputFixtureFile = fileURLToPath(new URL('./fixtures/mcp-windows-closed-input.ps1', import.meta.url))
+const closedInputFixtureFile = fileURLToPath(new URL('./fixtures/mcp-windows-closed-input.cs', import.meta.url))
+const compileFixture = promisify(execFile)
 const options = { skip: process.platform !== 'win32', timeout: 45_000 }
 const nativeTest = (name, body) => test(`Windows real MCP: ${name}`, options, body)
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -139,7 +141,8 @@ nativeTest('standard argv, Unicode, exact target environment and binary stderr',
     '&|<>^%PATH%', '$(literal data)', '中文🙂']
   for (const environment of [{}, { MCP_FIXTURE_VALUE: 'fixed literal & $ 中文🙂', FIXTURE_EMPTY: '', FIXTURE_UNICODE: '值🙂' }]) {
     const { owned, stdout, stderr } = await subject.launch('native-probe', args, environment)
-    assert.deepEqual(await bounded(owned.completed, 'native environment probe'), { exitCode: 0 })
+    assert.deepEqual(await bounded(owned.completed, 'native environment probe'), { exitCode: 0 },
+      stderr().subarray(0, 4096).toString('utf8'))
     const result = JSON.parse(stdout().toString('utf8'))
     assert.deepEqual(result.args, args)
     assert.equal(result.cwd.toLowerCase(), subject.directory.toLowerCase())
@@ -170,18 +173,38 @@ nativeTest('stdin preserves binary and Unicode bytes up to the frame limit', asy
 
 nativeTest('closed target stdin reports failure and cleans up without a manual stop', async t => {
   const subject = await sandbox(t)
-  // Windows libuv deliberately does not close CRT fd 0-2. Use an owned fixture
-  // that closes GetStdHandle(STD_INPUT_HANDLE), rather than a successful no-op.
+  // Windows libuv deliberately does not close CRT fd 0-2. Compile this one
+  // fixed console fixture directly, avoiding PowerShell/Node target host setup.
   const systemRoot = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
   assert.ok(systemRoot, 'Windows SystemRoot is unavailable')
-  const executable = win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const framework = win32.join(systemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319')
+  const compiler = win32.join(framework, 'csc.exe'), library = win32.join(framework, 'System.dll')
+  for (const file of [compiler, library]) {
+    const info = await lstat(file)
+    assert.ok(info.isFile() && !info.isSymbolicLink(), 'Unexpected installed OS compiler component')
+    let ancestor = win32.dirname(file)
+    while (true) {
+      const info = await lstat(ancestor)
+      assert.ok(info.isDirectory() && !info.isSymbolicLink(), 'Unexpected installed OS compiler ancestor')
+      const parent = win32.dirname(ancestor)
+      if (parent === ancestor) break
+      ancestor = parent
+    }
+  }
   const env = { SystemRoot: systemRoot }
   for (const name of ['TEMP', 'TMP']) {
     const value = Object.entries(process.env).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1]
     if (value !== undefined) env[name] = value
   }
-  const { owned, stderr } = await subject.launchTarget(executable,
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', closedInputFixtureFile, subject.log, subject.pidFile], env)
+  const executable = join(subject.directory, 'owned-closed-input.exe')
+  // No response file, package restore, tool download, shell, or product build.
+  // Compiler output is bounded; the test's existing cleanup removes the EXE.
+  await compileFixture(compiler, ['/nologo', '/noconfig', '/target:exe', `/reference:${library}`,
+    `/out:${executable}`, closedInputFixtureFile], { cwd: subject.directory, env,
+    windowsHide: true, timeout: 15_000, maxBuffer: 16_384 })
+  const compiled = await lstat(executable)
+  assert.ok(compiled.isFile() && !compiled.isSymbolicLink() && compiled.size > 0, 'Owned console fixture was not compiled')
+  const { owned, stderr } = await subject.launchTarget(executable, [subject.log, subject.pidFile], env)
   await until(() => stderr().includes(Buffer.from('native-stdin-closed\n')), 'closed stdin fixture readiness')
   const pids = await subject.pids()
   assert.equal(pids.length, 1)

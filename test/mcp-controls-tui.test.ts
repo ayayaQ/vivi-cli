@@ -3,6 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { BoxRenderable, CliRenderEvents, SelectRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
@@ -12,6 +13,7 @@ import { McpConfigStore } from '../src/mcp-config.js'
 import { McpManager } from '../src/mcp-manager.js'
 import { manageMcp } from '../src/mcp-controls.js'
 
+const scriptArgs = ['--no-install', fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))]
 const fixtures: { io: OpenTuiIO; manager: McpManager; directory: string; releaseCleanup(): void }[] = []
 afterEach(async () => {
   for (const f of fixtures.splice(0)) {
@@ -59,7 +61,7 @@ async function fixture(configured = false) {
   } })
   fixtures.push({ io, manager, directory, releaseCleanup: () => { cleanupBlocked = false } })
   if (configured) await manager.configure({ id: 'docs', label: 'Trusted offline peer', executable: process.execPath,
-    args: [], cwd: directory, protocol: 'legacy', environment: [] })
+    args: scriptArgs, cwd: directory, protocol: 'legacy', environment: [] })
   const phases: Phase[] = []
   let waiting: ((phase: Phase) => void) | undefined
   const announce = (phase: Phase) => { if (waiting) { const accept = waiting; waiting = undefined; accept(phase) } else phases.push(phase) }
@@ -108,7 +110,8 @@ test('native MCP picker and text input work while manager cancellation is regist
   const f = await fixture(), running = manageMcp(f.manager, f.io, f.store.directory)
   await f.choice('add', true)
   await f.text('docs'); await f.text('Offline peer'); await f.text(process.execPath)
-  await f.text(f.store.directory); await f.text('0')
+  await f.text(f.store.directory); await f.text(String(scriptArgs.length))
+  for (const arg of scriptArgs) await f.text(arg)
   await f.choice('legacy'); await f.choice([]); await f.choice(true); await f.choice('back')
   await running
   expect((await f.store.load()).servers.map(server => server.id)).toEqual(['docs'])

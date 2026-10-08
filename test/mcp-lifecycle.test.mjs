@@ -9,12 +9,13 @@ import { McpConfigStore, MCP_ENV_NAMES, mcpDisplayJson, prepareMcpLaunch } from 
 import { McpManager, mcpStartDisclosure } from '../dist/mcp-manager.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
 const signal = () => new AbortController().signal
 async function fixture(t, mode = 'normal', wrapTransport) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-lifecycle-'))
   const store = new McpConfigStore(directory)
   const server = { id: 'fixture', label: 'Fixture', executable: process.execPath,
-    args: [fixtureFile, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory,
+    args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory,
     protocol: 'legacy', environment: [] }
   let starts = 0
   const manager = new McpManager({ store, env: {}, transportFactory: launch => { starts++; const transport = new McpStdioTransport(launch); wrapTransport?.(transport, launch); return transport } })
@@ -37,7 +38,7 @@ test('invisible approval values remain exact JSON while rendering every hidden c
   const rendered = mcpDisplayJson(value)
   assert.equal(JSON.parse(rendered), value)
   assert(!/[\p{Cf}\p{Default_Ignorable_Code_Point}\u2028\u2029]/u.test(rendered))
-  const launch = await prepareMcpLaunch({ ...subject.server, label: value, args: [value] }, 'revision', {})
+  const launch = await prepareMcpLaunch({ ...subject.server, label: value, args: [...scriptArgs, value] }, 'revision', {})
   const disclosure = mcpStartDisclosure(launch)
   assert(disclosure.includes(rendered))
   assert.match(disclosure, /before any tool-call approval/)

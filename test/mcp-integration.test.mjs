@@ -16,6 +16,7 @@ import { McpManager } from '../dist/mcp-manager.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
 const answer = (content = 'Ordinary response', toolCalls = []) => ({ content, toolCalls })
 const credentials = { status: async () => ({ available: false, label: 'Offline test vault' }),
   load: async () => undefined, save: async () => { throw new Error('No credential writes in this test') } }
@@ -44,7 +45,7 @@ async function fixture(t) {
   t.after(() => rm(directory, { recursive: true, force: true }))
   const store = new McpConfigStore(directory)
   const server = { id: 'docs', label: 'Private fixture catalog', executable: process.execPath,
-    args: [fixtureFile, 'normal', join(directory, 'fixture-log'), join(directory, 'fixture-pid')],
+    args: [...scriptArgs, 'normal', join(directory, 'fixture-log'), join(directory, 'fixture-pid')],
     cwd: directory, protocol: 'legacy', environment: [] }
   await store.save([server], (await store.load()).revision)
   const observed = { starts: 0, closes: 0, addedSecrets: [], managers: [], transports: [], launchOptions: [] }
