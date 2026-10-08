@@ -256,14 +256,17 @@ const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
   validateArguments() {}, execute() { return { content: 'packed extension works' } }
 }] }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
-const mcp = new McpManager({ store: new McpConfigStore(directory), env: { OPENAI_API_KEY: 'fake-provider-key' } })
+const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
+const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
+const mcp = new McpManager({ store: new McpConfigStore(directory), env: { ...fixtureEnv, OPENAI_API_KEY: 'fake-provider-key' } })
 try {
   await mcp.configure({ id: 'packed', label: 'Owned package fixture', executable: process.execPath,
     args: [...(process.versions.bun ? ['--no-install'] : []), fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'normal', join(directory, 'mcp-log'), join(directory, 'mcp-pid')],
-    cwd: directory, protocol: 'legacy', environment: [] })
+    cwd: directory, protocol: 'legacy', environment: fixtureEnvironment })
   assert.equal(mcp.statuses()[0].state, 'disabled')
   assert.equal(await mcp.connect('packed', async () => false, new AbortController().signal), false)
-  assert.equal(await mcp.connect('packed', async () => true, new AbortController().signal), true)
+  assert.equal(await mcp.connect('packed', async launch => { assert.deepEqual(launch.environment, fixtureEnv); return true }, new AbortController().signal), true)
   const packedMcp = mcp.statuses()[0].snapshot
   assert.equal(packedMcp.categories.tools.state, 'ready')
   assert.equal(packedMcp.categories.tools.entries[0].remoteKey, 'same/name')

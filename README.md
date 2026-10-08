@@ -136,6 +136,8 @@ protocol. Entries start disabled every launch. Enable requires fresh human
 approval showing that exact launch; Disable closes the owned process tree.
 For Bun servers, use `--no-install` followed by an absolute installed JS/TS
 script path and its separate arguments. Inline code and package commands are unsupported.
+Windows Node servers should explicitly allow `SYSTEMROOT` (included in the minimal
+profile/temp option); an empty environment can prevent Node 26.4 from starting.
 For account-independent line management, run
 `node dist/launcher.js --no-tui --prompt /mcp`; no model or provider key is needed.
 

@@ -10,15 +10,18 @@ import { McpManager, mcpStartDisclosure } from '../dist/mcp-manager.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
 const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
+const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
+const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
 const signal = () => new AbortController().signal
 async function fixture(t, mode = 'normal', wrapTransport) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-lifecycle-'))
   const store = new McpConfigStore(directory)
   const server = { id: 'fixture', label: 'Fixture', executable: process.execPath,
     args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory,
-    protocol: 'legacy', environment: [] }
+    protocol: 'legacy', environment: fixtureEnvironment }
   let starts = 0
-  const manager = new McpManager({ store, env: {}, transportFactory: launch => { starts++; const transport = new McpStdioTransport(launch); wrapTransport?.(transport, launch); return transport } })
+  const manager = new McpManager({ store, env: fixtureEnv, transportFactory: launch => { assert.deepEqual(launch.environment, fixtureEnv); starts++; const transport = new McpStdioTransport(launch); wrapTransport?.(transport, launch); return transport } })
   t.after(async () => { await manager.close(); await rm(directory, { recursive: true, force: true }) })
   await manager.configure(server)
   return { directory, store, server, manager, starts: () => starts }
@@ -38,7 +41,7 @@ test('invisible approval values remain exact JSON while rendering every hidden c
   const rendered = mcpDisplayJson(value)
   assert.equal(JSON.parse(rendered), value)
   assert(!/[\p{Cf}\p{Default_Ignorable_Code_Point}\u2028\u2029]/u.test(rendered))
-  const launch = await prepareMcpLaunch({ ...subject.server, label: value, args: [...scriptArgs, value] }, 'revision', {})
+  const launch = await prepareMcpLaunch({ ...subject.server, label: value, args: [...scriptArgs, value] }, 'revision', fixtureEnv)
   const disclosure = mcpStartDisclosure(launch)
   assert(disclosure.includes(rendered))
   assert.match(disclosure, /before any tool-call approval/)
@@ -47,7 +50,7 @@ test('invisible approval values remain exact JSON while rendering every hidden c
 })
 test('an oversized escaped approval is refused before any startup', async t => {
   const subject = await fixture(t)
-  const launch = await prepareMcpLaunch(subject.server, 'revision', {})
+  const launch = await prepareMcpLaunch(subject.server, 'revision', fixtureEnv)
   const oversized = { ...launch, server: { ...launch.server, args: Array(3).fill('\u200b'.repeat(3000)) } }
   assert.throws(() => mcpStartDisclosure(oversized), /approval display exceeds/)
   assert.equal(subject.starts(), 0)

@@ -17,6 +17,9 @@ import { McpStdioTransport } from '../dist/mcp-transport.js'
 
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
 const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
+const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
+const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
 const answer = (content = 'Ordinary response', toolCalls = []) => ({ content, toolCalls })
 const credentials = { status: async () => ({ available: false, label: 'Offline test vault' }),
   load: async () => undefined, save: async () => { throw new Error('No credential writes in this test') } }
@@ -46,12 +49,13 @@ async function fixture(t) {
   const store = new McpConfigStore(directory)
   const server = { id: 'docs', label: 'Private fixture catalog', executable: process.execPath,
     args: [...scriptArgs, 'normal', join(directory, 'fixture-log'), join(directory, 'fixture-pid')],
-    cwd: directory, protocol: 'legacy', environment: [] }
+    cwd: directory, protocol: 'legacy', environment: fixtureEnvironment }
   await store.save([server], (await store.load()).revision)
   const observed = { starts: 0, closes: 0, addedSecrets: [], managers: [], transports: [], launchOptions: [] }
   const factory = options => {
     observed.launchOptions.push(options)
     const manager = new McpManager({ ...options, transportFactory: launch => {
+      assert.deepEqual(launch.environment, fixtureEnv)
       observed.starts++; const transport = new McpStdioTransport(launch); observed.transports.push(transport); return transport
     } })
     const close = manager.close.bind(manager), addSecrets = manager.addSecrets.bind(manager)
@@ -67,7 +71,7 @@ async function run(subject, mode, io, args = [], providerFactory = () => ({ gene
   const deps = { credentials, providerFactory, mcpManagerFactory: subject.factory,
     [mode === 'tui' ? 'tuiIO' : 'io']: io, ...extra }
   return main(['--no-workspace', ...(args.includes('--resume') ? [] : ['--model', 'offline-test-model']), ...args],
-    { VIVI_SESSION_DIR: subject.directory }, deps)
+    { ...fixtureEnv, VIVI_SESSION_DIR: subject.directory }, deps)
 }
 
 test('private /mcp routing consumes one-shot and composer commands without sending them to the host', async () => {
@@ -247,7 +251,7 @@ for (const mode of ['line', 'tui']) {
     // The real default provider factory would reject this keyless launch if it
     // were constructed. The missing workspace would likewise fail if opened.
     assert.equal(await main(['--prompt', prompt, '--workspace', join(subject.directory, 'missing-workspace')],
-      { VIVI_SESSION_DIR: subject.directory }, { ...untouchedServices, mcpManagerFactory: subject.factory,
+      { ...fixtureEnv, VIVI_SESSION_DIR: subject.directory }, { ...untouchedServices, mcpManagerFactory: subject.factory,
         [mode === 'tui' ? 'tuiIO' : 'io']: io }), 0)
     assert.equal(subject.observed.starts, 0); assert.equal(subject.observed.closes, 1)
     assert.equal(io.sessions.length, 0); assert.equal(io.results.length, 0)
@@ -263,7 +267,7 @@ for (const mode of ['line', 'tui']) {
       servers: [{ transport: 'http', enabled: true }] }), { mode: 0o600 })
     const original = (await readdir(subject.directory)).sort()
     assert.equal(await main(['--prompt', '/mcp', '--workspace', join(subject.directory, 'missing-workspace')],
-      { VIVI_SESSION_DIR: subject.directory }, { ...untouchedServices, mcpManagerFactory: subject.factory,
+      { ...fixtureEnv, VIVI_SESSION_DIR: subject.directory }, { ...untouchedServices, mcpManagerFactory: subject.factory,
         [mode === 'tui' ? 'tuiIO' : 'io']: io }), 1)
     assert.equal(subject.observed.closes, 1); assert.equal(subject.observed.starts, 0)
     assert.equal(io.isClosed, true); assert.equal(io.sessions.length, 0)

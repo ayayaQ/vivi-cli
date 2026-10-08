@@ -15,6 +15,9 @@ import { McpStdioTransport } from '../dist/mcp-transport.js'
 import { launchWindowsMcp } from '../dist/mcp-windows.js'
 
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
+const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
 const closedInputFixtureFile = fileURLToPath(new URL('./fixtures/mcp-windows-closed-input.cs', import.meta.url))
 const compileFixture = promisify(execFile)
 const options = { skip: process.platform !== 'win32', timeout: 45_000 }
@@ -97,7 +100,7 @@ async function sandbox(t) {
       const owned = await pids()
       await until(() => owned.every(dead), 'verified fixture death', 5_000)
     },
-    async launch(mode, args = [], env = {}) {
+    async launch(mode, args = [], env = fixtureEnv) {
       return subject.launchTarget(process.execPath, [fixtureFile, mode, log, pidFile, ...args], env)
     },
     async launchTarget(executable, args, env = {}) {
@@ -117,9 +120,9 @@ async function sandbox(t) {
     async manager(mode = 'pages', protocol = 'legacy') {
       const store = new McpConfigStore(directory)
       const server = { id: 'fixture', label: 'Owned local fixture', executable: process.execPath,
-        args: [fixtureFile, mode, log, pidFile], cwd: directory, protocol, environment: [] }
+        args: [fixtureFile, mode, log, pidFile], cwd: directory, protocol, environment: fixtureEnvironment }
       let starts = 0
-      const manager = new McpManager({ store, env: { NODE_OPTIONS: '--invalid-owned-fixture-option', PATH: 'unused-owned-fixture-path' },
+      const manager = new McpManager({ store, env: { ...fixtureEnv, NODE_OPTIONS: '--invalid-owned-fixture-option', PATH: 'unused-owned-fixture-path' },
         transportFactory(launch) {
           starts++
           const transport = new McpStdioTransport(launch)
@@ -139,7 +142,7 @@ nativeTest('standard argv, Unicode, exact target environment and binary stderr',
   const subject = await sandbox(t)
   const args = ['', 'white space', '"quote"', 'backslash\\"quote', 'trailing\\', 'trailing\\\\',
     '&|<>^%PATH%', '$(literal data)', '中文🙂']
-  for (const environment of [{}, { MCP_FIXTURE_VALUE: 'fixed literal & $ 中文🙂', FIXTURE_EMPTY: '', FIXTURE_UNICODE: '值🙂' }]) {
+  for (const environment of [fixtureEnv, { ...fixtureEnv, MCP_FIXTURE_VALUE: 'fixed literal & $ 中文🙂', FIXTURE_EMPTY: '', FIXTURE_UNICODE: '值🙂' }]) {
     const { owned, stdout, stderr } = await subject.launch('native-probe', args, environment)
     assert.deepEqual(await bounded(owned.completed, 'native environment probe'), { exitCode: 0 },
       stderr().subarray(0, 4096).toString('utf8'))
@@ -225,7 +228,7 @@ nativeTest('closed target stdin reports failure and cleans up without a manual s
 for (const protocol of ['legacy', '2026-07-28']) nativeTest(`initialize, lists, resource metadata, refresh, reconnect and disable (${protocol})`, async t => {
   const subject = await sandbox(t), { manager, starts } = await subject.manager('pages', protocol)
   let approvals = 0
-  const approve = async launch => { approvals++; assert.deepEqual(launch.environment, {}); return true }
+  const approve = async launch => { approvals++; assert.deepEqual(launch.environment, fixtureEnv); return true }
   assert.equal(await bounded(manager.connect('fixture', approve, signal()), 'native discovery connect'), true)
   let status = manager.statuses()[0]
   assert.equal(status.state, 'connected')
@@ -252,7 +255,7 @@ for (const protocol of ['legacy', '2026-07-28']) nativeTest(`initialize, lists, 
   await subject.assertDead()
   const messages = await subject.messages(), requests = messages.filter(message => message.method)
   assert.equal(messages.filter(message => message.event === 'start').length, 2)
-  assert.ok(messages.filter(message => message.event === 'start').every(message => message.env.length === 0))
+  for (const message of messages.filter(message => message.event === 'start')) assert.deepEqual(message.env, fixtureEnvironment)
   assert.ok(requests.every(message => allowedMethods.has(message.method)))
   const handshake = requests.find(message => message.method === (protocol === 'legacy' ? 'initialize' : 'server/discover'))
   if (protocol === 'legacy') assert.deepEqual(handshake.params.capabilities, {})
@@ -300,7 +303,7 @@ nativeTest('immediate startup cancellation completes verified cleanup', async t 
 nativeTest('transport close during startup sends no discovery requests', async t => {
   const subject = await sandbox(t)
   const { server } = await subject.manager()
-  const transport = new McpStdioTransport(await prepareMcpLaunch(server, 'fixture-revision', {}))
+  const transport = new McpStdioTransport(await prepareMcpLaunch(server, 'fixture-revision', fixtureEnv))
   subject.own(() => transport.close())
   const start = transport.start()
   const rejected = assert.rejects(start, /closed before startup|closed during startup/)

@@ -13,13 +13,16 @@ import { newSession } from '../dist/session.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
 const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
+const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
+const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
 const signal = () => new AbortController().signal
 async function fixture(t, mode = 'normal', protocol = 'legacy') {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-discovery-'))
   const store = new McpConfigStore(directory, ['fixture-secret'])
-  const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory, protocol, environment: [] }
+  const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory, protocol, environment: fixtureEnvironment }
   let starts = 0
-  const manager = new McpManager({ store, env: { OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--invalid', PATH: '/unexpected' }, secrets: ['fixture-secret'], transportFactory: launch => { starts++; return new McpStdioTransport(launch) } })
+  const manager = new McpManager({ store, env: { ...fixtureEnv, OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--invalid', PATH: '/unexpected' }, secrets: ['fixture-secret'], transportFactory: launch => { starts++; return new McpStdioTransport(launch) } })
   t.after(async () => { await manager.close(); await rm(directory, { recursive: true, force: true }) })
   await manager.reload(); await manager.configure(server)
   return { directory, store, server, manager, starts: () => starts,
@@ -67,8 +70,8 @@ test('configuration changes during approval invalidate the exact launch', async 
 })
 test('safe launch environment is exact and credentials are absent', async t => {
   const subject = await fixture(t)
-  const launch = await prepareMcpLaunch(subject.server, 'revision', { OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--inspect' }, ['fixture-secret'])
-  assert.deepEqual(launch.environment, {}); assert(Object.isFrozen(launch.server.args)); assert.equal(launch.server.executable, process.execPath)
+  const launch = await prepareMcpLaunch(subject.server, 'revision', { ...fixtureEnv, OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--inspect' }, ['fixture-secret'])
+  assert.deepEqual(launch.environment, fixtureEnv); assert(Object.isFrozen(launch.server.args)); assert.equal(launch.server.executable, process.execPath)
 })
 for (const protocol of ['legacy', '2026-07-28']) test(`real harmless stdio discovery: ${protocol}, one process, no call/read or client capabilities`, {}, async t => {
   const subject = await fixture(t, 'pages', protocol)
@@ -80,7 +83,7 @@ for (const protocol of ['legacy', '2026-07-28']) test(`real harmless stdio disco
   await subject.manager.refresh('docs', ['resources', 'resourceTemplates'], signal())
   assert.equal(subject.starts(), 1)
   const log = await subject.log(), requests = log.filter(value => value.method)
-  assert.deepEqual(log[0].env, [])
+  assert.deepEqual(log[0].env, fixtureEnvironment)
   assert(requests.every(value => ['initialize', 'server/discover', 'notifications/initialized', 'tools/list', 'resources/list', 'resources/templates/list'].includes(value.method)))
   const first = requests.find(value => value.method === 'tools/list')
   assert.equal(first.params.cursor, undefined)
@@ -157,7 +160,7 @@ test('cancellation during initialization closes the process and never reconnects
   assert.equal(subject.manager.statuses()[0].state, 'error')
 })
 test('transport refuses tool calls, resource reads and forbidden workflows', async t => {
-  const subject = await fixture(t), launch = await prepareMcpLaunch(subject.server, 'rev', {})
+  const subject = await fixture(t), launch = await prepareMcpLaunch(subject.server, 'rev', fixtureEnv)
   const transport = new McpStdioTransport(launch)
   for (const method of ['tools/call', 'resources/read', 'prompts/get', 'subscriptions/listen']) await assert.rejects(transport.send({ jsonrpc: '2.0', id: 1, method }), /Only MCP discovery/)
   await transport.close()
@@ -229,7 +232,7 @@ test('external configuration changes during a discovery request invalidate and c
   const subject = await fixture(t)
   await subject.manager.close()
   let lists=0
-  const manager = new McpManager({store:subject.store,env:{},transportFactory(launch) {
+  const manager = new McpManager({store:subject.store,env:fixtureEnv,transportFactory(launch) {
     const transport=new McpStdioTransport(launch),send=transport.send.bind(transport)
     transport.send=async message=>{
       if (message.method==='tools/list' && ++lists===2) {
