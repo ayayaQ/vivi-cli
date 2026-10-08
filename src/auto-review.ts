@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash, randomUUID } from 'node:crypto'
-import { createDecisionRequest, evaluateDecision, isDecisionCurrent } from '@ayayaq/vivi/decisions'
-import type { DecisionPolicy, DecisionProvider, DecisionRequest, DecisionResult, DecisionSnapshot } from '@ayayaq/vivi/decisions'
+import { createDecisionRequest, evaluateDecision, isDecisionCurrent, routePreparedAction } from '@ayayaq/vivi/decisions'
+import type { DecisionPolicy, DecisionProvider, DecisionRequest, DecisionResult, DecisionSnapshot, PreparedActionMetadata } from '@ayayaq/vivi/decisions'
 import type { JsonObject, JsonValue, ToolCall } from '@ayayaq/vivi'
 import type { ApprovalRequest } from './tools.js'
 import type { DecisionLedger, DecisionLedgerRecord } from './decision-ledger.js'
@@ -113,6 +113,10 @@ export interface ReviewProposal {
   currentResourceRevisions(): JsonObject
   isActive(): boolean
   eligible: boolean
+  /** Trusted host preparation is required for model review; absence stays manual. */
+  preparedAction?: PreparedActionMetadata
+  /** Recompute host classification at resource admission, not from model arguments. */
+  currentPreparedAction?(): PreparedActionMetadata
 }
 interface Turn {
   sessionId: string
@@ -257,7 +261,9 @@ export class AutoReviewController {
     const callReference = proposal.approval.call
     const callDigest = reviewDigest(callReference)
     const resourceDigest = reviewDigest(proposal.resourceRevisions)
-    reviewDigest(proposal.inputData)
+    const inputDigest = reviewDigest(proposal.inputData)
+    const preparedDigest = reviewDigest(proposal.preparedAction ?? null)
+    const capturedEligibility = proposal.eligible
     const call: ToolCall = structuredClone(callReference)
     const approval = { ...proposal.approval, call }
     const resources = structuredClone(proposal.resourceRevisions)
@@ -265,22 +271,57 @@ export class AutoReviewController {
     const enrollment = this.enrollmentRevision
     const account = this.config?.accountRevision()
     const mode = this.mode
+    const providerReference = this.config?.provider
+    const evaluateReference = this.config?.provider.evaluate
+    const ledgerReference = this.config?.ledger
+    const configuration = (): string => reviewDigest({ provider: this.config?.provider.id ?? null,
+      model: this.config?.provider.model ?? null, canAutoReview: this.config?.canAutoReview ?? false,
+      policy: this.config ? autoReviewPolicy(this.config.provider.id) : null,
+      policyRevision: AUTO_REVIEW_POLICY_REVISION, sharingRevision: AUTO_REVIEW_SHARING_REVISION })
+    const configurationDigest = configuration()
     let autoAuthorized = false
     const assertCurrent = (): void => {
       signal.throwIfAborted()
       if (!proposal.isActive() || mode === 'auto' && this.config?.isAvailable?.() === false || this.turn !== turn || this.enrollmentRevision !== enrollment ||
         this.config?.accountRevision() !== account || reviewDigest(callReference) !== callDigest ||
+        this.config?.provider !== providerReference || this.config?.provider.evaluate !== evaluateReference ||
+        this.config?.ledger !== ledgerReference || configuration() !== configurationDigest ||
+        proposal.eligible !== capturedEligibility || reviewDigest(proposal.resourceRevisions) !== resourceDigest ||
+        reviewDigest(proposal.inputData) !== inputDigest || reviewDigest(proposal.preparedAction ?? null) !== preparedDigest ||
+        reviewDigest(proposal.currentPreparedAction ? proposal.currentPreparedAction() ?? null : proposal.preparedAction ?? null) !== preparedDigest ||
         reviewDigest(proposal.currentResourceRevisions()) !== resourceDigest) throw new Error('Change became stale; request a fresh review')
-      if (autoAuthorized && reviewContainsSecret([call, proposal.inputData, turn?.text], this.secrets)) {
+      if (autoAuthorized && reviewContainsSecret([call, proposal.inputData, proposal.preparedAction, turn?.text], this.secrets)) {
         throw new Error('A newly registered credential invalidated automatic review; request fresh manual review')
       }
     }
     assertCurrent()
-    const eligible = proposal.eligible && ['note_set', 'create_memory', 'edit_memory'].includes(call.name)
+    const snapshot: DecisionSnapshot = {
+      sessionId: turn?.sessionId ?? 'manual', runId: turn?.runId ?? 'manual', toolCall: call,
+      userRequest: { id: turn?.requestId ?? 'manual', text: turn?.text ?? 'Manual resource review', approvedScope: {
+        tools: ['note_set', 'create_memory', 'edit_memory'],
+        effect: 'Only the ordinary non-sensitive local note or durable memory explicitly requested in this current user message; no deletion or other effects',
+        enrollmentRevision: enrollment,
+        ...(this.config ? { reviewDataSharing: autoReviewSharingScope(this.config.provider.id) } : {})
+      } },
+      policyRevision: `${AUTO_REVIEW_POLICY_REVISION}-${this.config?.provider.id ?? 'manual'}`,
+      resourceRevisions: { ...resources, accountRevision: account ?? null, enrollmentRevision: enrollment },
+      inputData: structuredClone(proposal.inputData),
+      ...(proposal.preparedAction ? { preparedAction: structuredClone(proposal.preparedAction) } : {})
+    }
+    const route = routePreparedAction(snapshot)
+    if (route.route === 'blocked') {
+      if (mode === 'auto') report('Host policy blocks this change; no save was made', 'denied')
+      return undefined
+    }
+    // A shared route is classification only. It cannot broaden the CLI write allowlist,
+    // enroll Auto, authorize data sharing, or bypass the existing resource commit guard.
+    const inScope = proposal.eligible && ['note_set', 'create_memory', 'edit_memory'].includes(call.name)
+    const eligible = inScope && route.route === 'model-review'
     if (!this.config || mode !== 'auto' || !eligible || !turn) {
       let manualApproval = approval
       if (this.config && mode === 'auto') {
-        const reason = !eligible ? 'This action is outside Auto review’s note/memory create/edit scope'
+        const reason = !inScope ? 'This action is outside Auto review’s note/memory create/edit scope'
+          : route.route !== 'model-review' ? 'Host preparation requires manual review for this action'
           : 'Auto review requires an active current user request'
         report(`${reason}; manual review is required`, 'needs_review')
         manualApproval = { ...approval, description: `${reason}; manual review is required.\n${approval.description}` }
@@ -298,21 +339,10 @@ export class AutoReviewController {
     if (turn.seen.has(call.id)) throw new Error('This tool proposal has already been reviewed')
     turn.seen.add(call.id)
     const policy = autoReviewPolicy(this.config.provider.id)
-    const snapshot: DecisionSnapshot = {
-      sessionId: turn.sessionId, runId: turn.runId, toolCall: call,
-      userRequest: { id: turn.requestId, text: turn.text, approvedScope: {
-        tools: ['note_set', 'create_memory', 'edit_memory'],
-        effect: 'Only the ordinary non-sensitive local note or durable memory explicitly requested in this current user message; no deletion or other effects',
-        enrollmentRevision: enrollment, reviewDataSharing: autoReviewSharingScope(policy.provider)
-      } },
-      policyRevision: `${AUTO_REVIEW_POLICY_REVISION}-${policy.provider}`,
-      resourceRevisions: { ...resources, accountRevision: account!, enrollmentRevision: enrollment },
-      inputData: structuredClone(proposal.inputData)
-    }
     let result: DecisionResult | undefined
     let reason: DecisionLedgerRecord['reasonCode'] = 'ineligible'
     const privatePayload = [snapshot, policy]
-    if (reviewContainsSecret(privatePayload, this.secrets) || reviewIsSensitive([turn.text, call, proposal.inputData])) reason = 'privacy'
+    if (reviewContainsSecret(privatePayload, this.secrets) || reviewIsSensitive([turn.text, call, proposal.inputData, proposal.preparedAction])) reason = 'privacy'
     else if (this.suspended) reason = 'audit_unavailable'
     else if (turn.calls >= AUTO_REVIEW_MAX_CALLS) reason = 'budget'
     else {
@@ -321,7 +351,7 @@ export class AutoReviewController {
         assertCurrent()
         if (Buffer.byteLength(JSON.stringify(request)) > AUTO_REVIEW_MAX_INPUT_BYTES) throw new Error('Review input exceeds the host budget')
         // Repeat directly at the provider boundary, including newly registered credentials.
-        if (reviewContainsSecret(request, this.secrets) || reviewIsSensitive([turn.text, call, request.snapshot.inputData])) reason = 'privacy'
+        if (reviewContainsSecret(request, this.secrets) || reviewIsSensitive([turn.text, call, request.snapshot.inputData, request.snapshot.preparedAction])) reason = 'privacy'
         else {
           turn.calls++
           report(`Reviewing ${call.name} with ${this.config.provider.model} (up to 8s)…`, 'reviewing')
