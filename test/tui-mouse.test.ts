@@ -327,7 +327,8 @@ test('short approval dialogs keep both decision buttons inside the visible viewp
     expect(await answer).toBe(false)
     const line = f.io.readLine('Message')
     await f.frame()
-    expect(f.node('vivi-header').height).toBe(2)
+    expect(f.node('vivi-header').height).toBe(1)
+    expect(f.node('vivi-tokens').y).toBeLessThan(f.node('vivi-transcript').y)
     f.io.close()
     expect(await line).toBeUndefined()
   }
@@ -410,4 +411,51 @@ test('stale model cells cannot activate while the updated filter frame is still 
   await f.frame()
   await f.mouse.click(picker.x + 3, picker.y)
   expect(await answer).toEqual({ kind: 'selected', value: choices[29]!.value, query: 'model-29' })
+})
+
+
+test('compact workspace choices render selectable rows on first open and after a native resize', async () => {
+  for (const [width, height] of [[30, 8], [40, 9]] as const) for (const resize of [false, true]) {
+    const f = await fixture(resize ? 100 : width, resize ? 30 : height)
+    f.io.setWorkspace('/fixture/project')
+    const answer = f.io.choose('Menu', [
+      { name: 'First', description: 'Description', value: 0 },
+      { name: 'Second', description: 'Description', value: 1 }
+    ])
+    await f.frame()
+    if (resize) f.setup.resize(width, height)
+    let display = await f.frame()
+    expect(display).toContain('First')
+    expect((f.node('vivi-picker') as SelectRenderable).showDescription).toBe(height > 8)
+    expect(f.node('vivi-picker').height).toBeGreaterThan(0)
+    expect(f.node('vivi-workspace').y + f.node('vivi-workspace').height).toBeLessThanOrEqual(height)
+    f.input.pressArrow('down'); display = await f.frame(); expect(display).toContain('Second')
+    f.input.pressEnter(); expect(await answer).toBe(1)
+    const line = f.io.readLine('Message'); await f.frame()
+    expect(f.node('vivi-composer-box').y + f.node('vivi-composer-box').height).toBeLessThanOrEqual(height)
+    expect(f.node('vivi-workspace').y + f.node('vivi-workspace').height).toBeLessThanOrEqual(height)
+    f.input.pressEnter(); expect(await line).toBe('')
+  }
+})
+
+
+test('choice resize budgets the planned header rows before Yoga settles', async () => {
+  const f = await fixture(160, 30)
+  f.io.setWorkspace('/fixture/project')
+  const answer = f.io.choose('Menu', Array.from({ length: 10 }, (_, index) =>
+    ({ name: `Option ${index}`, description: 'Description', value: index })))
+  await f.frame()
+  for (const height of [14, 15, 16]) {
+    f.setup.resize(40, height)
+    await f.setup.renderOnce()
+    const display = f.setup.captureCharFrame()
+    expect(display).toContain('Option 0')
+    expect(display).toContain('Workspace:')
+    expect(display).toContain('↑/↓ select')
+    const hints = f.node('vivi-hints')
+    expect(hints.y + hints.height).toBeLessThanOrEqual(height)
+    expect(f.node('vivi-workspace').y + f.node('vivi-workspace').height).toBeLessThanOrEqual(height)
+    f.setup.resize(160, 30); await f.frame()
+  }
+  f.input.pressEnter(); expect(await answer).toBe(0)
 })

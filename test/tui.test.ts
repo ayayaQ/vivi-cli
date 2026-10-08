@@ -414,7 +414,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   io.setSession(session)
   const output = await frame()
   expect(output).toContain('openai / mock-model')
-  expect(output).toContain(session.id)
+  expect(output).not.toContain(session.id)
   expect(output).toContain('reasoning high')
   expect(output).toContain('You')
   expect(output).toContain('Assistant')
@@ -425,7 +425,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
 })
 
 test('native status labels round, turn and session cache telemetry without inventing zero', async () => {
-  const { io, frame } = await fixture({ width: 80, height: 24 })
+  const { io, frame } = await fixture({ width: 160, height: 24 })
   const session = newSession({ provider: 'openai', model: 'fake-cache-model' })
   session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
   io.setSession(session)
@@ -454,12 +454,11 @@ test('compact native cache telemetry remains visible and fresh chats clear the p
   const session = newSession({ provider: 'openai', model: 'compact-cache' })
   session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
   io.setSession(session)
-  expect(await frame()).toContain('Cache input: read 0 / write 0')
+  expect(await frame()).toContain('Session I/O/T 3/2/7 · cache R/W 0/0')
   io.setDraft('openrouter')
   const output = await frame()
-  expect(output).toContain('Session tokens: 0 in / 0 out / 0 total')
-  expect(output).toContain('Cache input: read unreported / write')
-  expect(output.match(/unreported/g)?.length).toBe(2)
+  expect(output).toContain('Session I/O/T 0/0/0 · cache R/W ?/?')
+  expect(output).not.toContain('cache R/W 0/0')
 })
 
 test('Enter submits; Shift and Alt Enter compose multiline with preserved draft', async () => {
@@ -1512,7 +1511,7 @@ test('registering cancellation after close immediately aborts a late-starting op
   dispose()
 })
 
-test('long workspace paths stay on one status row and keep the composer visible after resize', async () => {
+test('long workspace paths stay on one right-aligned footer row and keep the composer visible after resize', async () => {
   const { io, setup, frame } = await fixture({ width: 180, height: 30 })
   io.setSession(newSession({ provider: 'openai', model: 'fixture' }))
   const reading = io.readLine('Message')
@@ -1521,15 +1520,19 @@ test('long workspace paths stay on one status row and keep the composer visible 
     for (const [width, height] of [[180, 30], [80, 24], [60, 20], [40, 20]] as const) {
       setup.resize(width, height)
       await frame()
-      const status = setup.renderer.root.findDescendantById('vivi-status') as TextRenderable
+      const workspace = setup.renderer.root.findDescendantById('vivi-workspace') as TextRenderable
       const composer = setup.renderer.root.findDescendantById('vivi-composer-box')!
       const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
-      expect(status.plainText.split('\n')[1]).toContain('Workspace:')
-      expect(status.plainText.split('\n')[1]).toContain('…')
-      expect(status.plainText.split('\n')[1]!.length).toBeLessThanOrEqual(width)
+      expect(workspace.plainText).toContain('Workspace:')
+      expect(workspace.plainText).toContain('…')
+      expect(workspace.plainText.split('\n')).toHaveLength(1)
+      expect(workspace.textAlign).toBe('right')
+      expect(workspace.x + workspace.width).toBe(width)
+      expect(workspace.y).toBeGreaterThanOrEqual(composer.y + composer.height)
+      expect(workspace.y + workspace.height).toBeLessThanOrEqual(height)
       expect(composer.y + composer.height).toBeLessThanOrEqual(height)
       expect(transcript.height).toBeGreaterThan(1)
-      expect(status.height).toBeLessThanOrEqual(6)
+      expect(workspace.height).toBe(1)
     }
   }
   io.close(); expect(await reading).toBeUndefined()
@@ -1558,4 +1561,172 @@ test('workspace status keeps search results, editor and refresh hints visible in
   expect(streaming).toContain('Ctrl+R refresh')
   expect(streaming).toContain('model-599')
   input.pressEnter(); expect(await selecting).toEqual({ kind: 'selected', value: 'selected-model', query: '' })
+})
+
+test('native transcript differentiates user, assistant and activity without changing content or selection', async () => {
+  const { io, setup, frame } = await fixture({ width: 120, height: 40 })
+  const session = newSession({ provider: 'openai', model: 'fixture' })
+  session.history = [
+    { kind: 'message', role: 'user', content: 'Selectable user text' },
+    { kind: 'assistant', content: 'Assistant content', toolCalls: [] },
+    { kind: 'tool_result', callId: 'normal', name: 'Assistant', content: 'Selectable tool text' },
+    { kind: 'message', role: 'system', content: 'System context' },
+    { kind: 'tool_result', callId: 'failed', name: 'failed_tool', content: 'Action failed', isError: true }
+  ]
+  const original = structuredClone(session)
+  io.setSession(session)
+  const display = await frame()
+  const entries = setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren() as BoxRenderable[]
+  const label = (index: number) => entries[index]!.getChildren()[0] as TextRenderable
+  const body = (index: number) => entries[index]!.getChildren()[1] as TextRenderable
+  expect(entries).toHaveLength(5)
+  expect(entries[0]!.border).toEqual(['left'])
+  expect(entries[0]!.borderColor.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
+  expect(entries[0]!.backgroundColor.equals(RGBA.fromHex(TUI_THEME.userBackground))).toBe(true)
+  expect(label(0).fg.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
+  expect(body(0).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
+  expect(label(1).fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
+  expect(entries[1]!.border).toBe(false)
+  for (const index of [2, 3]) {
+    expect(label(index).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+    expect(body(index).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+    expect(entries[index]!.border).toBe(false)
+  }
+  expect(label(4).fg.equals(RGBA.fromHex(TUI_THEME.attention))).toBe(true)
+  expect(body(4).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
+  for (const text of ['Selectable user text', 'Assistant content', 'Selectable tool text', 'System context', 'Action failed']) expect(display).toContain(text)
+  const spans = setup.captureSpans().lines.flatMap(line => line.spans)
+  expect(spans.some(span => span.text.includes('You') && span.fg.equals(RGBA.fromHex(TUI_THEME.lavender)) &&
+    span.bg.equals(RGBA.fromHex(TUI_THEME.userBackground)))).toBe(true)
+  expect(spans.some(span => span.text.includes('Selectable tool text') && span.fg.equals(RGBA.fromHex(TUI_THEME.muted)))).toBe(true)
+  for (const index of [0, 2]) {
+    const text = body(index)
+    expect(text.selectable).toBe(true)
+    await setup.mockMouse.drag(text.x, text.y, text.x + text.plainText.length, text.y)
+    expect(setup.renderer.getSelection()?.getSelectedText()).toContain(text.plainText)
+    setup.renderer.clearSelection()
+  }
+  expect(session).toEqual(original)
+})
+
+test('review state, pending approvals and result errors remain prominent while settled activity is muted', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 120, height: 40 })
+  const session = newSession({ provider: 'openai', model: 'fixture' })
+  io.setSession(session); io.runStarted()
+  const entry = (label: string): BoxRenderable => setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren()
+    .find(node => (node.getChildren()[0] as TextRenderable).plainText === label) as BoxRenderable
+  const colors = (label: string, attention: boolean) => {
+    const nodes = entry(label).getChildren() as TextRenderable[]
+    expect(nodes[0]!.fg.equals(RGBA.fromHex(attention ? TUI_THEME.attention : TUI_THEME.muted))).toBe(true)
+    expect(nodes[1]!.fg.equals(RGBA.fromHex(attention ? TUI_THEME.foreground : TUI_THEME.muted))).toBe(true)
+  }
+  const context = { sessionId: session.id, runId: 'fixture', callId: 'save', toolName: 'note_set' }
+  io.reviewNotice('Reviewing note_set', { ...context, state: 'reviewing' }); await frame()
+  colors('Review · note_set', false)
+  io.reviewNotice('Needs your review', { ...context, state: 'needs_review' }); await frame()
+  colors('Review · note_set', true)
+  io.reviewNotice('Approved by you; change saved', { ...context, state: 'saved', source: 'human' }); await frame()
+  colors('Review · note_set', false)
+  for (const state of ['failed', 'unknown'] as const) {
+    io.reviewNotice(`Unresolved ${state}`, { ...context, callId: state, toolName: state, state }); await frame()
+    colors(`Review · ${state}`, true)
+  }
+  io.reviewNotice('Audit could not be saved'); await frame(); colors('Review warning', true)
+  const pending = io.approve(request, new AbortController().signal)
+  await tick(); await frame(); colors('Approval required · current revision 4', true)
+  input.pressEnter(); expect(await pending).toBe(false)
+  io.result({ ...result('Failed', 'error'), error: new Error('Visible result error') }); await frame()
+  colors('Error', true)
+})
+
+test('title-only header and responsive metadata keep native controls separate from the workspace', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 160, height: 30 })
+  const session = newSession({ provider: 'openrouter', model: 'fixture-model', reasoning: 'high' })
+  session.title = 'Friendly title 日本語'; session.titleRevision = 1
+  session.usage = { inputTokens: 10, outputTokens: 5, totalTokens: 18, cachedInputTokens: 0, cacheWriteInputTokens: 7 }
+  io.setSession(session); io.setApprovalMode('auto'); io.setWorkspace('/fixture/project')
+  const node = (id: string) => setup.renderer.root.findDescendantById(id)!
+  const text = (id: string) => node(id) as TextRenderable
+  for (const width of [160, 100, 80, 72, 71, 60, 59, 40, 20]) {
+    setup.resize(width, 30)
+    const reading = io.readLine('Message')
+    const display = await frame()
+    expect(display).not.toContain(session.id)
+    expect(text('vivi-header').plainText).not.toContain('Session ')
+    expect(text('vivi-tokens').height).toBe(1)
+    expect(text('vivi-tokens').plainText.split('\n')).toHaveLength(1)
+    expect(text('vivi-tokens').textAlign).toBe('right')
+    expect(text('vivi-tokens').x + text('vivi-tokens').width).toBe(width)
+    expect(text('vivi-tokens').y).toBeLessThan(node('vivi-transcript').y)
+    expect(text('vivi-model').y + text('vivi-model').height).toBe(node('vivi-composer-box').y)
+    expect(text('vivi-model').plainText).toContain('Auto review')
+    expect(text('vivi-workspace').y).toBeGreaterThanOrEqual(node('vivi-composer-box').y + node('vivi-composer-box').height)
+    expect(text('vivi-workspace').x + text('vivi-workspace').width).toBe(width)
+    expect(text('vivi-workspace').y + text('vivi-workspace').height).toBeLessThanOrEqual(30)
+    const actions = node('vivi-actions')
+    if (width >= 40) {
+      expect(actions.visible).toBe(true)
+      for (const button of actions.getChildren()) {
+        expect(button.x + button.width).toBeLessThanOrEqual(width)
+        if (button.y === text('vivi-workspace').y) expect(button.x + button.width).toBeLessThanOrEqual(text('vivi-workspace').x)
+        else expect(button.y).toBeLessThan(text('vivi-workspace').y)
+      }
+      const menu = node('vivi-action-menu')
+      await setup.mockMouse.click(menu.x + 1, menu.y)
+      expect(await reading).toBe('/menu')
+    } else {
+      expect(actions.visible).toBe(false)
+      await input.typeText('/menu'); input.pressEnter(); expect(await reading).toBe('/menu')
+    }
+  }
+  io.setSession(newSession({ provider: 'openai', model: 'fixture' })); await frame()
+  expect(text('vivi-header').plainText).toContain('Untitled')
+  expect(session.id).toMatch(/^[a-f0-9-]+$/)
+})
+
+test('user borders wrap Unicode and long text without changing native scrolling, drafts or assistant streaming', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 40, height: 20 })
+  const session = newSession({ provider: 'openai', model: 'fixture' })
+  const content = '日本語 👩🏽‍💻 café '.repeat(15)
+  session.history = Array.from({ length: 30 }, (_, index) => ({ kind: 'message' as const, role: 'user' as const, content: `${index} ${content}` }))
+  io.setSession(session)
+  const reading = io.readLine('Message'); await input.typeText('unchanged draft'); await frame()
+  const transcript = setup.renderer.root.findDescendantById('vivi-transcript') as import('@opentui/core').ScrollBoxRenderable
+  for (const entry of transcript.getChildren()) {
+    expect(entry.x + entry.width).toBeLessThanOrEqual(40)
+    const body = entry.getChildren()[1] as TextRenderable
+    expect(body.plainText).toContain(content)
+  }
+  expect((transcript.getChildren().at(-1)!.getChildren()[1] as TextRenderable).height).toBeGreaterThan(2)
+  const before = transcript.scrollTop
+  input.pressKey('\x1b[5~'); await frame(); expect(transcript.scrollTop).toBeLessThan(before)
+  const page = transcript.scrollTop
+  await setup.mockMouse.scroll(transcript.x + 5, transcript.y + 1, 'up'); await frame()
+  expect(transcript.scrollTop).toBeLessThan(page)
+  input.pressEnter(); expect(await reading).toBe('unchanged draft')
+  io.event({ type: 'text_delta', text: 'Streaming 日本語 '.repeat(10) }); await frame()
+  const partial = setup.renderer.root.findDescendantById('vivi-partial') as BoxRenderable
+  expect((partial.getChildren()[0] as TextRenderable).fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
+  expect(partial.border).toBe(false)
+  io.event({ type: 'assistant', message: { kind: 'assistant', content: 'Accepted 日本語', toolCalls: [] } }); await frame()
+  expect(setup.renderer.root.findDescendantById('vivi-partial')).toBeUndefined()
+})
+
+
+test('extremely narrow telemetry preserves the complete total before clipping labels or title space', async () => {
+  const { io, setup, frame } = await fixture({ width: 20, height: 30 })
+  const session = newSession({ provider: 'openai', model: 'fixture' })
+  const tokens = () => setup.renderer.root.findDescendantById('vivi-tokens') as TextRenderable
+  for (const total of [2523, Number.MAX_SAFE_INTEGER]) {
+    session.usage = { inputTokens: 2197, outputTokens: 326, totalTokens: total }
+    io.setSession(session)
+    for (const [width, height] of [[20, 30], [30, 8], [20, 8]] as const) {
+      setup.resize(width, height); await frame()
+      expect(tokens().plainText).toContain(String(total))
+      expect(tokens().plainText).not.toContain('…')
+      expect(tokens().x + tokens().width).toBeLessThanOrEqual(width)
+    }
+  }
+  setup.resize(4, 8); await frame()
+  expect(tokens().plainText).toBe('…')
 })
