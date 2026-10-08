@@ -19,8 +19,9 @@ if (mode === 'native-stdin') {
   process.exit(0)
 }
 if (mode === 'native-stdin-closed') {
+  if (process.platform === 'win32') throw new Error('Use the owned Windows HANDLE fixture; fs.closeSync(0) does not close Windows stdin')
   // Close fd 0 before materializing process.stdin. A stdio stream can retain a
-  // duplicated handle, and destroy() alone does not reliably close the input.
+  // duplicated handle. This mode is for POSIX; Windows libuv ignores close(0).
   try { closeSync(0) } catch (error) { if (error.code !== 'EBADF') throw error }
   process.stderr.write('native-stdin-closed\n')
   setInterval(() => {}, 1000)

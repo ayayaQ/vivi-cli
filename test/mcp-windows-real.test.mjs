@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { McpConfigStore, prepareMcpLaunch } from '../dist/mcp-config.js'
@@ -14,6 +14,7 @@ import { McpStdioTransport } from '../dist/mcp-transport.js'
 import { launchWindowsMcp } from '../dist/mcp-windows.js'
 
 const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+const closedInputFixtureFile = fileURLToPath(new URL('./fixtures/mcp-windows-closed-input.ps1', import.meta.url))
 const options = { skip: process.platform !== 'win32', timeout: 45_000 }
 const nativeTest = (name, body) => test(`Windows real MCP: ${name}`, options, body)
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -95,8 +96,10 @@ async function sandbox(t) {
       await until(() => owned.every(dead), 'verified fixture death', 5_000)
     },
     async launch(mode, args = [], env = {}) {
-      const owned = await launchWindowsMcp({ executable: process.execPath,
-        args: [fixtureFile, mode, log, pidFile, ...args], cwd: directory, env }, {
+      return subject.launchTarget(process.execPath, [fixtureFile, mode, log, pidFile, ...args], env)
+    },
+    async launchTarget(executable, args, env = {}) {
+      const owned = await launchWindowsMcp({ executable, args, cwd: directory, env }, {
         hostEnv: { ...process.env, PSModulePath: directory, NODE_OPTIONS: '--invalid-owned-fixture-option' },
         cleanupTimeoutMs: 5_000,
         spawn(executable, argv, settings) {
@@ -167,8 +170,23 @@ nativeTest('stdin preserves binary and Unicode bytes up to the frame limit', asy
 
 nativeTest('closed target stdin reports failure and cleans up without a manual stop', async t => {
   const subject = await sandbox(t)
-  const { owned, stderr } = await subject.launch('native-stdin-closed')
+  // Windows libuv deliberately does not close CRT fd 0-2. Use an owned fixture
+  // that closes GetStdHandle(STD_INPUT_HANDLE), rather than a successful no-op.
+  const systemRoot = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  assert.ok(systemRoot, 'Windows SystemRoot is unavailable')
+  const executable = win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const env = { SystemRoot: systemRoot }
+  for (const name of ['TEMP', 'TMP']) {
+    const value = Object.entries(process.env).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1]
+    if (value !== undefined) env[name] = value
+  }
+  const { owned, stderr } = await subject.launchTarget(executable,
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', closedInputFixtureFile, subject.log, subject.pidFile], env)
   await until(() => stderr().includes(Buffer.from('native-stdin-closed\n')), 'closed stdin fixture readiness')
+  const pids = await subject.pids()
+  assert.equal(pids.length, 1)
+  assert.ok(pids.every(pid => !dead(pid)), 'closed-input fixture must remain alive before the failed write')
+  assert.equal((await subject.messages()).find(message => message.event === 'stdin-handle-closed')?.originalHandleInvalid, true)
   // The helper may accept this frame before its native pump sees the broken
   // target pipe. The authoritative lifecycle must still fail and close the job.
   await bounded(owned.write(Buffer.alloc(65_536, 97)), 'closed stdin write').catch(error => {

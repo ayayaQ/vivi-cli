@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { readFileSync } from 'node:fs'
 import { PassThrough } from 'node:stream'
 import { gunzipSync } from 'node:zlib'
 import { test } from 'node:test'
@@ -308,4 +309,20 @@ test('native input-pump failure terminates the owned job before final cleanup', 
   assert.match(pump, /TerminateJobObject\(activeJob, 1\)/)
   fake.child.emit('close', null, null)
   await owned.completed
+})
+
+test('closed-input fixture closes and verifies the original Windows handle using the fixed OS Utility bootstrap', () => {
+  const source = readFileSync(new URL('./fixtures/mcp-windows-closed-input.ps1', import.meta.url), 'utf8')
+  assert.match(source, /LanguageMode -ne 'FullLanguage'/)
+  assert.match(source, /\[String\]::Equals\(\$PSHOME, \$expectedHome, \[StringComparison\]::OrdinalIgnoreCase\)/)
+  assert.match(source, /Microsoft\.PowerShell\.Utility\\Microsoft\.PowerShell\.Utility\.psd1/)
+  assert.match(source, /GetAttributes\(\$ancestor\) -band \[IO\.FileAttributes\]::ReparsePoint/)
+  assert.ok(source.indexOf('Import-Module -Name $manifest') < source.indexOf('Microsoft.PowerShell.Utility\\Add-Type'))
+  assert.match(source, /IntPtr input = GetStdHandle\(-10\)/)
+  assert.match(source, /if \(!CloseHandle\(input\)\)/)
+  assert.match(source, /if \(GetHandleInformation\(input, out flags\)\)/)
+  assert.match(source, /Marshal\.GetLastWin32Error\(\) != 6/)
+  assert.match(source, /Console\.Error\.Write\("native-stdin-closed\\n"\)/)
+  assert.ok(source.indexOf('GetHandleInformation(input, out flags)') < source.indexOf('Console.Error.Write("native-stdin-closed\\n")'))
+  assert.match(source, /Thread\.Sleep\(Timeout\.Infinite\)/)
 })
