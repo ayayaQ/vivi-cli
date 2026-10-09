@@ -99,8 +99,8 @@ Workspace tools omit symlinks and private/ignored files; text writes require rev
 /mode selects Manual or optional Auto review for the current conversation and selected account.
 Auto review adds API charges; only eligible current-request note/memory changes and scoped text creation/precise-edit tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
-/mcp configures trusted installed stdio servers for metadata only; fresh human startup approval is required.
-MCP connections start disabled each launch. Catalogs never become model tools or provider context; credentials are unsupported.
+/mcp configures trusted installed stdio servers; fresh human startup approval is required.
+MCP connections start disabled each launch. Connected catalogs can expose model tools and exact resource reads; every remote operation needs human approval, even in Auto. Credentials are unsupported.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
@@ -347,7 +347,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
+    host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
       enableTools, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,

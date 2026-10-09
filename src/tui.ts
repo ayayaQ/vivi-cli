@@ -1328,8 +1328,12 @@ export class OpenTuiIO implements ChatIO {
     for (const entry of [...this.reviewNotices]) {
       if (!entry.review || reviewNoticeSettled(entry.review)) continue
       const unknown = entry.review.state === 'saving'
-      this.reviewNotice(unknown ? 'The write outcome could not be confirmed; check the resource before retrying'
-        : outcome === 'cancelled' ? 'Review cancelled; no save was made' : 'Review ended without a confirmed save',
+      const mcp = entry.review.toolName.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource'].includes(entry.review.toolName)
+      this.reviewNotice(mcp
+        ? unknown ? 'The MCP operation outcome could not be confirmed; check the remote service before retrying'
+          : outcome === 'cancelled' ? 'Review cancelled; no MCP operation was started' : 'Review ended before an MCP operation was started'
+        : unknown ? 'The write outcome could not be confirmed; check the resource before retrying'
+          : outcome === 'cancelled' ? 'Review cancelled; no save was made' : 'Review ended without a confirmed save',
       { ...entry.review, state: unknown ? 'unknown' : outcome === 'cancelled' ? 'cancelled' : 'failed' })
     }
   }

@@ -22,10 +22,18 @@ import type { JsonObject } from '@ayayaq/vivi'
 import type { PreparedActionMetadata } from '@ayayaq/vivi/decisions'
 import { createCommandExtension, COMMAND_GUIDANCE, COMMAND_TOOL_NAMES } from './commands.js'
 import type { TrustedCommandWorkspace, CommandApprovalContext } from './commands.js'
+import { mcpOperationDisclosure } from './mcp-manager.js'
+import type { McpManager, McpPreparedOperation } from './mcp-manager.js'
+import type { McpCatalogSnapshot } from './mcp-catalog.js'
+import { createMcpExtension, MCP_GUIDANCE } from './mcp-tools.js'
+import { mcpContainsSecret } from './mcp-content.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
 const commandToolNames = new Set<string>(COMMAND_TOOL_NAMES)
+const isMcpTool = (name: string): boolean => name.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource'].includes(name)
+const historyUsesMcp = (history: readonly HistoryMessage[]): boolean => history.some(message =>
+  message.kind === 'tool_result' && isMcpTool(message.name) || message.kind === 'assistant' && message.toolCalls.some(call => isMcpTool(call.name)))
 import { createSkillsExtension, formatSkillCatalogContext } from '@ayayaq/vivi/extensions/skills'
 import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import type { CliSkillStore } from './skills.js'
@@ -46,6 +54,72 @@ function memoryContextContainsSecret(value: unknown, secrets: readonly string[])
     }
   }
   return false
+}
+
+/** Withhold bytes without denying a remote response whose outcome was already confirmed. */
+function withholdMcpResult<T extends ToolResult>(result: T, secrets: readonly string[]): T {
+  let body: unknown
+  try { body = JSON.parse(result.content) } catch { /* Historical text may have no verifiable outcome envelope. */ }
+  if (!mcpContainsSecret([result.content, body ?? null], secrets)) return result
+  const record = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : undefined
+  const localListing = record?.source === 'mcp' && record.localMetadataOnly === true && Array.isArray(record.servers)
+  const confirmed = localListing || record?.source === 'mcp' && typeof record.success === 'boolean' && Array.isArray(record.content) &&
+    ['tools/call', 'resources/read'].includes(String(record.method)) && record.unknownOutcome !== true
+  const succeeded = localListing || record?.success === true
+  const projection = confirmed
+    ? { success: succeeded, source: 'mcp', untrusted: true, contentWithheld: true, confirmedOutcome: true,
+      ...(localListing ? { localMetadataOnly: true, requestSent: false } : { doNotRetry: true }),
+      message: localListing ? 'The local MCP metadata listing completed, but its content was withheld because it contains a known credential. No remote request was sent'
+        : 'MCP returned a confirmed response; its content was withheld because it contains a known credential. Do not repeat the operation to recover withheld content' }
+    : { success: false, source: 'mcp', untrusted: true, contentWithheld: true, unknownOutcome: true, doNotRetry: true,
+      error: { code: 'mcp_content_withheld', message: 'MCP content was withheld because it contains a known credential. The recorded outcome could not be confirmed; do not retry automatically' } }
+  return { ...result, content: JSON.stringify(projection),
+    ...(!confirmed || !succeeded || result.isError ? { isError: true } : {}) }
+}
+
+interface McpIdentityReplacements { readonly callIds: Map<string, string>; readonly toolNames: Map<string, string> }
+function withholdMcpIdentity(value: string, secrets: readonly string[], replacements: Map<string, string>, prefix = ''): string {
+  // Opaque replacements contain no original credential bytes or fingerprint.
+  if ([...replacements.values()].includes(value) || !mcpContainsSecret(value, secrets)) return value
+  let replacement = replacements.get(value)
+  if (!replacement) { replacement = prefix + randomUUID().replaceAll('-', ''); replacements.set(value, replacement) }
+  return replacement
+}
+function withholdMcpCall(call: ToolCall, secrets: readonly string[], replacements: McpIdentityReplacements): ToolCall {
+  const id = withholdMcpIdentity(call.id, secrets, replacements.callIds)
+  const name = withholdMcpIdentity(call.name, secrets, replacements.toolNames, 'mcp_withheld_')
+  const argumentsWithheld = mcpContainsSecret(call.arguments, secrets)
+  return id === call.id && name === call.name && !argumentsWithheld ? call : { ...call, id, name,
+    arguments: argumentsWithheld ? { mcpRequestWithheld: true, reason: 'known_credential' } : call.arguments }
+}
+
+/** Never change executable arguments: these replacements are canonical/display records only. */
+function withholdMcpHistory(history: HistoryMessage[], secrets: readonly string[], replacements: McpIdentityReplacements): HistoryMessage[] {
+  let changed = false, mcpSeen = false
+  const next = history.map(message => {
+    if (message.kind === 'tool_result' && isMcpTool(message.name)) {
+      mcpSeen = true
+      const safe = withholdMcpResult(message, secrets)
+      const callId = withholdMcpIdentity(message.callId, secrets, replacements.callIds)
+      const name = withholdMcpIdentity(message.name, secrets, replacements.toolNames, 'mcp_withheld_')
+      if (safe !== message || callId !== message.callId || name !== message.name) changed = true
+      return callId === safe.callId && name === safe.name ? safe : { ...safe, callId, name }
+    }
+    if (message.kind !== 'assistant') return message
+    if (message.toolCalls.some(call => isMcpTool(call.name))) mcpSeen = true
+    if (!mcpSeen) return message
+    const toolCalls = message.toolCalls.map(call => {
+      return isMcpTool(call.name) ? withholdMcpCall(call, secrets, replacements) : call
+    })
+    const contentWithheld = mcpContainsSecret(message.content, secrets)
+    const stateWithheld = mcpContainsSecret(message.providerState ?? null, secrets)
+    if (!contentWithheld && !stateWithheld && toolCalls.every((call, index) => call === message.toolCalls[index])) return message
+    changed = true
+    const { providerState, ...ordinary } = message
+    return { ...ordinary, content: contentWithheld ? '[MCP assistant content withheld: known credential]' : message.content,
+      toolCalls, ...(!stateWithheld && providerState ? { providerState } : {}) }
+  })
+  return changed ? next : history
 }
 
 /** Stored legacy extras/revision bytes remain intact; tools expose a bounded whitelist. */
@@ -88,6 +162,9 @@ export interface CliHostOptions {
   commandApproval?: { isAvailable(): boolean; accountRevision(): string }
   /** Trusted, explicitly imported tool packs. Registration is captured once per turn. */
   extensions?: readonly ToolExtension[]
+  /** Only human-connected launch-local catalogs can become reviewed model tools. */
+  mcp?: McpManager
+  onMcpNotice?(message: string): void
   /** A host can omit tools when the selected model's tool support is undeclared. */
   enableTools?: boolean
   secrets?: readonly string[]
@@ -115,6 +192,8 @@ export class CliHost {
   private readonly sessionStoreRevision = randomUUID()
   private readonly workspaceScopeRevision = randomUUID()
   private toolsetRevision = 'idle'
+  private readonly mcpManagerRevision = randomUUID()
+  private readonly mcpIdentityReplacements: McpIdentityReplacements = { callIds: new Map(), toolNames: new Map() }
   private readonly commandAccount: string | undefined
   private readonly commandLaunchId = randomUUID()
   private shutdownStarted = false
@@ -141,13 +220,13 @@ export class CliHost {
     settings: Parameters<typeof newSession>[0]
   }): Promise<CliHost> {
     const host = new CliHost({ ...options, session: newSession(options.settings) })
-    await host.options.store.save(host.current)
+    await host.checkpoint(host.current)
     return host
   }
   static async resume(options: Omit<CliHostOptions, 'session'> & { id: string }): Promise<CliHost> {
     const host = new CliHost({ ...options, session: await options.store.load(options.id) })
     // Persist recovered unknown-outcome results before the next model request.
-    await host.options.store.save(host.current)
+    await host.checkpoint(host.current)
     return host
   }
   get session(): CliSession { return structuredClone(this.current) }
@@ -177,7 +256,7 @@ export class CliHost {
       const next = structuredClone(this.current)
       next.title = title; next.titleRevision = revision + 1
       next.updatedAt = new Date().toISOString()
-      try { await this.options.store.save(next) }
+      try { await this.checkpoint(next) }
       catch (error) { if (error instanceof SessionCommitError) this.current = next; throw error }
       this.current = next
     })
@@ -388,13 +467,98 @@ export class CliHost {
         message: redactSecrets(error instanceof Error ? error.message : 'Memory change failed', this.options.secrets ?? []) } }), isError: true }
     }
   }
+  /** MCP annotations cannot prove effects or authorize automatic review. */
+  private async executeMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager): Promise<ToolResult> {
+    try {
+      signal.throwIfAborted()
+      const toolset = this.toolsetRevision
+      const resourceId = `cli-mcp:${operation.serverId}`
+      const affectedData = { serverId: operation.serverId, catalogKind: operation.catalogKind,
+        remoteKey: operation.remoteKey, arguments: operation.call.arguments }
+      const preparedAction = (): PreparedActionMetadata => ({ complete: false, effects: [{
+        kind: 'external', resourceId, scope: 'external', affectedData, review: 'manual'
+      }] })
+      const assertSecretFree = (): void => {
+        manager.addSecrets(this.options.secrets ?? [])
+        if (mcpContainsSecret([operation.call, operation.descriptor, operation.binding, operation.snapshot], this.options.secrets ?? [])) {
+          throw new Error('MCP operation contains a known credential; it was blocked')
+        }
+      }
+      const revisions = (): JsonObject => {
+        assertSecretFree()
+        return { ...manager.operationRevisions(operation), [resourceId]: reviewDigest(operation.binding),
+          mcpBinding: operation.binding, mcpManagerRevision: this.mcpManagerRevision,
+          mcpManagerCurrent: this.options.mcp === manager, toolsEnabled: this.options.enableTools !== false,
+          toolsetRevision: this.toolsetRevision, rawCallDigest: reviewDigest(operation.call) }
+      }
+      assertSecretFree()
+      const result = await this.reviews.execute({ approval: { call: operation.call,
+        currentRevision: reviewDigest(operation.binding), description: mcpOperationDisclosure(operation) },
+        eligible: false, operationLabel: 'MCP operation', inputData: affectedData,
+        preparedAction: preparedAction(), currentPreparedAction: preparedAction,
+        resourceRevisions: revisions(), currentResourceRevisions: revisions,
+        isActive: () => !this.shutdownStarted && this.controller?.signal === signal &&
+          this.toolsetRevision === toolset && this.options.enableTools !== false && this.options.mcp === manager
+      }, signal, async assertCurrent => {
+        assertCurrent()
+        assertSecretFree()
+        return manager.invoke(operation, signal, () => { assertCurrent(); assertSecretFree() })
+      })
+      return result ?? { content: JSON.stringify({ success: false, error: { code: 'approval_denied',
+        message: 'This MCP operation was not approved' } }), isError: true }
+    } catch (error) {
+      return { content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'mcp_operation_failed',
+        message: redactSecrets(error instanceof Error ? error.message : 'MCP operation failed', this.options.secrets ?? []) } }), isError: true }
+    }
+  }
   cancel(): void { this.controller?.abort() }
+  /** Repeat privacy checks at the durable store's last admission guard as well as queue entry. */
+  private async checkpoint(snapshot: CliSession, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<void> {
+    if (!historyUsesMcp(snapshot.history)) {
+      if (options) await this.options.store.save(snapshot, options)
+      else await this.options.store.save(snapshot)
+      return
+    }
+    snapshot.history = withholdMcpHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    const assertIdentitiesSafe = (): void => {
+      for (const replacements of Object.values(this.mcpIdentityReplacements)) for (const replacement of replacements.values()) {
+        if (mcpContainsSecret(replacement, this.options.secrets ?? [])) throw new Error('A canonical MCP identity contains a newly known credential; checkpoint was blocked')
+      }
+    }
+    let committed = false
+    for (;;) {
+      try {
+        assertIdentitiesSafe()
+        await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
+          options?.assertCurrent?.()
+          assertIdentitiesSafe()
+          const safe = withholdMcpHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          if (safe !== snapshot.history && JSON.stringify(safe) !== JSON.stringify(snapshot.history)) {
+            throw new Error('MCP transcript contains a newly known credential; checkpoint was blocked')
+          }
+        } })
+        committed = true
+        assertIdentitiesSafe()
+      } catch (error) {
+        // A privacy reconciliation failure cannot erase a preceding confirmed commit.
+        if (committed && !(error instanceof SessionCommitError)) throw new SessionCommitError(error)
+        throw error
+      }
+      // A store hook may register a credential after its replacement guard. Keep
+      // withholding monotonically until the successful checkpoint returns stable.
+      const safe = withholdMcpHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+      if (safe === snapshot.history || JSON.stringify(safe) === JSON.stringify(snapshot.history)) return
+      snapshot.history = safe
+    }
+  }
   private async save(): Promise<void> {
     this.current.updatedAt = new Date().toISOString()
+    this.current.history = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
     const snapshot = structuredClone(this.current)
-    const operation = this.persistence.then(() => this.options.store.save(snapshot))
+    const operation = this.persistence.then(() => this.checkpoint(snapshot))
     this.persistence = operation.catch(() => undefined)
-    await operation
+    try { await operation }
+    finally { this.current.history = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements) }
   }
   private notes(): NoteSnapshot {
     return { revision: this.current.noteRevision, notes: structuredClone(this.current.notes) }
@@ -410,7 +574,7 @@ export class CliHost {
       next.noteRevision++
       next.updatedAt = new Date().toISOString()
       assertCurrent?.()
-      try { await this.options.store.save(next, { signal, ...(assertCurrent ? { assertCurrent } : {}) }) }
+      try { await this.checkpoint(next, { signal, ...(assertCurrent ? { assertCurrent } : {}) }) }
       catch (error) { if (error instanceof SessionCommitError) this.current = next; throw error }
       this.current = next
       return next.noteRevision
@@ -477,11 +641,28 @@ export class CliHost {
     let prefix: HistoryMessage[] = []
     let memoryContents: readonly string[] = []
     let skillContents: readonly unknown[] = []
+    let mcpContents: readonly McpCatalogSnapshot[] = []
     try {
       // A metadata commit already admitted while idle must settle before this
       // turn mutates current history. Otherwise its pre-turn snapshot could
       // replace a newly accepted prompt while the initial checkpoint waits.
       await this.persistence
+      const mcpManager = enableTools ? this.options.mcp : undefined
+      let mcp: ToolExtension | undefined
+      if (mcpManager) {
+        try {
+          mcpManager.addSecrets(this.options.secrets ?? [])
+          mcpContents = await mcpManager.captureCatalogs(controller.signal)
+          controller.signal.throwIfAborted()
+          if (mcpContents.length) mcp = createMcpExtension(mcpManager, mcpContents,
+            (operation, signal) => this.executeMcp(operation, signal, mcpManager), this.options.secrets ?? [])
+        } catch (error) {
+          if (controller.signal.aborted) throw error
+          mcpContents = []
+          try { this.options.onMcpNotice?.('MCP catalogs are unavailable for this turn; ordinary chat remains available. Inspect /mcp for details') }
+          catch { /* Display failures do not enable a catalog. */ }
+        }
+      }
       const catalog = this.enabledSkills ? await this.listSkills(controller.signal) : undefined
       const diagnostics = catalog ? this.skillsDiagnostics : []
       const diagnosticKey = JSON.stringify(diagnostics)
@@ -498,7 +679,7 @@ export class CliHost {
           return this.enabledSkills && !memoryContextContainsSecret(catalog.document(request.name), this.options.secrets ?? [])
         }
       }) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands)
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp)
       if (catalog) {
         if (!this.options.skills?.writable) {
           try { this.options.onSkillsNotice?.('Automatic skill saving is disabled on every platform. The creator can draft standard SKILL.md text for manual saving') }
@@ -518,6 +699,7 @@ export class CliHost {
           { kind: 'message', role: 'user', content: formatMemoryContext(memories.memories) })
       }
       if (workspace) prefix.push({ kind: 'message', role: 'system', content: WORKSPACE_GUIDANCE })
+      if (mcp) prefix.push({ kind: 'message', role: 'system', content: MCP_GUIDANCE })
       if (commands) prefix.push({ kind: 'message', role: 'system', content: COMMAND_GUIDANCE })
       // Accept the prompt and its title in one successful checkpoint. A failed
       // initial write must not leave an unsaved prompt/title in memory for a retry.
@@ -537,20 +719,41 @@ export class CliHost {
           // after the turn snapshot loaded. Reject it immediately before every
           // provider request, without silently rewriting approved context.
           const memoryToolContext: unknown[] = []
+          const mcpToolContext: unknown[] = []
+          let mcpSeen = false
           for (const message of input.messages) {
+            if (message.kind === 'tool_result' && isMcpTool(message.name)) {
+              mcpSeen = true
+              mcpToolContext.push(message)
+              try { mcpToolContext.push(JSON.parse(message.content)) }
+              catch { mcpToolContext.push(message.content) }
+            }
             if (message.kind === 'tool_result' && (memoryToolNames.has(message.name) || workspaceToolNames.has(message.name) || commandToolNames.has(message.name) || skillsToolNames.has(message.name))) {
               // Decode quoted/escaped content before checking, including resumed
               // canonical results that were serialized by an older host.
               try { memoryToolContext.push(JSON.parse(message.content)) }
               catch { memoryToolContext.push(message.content) }
             } else if (message.kind === 'assistant') {
-              for (const call of message.toolCalls) if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name) || commandToolNames.has(call.name) || skillsToolNames.has(call.name)) memoryToolContext.push(call.arguments)
+              if (message.toolCalls.some(call => isMcpTool(call.name))) mcpSeen = true
+              if (mcpSeen) mcpToolContext.push(message.content, message.providerState ?? null)
+              for (const call of message.toolCalls) {
+                if (isMcpTool(call.name)) mcpToolContext.push(call, message.providerState ?? null)
+                if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name) || commandToolNames.has(call.name) || skillsToolNames.has(call.name)) memoryToolContext.push(call.arguments)
+              }
             }
           }
           if (memoryContextContainsSecret([memoryContents, skillContents, memoryToolContext], this.options.secrets ?? [])) {
             throw new Error('Saved memory, skills or workspace context contains a known credential; provider request was blocked')
           }
+          if (mcpContainsSecret([mcpContents, toolset.tools.filter(tool => isMcpTool(tool.name)), mcpToolContext], this.options.secrets ?? [])) {
+            throw new Error('MCP context contains a known credential; provider request was blocked')
+          }
           const output = await generate(input, signal, options)
+          if ((historyUsesMcp(input.messages) || output.toolCalls.some(call => isMcpTool(call.name))) && mcpContainsSecret([
+            output.toolCalls.filter(call => isMcpTool(call.name)), output.content, output.providerState ?? null
+          ], this.options.secrets ?? [])) {
+            throw new Error('MCP provider response contains a known credential; assistant request was blocked before admission')
+          }
           // Reject session-wide overflow before this response enters canonical history.
           aggregateUsage([...priorUsage, ...roundUsage, output.usage])
           return output
@@ -558,6 +761,10 @@ export class CliHost {
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: async (call, context) => {
+          if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
+            return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
+              error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true }
+          }
           if (skillsToolNames.has(call.name)) {
             this.options.skills?.addSecrets(this.options.secrets ?? [])
             if (memoryContextContainsSecret([skillContents, call.arguments], this.options.secrets ?? [])) {
@@ -574,25 +781,41 @@ export class CliHost {
           if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
             return { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }
           }
-          return result
+          return isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
         },
         onEvent: async (event) => {
-          if (event.type === 'assistant') {
-            this.current.history.push(structuredClone(event.message))
+          let admittedEvent = event
+          if (event.type === 'assistant' || event.type === 'tool_completed') {
+            const safe = withholdMcpHistory([...this.current.history, structuredClone(event.message)], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
+            admittedEvent = { ...event, message: safe } as AgentEvent
+          } else if (event.type === 'tool_started' && isMcpTool(event.call.name) && mcpContainsSecret(event.call, this.options.secrets ?? [])) {
+            admittedEvent = { ...event, call: withholdMcpCall(event.call, this.options.secrets ?? [], this.mcpIdentityReplacements) }
+          }
+          if (admittedEvent.type === 'assistant') {
+            this.current.history.push(structuredClone(admittedEvent.message))
             // This checkpoint precedes round telemetry. A crash here cannot leave
             // a stale cache sum looking like a complete aggregate of the new history.
             delete this.current.usage.cachedInputTokens
             delete this.current.usage.cacheWriteInputTokens
             await this.save()
-          } else if (event.type === 'tool_completed') {
-            this.current.history.push(structuredClone(event.message))
+          } else if (admittedEvent.type === 'tool_completed') {
+            this.current.history.push(structuredClone(admittedEvent.message))
             await this.save()
           } else if (event.type === 'round_completed') {
             roundUsage.push(event.usage)
             this.current.usage = aggregateUsage([...priorUsage, ...roundUsage])
             await this.save()
           }
-          if (!controller.signal.aborted) await this.options.onEvent?.(event)
+          if (!controller.signal.aborted) {
+            // A persistence hook may register credentials after the event's first scan.
+            if (admittedEvent.type === 'assistant' || admittedEvent.type === 'tool_completed') {
+              const safe = withholdMcpHistory([...this.current.history, admittedEvent.message], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
+              admittedEvent = { ...admittedEvent, message: safe } as AgentEvent
+            }
+            await this.options.onEvent?.(admittedEvent)
+          }
+          const safeHistory = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
         }
       })
       // Await any in-flight atomic write, including a committed note whose result raced abort.
@@ -605,12 +828,17 @@ export class CliHost {
       if (prefix.some((message, index) => JSON.stringify(result.history[index]) !== JSON.stringify(message))) {
         throw new Error('Agent returned an unexpected ephemeral context prefix')
       }
-      const canonicalResult = { ...result, history: structuredClone(result.history.slice(prefix.length)) }
+      const canonicalResult = { ...result, history: withholdMcpHistory(structuredClone(result.history.slice(prefix.length)), this.options.secrets ?? [], this.mcpIdentityReplacements) }
       this.current.history = canonicalResult.history
       // Reconcile from the original baseline, never add final usage to event sums.
       // A cancelled/unaccepted response contributes no round and preserves prior metrics.
       this.current.usage = aggregateUsage([...priorUsage, ...(result.rounds > 0 ? [result.usage] : [])])
       await this.save()
+      canonicalResult.history = withholdMcpHistory(structuredClone(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
+      if (historyUsesMcp(canonicalResult.history) &&
+        mcpContainsSecret(canonicalResult.content, this.options.secrets ?? [])) {
+        canonicalResult.content = '[MCP response content withheld: known credential]'
+      }
       return canonicalResult
     } finally {
       // runAgent aborts uncooperative tools without awaiting their I/O. A save

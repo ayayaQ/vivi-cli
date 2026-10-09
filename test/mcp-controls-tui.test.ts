@@ -163,10 +163,14 @@ for (const cancel of ['deny', 'escape', 'ctrl-c', 'close', 'failure'] as const) 
   expect(f.starts()).toBe(0); expect(f.manager.statuses()[0]?.state).toBe('disabled')
 })
 
-test('fresh native human approval connects metadata only, and disable closes the owned peer', async () => {
+test('fresh native human approval connects the catalog with separate call/read approval, and disable closes the owned peer', async () => {
   const f = await fixture(true), running = manageMcp(f.manager, f.io)
   await f.choice('server:docs'); await f.choice('connect')
   expect((await f.next()).kind).toBe('approval')
+  // Startup approval discloses model metadata and separately reviewed calls/reads.
+  expect(contents(f.setup.renderer.root)).toContain('before any tool-call approval')
+  expect(contents(f.setup.renderer.root)).toContain('Ready tool metadata is advertised to the selected model')
+  expect(contents(f.setup.renderer.root)).toContain('Every tool call and resource read requires separate human approval')
   // Queued and repeat gestures cannot authorize the just-opened request.
   f.input.pressArrow('right'); f.input.pressEnter()
   f.setup.renderer.keyInput.emit('keypress', { name: 'return', sequence: '\r', repeated: true, eventType: 'repeat',
@@ -185,7 +189,7 @@ test('fresh native human approval connects metadata only, and disable closes the
   expect(f.starts()).toBe(1); expect(f.closes()).toBe(1)
   expect(f.manager.statuses()[0]?.state).toBe('disabled')
   expect(f.methods).toEqual(['initialize', 'notifications/initialized', 'tools/list', 'resources/list', 'resources/templates/list'])
-  expect(contents(f.setup.renderer.root)).toContain('execution and resource content retrieval are unavailable')
+  expect(contents(f.setup.renderer.root)).toContain('Ready tools and discovered concrete resources are available to the agent with separate human approval')
 })
 
 test('manager modal permissions do not permit active chat keys, paste, mouse actions or direct composer submit', async () => {

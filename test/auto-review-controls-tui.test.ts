@@ -186,3 +186,29 @@ test('native workspace diff is shown exactly with terminal controls escaped and 
   f.input.pressEnter()
   expect(await pending).toBe(false)
 })
+
+for (const toolName of ['mcp_docs_offline_alias', 'list_mcp_resources', 'read_mcp_resource']) {
+  for (const state of ['reviewing', 'needs_review', 'saving'] as const) {
+    test(`interrupted ${toolName} ${state} uses remote-operation wording without claiming a save`, async () => {
+      for (const outcome of ['cancelled', 'error', 'completed'] as const) {
+        const f = await fixture()
+        f.io.runStarted()
+        f.io.reviewNotice('Offline MCP review in progress', { sessionId: f.host.session.id,
+          runId: 'offline-mcp-review', callId: 'offline-mcp-call', toolName, state })
+        f.io.runFinished(outcome)
+        await f.frame()
+        const contents = text(f.setup.renderer.root)
+        expect(contents).not.toContain('Offline MCP review in progress')
+        expect(contents).not.toContain('save was made')
+        expect(contents).not.toContain('confirmed save')
+        expect(contents).not.toContain('change saved')
+        expect(contents).not.toContain('The write outcome')
+        if (state === 'saving') {
+          expect(contents).toContain('The MCP operation outcome could not be confirmed')
+          expect(contents).toContain('check the remote service before retrying')
+        } else if (outcome === 'cancelled') expect(contents).toContain('Review cancelled; no MCP operation was started')
+        else expect(contents).toContain('Review ended before an MCP operation was started')
+      }
+    })
+  }
+}

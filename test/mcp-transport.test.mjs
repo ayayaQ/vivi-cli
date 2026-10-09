@@ -216,3 +216,17 @@ for (const surface of ['picker', 'line']) test(`${surface} cleanup UI retries ac
   await assert.rejects(subject.transport.send({ jsonrpc: '2.0', id: 3, method: 'tools/list' }), /connection is closed/)
   await subject.transport.close(); assert.equal(stops, 3)
 })
+
+test('owned transport permits exact invocation requests but rejects all other client workflows', async () => {
+  const subject = injectedOwnedTransport({}, async () => {})
+  await subject.transport.start()
+  try {
+    for (const method of ['tools/call', 'resources/read']) await subject.transport.send({ jsonrpc: '2.0', id: method, method,
+      params: method === 'tools/call' ? { name: 'owned/name', arguments: {} } : { uri: 'fixture:///owned' } })
+    assert.deepEqual(subject.methods, ['tools/call', 'resources/read'])
+    for (const method of ['prompts/list', 'prompts/get', 'resources/subscribe', 'subscriptions/listen', 'sampling/createMessage', 'elicitation/create', 'roots/list']) {
+      await assert.rejects(subject.transport.send({ jsonrpc: '2.0', id: 'forbidden', method }), /MCP request is unsupported/)
+    }
+    assert.deepEqual(subject.methods, ['tools/call', 'resources/read'])
+  } finally { await subject.transport.close() }
+})

@@ -7,7 +7,7 @@ import type { McpLaunchIdentity } from './mcp-config.js'
 import type { WindowsMcpProcess } from './mcp-windows.js'
 import { verifyMcpGroupDead } from './mcp-process-group.js'
 
-const REQUESTS = new Set(['initialize', 'server/discover', 'tools/list', 'resources/list', 'resources/templates/list'])
+const REQUESTS = new Set(['initialize', 'server/discover', 'tools/list', 'resources/list', 'resources/templates/list', 'tools/call', 'resources/read'])
 const NOTIFICATIONS = new Set(['notifications/initialized', 'notifications/cancelled'])
 const wait = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 /** Single owned process group, strict launch environment, no shell or automatic sibling probe. */
@@ -66,7 +66,7 @@ export class McpStdioTransport implements Transport {
   }
   async send(message: JSONRPCMessage): Promise<void> {
     if (this.closed) throw new Error('MCP connection is closed')
-    if ('method' in message && !('id' in message ? REQUESTS : NOTIFICATIONS).has(message.method)) throw new Error('Only MCP discovery requests are supported')
+    if ('method' in message && !('id' in message ? REQUESTS : NOTIFICATIONS).has(message.method)) throw new Error('MCP request is unsupported')
     const encoded = serializeMessage(message)
     if (Buffer.byteLength(encoded) > 64 * 1024) throw new Error('MCP outgoing frame exceeds its limit')
     if (this.windows) { await this.windows.write(Buffer.from(encoded, 'utf8')); return }

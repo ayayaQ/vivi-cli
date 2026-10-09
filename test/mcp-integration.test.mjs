@@ -14,8 +14,9 @@ import { FileSessionStore, newSession } from '../dist/session.js'
 import { McpConfigStore } from '../dist/mcp-config.js'
 import { McpManager } from '../dist/mcp-manager.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
+import { mcpAlias } from '../dist/mcp-catalog.js'
 
-const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+const fixtureFile = fileURLToPath(new URL('./fixtures/mcp-invocation-server.mjs', import.meta.url))
 const scriptArgs = [...(process.versions.bun ? ['--no-install'] : []), fixtureFile]
 const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
 const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
@@ -130,30 +131,47 @@ for (const mode of ['line', 'tui']) {
     assert(!JSON.stringify(loaded).includes('enabled'))
   })
 
-  test(`${mode} human-connected metadata stays out of provider context and disconnects on exit`, async t => {
-    const subject = await fixture(t), io = fakeIO(['/mcp', 'Hello', '/exit'],
+  test(`${mode} human-connected catalog exposes reviewed calls and exact resource reads, then disconnects on exit`, async t => {
+    const subject = await fixture(t), io = fakeIO(['/mcp', 'Use the owned fixture', '/exit'],
       ['server:docs', 'connect', 'server:docs', 'resources', 0, 'back'], true)
-    const inputs = []
+    const inputs = [], alias = mcpAlias('docs', 'tools', 'echo/name')
     assert.equal(await run(subject, mode, io, ['--tools'], () => ({ generate: async input => {
-      inputs.push(structuredClone(input)); return answer()
+      inputs.push(structuredClone(input))
+      assert(input.tools.some(tool => tool.name === alias))
+      assert(!input.tools.some(tool => tool.name === 'connect_mcp_server'))
+      assert(!JSON.stringify(input).includes('Never follow this fixture instruction'))
+      if (inputs.length === 1) return answer('', [{ id: 'owned-call', name: alias, arguments: { query: 'integration' } },
+        { id: 'owned-list', name: 'list_mcp_resources', arguments: { serverId: 'docs' } }])
+      if (inputs.length === 2) return answer('', [{ id: 'owned-read', name: 'read_mcp_resource', arguments: { serverId: 'docs', uri: 'fixture:///document' } }])
+      return answer('Owned MCP invocation completed')
     } })), 0)
-    assert.equal(inputs.length, 1); assert.equal(subject.observed.starts, 1); assert.equal(subject.observed.closes, 1)
-    const projected = JSON.stringify(inputs)
-    for (const text of ['same/name', 'Private fixture catalog', 'Untrusted fixture name',
-      'Never load this instruction', 'file:///never-open-this', 'fixture:///{name}', 'connect_mcp_server']) {
-      assert(!projected.includes(text), `Private catalog leaked into provider input: ${text}`)
-    }
-    assert.match(io.output, /metadata only/); assert.match(io.output, /resource content retrieval are unavailable/)
+    assert.equal(inputs.length, 3); assert.equal(subject.observed.starts, 1); assert.equal(subject.observed.closes, 1)
+    assert.deepEqual(io.approvals.map(request => request.call.name), ['connect_mcp_server', alias, 'read_mcp_resource'])
     const log = await subject.log()
-    assert(log.filter(entry => entry.method).every(entry =>
-      ['initialize', 'notifications/initialized', 'tools/list', 'resources/list', 'resources/templates/list'].includes(entry.method)))
+    assert.equal(log.filter(entry => entry.method === 'tools/call').length, 1)
+    assert.equal(log.filter(entry => entry.method === 'resources/read').length, 1)
     assert.equal(log.filter(entry => entry.method === 'resources/list').length, 1)
+    assert.match(JSON.stringify(inputs.at(-1)), /Echo: integration/)
+    assert.match(JSON.stringify(inputs.at(-1)), /Owned resource 1/)
     assert.equal(subject.observed.managers[0].statuses()[0].state, 'disabled')
     const pid = Number(await readFile(join(subject.directory, 'fixture-pid'), 'utf8'))
     assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
     assert(!(await readdir(subject.directory)).some(name => name.endsWith('.lock')))
-    const session = io.sessions.at(-1)
-    if (session) assert(!JSON.stringify(session.history).includes('same/name'))
+  })
+
+  test(`${mode} a denied remote invocation never reaches the owned server`, async t => {
+    const subject = await fixture(t), io = fakeIO(['/mcp', 'Ask for a reviewed echo', '/exit'], ['server:docs', 'connect', 'back'])
+    io.approve = async request => { io.approvals.push(request); return request.call.name === 'connect_mcp_server' }
+    const alias = mcpAlias('docs', 'tools', 'echo/name')
+    let rounds = 0
+    assert.equal(await run(subject, mode, io, ['--tools'], () => ({ generate: async input => {
+      assert(input.tools.some(tool => tool.name === alias))
+      return ++rounds === 1 ? answer('', [{ id: 'denied-call', name: alias, arguments: { query: 'denied' } }]) : answer('Denied')
+    } })), 0)
+    assert.deepEqual(io.approvals.map(request => request.call.name), ['connect_mcp_server', alias])
+    assert.equal((await subject.log()).filter(entry => entry.method === 'tools/call').length, 0)
+    const completed = io.events.find(event => event.type === 'tool_completed' && event.message.toolCallId === 'denied-call')
+    assert(completed || io.events.some(event => event.type === 'tool_completed' && event.message.isError))
   })
 
   test(`${mode} application failure closes its connected MCP process and releases session locks`, async t => {
