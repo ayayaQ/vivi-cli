@@ -34,7 +34,8 @@ if (process.argv[2] === '--command-fixture') {
 function expectCompiledCreator(content: string | undefined): void { assert.equal(content, skillCreatorSource.content) }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-memory-'))
 const mcpMethods: string[] = []
-// Compiler/runtime acceptance uses an owned in-memory discovery peer, never a live server.
+let mcpBadOutput = false
+// Compiler/runtime acceptance uses an owned in-memory invocation peer, never a live server.
 const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, transportFactory: () => {
   const transport: Transport = { start: async () => {}, close: async () => transport.onclose?.(),
     send: async message => {
@@ -45,8 +46,13 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
         ? { resultType: 'complete', protocolVersion: '2025-11-25', capabilities: { tools: {}, resources: {} },
           serverInfo: { name: 'Owned compiled peer', version: '1' } }
         : message.method === 'tools/list'
-          ? { resultType: 'complete', tools: [{ name: 'compiled/name', inputSchema: { type: 'object', properties: { query: { type: 'string' } } } }] }
-          : { resultType: 'complete', resources: [{ name: 'Metadata only', uri: 'fixture:///never-read' }] }
+          ? { resultType: 'complete', tools: [{ name: 'compiled/name', inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false },
+            outputSchema: { type: 'object', properties: { echo: { type: 'string' } }, required: ['echo'], additionalProperties: false } }] }
+          : message.method === 'tools/call'
+            ? { resultType: 'complete', content: [{ type: 'text', text: 'Owned compiled echo' }], structuredContent: { echo: mcpBadOutput ? 7 : 'compiled' } }
+            : message.method === 'resources/read'
+              ? { resultType: 'complete', contents: [{ uri: 'fixture:///document', text: 'Owned compiled resource' }], ttlMs: 60000, cacheScope: 'private' }
+              : { resultType: 'complete', resources: [{ name: 'Owned document', uri: 'fixture:///document' }] }
       const id = message.id
       queueMicrotask(() => transport.onmessage?.({ jsonrpc: '2.0', id, result }))
     } }
@@ -60,10 +66,42 @@ try {
   assert.equal(await mcp.connect('compiled', async () => true, new AbortController().signal), true)
   assert.equal(mcp.statuses()[0]!.snapshot!.categories.tools.entries[0]!.state, 'available')
   await mcp.refresh('compiled', ['resources'], new AbortController().signal)
-  assert.equal(mcp.statuses()[0]!.snapshot!.categories.resources.entries[0]!.remoteKey, 'fixture:///never-read')
+  assert.equal(mcp.statuses()[0]!.snapshot!.categories.resources.entries[0]!.remoteKey, 'fixture:///document')
+  const alias = mcp.statuses()[0]!.snapshot!.categories.tools.entries[0]!.alias
+  let mcpRounds = 0, mcpApprovals = 0
+  const mcpHost = await CliHost.create({ mcp, store: new FileSessionStore(directory),
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => { mcpApprovals++; return true },
+    provider: { async generate({ tools }) {
+      assert(tools.some(tool => tool.name === alias))
+      if (++mcpRounds === 1) return { content: '', toolCalls: [{ id: 'compiled-mcp-call', name: alias, arguments: { query: 'compiled' } },
+        { id: 'compiled-mcp-list', name: 'list_mcp_resources', arguments: { serverId: 'compiled' } }] }
+      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'compiled-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'compiled', uri: 'fixture:///document' } }] }
+      return { content: 'Compiled MCP invocation accepted', toolCalls: [] }
+    } } })
+  const mcpResult = await mcpHost.send('Use the owned compiled MCP fixture')
+  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 2)
+  assert.match(JSON.stringify(mcpResult.history), /Owned compiled echo/)
+  assert.match(JSON.stringify(mcpResult.history), /Owned compiled resource/)
+  let denyRounds = 0
+  const deniedMcpHost = await CliHost.create({ mcp, store: new FileSessionStore(directory),
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => false,
+    provider: { async generate() { return ++denyRounds === 1
+      ? { content: '', toolCalls: [{ id: 'compiled-mcp-denied', name: alias, arguments: { query: 'denied' } }] }
+      : { content: 'Compiled MCP denied', toolCalls: [] } } } })
+  assert.equal((await deniedMcpHost.send('Review the owned echo')).status, 'completed')
+  assert.equal(mcpMethods.filter(method => method === 'tools/call').length, 1)
+  assert.equal(mcpMethods.filter(method => method === 'resources/read').length, 1)
+  mcpBadOutput = true
+  const [unknownCatalog] = await mcp.captureCatalogs(new AbortController().signal)
+  const unknownEntry = unknownCatalog!.categories.tools.entries[0]!
+  const unknownOperation = mcp.prepareOperation(unknownCatalog!, unknownEntry, 'tools', { id: 'compiled-unknown', name: alias, arguments: { query: 'uncertain' } })
+  const uncertain = await mcp.invoke(unknownOperation, new AbortController().signal, () => {})
+  assert.equal(uncertain.isError, true); assert.equal(JSON.parse(uncertain.content).unknownOutcome, true)
+  assert.equal(mcp.statuses()[0]!.state, 'error')
+  assert.equal(mcpMethods.filter(method => method === 'tools/call').length, 2)
+  assert.equal(mcpMethods.filter(method => method === 'tools/list').length, 1)
   await mcp.disconnect('compiled')
   assert.equal(mcp.statuses()[0]!.state, 'disabled')
-  assert.deepEqual(mcpMethods, ['initialize', 'notifications/initialized', 'tools/list', 'resources/list'])
   const memory = new FileMemoryStore(directory)
   await memory.commit(await memory.prepareCreate('Prefer compiled test fixtures', 'user'))
   const host = await CliHost.create({ memory, enableMemory: true, enableTools: false,
@@ -186,5 +224,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution, MCP discovery and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/unknown-outcome boundaries and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

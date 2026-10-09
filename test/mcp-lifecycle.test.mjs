@@ -45,7 +45,9 @@ test('invisible approval values remain exact JSON while rendering every hidden c
   const disclosure = mcpStartDisclosure(launch)
   assert(disclosure.includes(rendered))
   assert.match(disclosure, /before any tool-call approval/)
-  assert.match(disclosure, /no model tools or resource contents/)
+  assert.match(disclosure, /Ready tool metadata is advertised to the selected model/)
+  assert.match(disclosure, /Every tool call and resource read requires separate human approval/)
+  assert.match(disclosure, /returned text enters the local transcript and selected provider context/)
   assert(!disclosure.includes(value))
 })
 test('an oversized escaped approval is refused before any startup', async t => {

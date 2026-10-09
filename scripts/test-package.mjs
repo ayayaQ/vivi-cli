@@ -102,7 +102,7 @@ try {
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
-  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows']) {
+  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content']) {
     for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
       assert(paths.has(path), `Missing ${path}`)
     }
@@ -195,8 +195,8 @@ try {
   assert.match(run(process.execPath, [...nodeGuard, launcher, '--no-tui', '--help'], temporary), /--provider/)
   // Anchor runtime/type consumers beside the installed package: its bundled core is an
   // implementation dependency, not a promise that npm hoists that package for other consumers.
-  // The installed discovery prototype executes only this package-authored local fixture.
-  await writeFile(join(installed, 'mcp-fixture.mjs'), await readFile(join(root, 'test/fixtures/mcp-discovery-server.mjs')))
+  // The installed invocation consumer executes only this package-authored local fixture.
+  await writeFile(join(installed, 'mcp-fixture.mjs'), await readFile(join(root, 'test/fixtures/mcp-invocation-server.mjs')))
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
@@ -269,12 +269,51 @@ try {
   assert.equal(await mcp.connect('packed', async launch => { assert.deepEqual(launch.environment, fixtureEnv); return true }, new AbortController().signal), true)
   const packedMcp = mcp.statuses()[0].snapshot
   assert.equal(packedMcp.categories.tools.state, 'ready')
-  assert.equal(packedMcp.categories.tools.entries[0].remoteKey, 'same/name')
+  assert.equal(packedMcp.categories.tools.entries[0].remoteKey, 'echo/name')
   assert(Object.isFrozen(packedMcp.categories.tools.entries[0].descriptor))
   await mcp.refresh('packed', ['resources', 'resourceTemplates'], new AbortController().signal)
   assert.equal(mcp.statuses()[0].snapshot.categories.resources.state, 'ready')
+  const alias = packedMcp.categories.tools.entries[0].alias
+  let mcpRounds = 0, mcpApprovals = 0
+  const mcpHost = await CliHost.create({ store: new FileSessionStore(directory), mcp,
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => { mcpApprovals++; return true },
+    provider: { async generate(input) {
+      assert(input.tools.some(tool => tool.name === alias))
+      if (++mcpRounds === 1) return { content: '', toolCalls: [{ id: 'packed-mcp-call', name: alias, arguments: { query: 'packed' } },
+        { id: 'packed-mcp-list', name: 'list_mcp_resources', arguments: { serverId: 'packed' } }] }
+      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'packed-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'packed', uri: 'fixture:///document' } }] }
+      return { content: 'Packed MCP invocation accepted', toolCalls: [] }
+    } } })
+  const mcpResult = await mcpHost.send('Use the owned packed MCP fixture')
+  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 2)
+  assert.match(JSON.stringify(mcpResult.history), /Echo: packed/)
+  assert.match(JSON.stringify(mcpResult.history), /Owned resource 1/)
+  let denyRounds = 0
+  const deniedMcpHost = await CliHost.create({ store: new FileSessionStore(directory), mcp,
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => false,
+    provider: { async generate() { return ++denyRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-mcp-denied', name: alias, arguments: { query: 'denied' } }] }
+      : { content: 'Packed MCP denied', toolCalls: [] } } } })
+  assert.equal((await deniedMcpHost.send('Review the owned echo')).status, 'completed')
+  const protocolLog = (await readFile(join(directory, 'mcp-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
+  assert.equal(protocolLog.filter(message => message.method === 'tools/call').length, 1)
+  assert.equal(protocolLog.filter(message => message.method === 'resources/read').length, 1)
   await mcp.disconnect('packed')
   assert.equal(mcp.statuses()[0].state, 'disabled')
+  await mcp.remove('packed')
+  await mcp.configure({ id: 'unknown', label: 'Owned unknown-outcome fixture', executable: process.execPath,
+    args: [...(process.versions.bun ? ['--no-install'] : []), fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'bad-output', join(directory, 'unknown-log'), join(directory, 'unknown-pid')],
+    cwd: directory, protocol: 'legacy', environment: fixtureEnvironment })
+  assert.equal(await mcp.connect('unknown', async () => true, new AbortController().signal), true)
+  const [unknownCatalog] = await mcp.captureCatalogs(new AbortController().signal)
+  const unknownEntry = unknownCatalog.categories.tools.entries.find(entry => entry.remoteKey === 'echo/name')
+  const unknownOperation = mcp.prepareOperation(unknownCatalog, unknownEntry, 'tools', { id: 'packed-unknown', name: unknownEntry.alias, arguments: { query: 'uncertain' } })
+  const uncertain = await mcp.invoke(unknownOperation, new AbortController().signal, () => {})
+  assert.equal(uncertain.isError, true); assert.equal(JSON.parse(uncertain.content).unknownOutcome, true)
+  assert.equal(mcp.statuses()[0].state, 'error')
+  const unknownLog = (await readFile(join(directory, 'unknown-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
+  assert.equal(unknownLog.filter(message => message.method === 'tools/call').length, 1)
+  await mcp.disconnect('unknown')
   const host = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' },
     provider: { generate: async () => ({ content: 'Packed host works', toolCalls: [],
@@ -423,7 +462,7 @@ try {
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
-  type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
+  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
@@ -451,7 +490,11 @@ const commandContext: CommandApprovalContext = { launchId: 'types', sessionId: '
 let preparedCommand: PreparedCommand | undefined
 void commandWorkspace; void commandContext; void preparedCommand
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
-const options: CliHostOptions = { provider, session, store, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
+const mcp: McpManager = new McpManager({ store: new McpConfigStore('/tmp/fake-types-only'), env: {} })
+const catalogs: Promise<readonly McpCatalogSnapshot[]> = mcp.captureCatalogs(new AbortController().signal)
+let operation: McpPreparedOperation | undefined
+void catalogs; void operation; void createMcpExtension
+const options: CliHostOptions = { provider, session, store, mcp, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')

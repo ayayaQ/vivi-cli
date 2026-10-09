@@ -79,7 +79,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     ])
     if (entry === undefined || entry < 0) return
     const selected = category.entries[entry]
-    if (selected) io.write(`Server: ${status.server.id}\n${kind === 'tools' ? 'Tool name' : kind === 'resources' ? 'Resource URI' : 'URI template'}: ${mcpDisplayJson(selected.remoteKey)}\nStatus: ${selected.state}${selected.reason ? ` · ${selected.reason}` : ''}\nCatalog metadata only; execution and resource content retrieval are unavailable\n`)
+    if (selected) io.write(`Server: ${status.server.id}\n${kind === 'tools' ? 'Tool name' : kind === 'resources' ? 'Resource URI' : 'URI template'}: ${mcpDisplayJson(selected.remoteKey)}\nStatus: ${selected.state}${selected.reason ? ` · ${selected.reason}` : ''}\n${kind === 'resourceTemplates' ? 'URI templates are metadata-only; expansion is unavailable' : 'Ready tools and discovered concrete resources are available to the agent with separate human approval'}\n`)
   }
   const cleanupUnavailableConfiguration = async (): Promise<void> => {
     for (;;) {
@@ -123,7 +123,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         return
       }
       const statuses = manager.statuses()
-      io.write(`MCP · ${statuses.length} configured servers · metadata only · connections start disabled each launch\n`)
+      io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · connections start disabled each launch\n`)
       const selected = await choose('MCP connections', [
         { name: 'Back', value: 'back' }, { name: 'Add trusted installed server', value: 'add' },
         ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` }))

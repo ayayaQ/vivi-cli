@@ -51,7 +51,7 @@ export interface ApplicationOptions {
   registerSecret?(secret: string): void
   providerFactory(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider
   decisionProviderFactory?: typeof decisionProviderForSession
-  /** Trusted launch wiring only; never part of the host or provider context. */
+  /** Trusted launch wiring only; never configured by the model. */
   mcpManagerFactory?(options: McpManagerOptions): McpManager
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
@@ -84,7 +84,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
 /commands on requests launch/session-only workspace trust; every unsandboxed command needs fresh human approval, even in Auto. /commands off disables it.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
-/mcp manages trusted installed server connections for metadata only; each launch starts disabled.
+/mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
@@ -498,7 +498,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       if (io.isClosed) { await nextRelease(); return false }
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await nextRelease(); return false }
-      nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
+      nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
@@ -585,7 +585,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           { name: 'Trusted commands', value: '/commands' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
           { name: 'Skills', value: '/skills' },
-          { name: 'MCP connections', description: 'Trusted installed servers; metadata only', value: '/mcp' },
+          { name: 'MCP connections', description: 'Trusted installed servers; human-reviewed tools and resource reads', value: '/mcp' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
         if (!action || action === 'continue') continue

@@ -108,6 +108,8 @@ export interface AutoReviewConfiguration {
   accountRevision(): string
 }
 export interface ReviewProposal {
+  /** Host-only wording for unknown-effect manual remote operations; never authority. */
+  operationLabel?: 'MCP operation'
   approval: ApprovalRequest
   inputData: JsonValue
   resourceRevisions: JsonObject
@@ -161,7 +163,7 @@ export function reviewDigest(value: unknown): string {
   return createHash('sha256').update(encode(value, 0)).digest('hex')
 }
 
-function decodeEscapes(text: string): string {
+export function decodeEscapes(text: string): string {
   return text.replace(/\\(?:u([\da-fA-F]{4})|(["\\/bfnrt]))/g, (_match, unicode: string | undefined, escape: string | undefined) =>
     unicode ? String.fromCharCode(Number.parseInt(unicode, 16)) : ({ b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' } as Record<string, string>)[escape!] ?? escape!)
 }
@@ -252,8 +254,12 @@ export class AutoReviewController {
       // A fresh enrollment must not hide that unsettled resource outcome.
       if (error instanceof WorkspaceCommitError) this.suspended = true
       if (latest && !reviewNoticeSettled(latest)) {
-        if (latest.state === 'saving') report('The write outcome could not be confirmed; check the resource before retrying', 'unknown', latest.source)
-        else report(signal.aborted ? 'Review cancelled; no save was made' : 'Review failed; no save was made', signal.aborted ? 'cancelled' : 'failed')
+        if (latest.state === 'saving') report(proposal.operationLabel
+          ? 'The MCP operation outcome could not be confirmed; check the remote service before retrying'
+          : 'The write outcome could not be confirmed; check the resource before retrying', 'unknown', latest.source)
+        else report(proposal.operationLabel
+          ? signal.aborted ? 'Review cancelled; no MCP operation was started' : 'Review failed; no MCP operation was started'
+          : signal.aborted ? 'Review cancelled; no save was made' : 'Review failed; no save was made', signal.aborted ? 'cancelled' : 'failed')
       }
       throw error
     }
@@ -324,20 +330,36 @@ export class AutoReviewController {
     if (!this.config || mode !== 'auto' || !eligible || !turn) {
       let manualApproval = approval
       if (this.config && mode === 'auto') {
-        const reason = !inScope ? 'This action is outside Auto review’s note/memory create/edit and scoped text-file creation/precise-edit scope'
+        const reason = proposal.operationLabel ? 'MCP operations always require human approval, even in Auto'
+          : !inScope ? 'This action is outside Auto review’s note/memory create/edit and scoped text-file creation/precise-edit scope'
           : route.route !== 'model-review' ? 'Host preparation requires manual review for this action'
           : 'Auto review requires an active current user request'
         report(`${reason}; manual review is required`, 'needs_review')
         manualApproval = { ...approval, description: `${reason}; manual review is required.\n${approval.description}` }
       }
       if (!await this.human(manualApproval, signal)) {
-        if (mode === 'auto') report(signal.aborted ? 'Review cancelled; no save was made' : 'Denied by you; no save was made', signal.aborted ? 'cancelled' : 'denied', 'human')
+        if (mode === 'auto') report(proposal.operationLabel
+          ? signal.aborted ? 'Review cancelled; no MCP operation was started' : 'Denied by you; no MCP operation was started'
+          : signal.aborted ? 'Review cancelled; no save was made' : 'Denied by you; no save was made', signal.aborted ? 'cancelled' : 'denied', 'human')
         return undefined
       }
       assertCurrent()
-      if (mode === 'auto') report('Approved by you; saving this change', 'saving', 'human')
+      if (mode === 'auto') report(proposal.operationLabel ? 'Approved by you; running this MCP operation'
+        : 'Approved by you; saving this change', 'saving', 'human')
       const value = await commit(assertCurrent)
-      if (mode === 'auto') report('Approved by you; change saved', 'saved', 'human')
+      if (mode === 'auto') {
+        if (proposal.operationLabel) {
+          const result = value as unknown as { isError?: boolean; content?: string }
+          let unknownOutcome = false
+          if (typeof result?.content === 'string') {
+            try { unknownOutcome = JSON.parse(result.content)?.unknownOutcome === true }
+            catch { /* A non-JSON result cannot assert an unknown outcome. */ }
+          }
+          report(unknownOutcome ? 'The MCP operation was sent, but its outcome could not be confirmed; check the remote service before retrying'
+            : result?.isError ? 'MCP operation returned an error; review the result before deciding what to do next'
+            : 'Approved by you; MCP operation returned a response', unknownOutcome ? 'unknown' : result?.isError ? 'failed' : 'saved', 'human')
+        } else report('Approved by you; change saved', 'saved', 'human')
+      }
       return value
     }
     if (turn.seen.has(call.id)) throw new Error('This tool proposal has already been reviewed')

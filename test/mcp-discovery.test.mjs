@@ -159,10 +159,10 @@ test('cancellation during initialization closes the process and never reconnects
   assert.throws(() => process.kill(pid, 0), /ESRCH/)
   assert.equal(subject.manager.statuses()[0].state, 'error')
 })
-test('transport refuses tool calls, resource reads and forbidden workflows', async t => {
+test('transport refuses unsupported prompts and subscription workflows', async t => {
   const subject = await fixture(t), launch = await prepareMcpLaunch(subject.server, 'rev', fixtureEnv)
   const transport = new McpStdioTransport(launch)
-  for (const method of ['tools/call', 'resources/read', 'prompts/get', 'subscriptions/listen']) await assert.rejects(transport.send({ jsonrpc: '2.0', id: 1, method }), /Only MCP discovery/)
+  for (const method of ['prompts/get', 'subscriptions/listen', 'resources/subscribe', 'sampling/createMessage', 'elicitation/create']) await assert.rejects(transport.send({ jsonrpc: '2.0', id: 1, method }), /MCP request is unsupported/)
   await transport.close()
 })
 
@@ -206,7 +206,7 @@ test('server stderr and error messages are never surfaced in status metadata', a
   assert.equal(await subject.manager.connect('docs', async () => true, signal()), true)
   assert(!JSON.stringify(subject.manager.statuses()).includes('fixture-secret'))
 })
-test('MCP catalogs never enter model tools, messages or automatic configuration actions', async t => {
+test('an unrelated host never acquires a manager catalog or automatic configuration authority', async t => {
   const subject = await fixture(t)
   assert.equal(await subject.manager.connect('docs', async () => true, signal()), true)
   let calls = 0

@@ -29,7 +29,7 @@ then choose a model.
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
 - `/settings` — change defaults for future conversations
 - `/memories` — manage this launch’s app-wide saved context
-- `/mcp` — configure and explicitly connect trusted installed stdio servers for metadata discovery
+- `/mcp` — configure and explicitly connect trusted installed stdio servers for reviewed tools and resource reads
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -128,7 +128,7 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
 
-## Optional MCP discovery
+## Optional MCP tools
 
 Use `/mcp` in full-screen or line mode to add an already installed executable,
 its separate arguments, working directory and explicit legacy or pinned modern
@@ -143,10 +143,13 @@ For account-independent line management, run
 
 Starting a trusted server runs its code with your OS permissions before any
 tool-call approval. It can access files and network; this is not a sandbox.
-Catalogs show bounded tool names, resource URIs and templates only. They are
-never model tools or provider context. Unsupported schemas are quarantined.
-There are no resource reads, OAuth, HTTP, credential environment values,
-repository auto-discovery, package installation or automatic reconnects.
+Connected, ready catalogs expose bounded tool aliases and schemas to the agent.
+Every remote tool call and resource read requires human approval, including in Auto
+review. Reads use exact discovered resource URIs; templates are metadata only.
+Unsupported schemas are quarantined; stale catalogs and changed connections block
+calls. Results are bounded, untrusted data; uncertain outcomes disable the connection
+without retry. OAuth, HTTP, credential environment values, repository auto-discovery,
+package installation and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
 FullLanguage for owned Job Object cleanup.
 

@@ -43,6 +43,11 @@ function boundedJson(value: unknown, depth = 0, budget = { nodes: MCP_LIMITS.nod
   if (!Array.isArray(value) && !mcpRecord(value)) throw new Error('MCP descriptor must be plain JSON')
   for (const child of Object.values(value)) boundedJson(child, depth + 1, budget)
 }
+/** Bound untrusted JSON before cloning, hashing, validation or provider projection. */
+export function assertMcpJson(value: unknown, maxBytes: number): void {
+  boundedJson(value)
+  if (Buffer.byteLength(JSON.stringify(value)) > maxBytes) throw new Error('MCP JSON exceeds its byte limit')
+}
 const keywords = new Set(['$schema', '$id', '$ref', '$defs', 'definitions', '$comment', 'title', 'description', 'type',
   'properties', 'required', 'additionalProperties', 'items', 'prefixItems', 'additionalItems', 'enum', 'const', 'allOf', 'anyOf', 'oneOf', 'not',
   'if', 'then', 'else', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf', 'minLength', 'maxLength',
@@ -83,6 +88,7 @@ function schemaReason(value: unknown, root = true): string | undefined {
   return undefined
 }
 function toolReason(descriptor: Record<string, unknown>, validator: AjvJsonSchemaValidator): string | undefined {
+  if (mcpRecord(descriptor.execution) && descriptor.execution.taskSupport === 'required') return 'Required task execution is unavailable'
   if (descriptor['x-mcp-header'] !== undefined) return 'Header declarations are unavailable in stdio discovery'
   if (!mcpRecord(descriptor.inputSchema) || descriptor.inputSchema.type !== 'object') return 'Tool input schema must have object type'
   for (const schema of [descriptor.inputSchema, ...(descriptor.outputSchema === undefined ? [] : [descriptor.outputSchema])]) {

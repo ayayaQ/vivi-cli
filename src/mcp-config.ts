@@ -26,8 +26,10 @@ export function mcpText(value: unknown, limit: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= limit && !controls.test(value)
 }
 /** Preserve exact text while making invisible approval/display characters visible. */
-export function mcpDisplayJson(value: string): string {
-  return JSON.stringify(value).replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}\u007f-\u009f\u2028\u2029]/gu,
+export function mcpDisplayJson(value: unknown): string {
+  const serialized = JSON.stringify(value)
+  if (serialized === undefined) throw new Error('MCP display requires JSON data')
+  return serialized.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}\u007f-\u009f\u2028\u2029]/gu,
     character => character.split('').map(unit => `\\u${unit.charCodeAt(0).toString(16).padStart(4, '0')}`).join(''))
 }
 export function mcpDigest(value: unknown): string {
