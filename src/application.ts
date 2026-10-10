@@ -545,6 +545,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
     activeSettings = nextSettings; candidate = undefined
     await previousRelease?.().catch(report)
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setSession(host.session)
     io.setApprovalMode?.('manual')
     io.write('Approval mode: Manual\n')

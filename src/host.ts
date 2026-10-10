@@ -33,6 +33,7 @@ import { mcpContainsSecret } from './mcp-content.js'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOutcomeResult, reconcileMcpOutcomes, unattemptedMcpResult, unresolvedMcpResult, validateMcpOutcomes } from './mcp-outcomes.js'
 import type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
+import type { CliToolEvidence } from './tool-presentation.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
@@ -279,6 +280,11 @@ export class CliHost {
     }
   }
   get conversationRecords(): CliConversationView { return this.records.view }
+  /** Read-only exact host evidence. Rendering it cannot approve, execute or repair a tool. */
+  get toolPresentationEvidence(): CliToolEvidence {
+    const projection = this.conversationRecords.projection
+    return { sessionId: this.current.id, ...(projection ? { projection } : {}) }
+  }
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
   get approvalMode(): ApprovalMode { return this.reviews.mode }

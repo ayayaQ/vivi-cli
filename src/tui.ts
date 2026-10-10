@@ -9,7 +9,8 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable } from '@opentui/core'
-import type { AgentEvent, AgentResult, HistoryMessage, Usage } from '@ayayaq/vivi'
+import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, Usage } from '@ayayaq/vivi'
+import type { ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
 import type { ChatIO } from './terminal.js'
@@ -27,6 +28,8 @@ import type { RunClock, RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { reviewNoticeSettled } from './auto-review.js'
+import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolSource } from './tool-presentation.js'
+import type { CliToolEvidence } from './tool-presentation.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
@@ -117,6 +120,7 @@ interface DisplayEntry {
   reviewKey?: string
   review?: ReviewNotice
   historyStart?: number
+  tool?: { encoded: string; key: string }
 }
 interface SearchPicker {
   choices: readonly Choice<unknown>[]
@@ -211,6 +215,10 @@ export class OpenTuiIO implements ChatIO {
   private partialBox: BoxRenderable | undefined
   private partial: MarkdownRenderable | undefined
   private entries: DisplayEntry[] = []
+  private toolEvidence: CliToolEvidence | undefined
+  private readonly collapsedTools = new Set<string>()
+  private liveToolCalls = new Map<string, { call: ToolCall; index: number; key: string; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
+  private liveHistoryIndex = 0
   private resultNotices: DisplayEntry[] = []
   private reviewNotices: DisplayEntry[] = []
   private historyLength = 0
@@ -875,6 +883,15 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) { this.consume(key); return }
     if (this.diagnosticKey) { this.consume(key); this.diagnosticKey(key); return }
     if (key.eventType === 'release') { this.consume(key); return }
+    // This shortcut changes display details only, including while an approval is open.
+    if (key.ctrl && key.name === 'o') {
+      this.consume(key)
+      if (!key.repeated && key.eventType !== 'repeat') {
+        const latest = [...this.entries].reverse().find(entry => entry.tool)
+        if (latest?.tool) this.toggleToolDetails(latest.tool.key)
+      }
+      return
+    }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
       this.consume(key)
       if (key.name === 'escape' && (this.pending?.kind === 'choice' || this.pending?.kind === 'search' || this.pending?.kind === 'text' || this.pending?.kind === 'secret')) {
@@ -1167,6 +1184,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || signal.aborted) return false
     const enrollment = request.call.name === 'enroll_auto_review'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
+    this.showTool(request.call.id, 'approval_required', 'not_attempted', 'Exact action needs human review')
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     this.appendEntry({ category: 'activity', attention: true, label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false })
@@ -1179,6 +1197,8 @@ export class OpenTuiIO implements ChatIO {
     this.runStatus.setPhase('waiting_approval')
     try {
       const reply = await answer
+      this.showTool(request.call.id, reply === 'allow' && !signal.aborted && !this.closed ? 'running' : signal.aborted ? 'cancelled' : 'denied',
+        reply === 'allow' && !signal.aborted && !this.closed ? 'unreported' : 'not_attempted')
       return reply === 'allow' && !signal.aborted && !this.closed
     } finally {
       this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
@@ -1189,12 +1209,18 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return
     this.settleReviews('cancelled')
     this.turnHistoryStart = this.historyLength
+    this.liveHistoryIndex = this.historyLength
+    this.liveToolCalls.clear()
     this.runStatus.start()
     this.updateStatus('Working · Escape / Ctrl+C cancels')
   }
   runFinished(outcome: RunOutcome): void {
     if (this.closed) return
     this.settleReviews(outcome)
+    for (const [id, live] of this.liveToolCalls) {
+      if (!['requested', 'approval_required', 'running'].includes(live.status ?? 'requested')) continue
+      this.showTool(id, live.effect === 'not_attempted' ? 'cancelled' : 'unknown', live.effect === 'not_attempted' ? 'not_attempted' : 'unreported')
+    }
     this.runStatus.finish(outcome)
     this.updateStatus(outcome === 'completed' ? 'Completed' : outcome === 'cancelled' ? 'Cancelled' : 'Error')
   }
@@ -1244,16 +1270,76 @@ export class OpenTuiIO implements ChatIO {
     const box = new BoxRenderable(this.renderer, { flexDirection: 'column', flexShrink: 0, width: '100%', marginBottom: 1,
       ...(user ? { backgroundColor: TUI_THEME.userBackground, border: ['left'], borderColor: TUI_THEME.lavender, paddingLeft: 1 } : {}) })
     box.add(new TextRenderable(this.renderer, { content: entry.label, fg: headerColor, flexShrink: 0, wrapMode: 'word' }))
-    if (entry.content) box.add(entry.markdown ? this.markdown(entry.content) : new TextRenderable(this.renderer,
+    if (entry.tool) {
+      const key = entry.tool.key, collapsed = this.collapsedTools.has(key)
+      const view = cliToolPresentationView(entry.tool.encoded, collapsed, 8192, this.secrets)
+      for (const line of view.header) box.add(new TextRenderable(this.renderer,
+        { content: this.safe(line), fg: TUI_THEME.muted, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+      // Safety and provenance are sibling rows, never part of the detail container/budget.
+      for (const warning of view.warnings) box.add(new TextRenderable(this.renderer,
+        { content: this.safe(`Warning: ${warning}`), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+      const button = new TextRenderable(this.renderer, { id: `vivi-tool-details-${key}`,
+        content: `${collapsed ? 'Show' : 'Hide'} details · Ctrl+O latest`, fg: TUI_THEME.lavender,
+        flexShrink: 0, width: '100%', wrapMode: 'word' })
+      button.selectable = false
+      button.onMouse = event => this.mouseActivation.handle(event, button, key, entry.tool, !this.closed && this.entries.includes(entry),
+        () => this.toggleToolDetails(key))
+      box.add(button)
+      const details = new BoxRenderable(this.renderer, { id: `vivi-tool-body-${key}`, flexDirection: 'column',
+        flexShrink: 0, width: '100%' })
+      for (const section of view.details) details.add(new TextRenderable(this.renderer,
+        { content: this.safe(`${section.label}:\n${section.text}`), fg: bodyColor, width: '100%', wrapMode: 'word', flexShrink: 0 }))
+      box.add(details)
+      if (view.notice) box.add(new TextRenderable(this.renderer,
+        { content: view.notice, fg: TUI_THEME.muted, width: '100%', wrapMode: 'word', flexShrink: 0 }))
+    }
+    if (entry.content && !entry.tool) box.add(entry.markdown ? this.markdown(entry.content) : new TextRenderable(this.renderer,
       { content: entry.content, fg: bodyColor, width: '100%', wrapMode: 'word', flexShrink: 0 }))
     this.transcript.add(box)
     return box
   }
+  private toggleToolDetails(key: string): void {
+    this.mouseActivation.clear()
+    if (this.collapsedTools.has(key)) this.collapsedTools.delete(key)
+    else this.collapsedTools.add(key)
+    this.rebuild()
+  }
+  setToolEvidence(evidence: CliToolEvidence): void { this.toolEvidence = evidence }
+  /** Inert display sink for shared versioned data; it contains no action handlers. */
+  toolPresentation(encoded: string): void {
+    this.appendEntry({ category: 'activity', label: 'Tool presentation', content: '', markdown: false,
+      tool: { encoded, key: `display-${this.liveHistoryIndex++}` } })
+  }
+  private toolKey(index: number, callId: string): string {
+    // No user-controlled ID is a renderable ID or an executable link.
+    return Buffer.from(JSON.stringify([this.sessionId ?? 'unreported', index, callId])).toString('hex')
+  }
+  private showTool(callId: string, status: ToolPresentationStatus, effect: ToolPresentationEffect,
+    progress?: string): void {
+    const live = this.liveToolCalls.get(callId)
+    if (!live) return
+    live.status = status; live.effect = effect
+    let encoded: string
+    try { encoded = JSON.stringify(createCliToolPresentation({ call: live.call, status, effect,
+      source: cliToolSource(this.sessionId, live.index, live.call), secrets: this.secrets, ...(progress ? { progress } : {}) })) }
+    catch { encoded = '' }
+    const old = this.entries.find(entry => entry.tool?.key === live.key)
+    const entry: DisplayEntry = { category: 'activity', label: this.safe(`Tool ${live.call.name}`, 4096), content: '',
+      markdown: false, tool: { encoded, key: live.key }, historyIndex: live.index }
+    if (old) this.entries[this.entries.indexOf(old)] = entry
+    else this.entries.push(entry)
+    this.rebuild()
+  }
   private trimEntries(): void {
-    let total = this.entries.reduce((sum, entry) => sum + entry.label.length + entry.content.length, 0)
+    const size = (entry: DisplayEntry): number => {
+      if (!entry.tool) return entry.label.length + entry.content.length
+      const view = cliToolPresentationView(entry.tool.encoded, false, 8192, this.secrets)
+      return entry.label.length + [...view.header, ...view.warnings, ...view.details.map(section => section.text)].join('\n').length
+    }
+    let total = this.entries.reduce((sum, entry) => sum + size(entry), 0)
     while (this.entries.length > 1 && (this.entries.length > MAX_ENTRIES || total > MAX_DISPLAY)) {
       const first = this.entries.shift()!
-      total -= first.label.length + first.content.length
+      total -= size(first)
     }
   }
   private rebuild(): void {
@@ -1280,9 +1366,29 @@ export class OpenTuiIO implements ChatIO {
       const tools = message.kind === 'assistant' && message.toolCalls.length
         ? `\nTools requested: ${message.toolCalls.map((call) => call.name).join(', ')}` : ''
       const safeLabel = this.safe(label, 4096)
+      if (message.kind === 'tool_result') {
+        let encoded: string
+        try { encoded = JSON.stringify(cliHistoryToolPresentation(history, index, this.sessionId, this.toolEvidence, this.secrets)) }
+        catch { encoded = '' }
+        let requestIndex = index
+        for (let previous = index - 1; previous >= 0; previous--) {
+          const candidate = history[previous]!
+          if (candidate.kind === 'message' && candidate.role === 'user') break
+          if (candidate.kind === 'assistant' && candidate.toolCalls.some(call => call.id === message.callId && call.name === message.name)) {
+            requestIndex = previous; break
+          }
+        }
+        const key = this.toolKey(requestIndex, message.callId)
+        const view = cliToolPresentationView(encoded, false, Math.max(0, Math.min(8192, budget)), this.secrets)
+        entries.unshift({ category: 'activity', label: safeLabel, content: '', markdown: false, historyIndex: index,
+          attention: view.warnings.length > 0, tool: { encoded, key } })
+        // Whole-history retention may omit old complete cards, never slice their safety rows.
+        budget -= safeLabel.length + [...view.header, ...view.warnings, ...view.details.map(section => section.text)].join('\n').length
+        continue
+      }
       const content = this.safe(message.content + tools, Math.max(0, budget - safeLabel.length))
       entries.unshift({ category: message.kind === 'message' && message.role === 'user' ? 'user' : message.kind === 'assistant' ? 'assistant' : 'activity',
-        ...(message.kind === 'tool_result' && message.isError ? { attention: true } : {}), label: safeLabel, content, markdown: message.kind === 'assistant', historyIndex: index })
+        label: safeLabel, content, markdown: message.kind === 'assistant', historyIndex: index })
       budget -= safeLabel.length + content.length
     }
     if (entries.length < history.length) entries.unshift({ category: 'activity', label: 'Display limit',
@@ -1348,6 +1454,9 @@ export class OpenTuiIO implements ChatIO {
     this.entries = []
     this.resultNotices = []
     this.reviewNotices = []
+    this.toolEvidence = undefined
+    this.collapsedTools.clear()
+    this.liveToolCalls.clear()
     this.historyLength = 0
     this.turnHistoryStart = 0
     this.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
@@ -1371,6 +1480,8 @@ export class OpenTuiIO implements ChatIO {
       this.reviewNotices = []
       this.turnHistoryStart = 0
       this.clearStream()
+      this.collapsedTools.clear()
+      this.liveToolCalls.clear()
       this.status = 'Ready'
     }
     this.sessionId = session.id
@@ -1393,6 +1504,13 @@ export class OpenTuiIO implements ChatIO {
     const key = context ? JSON.stringify([context.sessionId, context.runId, context.callId]) : undefined
     const previous = key === undefined ? undefined : this.reviewNotices.find(entry => entry.reviewKey === key)
     if (previous?.review && reviewNoticeSettled(previous.review)) return
+    if (context) {
+      const state: Record<ReviewNotice['state'], readonly [ToolPresentationStatus, ToolPresentationEffect]> = {
+        reviewing: ['running', 'not_attempted'], needs_review: ['approval_required', 'not_attempted'],
+        saving: ['running', 'unknown'], saved: ['succeeded', 'confirmed'], denied: ['denied', 'not_attempted'],
+        cancelled: ['cancelled', 'not_attempted'], failed: ['failed', 'not_attempted'], unknown: ['unknown', 'unknown'] }
+      this.showTool(context.callId, ...state[context.state], message)
+    }
     const content = this.safe(message, 2048)
     if (!context && this.reviewNotices.some(entry => !entry.review && entry.historyStart === this.turnHistoryStart && entry.content === content)) return
     const entry: DisplayEntry = { category: 'activity',
@@ -1456,13 +1574,31 @@ export class OpenTuiIO implements ChatIO {
     } else if (event.type === 'assistant') {
       this.clearStream()
       this.appendEntry({ category: 'assistant', label: 'Assistant', content: event.message.content, markdown: true })
+      const index = this.liveHistoryIndex++
+      for (const call of event.message.toolCalls) {
+        this.liveToolCalls.set(call.id, { call, index, key: this.toolKey(index, call.id) })
+        this.showTool(call.id, 'requested', 'not_attempted')
+      }
     } else if (event.type === 'tool_started') {
       this.updateStatus(`Tool running: ${event.call.name}`)
-      this.appendEntry({ category: 'activity', label: 'Tool activity', content: `${event.call.name} · running`, markdown: false })
+      if (!this.liveToolCalls.has(event.call.id)) this.liveToolCalls.set(event.call.id,
+        { call: event.call, index: this.liveHistoryIndex, key: this.toolKey(this.liveHistoryIndex, event.call.id) })
+      this.showTool(event.call.id, 'running', 'unreported', `${event.call.name} · running`)
     } else if (event.type === 'tool_completed') {
       this.updateStatus('Working')
-      this.appendEntry({ category: 'activity', attention: !!event.message.isError, label: `Tool ${event.message.name} · ${event.message.isError ? 'error' : 'done'}`,
-        content: event.message.content, markdown: false })
+      const history = [{ kind: 'assistant', content: '', toolCalls: [this.liveToolCalls.get(event.message.callId)?.call ??
+        { id: event.message.callId, name: event.message.name, arguments: {} }] }, event.message] as HistoryMessage[]
+      let encoded: string
+      try { encoded = JSON.stringify(cliHistoryToolPresentation(history, 1, this.sessionId, undefined, this.secrets)) }
+      catch { encoded = '' }
+      const old = this.entries.find(entry => entry.tool?.key === this.liveToolCalls.get(event.message.callId)?.key)
+      const entry: DisplayEntry = { category: 'activity', attention: true,
+        label: this.safe(`Tool ${event.message.name} · ${event.message.isError ? 'error' : 'done'}`, 4096), content: '', markdown: false,
+        historyIndex: this.liveHistoryIndex++, tool: { encoded, key: this.liveToolCalls.get(event.message.callId)?.key ?? this.toolKey(this.liveHistoryIndex, event.message.callId) } }
+      if (old) this.entries[this.entries.indexOf(old)] = entry
+      else this.entries.push(entry)
+      this.liveToolCalls.delete(event.message.callId)
+      this.rebuild()
     } else if (event.type === 'round_completed') {
       this.usage = aggregateUsage([event.usage])
       this.usageScope = 'Round'
