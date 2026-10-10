@@ -2,9 +2,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { test as nodeTest } from 'node:test'
-import { AGENT_RECORD_LIMITS, applyAgentRecord, createAgentProjection, projectAgentRecords } from '@ayayaq/vivi/events'
-import { applyAgentRunRecord, createAgentRunProjection, projectAgentRunRecords } from '@ayayaq/vivi/events/stream'
-import { assertMcpJson, emptyMcpCategory, mcpAlias, mcpDigest, mcpOperationRevisions, prepareMcpOperation } from '@ayayaq/vivi/extensions/mcp'
+import { AGENT_RECORD_LIMITS, agentArgumentsDigest, applyAgentRecord, createAgentProjection, projectAgentRecords } from '@ayayaq/vivi/events'
+import { applyAgentRunRecord, assertAgentRunCurrent, createAgentRunProjection, projectAgentRunRecords } from '@ayayaq/vivi/events/stream'
+import { assertMcpJson, assertMcpOperationCurrent, emptyMcpCategory, mcpAlias, mcpDigest, mcpOperationRevisions, prepareMcpOperation } from '@ayayaq/vivi/extensions/mcp'
 import { CliHost } from '../dist/host.js'
 import { CLI_CONVERSATION_LIMITS, replayCliConversationDocument } from '../dist/conversation-records.js'
 import { createMcpSchemaValidator } from '../dist/mcp-schema.js'
@@ -21,6 +21,7 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 const call = (name = 'calculate', arguments_ = { expression: '2+3' }, id = 'record-call') => ({ id, name, arguments: arguments_ })
 const answer = (content = 'Owned final answer', toolCalls = [], usage) => ({ content, toolCalls, ...(usage ? { usage } : {}) })
 const counts = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 1 }
+const sevenDays = 7 * 24 * 60 * 60 * 1000
 const messages = projection => projection.history.map(entry => entry.message)
 const toolResults = history => history.filter(message => message.kind === 'tool_result')
 const extension = (name, execute) => ({ id: `${name}-fixture`, apiVersion: 1, tools: [{
@@ -85,7 +86,7 @@ async function fixture(t, input = {}) {
   const records = input.conversationStore ?? conversationStore(input.onWrite)
   const live = [], notices = [], providerInputs = []
   let generations = 0, host
-  const options = { store, conversationStore: records,
+  const options = { store, conversationStore: records, session: input.session ?? newSession(settings),
     provider: { async generate(value, signal, generation) {
       generations++; providerInputs.push(structuredClone(value))
       return input.generate ? input.generate(value, signal, generation, generations) : answer()
@@ -95,8 +96,10 @@ async function fixture(t, input = {}) {
       live.push({ event: structuredClone(event), view: host.conversationRecords, canonical: host.session })
       await input.onEvent?.(event, host)
     } }
-  host = input.session ? new CliHost({ ...options, session: input.session }) : await CliHost.create({ ...options, settings })
-  if (input.session) await host.initialize()
+  // Keep the actual constructor's options object so fixture scope changes reach
+  // the production admission checks rather than a detached create() input copy.
+  host = new CliHost(options)
+  await host.initialize()
   t.after(async () => { await host.shutdown() })
   return { host, store, records, live, notices, providerInputs, options, generations: () => generations }
 }
@@ -117,6 +120,54 @@ function replayAcknowledged(writes, sessionId) {
     }
   }
   return { projection: session, runs: [...runs.values()] }
+}
+/** Only Date advances: no multi-day sleep, timer expiry or execution-resume API. */
+function pauseClock(t) {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 9, 10, 12) })
+  return () => {
+    const before = Date.now()
+    t.mock.timers.tick(sevenDays)
+    assert.equal(Date.now() - before, sevenDays, 'The elapsed seven-day pause is clock-only simulation')
+  }
+}
+/** Pending accepted data is paired with actual acknowledged bytes, never a guessed cursor. */
+async function assertPausedPaired(subject, expectedCall) {
+  const { host, store, records } = subject, id = host.session.id
+  const canonical = await store.load(id), stored = await records.read(id)
+  const replay = replayCliConversationDocument(stored.value)
+  const incremental = replayAcknowledged(records.writes, id), view = host.conversationRecords
+  assert.equal(host.running, true); assert.equal(view.state, 'shadow'); assert.equal(view.durability, 'disk')
+  assert.deepEqual(view.projection, replay.projection); assert.deepEqual(view.runs, replay.runs)
+  assert.deepEqual(incremental, { projection: replay.projection, runs: replay.runs })
+  assert.deepEqual(projectAgentRecords(id, stored.value.records), replay.projection)
+  const chain = stored.value.runs.at(-1), run = replay.runs.at(-1), base = replay.projection
+  assert.deepEqual(projectAgentRunRecords(base, run.runId, chain.records), run)
+  assert.deepEqual(chain.records.map(record => record.type), ['run_started', 'assistant_accepted'])
+  assert.equal(run.state, 'running'); assert.equal(run.rounds, 1); assert.deepEqual(run.runUsage, counts)
+  assert.deepEqual(messages(run), canonical.history); assert.deepEqual(host.session.history, canonical.history)
+  assert.equal(toolResults(canonical.history).length, 0)
+  assert.deepEqual(run.history.at(-1).message.toolCalls, [expectedCall], 'Exact pending call ID/name/arguments survive replay')
+  assert.equal(run.history.at(-1).message.kind, 'assistant')
+  for (const [index, entry] of run.history.entries()) {
+    assert.equal(entry.id, `cli-history:${index}`)
+    assert.equal(entry.source.reference, `cli-session:${id}:history:${index}`)
+    assert.equal(entry.source.revision, digest(entry.message), 'The original host-owned SHA-256 source revision is retained')
+  }
+  const start = chain.records[0]
+  assert.equal(base.sequence, 1); assert.equal(view.observedSequence, 1); assert.equal(view.committedSequence, 1)
+  assert.equal(run.baseSequence, base.sequence); assert.equal(start.baseSequence, base.sequence)
+  assert.equal(run.baseEventId, base.eventId); assert.equal(start.baseEventId, base.eventId)
+  assert.equal(run.baseReceiptDigest, base.receipts.at(-1).digest)
+  assert.equal(start.baseReceiptDigest, run.baseReceiptDigest); assert.match(run.baseReceiptDigest, /^[a-f0-9]{64}$/)
+  assert.equal(run.sequence, 2); assert.equal(run.eventId, chain.records.at(-1).eventId)
+  assert.deepEqual(view.committedRuns.at(-1), { runId: run.runId, sequence: 2, eventId: run.eventId },
+    'The acknowledged run cursor is separate from the unchanged settled-session cursor')
+  assertAgentRunCurrent(run, base)
+  const displayed = subject.live.find(item => item.event.type === 'assistant')
+  assert(displayed, 'The actual host displayed the checkpointed accepted assistant')
+  assert.deepEqual(displayed.event.message, run.history.at(-1).message)
+  assert.deepEqual(displayed.view.runs.at(-1), run)
+  return { canonical, stored, replay, run, view }
 }
 async function assertPaired(t, subject, result) {
   const { host, store, records } = subject
@@ -178,14 +229,17 @@ function syntheticMcp(input = {}) {
       resources: emptyMcpCategory(), resourceTemplates: emptyMcpCategory()
     } }
   const launchDigest = mcpDigest({ owned: 'synthetic-no-process-launch' })
-  const invocations = []
+  const invocations = [], preparations = []
+  const assertCurrentOperation = operation => assertMcpOperationCurrent(operation, snapshot, launchDigest, true, snapshot.configRevision)
   const manager = { addSecrets() {}, async captureCatalogs(signal) { signal.throwIfAborted(); return [structuredClone(snapshot)] },
     prepareOperation(catalog, entry, kind, requested) {
-      return prepareMcpOperation(catalog, entry, kind, requested, launchDigest, createMcpSchemaValidator())
+      const operation = prepareMcpOperation(catalog, entry, kind, requested, launchDigest, createMcpSchemaValidator())
+      assertCurrentOperation(operation); preparations.push(operation)
+      return operation
     }, operationRevisions(operation) { return mcpOperationRevisions(operation, snapshot, launchDigest, true, snapshot.configRevision) },
     async invoke(operation, signal, assertCurrent, hooks) {
-      signal.throwIfAborted(); assertCurrent(); await hooks.beforeSend()
-      signal.throwIfAborted(); assertCurrent(); invocations.push(structuredClone(operation.call))
+      signal.throwIfAborted(); assertCurrent(); assertCurrentOperation(operation); await hooks.beforeSend()
+      signal.throwIfAborted(); assertCurrent(); assertCurrentOperation(operation); invocations.push(structuredClone(operation.call))
       if (input.invoke) return input.invoke(operation, signal, assertCurrent, hooks)
       const result = { content: JSON.stringify({ source: 'mcp', untrusted: true, success: true,
         method: 'tools/call', requestSent: true, confirmedOutcome: true, doNotRetry: true,
@@ -193,7 +247,13 @@ function syntheticMcp(input = {}) {
       await hooks.settle(result)
       return result
     } }
-  return { manager, alias, invocations, call: id => call(alias, { query: 'owned exact arguments' }, id) }
+  return { manager, alias, invocations, preparations, snapshot,
+    changeCatalog() {
+      entries[0].descriptor.description = 'Owned catalog revised during the simulated pause'
+      snapshot.catalogGeneration++; snapshot.categories.tools.digest = mcpDigest(entries)
+    },
+    changeConfig() { snapshot.configRevision = mcpDigest({ owned: 'configuration revised during the simulated pause' }) },
+    call: id => call(alias, { query: 'owned exact arguments' }, id) }
 }
 
 test('actual CLI pairs two tool turns, provider state, reported cache counts and independent reload', async t => {
@@ -394,6 +454,190 @@ test('actual CLI auto mode still manually denies an MCP operation and records ex
   const { replay } = await assertPaired(t, subject, result)
   assert.equal(replay.projection.outcomes[0].effect, 'not_attempted')
   assert.equal(replay.projection.outcomes[0].status, 'denied')
+})
+
+const pauseChanges = [
+  { name: 'unchanged state', sends: 1 },
+  { name: 'actual catalog revision', sends: 0, revisionChanges: true, change(_subject, mcp) { mcp.changeCatalog() } },
+  { name: 'actual configuration revision', sends: 0, revisionChanges: true, change(_subject, mcp) { mcp.changeConfig() } },
+  { name: 'manager owner replacement', sends: 0, change(subject) { subject.options.mcp = undefined } },
+  { name: 'tools scope disabled', sends: 0, change(subject) { subject.options.enableTools = false } },
+  { name: 'cancellation', sends: 0, change(subject) { subject.host.cancel() } }
+]
+for (const scenario of pauseChanges) test(`actual CLI seven-day clock-only approval pause revalidates ${scenario.name}`, async t => {
+  const advanceClock = pauseClock(t), held = gate(t), mcp = syntheticMcp(), outcomes = outcomeStore(), approvals = []
+  const requested = mcp.call(`paused-${scenario.name.replaceAll(' ', '-')}`)
+  let approvalSignal
+  const subject = await fixture(t, { options: { mcp: mcp.manager, mcpOutcomes: outcomes,
+    async approve(request, signal) {
+      approvals.push(structuredClone(request)); approvalSignal = signal; held.enter(); await held.wait
+      return true // A late human response is still subjected to the actual host's currentness checks.
+    } }, generate(_value, _signal, _options, round) {
+    return round === 1 ? answer('Accepted pending manual MCP operation', [requested], counts) : answer('Current review outcome retained')
+  } })
+  const sending = observe(subject.host.send('Hold the exact owned operation for manual review'))
+  await held.entered
+  const before = await assertPausedPaired(subject, requested)
+  assert.equal(approvals.length, 1); assert.deepEqual(approvals[0].call, requested)
+  assert.equal(mcp.preparations.length, 1)
+  assert.equal(approvals[0].currentRevision, mcpDigest(mcp.preparations[0].binding))
+  const revisions = mcp.manager.operationRevisions(mcp.preparations[0])
+  const accepted = await outcomes.load(subject.host.session.id)
+  assert.equal(accepted.length, 1); assert.equal(accepted[0].state, 'accepted')
+  assert.equal(accepted[0].runId, before.run.runId); assert.equal(accepted[0].callId, requested.id)
+  assert.equal(accepted[0].toolName, requested.name); assert.equal(accepted[0].callDigest, mcpDigest(requested))
+  advanceClock(); await tick()
+  const after = await assertPausedPaired(subject, requested)
+  assert.deepEqual(after, before, 'Clock-only elapsed time does not change pending work, sources or either committed cursor')
+  assert.equal(sending.settled, false); assert.equal(subject.generations(), 1); assert.equal(mcp.invocations.length, 0)
+  assert.equal(approvals.length, 1); assert.equal(approvalSignal.aborted, false)
+  await scenario.change?.(subject, mcp)
+  const currentRevisions = mcp.manager.operationRevisions(mcp.preparations[0])
+  if (scenario.revisionChanges) {
+    assert.notDeepEqual(currentRevisions, revisions, 'Production shared current-binding evidence reflects the actual changed fixture state')
+    assert.throws(() => assertMcpOperationCurrent(mcp.preparations[0], mcp.snapshot,
+      mcp.preparations[0].binding.launchDigest, true, mcp.snapshot.configRevision), /stale/)
+  } else assert.deepEqual(currentRevisions, revisions)
+  if (scenario.name === 'cancellation') {
+    await tick(); assert.equal(approvalSignal.aborted, true)
+    assert.equal(sending.settled, false, 'The cancelled host retains admitted review work until the late response drains')
+  }
+  held.release(); await sending.done
+  assert.equal(sending.error, undefined)
+  assert.equal(sending.value.status, scenario.name === 'cancellation' ? 'cancelled' : 'completed')
+  assert.equal(approvals.length, 1); assert.equal(mcp.invocations.length, scenario.sends)
+  assert.deepEqual(mcp.invocations, scenario.sends ? [requested] : [])
+  const finalResult = toolResults(sending.value.history)[0], body = JSON.parse(finalResult.content)
+  assert.equal(finalResult.callId, requested.id); assert.equal(finalResult.name, requested.name)
+  assert.equal(body.requestSent, Boolean(scenario.sends))
+  assert.equal(body.confirmedOutcome === true, Boolean(scenario.sends))
+  assert.equal(body.unknownOutcome === true, false)
+  assert.equal(outcomes.writes.some(rows => rows.some(row => row.state === 'intent')), Boolean(scenario.sends),
+    'A stale or cancelled approval cannot enter the production durable-intent pipeline')
+  const { document, replay } = await assertPaired(t, subject, sending.value)
+  assert.deepEqual(replay.projection.history.slice(0, before.run.history.length), before.run.history)
+  assert.deepEqual(document.runs[0].records.slice(0, 2), before.stored.value.runs[0].records)
+  const evidence = replay.projection.outcomes[0]
+  assert.equal(evidence.runId, before.run.runId); assert.equal(evidence.callId, requested.id); assert.equal(evidence.name, requested.name)
+  assert.equal(evidence.argumentsDigest, agentArgumentsDigest(requested.arguments))
+  assert.equal(evidence.effect, scenario.sends ? 'confirmed' : 'not_attempted')
+  assert.equal(evidence.status, scenario.sends ? 'succeeded' : 'denied')
+  assert.equal(evidence.source.reference, `cli-mcp-outcome:${accepted[0].id}`)
+  const settled = outcomes.writes.flat().findLast(row => row.callId === requested.id && row.state === 'settled')
+  assert.equal(evidence.source.revision, digest(settled))
+  assert.equal((await outcomes.load(subject.host.session.id)).length, 0)
+  assert.equal(mcp.invocations.length, scenario.sends, 'Full, incremental and fresh-host replay never resends the effect')
+})
+
+for (const retainReceipt of [true, false]) test(`actual CLI cold copy after seven-day clock-only approval pause retains ${retainReceipt ? 'exact no-send' : 'unknown'} recovery and requires fresh approval`, async t => {
+  const advanceClock = pauseClock(t), oldApproval = gate(t), recoveryWrite = gate(t), freshApproval = gate(t)
+  const mcp = syntheticMcp(), outcomes = outcomeStore(), approvals = []
+  const requested = mcp.call('cold-paused-call')
+  const subject = await fixture(t, { options: { mcp: mcp.manager, mcpOutcomes: outcomes,
+    async approve(request) { approvals.push(structuredClone(request)); oldApproval.enter(); await oldApproval.wait; return true } },
+    generate() { return answer('Accepted before a simulated process loss', [requested], counts) }
+  })
+  const sending = observe(subject.host.send('Hold pending work before a cold data-only restore'))
+  await oldApproval.entered
+  const before = await assertPausedPaired(subject, requested)
+  advanceClock(); await tick()
+  const paused = await assertPausedPaired(subject, requested)
+  assert.deepEqual(paused, before); assert.equal(sending.settled, false); assert.equal(mcp.invocations.length, 0)
+  const id = subject.host.session.id, receipt = await outcomes.load(id)
+  assert.equal(receipt.length, 1); assert.equal(receipt[0].state, 'accepted')
+  // Copy only acknowledged canonical/record/optional receipt data. No original
+  // executor, owner, callbacks or outstanding human approval enters the new host.
+  // Dropping the optional accepted receipt models lost evidence, never proof of no send.
+  const recoveredStore = canonicalStore(), recoveredOutcomes = outcomeStore()
+  let recoveryBlocked = false
+  const recoveredRecords = conversationStore(async document => {
+    if (!recoveryBlocked && document.records.at(-1).reason === 'reconciliation') {
+      recoveryBlocked = true; recoveryWrite.enter(); await recoveryWrite.wait
+    }
+  })
+  await recoveredStore.save(paused.canonical)
+  await recoveredRecords.write(id, paused.stored.value, null, () => {})
+  if (retainReceipt) await recoveredOutcomes.save(id, receipt)
+  const freshMcp = syntheticMcp(), newCall = freshMcp.call('fresh-after-cold-pause'), freshApprovals = [], live = [], providerInputs = []
+  let generations = 0, resumed
+  const options = { session: await recoveredStore.load(id), store: recoveredStore, conversationStore: recoveredRecords,
+    mcp: freshMcp.manager, mcpOutcomes: recoveredOutcomes,
+    provider: { async generate(value) {
+      generations++; providerInputs.push(structuredClone(value))
+      return generations === 1 ? answer('A new proposal needs new review', [newCall], counts) : answer('Freshly approved operation finished')
+    } }, async approve(request) {
+      freshApprovals.push(structuredClone(request)); freshApproval.enter(); await freshApproval.wait; return true
+    }, onEvent(event) { live.push({ event: structuredClone(event), view: resumed.conversationRecords, canonical: resumed.session }) } }
+  resumed = new CliHost(options)
+  t.after(() => resumed.shutdown())
+  const initializing = observe(resumed.initialize())
+  await recoveryWrite.entered
+  const unacknowledged = resumed.conversationRecords
+  assert.equal(initializing.settled, false); assert.equal(generations, 0); assert.equal(freshApprovals.length, 0)
+  assert.equal(freshMcp.preparations.length, 0); assert.equal(freshMcp.invocations.length, 0); assert.equal(resumed.running, false)
+  assert.equal(unacknowledged.observedSequence, 2); assert.equal(unacknowledged.committedSequence, 1,
+    'An observed reconciliation is not a checkpoint acknowledgement while its actual store write is held')
+  assert.deepEqual(unacknowledged.committedRuns, paused.view.committedRuns)
+  assert.deepEqual(unacknowledged.runs[0], paused.run, 'The original active chain and cursor are immutable recovery data')
+  assert.deepEqual((await recoveredRecords.read(id)).value, paused.stored.value)
+  assert.deepEqual(replayAcknowledged(recoveredRecords.writes, id), { projection: paused.replay.projection, runs: paused.replay.runs })
+  recoveryWrite.release(); await initializing.done
+  assert.equal(initializing.error, undefined)
+  const restored = resumed.conversationRecords, recoveredDocument = (await recoveredRecords.read(id)).value
+  const full = replayCliConversationDocument(recoveredDocument), incremental = replayAcknowledged(recoveredRecords.writes, id)
+  assert.equal(restored.state, 'shadow'); assert.equal(restored.observedSequence, 2); assert.equal(restored.committedSequence, 2)
+  assert.deepEqual(restored.projection, full.projection); assert.deepEqual(restored.runs, full.runs)
+  assert.deepEqual(incremental, { projection: full.projection, runs: full.runs })
+  assert.deepEqual(recoveredDocument.runs, paused.stored.value.runs); assert.deepEqual(full.runs[0], paused.run)
+  assert.deepEqual(restored.committedRuns, paused.view.committedRuns)
+  assert.deepEqual(full.projection.history.slice(0, paused.run.history.length), paused.run.history)
+  assert.deepEqual(messages(full.projection), resumed.session.history)
+  assert.deepEqual(full.projection.runs, [], 'Recovery does not invent a terminal status for the interrupted run')
+  const reconciliation = recoveredDocument.records.at(-1)
+  assert.equal(reconciliation.type, 'session_snapshot'); assert.equal(reconciliation.reason, 'reconciliation')
+  assert.equal(reconciliation.previousEventId, paused.replay.projection.eventId)
+  assert.deepEqual(full.projection.usage, paused.canonical.usage)
+  assert.throws(() => assertAgentRunCurrent(full.runs[0], full.projection), /obsolete/,
+    'The preserved active cursor cannot authorize use against the newer canonical reconciliation')
+  assert.equal(applyAgentRecord(full.projection, paused.stored.value.records[0]), full.projection,
+    'An old session duplicate cannot roll recovery back')
+  assert.equal(applyAgentRunRecord(full.runs[0], paused.stored.value.runs[0].records[1]), full.runs[0])
+  const closure = toolResults(resumed.session.history)[0], body = JSON.parse(closure.content)
+  assert.equal(closure.callId, requested.id); assert.equal(closure.name, requested.name); assert.equal(closure.isError, true)
+  assert.equal(toolResults(resumed.session.history).length, 1)
+  if (retainReceipt) {
+    assert.equal(body.requestSent, false); assert.equal(body.unknownOutcome === true, false)
+    assert.deepEqual(full.projection.outcomes, [{ runId: paused.run.runId, callId: requested.id, name: requested.name,
+      argumentsDigest: agentArgumentsDigest(requested.arguments), status: 'cancelled', effect: 'not_attempted',
+      source: { reference: `cli-mcp-outcome:${receipt[0].id}`, revision: digest(receipt[0]) } }])
+  } else {
+    assert.equal(body.error.code, 'interrupted'); assert.match(body.error.message, /outcome may be unknown/)
+    assert.equal(body.requestSent, undefined); assert.equal(body.confirmedOutcome, undefined)
+    assert.deepEqual(full.projection.outcomes, [], 'Absent receipt remains unknown; it is not invented no-send evidence')
+  }
+  assert.equal(generations, 0); assert.equal(freshApprovals.length, 0); assert.equal(freshMcp.invocations.length, 0)
+  const reloaded = await CliHost.resume({ id, store: recoveredStore, conversationStore: recoveredRecords,
+    mcp: freshMcp.manager, mcpOutcomes: recoveredOutcomes,
+    provider: { async generate() { assert.fail('Cold replay cannot invoke a provider') } },
+    async approve() { assert.fail('Cold replay cannot reconstruct human approval') } })
+  t.after(() => reloaded.shutdown())
+  assert.deepEqual(reloaded.conversationRecords, restored); assert.deepEqual(reloaded.session.history, resumed.session.history)
+  assert.equal(freshMcp.invocations.length, 0)
+  subject.host.cancel(); oldApproval.release(); await sending.done
+  assert.equal(sending.error, undefined); assert.equal(sending.value.status, 'cancelled'); assert.equal(mcp.invocations.length, 0)
+  const continuing = observe(resumed.send('Approve a later newly proposed exact call'))
+  await freshApproval.entered
+  assert.equal(continuing.settled, false); assert.equal(generations, 1); assert.equal(freshApprovals.length, 1)
+  assert.deepEqual(freshApprovals[0].call, newCall); assert.notEqual(newCall.id, requested.id)
+  assert.equal(freshMcp.invocations.length, 0, 'A restored pending call or old human response cannot approve a later call')
+  assert.deepEqual(toolResults(providerInputs[0].messages), [closure])
+  freshApproval.release(); await continuing.done
+  assert.equal(continuing.error, undefined); assert.equal(continuing.value.status, 'completed')
+  assert.deepEqual(freshMcp.invocations, [newCall]); assert.equal(approvals.length, 1); assert.equal(freshApprovals.length, 1)
+  const { replay } = await assertPaired(t, { host: resumed, store: recoveredStore, records: recoveredRecords, live, options }, continuing.value)
+  assert.deepEqual(replay.runs[0], paused.run)
+  assert.deepEqual(replay.projection.history.slice(0, full.projection.history.length), full.projection.history)
+  assert.equal(mcp.invocations.length, 0); assert.deepEqual(freshMcp.invocations, [newCall])
 })
 
 test('actual CLI exact intent without settlement remains unknown and never replays an MCP operation', async t => {
