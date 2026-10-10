@@ -169,6 +169,24 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   let launchCommandsPending = options.enableCommands
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
+  let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
+  let sessionCleanupFailed = false
+  const discardCandidate = async (): Promise<void> => {
+    if (!candidate) return
+    try {
+      // Keep the lease while shutdown is unconfirmed: this host may still write.
+      if (!candidate.shutdownConfirmed) { await candidate.host?.shutdown(); candidate.shutdownConfirmed = true }
+      // FileSessionStore's release is one-shot, including failed unlink attempts.
+      if (candidate.releaseFailed) return
+      try { await candidate.release() }
+      catch (error) { candidate.releaseFailed = true; throw error }
+      candidate = undefined
+    } catch (error) {
+      sessionCleanupFailed = true
+      // A secondary cleanup/display failure must not replace the setup error.
+      try { io.write('Candidate session cleanup failed; its session may remain locked\n'); report(error) } catch { /* Preserve the primary error. */ }
+    }
+  }
   let selected: { resume?: string; fresh?: boolean } | undefined = options.resume ? { resume: options.resume }
     : settings.model ? { fresh: true } : undefined
   const loadKey = async (provider: CliProviderName): Promise<string | undefined> => {
@@ -468,7 +486,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     await host?.drainSkills()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
     const nextRelease = await store.acquire(selection.resume ?? fresh!.id)
-    let nextHost: CliHost
+    candidate = { release: nextRelease }
+    let nextHost: CliHost, nextSettings: TuiPreferences
+    const previousRelease = release, previousHost = host
     try {
       const session = selection.resume ? await store.load(selection.resume) : fresh!
       const sameModel = session.provider === settings.provider && session.model === settings.model
@@ -482,7 +502,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         const declared = await io.choose(`Resume requires verified support for reasoning '${session.reasoning}'`, [
           { name: 'Cancel resume', value: false }, { name: 'I verified this model supports that effort', value: true }
         ])
-        if (!declared) { await nextRelease(); return false }
+        if (!declared) { await discardCandidate(); return false }
         capabilities = [session.reasoning as ReasoningEffort]
       }
       const declaredTools = (args.includes('--tools') || args.includes('--enable-notes')) &&
@@ -495,9 +515,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         enableMemory: activeMemory, enableSkills: activeSkills,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
-      if (io.isClosed) { await nextRelease(); return false }
+      if (io.isClosed) { await discardCandidate(); return false }
       const provider = providerFactory(session, effective, env)
-      if (io.isClosed) { await nextRelease(); return false }
+      if (io.isClosed) { await discardCandidate(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
@@ -511,16 +531,19 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           isAvailable: () => io.canAutoReview === true && !io.isClosed
         } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
+      candidate.host = nextHost
       await nextHost.initialize()
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
-      if (io.isClosed) { await nextRelease(); return false }
-      activeSettings = { ...settings, provider: session.provider, model: session.model,
+      if (io.isClosed) { await discardCandidate(); return false }
+      nextSettings = { ...settings, provider: session.provider, model: session.model,
         reasoning: session.reasoning ?? 'default', reasoningCapabilities: [...capabilities],
         enableTools: effective.enableTools, enableNotes: effective.enableNotes }
-    } catch (error) { await nextRelease().catch(report); throw error }
-    const previousRelease = release, previousHost = host
-    await previousHost?.shutdown()
+      try { await previousHost?.shutdown() }
+      catch (error) { sessionCleanupFailed = true; throw error }
+      if (io.isClosed) { await discardCandidate(); return false }
+    } catch (error) { await discardCandidate(); throw error }
     release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
+    activeSettings = nextSettings; candidate = undefined
     await previousRelease?.().catch(report)
     io.setSession(host.session)
     io.setApprovalMode?.('manual')
@@ -544,6 +567,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       if (io.isClosed) { if (io.failed) await io.readLine(''); return 0 }
       if (selected) {
         try { await openSession(selected) } catch (error) { report(error); if (options.prompt !== undefined) return 1 }
+        // A failed shutdown may have partially revoked its owner. Do not run again.
+        if (sessionCleanupFailed) return 1
         selected = undefined
       }
       if (io.isClosed) continue
@@ -660,5 +685,18 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         finally { dispose() }
       } catch (error) { report(error) }
     }
-  } finally { try { await host?.shutdown(); await skills.drain({ close: true }) } finally { await release?.() } }
+  } finally {
+    await discardCandidate()
+    if (sessionCleanupFailed) {
+      // Preserve the original failure and keep any incompletely shut-down owner locked.
+      const reportCleanup = (error: unknown): void => { try { report(error) } catch { /* Preserve the primary error. */ } }
+      let shutdownConfirmed = false
+      try { await host?.shutdown(); shutdownConfirmed = true }
+      catch (error) { reportCleanup(error) }
+      await skills.drain({ close: true }).catch(reportCleanup)
+      if (shutdownConfirmed) await release?.().catch(reportCleanup)
+    } else {
+      try { await host?.shutdown(); await skills.drain({ close: true }) } finally { await release?.() }
+    }
+  }
 }
