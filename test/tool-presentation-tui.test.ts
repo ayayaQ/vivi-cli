@@ -92,6 +92,8 @@ for (const action of ['deny', 'allow', 'cancel'] as const) test(`actual host/nat
     const running = sendChatTurn(host, f.io, 'Set a color note to pink')
     for (let attempt = 0; attempt < 1000 && !request; attempt++) await f.frame()
     expect(request).toBeDefined(); await f.frame()
+    const requestIndex = host.session.history.findIndex(message => message.kind === 'assistant' && message.toolCalls.some(call => call.id === request!.call.id))
+    expect(contents(f.transcript())).toContain(`cli-session:${host.session.id}:history:${requestIndex}`)
     expect(contents(f.transcript())).toContain('Approval required. This display grants no permission to execute.')
     f.input.pressKey('o', { ctrl: true }); f.input.pressKey('o', { ctrl: true }); f.input.pressKey('o', { ctrl: true }); await f.frame()
     expect(contents(f.transcript())).toContain('Approval required. This display grants no permission to execute.')
@@ -101,6 +103,7 @@ for (const action of ['deny', 'allow', 'cancel'] as const) test(`actual host/nat
     else f.input.pressEnter()
     const result = await running; f.io.result(result); f.io.setSession(host.session); await f.frame()
     expect(host.session.noteRevision).toBe(action === 'allow' ? turn + 1 : 0)
+    expect(contents(f.transcript())).toContain('Details collapsed.')
     expect(contents(f.transcript())).not.toContain('Status: approval_required')
     expect(contents(f.transcript())).not.toContain('Status: running')
     expect(contents(f.transcript())).toContain(`Status: ${action === 'allow' ? 'unknown' : action === 'deny' ? 'denied' : 'cancelled'}`)
@@ -153,4 +156,49 @@ test('detail key repeats/releases and stale mouse gestures cannot select or conf
   f.input.pressKey('o', { ctrl: true }); await f.frame()
   expect(contents(f.transcript())).toContain('Approval required. This display grants no permission to execute.')
   f.input.pressEnter(); expect(await answer).toBe(false)
+})
+
+test('live request/result source revisions and indices equal the actual host canonical entries', async () => {
+  const f = await fixture(100, 45)
+  const sourceHashes: string[] = []
+  let rounds = 0
+  const { createHash } = await import('node:crypto')
+  const host = await CliHost.create({ store: { async save() {}, async load() { throw new Error('unused') } },
+    settings: { provider: 'openai', model: 'offline' },
+    provider: { async generate() { return ++rounds % 2 === 1 ? { content: 'Before', toolCalls: [{ id: `call-${rounds}`, name: 'current_time', arguments: {} }] }
+      : { content: 'After', toolCalls: [] } } },
+    onEvent(event) {
+      f.io.event(event)
+      if (event.type === 'assistant' && event.message.toolCalls.length || event.type === 'tool_completed') {
+        const index = host.session.history.length - 1, message = host.session.history[index]!
+        const revision = createHash('sha256').update(JSON.stringify(message)).digest('hex')
+        const text = contents(f.transcript())
+        expect(text).toContain(`cli-session:${host.session.id}:history:${index}`)
+        expect(text).toContain(revision); sourceHashes.push(revision)
+      }
+    } })
+  cleanups.push(async () => host.shutdown()); f.io.setSession(host.session)
+  for (let turn = 0; turn < 2; turn++) {
+    const result = await sendChatTurn(host, f.io, 'Use the offline clock'); f.io.result(result); f.io.setSession(host.session); await f.frame()
+  }
+  expect(sourceHashes).toHaveLength(4); expect(new Set(sourceHashes).size).toBe(4)
+})
+for (const late of [false, true]) test(`encoded private tool identities and summaries are withheld ${late ? 'after registration' : 'at first render'}`, async () => {
+  const f = await fixture(100, 45)
+  const encoded = '%6b%6e%6f%77%6e%2d%63%72%65%64%65%6e%74%69%61%6c'
+  if (!late) f.io.addSecrets(['known-credential'])
+  const session = newSession({ provider: 'openai', model: 'offline' })
+  session.history = [{ kind: 'message', role: 'user', content: 'ordinary' },
+    { kind: 'assistant', content: '', toolCalls: [{ id: 'identity-call', name: encoded, arguments: {} }] },
+    { kind: 'tool_result', callId: 'identity-call', name: encoded, content: 'ordinary result' }]
+  const { validateSession } = await import('../src/session.js'); validateSession(session)
+  const original = structuredClone(session)
+  f.io.setSession(session); await f.frame()
+  if (late) { expect(contents(f.transcript())).toContain(encoded); f.io.addSecrets(['known-credential']); await f.frame() }
+  expect(contents(f.transcript())).not.toContain(encoded)
+  expect(contents(f.transcript())).not.toContain('known-credential')
+  expect(contents(f.transcript())).toContain('withheld')
+  f.io.setSession(session); await f.frame()
+  expect(contents(f.transcript())).not.toContain(encoded)
+  expect(session).toEqual(original)
 })

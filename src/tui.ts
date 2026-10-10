@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable } from '@opentui/core'
 import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, Usage } from '@ayayaq/vivi'
-import type { ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
+import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
 import type { ChatIO } from './terminal.js'
@@ -30,6 +30,7 @@ import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { reviewNoticeSettled } from './auto-review.js'
 import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolSource } from './tool-presentation.js'
 import type { CliToolEvidence } from './tool-presentation.js'
+import { mcpContainsSecret } from './mcp-content.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
@@ -217,7 +218,7 @@ export class OpenTuiIO implements ChatIO {
   private entries: DisplayEntry[] = []
   private toolEvidence: CliToolEvidence | undefined
   private readonly collapsedTools = new Set<string>()
-  private liveToolCalls = new Map<string, { call: ToolCall; index: number; key: string; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
+  private liveToolCalls = new Map<string, { call: ToolCall; index: number; key: string; source: ToolPresentation['source']; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
   private liveHistoryIndex = 0
   private displaySequence = 0
   private resultNotices: DisplayEntry[] = []
@@ -499,7 +500,10 @@ export class OpenTuiIO implements ChatIO {
   }
 
   private safe(text: string, limit = MAX_DISPLAY): string {
-    const safe = redactSecrets(stripControls(text), this.secrets)
+    const redacted = redactSecrets(stripControls(text), this.secrets)
+    // Labels, summaries and late credential registration use the same complete
+    // encoded-credential screen as cards; clipping cannot hide a private suffix.
+    const safe = mcpContainsSecret(redacted, this.secrets) ? '[Display content withheld: known credential]' : redacted
     return safe.length > limit ? `${safe.slice(0, limit)}\n[display truncated]` : safe
   }
   private ready(pending = this.pending): boolean {
@@ -1210,7 +1214,8 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return
     this.settleReviews('cancelled')
     this.turnHistoryStart = this.historyLength
-    this.liveHistoryIndex = this.historyLength
+    // The host accepts this turn's user message before its first assistant event.
+    this.liveHistoryIndex = this.historyLength + 1
     this.liveToolCalls.clear()
     this.runStatus.start()
     this.updateStatus('Working · Escape / Ctrl+C cancels')
@@ -1322,7 +1327,7 @@ export class OpenTuiIO implements ChatIO {
     live.status = status; live.effect = effect
     let encoded: string
     try { encoded = JSON.stringify(createCliToolPresentation({ call: live.call, status, effect,
-      source: cliToolSource(this.sessionId, live.index, live.call), secrets: this.secrets, ...(progress ? { progress } : {}) })) }
+      source: live.source, secrets: this.secrets, ...(progress ? { progress } : {}) })) }
     catch { encoded = '' }
     const old = this.entries.find(entry => entry.tool?.key === live.key)
     const entry: DisplayEntry = { category: 'activity', label: this.safe(`Tool ${live.call.name}`, 4096), content: '',
@@ -1578,20 +1583,21 @@ export class OpenTuiIO implements ChatIO {
       this.appendEntry({ category: 'assistant', label: 'Assistant', content: event.message.content, markdown: true })
       const index = this.liveHistoryIndex++
       for (const call of event.message.toolCalls) {
-        this.liveToolCalls.set(call.id, { call, index, key: this.toolKey(index, call.id) })
+        this.liveToolCalls.set(call.id, { call, index, key: this.toolKey(index, call.id), source: cliToolSource(this.sessionId, index, event.message) })
         this.showTool(call.id, 'requested', 'not_attempted')
       }
     } else if (event.type === 'tool_started') {
       this.updateStatus(`Tool running: ${event.call.name}`)
       if (!this.liveToolCalls.has(event.call.id)) this.liveToolCalls.set(event.call.id,
-        { call: event.call, index: this.liveHistoryIndex, key: this.toolKey(this.liveHistoryIndex, event.call.id) })
+        { call: event.call, index: this.liveHistoryIndex, key: this.toolKey(this.liveHistoryIndex, event.call.id),
+          source: { ...cliToolSource(undefined, this.liveHistoryIndex, event.call), reference: 'cli-live:unreported-request' } })
       this.showTool(event.call.id, 'running', 'unreported', `${event.call.name} · running`)
     } else if (event.type === 'tool_completed') {
       this.updateStatus('Working')
-      const history = [{ kind: 'assistant', content: '', toolCalls: [this.liveToolCalls.get(event.message.callId)?.call ??
-        { id: event.message.callId, name: event.message.name, arguments: {} }] }, event.message] as HistoryMessage[]
+      const call = this.liveToolCalls.get(event.message.callId)?.call ?? { id: event.message.callId, name: event.message.name, arguments: {} }
       let encoded: string
-      try { encoded = JSON.stringify(cliHistoryToolPresentation(history, 1, this.sessionId, undefined, this.secrets)) }
+      try { encoded = JSON.stringify(createCliToolPresentation({ call, result: event.message, status: 'unknown', effect: 'unreported',
+        source: cliToolSource(this.sessionId, this.liveHistoryIndex, event.message), secrets: this.secrets })) }
       catch { encoded = '' }
       const old = this.entries.find(entry => entry.tool?.key === this.liveToolCalls.get(event.message.callId)?.key)
       const entry: DisplayEntry = { category: 'activity', attention: !!event.message.isError,
