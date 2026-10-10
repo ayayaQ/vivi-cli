@@ -506,7 +506,11 @@ export class OpenTuiIO implements ChatIO {
     // Labels, summaries and late credential registration use the same complete
     // encoded-credential screen as cards; clipping cannot hide a private suffix.
     const safe = mcpContainsSecret(redacted, this.secrets) ? '[Display content withheld: known credential]' : redacted
-    return safe.length > limit ? `${safe.slice(0, limit)}\n[display truncated]` : safe
+    const notice = '\n[display truncated]'
+    // A truncation notice is part of this exact body budget, not an extra tail
+    // that can evict an otherwise admitted final answer during aggregate trim.
+    return safe.length > limit ? limit >= notice.length
+      ? `${safe.slice(0, limit - notice.length)}${notice}` : safe.slice(0, Math.max(0, limit)) : safe
   }
   private ready(pending = this.pending): boolean {
     return !!pending?.armed && !this.closed &&

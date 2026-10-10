@@ -278,7 +278,7 @@ test('pending exact review cannot displace its current presentation warning/sour
     setup.mockInput.pressEnter(); expect(await answer).toBe(false)
   } finally { io.close() }
 })
-test('long final response preserves the latest tool result safety/source', async () => {
+for (const length of [60000, 65536]) test(`admitted ${length}-character final response retains text and multiple current tool safety/source rows`, async () => {
   const setup = await createTestRenderer({ width: 100, height: 50, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
   try {
@@ -288,13 +288,14 @@ test('long final response preserves the latest tool result safety/source', async
       { kind: 'tool_result', callId: call.id, name: call.name, content: 'ordinary result' },
       { kind: 'assistant', content: 'Another owned call', toolCalls: [{ ...call, id: 'later-card', arguments: {} }] },
       { kind: 'tool_result', callId: 'later-card', name: call.name, content: 'later result', isError: true },
-      { kind: 'assistant', content: 'z'.repeat(60000), toolCalls: [] }]
+      { kind: 'assistant', content: 'z'.repeat(length), toolCalls: [] }]
     validateSession(session); io.setSession(session); await setup.renderOnce(); await setup.renderOnce()
     const text = contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
     expect(text).toContain('External effects are unreported. Do not infer that no effects occurred.')
     expect(text).toContain(`cli-session:${session.id}:history:2`)
     expect(text).toContain(`cli-session:${session.id}:history:4`)
     expect(text).toContain('z'.repeat(60000))
+    if (length === 65536) expect(text).toContain('[display truncated]')
     setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
     const collapsed = contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
     expect(collapsed).toContain(`cli-session:${session.id}:history:2`)
