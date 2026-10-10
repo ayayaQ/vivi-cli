@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.9.0'
-const coreIntegrity = 'sha512-UkM7KUCydEPtcALkfFVtZaJD/h7mZSHoNk3nIt0obVuzLmF1WhfleVs0aqU8AWm9B99AG2iTKBAnJ731t9eN6g=='
+const coreVersion = '0.10.0'
+const coreIntegrity = 'sha512-oK3NY4hpzlOIuW7/YkIonTVaFjVzEAkjEtYV24KjE6Ei48e5vJ9bx7kLtKTrHOeK0/+XgwQRLUsh87kn2v7epQ=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.9.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.10.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -258,6 +258,22 @@ const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
   definition: { name: 'packed_fixture', description: 'Packed extension', parameters: { type: 'object' } },
   validateArguments() {}, execute() { return { content: 'packed extension works' } }
 }] }
+const scopedTools = createBuiltinToolset(true, [fixture]), scopedCleanup = []
+scopedTools.defer(() => { scopedCleanup.push('first') })
+scopedTools.defer(async () => { await Promise.resolve(); scopedCleanup.push('last') })
+const scopedHost = { enableNotes: true, readNotes() { assert.fail('Closed note dispatch') },
+  async commitNote() { assert.fail('Closed note commit') }, async approve() { assert.fail('Closed approval') } }
+assert.equal((await scopedTools.executeTool({ id: 'packed-scoped', name: 'packed_fixture', arguments: {} },
+  new AbortController().signal, scopedHost)).content, 'packed extension works')
+const scopedDisposal = scopedTools.dispose()
+assert.equal(scopedTools.signal.aborted, true)
+assert.equal(scopedTools.dispose(), scopedDisposal)
+await scopedDisposal
+assert.deepEqual(scopedCleanup, ['last', 'first'])
+for (const name of ['packed_fixture', 'current_time', 'note_read']) {
+  await assert.rejects(scopedTools.executeTool({ id: 'packed-closed', name, arguments: {} },
+    new AbortController().signal, scopedHost), { name: 'AbortError' })
+}
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
 const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
 const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]

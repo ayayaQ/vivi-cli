@@ -359,6 +359,10 @@ npm run test:tui
 See [RELEASING.md](RELEASING.md) for packaging and release checks.
 Licensed under [Apache-2.0](LICENSE).
 
+Each CLI turn owns its shared extension registrations and cancellation listeners.
+Closing a turn seals dispatch and awaits admitted checkpoints and resource drains;
+MCP connections stay launch-owned. Trusted imports grant no extra permissions.
+
 ## Usage counts
 
 Round and turn displays show provider-reported token counts. `/session` shows the

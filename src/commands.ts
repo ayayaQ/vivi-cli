@@ -215,7 +215,7 @@ export class TrustedCommandWorkspace {
       'Executable or working directory changed; request a fresh command approval')
     check(!reviewContainsSecret([command.executable, command.args, this.environment], this.secrets), 'A known credential invalidated this command')
   }
-  async start(call: ToolCall, context: CommandApprovalContext, signal: AbortSignal): Promise<ToolResult> {
+  async start(call: ToolCall, context: CommandApprovalContext, signal: AbortSignal, lifetimeSignal = signal): Promise<ToolResult> {
     check(this.isEnabledFor(context.launchId, context.sessionId, context.accountRevision) && context.canApprove() && context.isCurrent(), 'Trusted commands require enabled workspace trust and an interactive human approval surface')
     check(this.secrets.every(secret => secret.length <= COMMAND_LIMITS.maximumPendingBytes), 'A known credential exceeds the bounded streaming redaction limit')
     const executionOwner = owner(context), callDigest = reviewDigest(call)
@@ -228,7 +228,7 @@ export class TrustedCommandWorkspace {
     check(approval.description.length <= 48 * 1024, 'Command approval display exceeds its limit; use a smaller argv array')
     const approvalDigest = reviewDigest(approval), preparedDigest = reviewDigest(command)
     const assertCurrent = (): void => {
-      signal.throwIfAborted()
+      signal.throwIfAborted(); lifetimeSignal.throwIfAborted()
       check(this.isEnabledFor(context.launchId, context.sessionId, context.accountRevision) && context.canApprove() && context.isCurrent() && context.accountRevision === account &&
         owner(context) === executionOwner && this.trustBinding === binding && reviewDigest(call) === callDigest &&
         reviewDigest(approval) === approvalDigest && reviewDigest(command) === preparedDigest, 'Command approval changed; request fresh human approval')
@@ -276,9 +276,11 @@ export class TrustedCommandWorkspace {
       await execution.completed
     }
     const abort = (): void => { void stop('cancelled').catch(() => undefined) }
-    execution.detach = () => signal.removeEventListener('abort', abort)
+    // A process outlives command_start's scoped dispatch/forwarding listeners.
+    // Keep its abort subscription on the run owner until actual process settlement.
+    execution.detach = () => lifetimeSignal.removeEventListener('abort', abort)
     process_.stdout.on('data', stdout); process_.stderr.on('data', stderr)
-    signal.addEventListener('abort', abort, { once: true })
+    lifetimeSignal.addEventListener('abort', abort, { once: true })
     execution.timeout = setTimeout(() => { void stop('timed_out').catch(() => undefined) }, command.timeoutMs)
     execution.completed = process_.completed.then(result => {
       for (const index of [0, 1]) {
@@ -292,7 +294,7 @@ export class TrustedCommandWorkspace {
       execution.exitCode = result.exitCode; if (result.signal) execution.exitSignal = result.signal
     }, () => { ended = true; execution.state = 'failed'; clearTimeout(execution.timeout); execution.detach() })
     this.executions.set(id, execution)
-    if (signal.aborted) abort()
+    if (lifetimeSignal.aborted) abort()
     return this.poll(id, executionOwner, command.yieldMs, signal)
   }
   private find(id: unknown, owner: string): Execution {
@@ -334,14 +336,14 @@ export class TrustedCommandWorkspace {
   async shutdown(): Promise<void> { this.enabled = false; this.generation++; this.shutdownStarted = true; await this.stopAll() }
 }
 
-export function createCommandExtension(workspace: TrustedCommandWorkspace, context: CommandApprovalContext): ToolExtension {
+export function createCommandExtension(workspace: TrustedCommandWorkspace, context: CommandApprovalContext, lifetimeSignal?: AbortSignal): ToolExtension {
   return { id: 'vivi-cli-trusted-commands', apiVersion: 1, tools: [
     { definition: { name: 'command_start', description: 'Propose a trusted unsandboxed process. Fresh human approval is always required; shell:false uses executable plus argv. cwd is workspace-relative; output waits are separate from the hard timeout.',
       parameters: schema({ executable: { type: 'string', maxLength: 4096 }, args: { type: 'array', maxItems: COMMAND_LIMITS.maximumArguments, items: { type: 'string', maxLength: COMMAND_LIMITS.maximumArgumentBytes } },
         cwd: { type: 'string', maxLength: 4096 }, yieldMs: { type: 'integer', minimum: 0, maximum: COMMAND_LIMITS.maximumYieldMs },
         timeoutMs: { type: 'integer', minimum: 1, maximum: COMMAND_LIMITS.maximumTimeoutMs } }, ['executable', 'args']) },
       validateArguments(args) { exact(args, ['executable', 'args', 'cwd', 'yieldMs', 'timeoutMs']) },
-      execute: (call, { signal }) => workspace.start(call, context, signal) },
+      execute: (call, { signal }) => workspace.start(call, context, signal, lifetimeSignal) },
     { definition: { name: 'command_poll', description: 'Read bounded untrusted output/status from an existing execution ID in this session/run. Does not launch a process.',
       parameters: schema({ executionId: { type: 'string' }, yieldMs: { type: 'integer', minimum: 0, maximum: COMMAND_LIMITS.maximumYieldMs } }, ['executionId']) },
       validateArguments(args) { exact(args, ['executionId', 'yieldMs']) },
