@@ -365,7 +365,7 @@ export class McpManager {
     return { ...result, content: JSON.stringify(projection) }
   }
   private assertOperationPrivacy(operation: McpPreparedOperation): void {
-    if (mcpContainsSecret([operation.call, operation.descriptor], this.secrets)) throw new Error('MCP request contains a known credential')
+    if (mcpContainsSecret([operation.call, operation.descriptor, operation.binding, operation.snapshot], this.secrets)) throw new Error('MCP request contains a known credential')
   }
   /** One exact approved request, never an SDK retry or cache-served resource body. */
   async invoke(operation: McpPreparedOperation, signal: AbortSignal, assertCurrent: () => void,
