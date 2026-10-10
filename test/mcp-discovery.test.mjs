@@ -30,8 +30,10 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
       const startedAt = Date.now(), start = transport.start.bind(transport), close = transport.close.bind(transport)
       let nativeResult, completedAfterMs, reported = false
       transport.start = async () => {
-        await start()
-        void transport.windows?.completed.then(result => { nativeResult = result; completedAfterMs = Date.now() - startedAt })
+        try { await start() }
+        finally {
+          void transport.windows?.completed.then(result => { nativeResult = result; completedAfterMs = Date.now() - startedAt })
+        }
       }
       transport.close = async () => {
         try { await close() }
