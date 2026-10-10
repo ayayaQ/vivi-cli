@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
-import { createToolRegistry, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
+import { createExtensionScope, type ExtensionCleanup, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
 import { WORKSPACE_TOOL_NAMES } from './workspace.js'
 import { COMMAND_TOOL_NAMES } from './commands.js'
@@ -43,36 +43,54 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
 export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension): {
   tools: ToolDefinition[]
+  readonly signal: AbortSignal
+  defer(cleanup: ExtensionCleanup): void
+  dispose(): Promise<void>
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
 } {
-  const registry = createToolRegistry([calculatorExtension, ...extensions], {
+  const scope = createExtensionScope({
     reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
       'list_mcp_resources', 'read_mcp_resource', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
-  const memoryRegistry = memory ? createToolRegistry([memory]) : undefined
-  const workspaceRegistry = workspace ? createToolRegistry([workspace]) : undefined
-  const skillsRegistry = skills ? createToolRegistry([skills], { reservedNames: ['save_skill'] }) : undefined
-  const commandRegistry = commands ? createToolRegistry([commands]) : undefined
-  const mcpRegistry = mcp ? createToolRegistry([mcp]) : undefined
-  return {
-    tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? []), ...(workspaceRegistry?.tools ?? []), ...(skillsRegistry?.tools ?? []), ...(commandRegistry?.tools ?? []), ...(mcpRegistry?.tools ?? [])],
-    executeTool: (call, signal, host) => memoryRegistry?.has(call.name)
-      ? memoryRegistry.executeTool(call, { signal }) : workspaceRegistry?.has(call.name)
-        ? workspaceRegistry.executeTool(call, { signal }) : skillsRegistry?.has(call.name)
-          ? skillsRegistry.executeTool(call, { signal }) : commandRegistry?.has(call.name)
-            ? commandRegistry.executeTool(call, { signal }) : mcpRegistry?.has(call.name)
-              ? mcpRegistry.executeTool(call, { signal }) : executeHostTool(call, signal, host, registry)
+  const builtins = createExtensionScope({ reservedNames: ['save_skill'] })
+  scope.defer(() => builtins.dispose())
+  try {
+    scope.register(calculatorExtension)
+    for (const extension of extensions) scope.register(extension)
+    for (const extension of [memory, workspace, skills, commands, mcp]) if (extension) builtins.register(extension)
+    const registry = scope.snapshot(), builtinRegistry = builtins.snapshot()
+    return {
+      tools: [...registry.tools, ...hostTools(enableNotes), ...builtinRegistry.tools],
+      signal: scope.signal,
+      defer: cleanup => scope.defer(cleanup),
+      dispose: () => scope.dispose(),
+      executeTool: async (call, signal, host) => {
+        scope.signal.throwIfAborted()
+        // Host tools and built-in packs are restricted by this same turn owner.
+        const ownedSignal = AbortSignal.any([signal, scope.signal])
+        return builtinRegistry.has(call.name) ? builtinRegistry.executeTool(call, { signal: ownedSignal })
+          : executeHostTool(call, ownedSignal, host, registry)
+      }
+    }
+  } catch (error) {
+    // No caller resource can have transferred yet. Seal every partial registration.
+    void scope.dispose().catch(() => {})
+    throw error
   }
 }
 
 export function builtinTools(enableNotes = false): ToolDefinition[] {
-  return structuredClone(createBuiltinToolset(enableNotes).tools)
+  const toolset = createBuiltinToolset(enableNotes)
+  try { return structuredClone(toolset.tools) }
+  finally { void toolset.dispose() }
 }
 
-export function executeBuiltin(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult> {
-  return createBuiltinToolset(host.enableNotes).executeTool(call, signal, host)
+export async function executeBuiltin(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult> {
+  const toolset = createBuiltinToolset(host.enableNotes)
+  try { return await toolset.executeTool(call, signal, host) }
+  finally { await toolset.dispose() }
 }
 
 function error(code: string, message: string): ToolResult {

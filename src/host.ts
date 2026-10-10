@@ -7,7 +7,7 @@ import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ay
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 import { createBuiltinToolset } from './tools.js'
-import type { ToolExtension } from '@ayayaq/vivi/extensions'
+import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { FileSessionStore, newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
@@ -209,10 +209,11 @@ export class CliHost {
   private readonly mcpRecoveryCalls: readonly ToolCall[]
   private mcpOutcomeLoading: Promise<void> | undefined
   private readonly mcpJobs = new Set<Promise<ToolResult>>()
-  private readonly mcpEventJobs = new Set<Promise<void>>()
+  private readonly eventJobs = new Set<Promise<void>>()
   private readonly mcpIdentityReplacements: McpIdentityReplacements = { callIds: new Map(), toolNames: new Map() }
   private readonly commandAccount: string | undefined
   private readonly commandLaunchId = randomUUID()
+  private activeTurn: { readonly scope: ExtensionScope; readonly settled: Promise<void> } | undefined
   private shutdownStarted = false
   private commandOpening: Promise<TrustedCommandWorkspace> | undefined
   private commandSetupEpoch = 0
@@ -331,8 +332,23 @@ export class CliHost {
     await this.options.commandWorkspace?.disable()
   }
   /** Cancels children before releasing a session or closing its approval surface. */
-  async shutdown(): Promise<void> { this.shutdownStarted = true; this.commandSetupEpoch++; this.commandOpening = undefined
-    this.cancel(); await this.options.commandWorkspace?.shutdown(); await this.drainMcp(); await this.drainMemory(); await this.drainSkills() }
+  async shutdown(): Promise<void> {
+    this.shutdownStarted = true; this.commandSetupEpoch++; this.commandOpening = undefined
+    this.cancel()
+    const active = this.activeTurn, errors: unknown[] = []
+    if (active) {
+      // Seal callbacks/dispatch now. The complete send still owns terminal checkpoints.
+      try { await active.scope.dispose() } catch (error) { errors.push(error) }
+      await active.settled
+    }
+    // Keep domain-owned retry records intact and attempt every independent drain.
+    for (const cleanup of [() => this.options.commandWorkspace?.shutdown(), () => this.drainMcp(),
+      () => this.drainMemory(), () => this.drainSkills()]) {
+      try { await cleanup() } catch (error) { errors.push(error) }
+    }
+    if (errors.length === 1) throw errors[0]
+    if (errors.length) throw new AggregateError(errors, 'CLI host cleanup failed')
+  }
   get skillsEnabled(): boolean { return this.enabledSkills }
   get skillsDiagnostics(): readonly string[] { return this.options.skills?.diagnostics ?? [] }
   setSkillsEnabled(enabled: boolean): void {
@@ -375,7 +391,7 @@ export class CliHost {
   async drainMemory(): Promise<void> {
     await this.options.memory?.drain(); await this.options.workspace?.drainMutations(); await this.reviews.drain()
   }
-  private async executeWorkspaceMutation(call: ToolCall, signal: AbortSignal): Promise<ToolResult> {
+  private async executeWorkspaceMutation(call: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
     const workspace = this.options.workspace, capturedCall = structuredClone(call)
     try {
       signal.throwIfAborted()
@@ -403,7 +419,7 @@ export class CliHost {
           `Before SHA-256: ${prepared.expectedRevision}\nAfter SHA-256: ${prepared.revision}\n${prepared.diff}` },
         eligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
         resourceRevisions: revisions(), currentResourceRevisions: revisions,
-        isActive: () => this.controller?.signal === signal && this.options.workspace === workspace && this.options.enableTools !== false
+        isActive: () => this.controller?.signal === ownerSignal && this.options.workspace === workspace && this.options.enableTools !== false
       }, signal, assertCurrent => {
         workspace.addSecrets(this.options.secrets ?? [])
         return workspace.commitMutation(prepared, signal, () => {
@@ -429,7 +445,7 @@ export class CliHost {
     if (request.kind === 'update') return this.options.memory.prepareUpdate(request.id, request.expectedRevision, request.content, actor, signal)
     return this.options.memory.prepareDelete(request.id, request.expectedRevision, signal)
   }
-  private async reviewMemory(request: MemoryChangeRequest, actor: MemoryActor, call: ToolCall, signal: AbortSignal): Promise<MemoryCommitResult | undefined> {
+  private async reviewMemory(request: MemoryChangeRequest, actor: MemoryActor, call: ToolCall, signal: AbortSignal, ownerSignal = signal): Promise<MemoryCommitResult | undefined> {
     const memory = this.options.memory
     const capturedCall = structuredClone(call)
     const mutation = await this.prepareMemory(request, actor, signal)
@@ -460,7 +476,7 @@ export class CliHost {
     return this.reviews.execute({ approval, eligible: actor === 'agent' && prepared.kind !== 'delete',
       inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
       resourceRevisions: revisions(), currentResourceRevisions: revisions,
-      isActive: () => actor === 'agent' ? this.controller?.signal === signal && this.enabledMemory
+      isActive: () => actor === 'agent' ? this.controller?.signal === ownerSignal && this.enabledMemory
         && this.options.enableTools !== false && this.options.memory === memory
         : !this.running && this.enabledMemory && this.options.memory === memory }, signal, async assertCurrent => {
       assertCurrent()
@@ -476,7 +492,7 @@ export class CliHost {
     const { kind: _kind, ...arguments_ } = request
     return this.reviewMemory(request, 'user', { id: randomUUID(), name, arguments: arguments_ }, signal)
   }
-  private async executeMemory(call: MemoryToolCall, signal: AbortSignal): Promise<ToolResult> {
+  private async executeMemory(call: MemoryToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
     try {
       signal.throwIfAborted()
       if (!this.enabledMemory || this.options.enableTools === false) throw new Error('Memory tools are unavailable for this turn')
@@ -485,7 +501,7 @@ export class CliHost {
         ? { kind: 'create', content: arguments_.content }
         : call.name === 'edit_memory' ? { kind: 'update', id: arguments_.id, expectedRevision: arguments_.expectedRevision, content: arguments_.content }
         : { kind: 'delete', id: arguments_.id, expectedRevision: arguments_.expectedRevision }
-      const result = await this.reviewMemory(request, 'agent', call, signal)
+      const result = await this.reviewMemory(request, 'agent', call, signal, ownerSignal)
       return result ? memoryToolResult(result, true)
         : { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'Human denied this memory change' } }), isError: true }
     } catch (error) {
@@ -511,12 +527,12 @@ export class CliHost {
   }
   /** Await the host-owned operations the core may stop awaiting when cancelled. */
   async drainMcp(): Promise<void> {
-    while (this.mcpJobs.size || this.mcpEventJobs.size) await Promise.allSettled([...this.mcpJobs, ...this.mcpEventJobs])
+    while (this.mcpJobs.size || this.eventJobs.size) await Promise.allSettled([...this.mcpJobs, ...this.eventJobs])
     await this.mcpOutcomes?.drain?.()
     await this.persistence
   }
-  private executeMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager): Promise<ToolResult> {
-    const job = this.performMcp(operation, signal, manager)
+  private executeMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager, ownerSignal: AbortSignal): Promise<ToolResult> {
+    const job = this.performMcp(operation, signal, manager, ownerSignal)
     this.mcpJobs.add(job)
     void job.then(() => this.mcpJobs.delete(job), () => this.mcpJobs.delete(job))
     return job
@@ -587,7 +603,7 @@ export class CliHost {
     } catch { /* A failed cleanup retains evidence and cannot cause replay. */ }
   }
   /** MCP annotations cannot prove effects or authorize automatic review. */
-  private async performMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager): Promise<ToolResult> {
+  private async performMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager, ownerSignal: AbortSignal): Promise<ToolResult> {
     const call = structuredClone(operation.call)
     const accepted = this.acceptedMcpRow(call)
     if (!accepted && this.mcpRows.size >= MAX_MCP_OUTCOME_ROWS) return unattemptedMcpResult('mcp_outcome_capacity')
@@ -626,7 +642,7 @@ export class CliHost {
         eligible: false, operationLabel: 'MCP operation', inputData: affectedData,
         preparedAction: preparedAction(), currentPreparedAction: preparedAction,
         resourceRevisions: revisions(), currentResourceRevisions: revisions,
-        isActive: () => !this.shutdownStarted && this.controller?.signal === signal &&
+        isActive: () => !this.shutdownStarted && this.controller?.signal === ownerSignal &&
           this.toolsetRevision === toolset && this.options.enableTools !== false && this.options.mcp === manager
       }, signal, async assertCurrent => {
         assertCurrent()
@@ -731,7 +747,7 @@ export class CliHost {
     this.persistence = operation.then(() => undefined, () => undefined)
     return operation
   }
-  private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | undefined> {
+  private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal, ownerSignal: AbortSignal): Promise<number | undefined> {
     const capturedBefore = structuredClone(before)
     const store = this.options.store
     const resourceId = (): string => `cli-session:${this.current.id}:note:${key}`
@@ -748,7 +764,7 @@ export class CliHost {
       description: `Set session note ${JSON.stringify(key)}.\nBefore: ${Object.hasOwn(capturedBefore.notes, key) ? JSON.stringify(capturedBefore.notes[key]) : '(new note)'}\nAfter: ${JSON.stringify(value)}` },
       eligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
       resourceRevisions: revisions(), currentResourceRevisions: revisions,
-      isActive: () => this.controller?.signal === signal && (this.options.enableNotes ?? false) && this.options.enableTools !== false },
+      isActive: () => this.controller?.signal === ownerSignal && (this.options.enableNotes ?? false) && this.options.enableTools !== false },
     signal, assertCurrent => this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent), revision => revision)
   }
   async send(content: string, signal?: AbortSignal): Promise<AgentResult> {
@@ -761,23 +777,24 @@ export class CliHost {
     }
     const enableNotes = this.options.enableNotes ?? false
     const enableTools = this.options.enableTools !== false
-    const memory = this.enabledMemory && enableTools ? createMemoryExtension({
-      listMemories: async ({ signal }) => memoryToolResult(await this.listMemories(signal)),
-      executeMutation: (call, { signal }) => this.executeMemory(call, signal)
-    }) : undefined
-    const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets,
-      (call, signal) => this.executeWorkspaceMutation(call, signal)) : undefined
-    const controller = new AbortController()
-    // The registry is captured once per turn. Its opaque identity binds capabilities
-    // without imposing Decisions JSON/depth limits on unchanged trusted extensions.
+    const controller = new AbortController(), owner = createExtensionScope()
+    let finish!: () => void
+    const settled = new Promise<void>(resolve => { finish = resolve })
+    this.activeTurn = { scope: owner, settled }
+    this.controller = controller
     this.toolsetRevision = randomUUID()
     const commandRunId = randomUUID()
-    const commands = enableTools && this.commandsEnabled && this.options.commandApproval?.isAvailable() === true && this.options.commandWorkspace
-      ? createCommandExtension(this.options.commandWorkspace, this.commandContext(commandRunId, controller.signal)) : undefined
-    this.controller = controller
     this.reviews.beginTurn(this.current.id, content)
+    // Every admitted domain effect outlives core cancellation until its drain settles.
+    owner.defer(() => this.drainSkills())
+    owner.defer(() => this.drainMemory())
+    owner.defer(() => this.drainMcp())
+    owner.defer(() => this.options.commandWorkspace?.endRun())
     const abort = (): void => controller.abort()
+    owner.signal.addEventListener('abort', abort, { once: true })
+    owner.defer(() => owner.signal.removeEventListener('abort', abort))
     signal?.addEventListener('abort', abort, { once: true })
+    owner.defer(() => signal?.removeEventListener('abort', abort))
     if (signal?.aborted) controller.abort()
     const baseUsage = structuredClone(this.current.usage)
     // An empty new session has no prior rounds. Historical assistant rounds with
@@ -794,6 +811,14 @@ export class CliHost {
     const pendingMcpDisplay = new Map<string, ToolCall>()
     const enteredMcpCalls = new Set<string>()
     try {
+      const memory = this.enabledMemory && enableTools ? createMemoryExtension({
+        listMemories: async ({ signal }) => memoryToolResult(await this.listMemories(signal)),
+        executeMutation: (call, { signal }) => this.executeMemory(call, signal, controller.signal)
+      }) : undefined
+      const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets,
+        (call, signal) => this.executeWorkspaceMutation(call, signal, controller.signal)) : undefined
+      const commands = enableTools && this.commandsEnabled && this.options.commandApproval?.isAvailable() === true && this.options.commandWorkspace
+        ? createCommandExtension(this.options.commandWorkspace, this.commandContext(commandRunId, controller.signal), controller.signal) : undefined
       // A metadata commit already admitted while idle must settle before this
       // turn mutates current history. Otherwise its pre-turn snapshot could
       // replace a newly accepted prompt while the initial checkpoint waits.
@@ -807,7 +832,7 @@ export class CliHost {
           mcpContents = await mcpManager.captureCatalogs(controller.signal)
           controller.signal.throwIfAborted()
           if (mcpContents.length) mcp = createMcpExtension(mcpManager, mcpContents,
-            (operation, signal) => this.executeMcp(operation, signal, mcpManager), this.options.secrets ?? [])
+            (operation, signal) => this.executeMcp(operation, signal, mcpManager, controller.signal), this.options.secrets ?? [])
         } catch (error) {
           if (controller.signal.aborted) throw error
           mcpContents = []
@@ -832,6 +857,7 @@ export class CliHost {
         }
       }) : undefined
       const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp)
+      owner.defer(() => toolset.dispose())
       const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name) ?? [])
       if (catalog) {
         if (!this.options.skills?.writable) {
@@ -929,7 +955,7 @@ export class CliHost {
           enableNotes,
           readNotes: () => this.notes(),
           commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
-          reviewNote: (call, before, key, value, signal) => this.reviewNote(call, before, key, value, signal),
+          reviewNote: (call, before, key, value, signal) => this.reviewNote(call, before, key, value, signal, controller.signal),
           approve: this.options.approve ?? (async () => false)
           })
           if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
@@ -949,6 +975,8 @@ export class CliHost {
           return isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
         },
         onEvent: (event) => {
+          // Retained callbacks from a sealed owner cannot enter a replacement run.
+          if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return
           const work = (async (): Promise<void> => {
           let admittedEvent = event
           if (event.type === 'assistant' || event.type === 'tool_completed') {
@@ -980,7 +1008,7 @@ export class CliHost {
             this.current.usage = aggregateUsage([...priorUsage, ...roundUsage])
             await this.save()
           }
-          if (!controller.signal.aborted) {
+          if (!controller.signal.aborted && owner.state === 'open' && this.activeTurn?.scope === owner) {
             // A persistence hook may register credentials after the event's first scan.
             if (admittedEvent.type === 'assistant' || admittedEvent.type === 'tool_completed') {
               const safe = withholdMcpHistory([...this.current.history, admittedEvent.message], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
@@ -996,12 +1024,10 @@ export class CliHost {
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
           if (admittedEvent.type === 'tool_completed') await this.retireMcpOutcomes(this.current.history)
           })()
-          // The runner may stop awaiting an event on abort. Keep MCP admission and
-          // result checkpoints owned until their complete callback has settled.
-          if (mcp) {
-            this.mcpEventJobs.add(work)
-            void work.then(() => this.mcpEventJobs.delete(work), () => this.mcpEventJobs.delete(work))
-          }
+          // Core may stop awaiting any callback on abort, even ordinary chat.
+          // Keep admitted checkpoints and deliveries owned until they settle.
+          this.eventJobs.add(work)
+          void work.then(() => this.eventJobs.delete(work), () => this.eventJobs.delete(work))
           return work
         }
       })
@@ -1066,13 +1092,14 @@ export class CliHost {
       }
       return canonicalResult
     } finally {
-      // runAgent aborts uncooperative tools without awaiting their I/O. A save
-      // already admitted by memory still owns its commit and lease until settled.
-      try { await this.options.commandWorkspace?.endRun(); await this.drainMcp(); await this.drainMemory(); await this.drainSkills() }
+      // Scope closure aborts retained dispatch, unsubscribes forwarding listeners,
+      // and attempts every owned drain. Arbitrary custom executors are not awaited.
+      try { await owner.dispose() }
       finally {
-        signal?.removeEventListener('abort', abort)
         this.controller = undefined
+        this.activeTurn = undefined
         this.reviews.endTurn()
+        finish()
       }
     }
   }
