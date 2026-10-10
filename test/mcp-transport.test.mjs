@@ -53,6 +53,56 @@ async function managerFixture(t) {
   return { manager, store, transports }
 }
 
+for (const cleanup of ['reject', 'throw']) test(`failed legacy handshake observes SDK cleanup while retaining strict host cleanup failures (${cleanup})`, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-sdk-cleanup-'))
+  const store = new McpConfigStore(directory), failure = new Error('Owned inert cleanup fixture failed')
+  let starts = 0, closes = 0, failCleanup = true
+  const methods = [], unhandled = []
+  const onUnhandled = error => { unhandled.push(error) }
+  process.on('unhandledRejection', onUnhandled)
+  const transport = {
+    async start() { starts++ },
+    async send(message) {
+      methods.push(message.method)
+      if (message.method === 'initialize') queueMicrotask(() => transport.onmessage?.({
+        jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Owned inert handshake failure' },
+      }))
+    },
+    close() {
+      closes++
+      if (failCleanup) {
+        if (cleanup === 'throw') throw failure
+        return Promise.reject(failure)
+      }
+      transport.onclose?.()
+      return Promise.resolve()
+    },
+  }
+  const manager = new McpManager({ store, env: {}, transportFactory: () => transport })
+  t.after(async () => {
+    failCleanup = false
+    try { await manager.close() }
+    finally { process.off('unhandledRejection', onUnhandled); await rm(directory, { recursive: true, force: true }) }
+  })
+  const script = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
+  await manager.configure({ id: 'docs', label: 'Owned inert peer', executable: process.execPath,
+    args: [...(process.versions.bun ? ['--no-install'] : []), script], cwd: directory, protocol: 'legacy', environment: [] })
+  await assert.rejects(manager.connect('docs', async () => true, new AbortController().signal), error => error === failure)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(unhandled, [])
+  assert.equal(starts, 1); assert.deepEqual(methods, ['initialize']); assert.ok(closes >= 2)
+  assert.equal(manager.statuses()[0].state, 'error')
+  await assert.rejects(manager.connect('docs', async () => true, new AbortController().signal), /Disable/)
+  await assert.rejects(manager.disconnect('docs'), error => error === failure)
+  await assert.rejects(manager.close(), error => error === failure)
+  assert.equal(starts, 1)
+  failCleanup = false
+  await manager.close()
+  assert.equal(manager.statuses()[0].state, 'disabled')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(unhandled, [])
+})
+
 function gateFinalConfigurationRead(store) {
   const load = store.load.bind(store)
   let reads = 0, entered, release

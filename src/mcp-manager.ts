@@ -50,6 +50,7 @@ export interface McpManagerOptions {
 interface Connection {
   readonly client: Client
   readonly transport: Transport
+  readonly closeOwned: () => Promise<void>
   readonly controller: AbortController
   readonly generation: string
   readonly launch: McpLaunchIdentity
@@ -91,7 +92,7 @@ export class McpManager {
     const outcomes = await Promise.allSettled([...this.connections].map(async ([id, connection]) => {
       connection.state = 'error'; connection.message = 'MCP configuration changed or is unavailable'
       connection.catalogGeneration++; delete connection.snapshot; connection.controller.abort()
-      await connection.transport.close()
+      await connection.closeOwned()
       if (this.connections.get(id) === connection) this.connections.delete(id)
     }))
     if (outcomes.some(outcome => outcome.status === 'rejected')) {
@@ -154,7 +155,10 @@ export class McpManager {
     const owned = (this.options.transportFactory ?? (value => new McpStdioTransport(value)))(launch)
     // Keep the guard at the actual transport boundary, including SDK async setup.
     // The SDK may attach only its fixed modern protocol envelope to our params.
-    const transport: Transport = { start: () => owned.start(), close: () => owned.close(), send: (message, options) => {
+    const closeOwned = async (): Promise<void> => { await owned.close() }
+    // The pinned SDK starts detached cleanup after a failed legacy handshake.
+    // Observe that rejection here; host ownership paths still await strict cleanup.
+    const transport: Transport = { start: () => owned.start(), close: () => closeOwned().catch(() => undefined), send: (message, options) => {
       if (!('method' in message) || !['tools/call', 'resources/read'].includes(message.method)) return owned.send(message, options)
       const pending = connection.pending
       if (!pending || pending.boundaryStarted || !('id' in message)) return Promise.reject(new Error('MCP operation has no one-shot approval'))
@@ -176,7 +180,7 @@ export class McpManager {
       void pending.boundaryWork.catch(() => undefined)
       return pending.boundaryWork
     } }
-    const connection: Connection = { client, transport, launch, controller: new AbortController(), generation: randomUUID(), catalogGeneration: 0, state: 'connecting' }
+    const connection: Connection = { client, transport, closeOwned, launch, controller: new AbortController(), generation: randomUUID(), catalogGeneration: 0, state: 'connecting' }
     owned.onclose = () => transport.onclose?.()
     owned.onerror = error => transport.onerror?.(error)
     owned.onmessage = (message: JSONRPCMessage) => {
@@ -211,7 +215,7 @@ export class McpManager {
     client.onclose = () => { connection.state = 'error'; connection.message = 'MCP connection closed; reconnect requires fresh approval'; invalidate(kinds); connection.controller.abort() }
     client.onerror = () => { /* Untrusted server details are never logged, persisted or sent to a provider. */ }
     const combined = AbortSignal.any([signal, connection.controller.signal, AbortSignal.timeout(MCP_LIMITS.categoryMs)])
-    const abort = (): void => { void transport.close().catch(() => undefined) }
+    const abort = (): void => { void closeOwned().catch(() => undefined) }
     combined.addEventListener('abort', abort, { once: true })
     try {
       await client.connect(transport, { signal: combined, timeout: MCP_LIMITS.pageMs, maxTotalTimeout: MCP_LIMITS.categoryMs })
@@ -226,7 +230,7 @@ export class McpManager {
     } catch {
       connection.state = 'error'; connection.message = signal.aborted ? 'MCP connection cancelled' : 'MCP connection failed or timed out; ordinary chat remains available'
       connection.controller.abort()
-      await transport.close()
+      await closeOwned()
       return false
     } finally { combined.removeEventListener('abort', abort) }
   }
@@ -396,7 +400,7 @@ export class McpManager {
       if (pending && connection && (pending.sent && !pending.confirmed || pending.boundaryStarted && !pending.boundaryFinished)) {
         connection.state = 'error'; connection.message = 'MCP operation interrupted; disable before reconnecting with fresh approval'
         connection.catalogGeneration++; delete connection.snapshot; connection.controller.abort()
-        try { await connection.transport.close() } catch { connection.message += '; owned process cleanup remains unverified' }
+        try { await connection.closeOwned() } catch { connection.message += '; owned process cleanup remains unverified' }
       }
       await pending?.boundaryWork?.catch(() => undefined)
       if (pending?.confirmed) result = pending.confirmed
@@ -436,7 +440,7 @@ export class McpManager {
     const connection = this.connections.get(id)
     if (!connection) return
     connection.controller.abort()
-    await connection.transport.close()
+    await connection.closeOwned()
     await connection.refresh?.catch(() => undefined)
     this.connections.delete(id)
   }

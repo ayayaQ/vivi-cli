@@ -207,8 +207,25 @@ nativeTest('closed target stdin reports failure and cleans up without a manual s
     windowsHide: true, timeout: 15_000, maxBuffer: 16_384 })
   const compiled = await lstat(executable)
   assert.ok(compiled.isFile() && !compiled.isSymbolicLink() && compiled.size > 0, 'Owned console fixture was not compiled')
+  const launchedAt = Date.now()
   const { owned, stderr } = await subject.launchTarget(executable, [subject.log, subject.pidFile], env)
-  await until(() => stderr().includes(Buffer.from('native-stdin-closed\n')), 'closed stdin fixture readiness')
+  let nativeResult
+  void owned.completed.then(result => { nativeResult = result })
+  try {
+    await until(() => {
+      if (stderr().includes(Buffer.from('native-stdin-closed\n'))) return true
+      assert.equal(nativeResult, undefined, 'closed stdin fixture ended before readiness')
+      return false
+    }, 'closed stdin fixture readiness')
+  } catch (error) {
+    // These bytes come only from the fixed owned fixture, never a user's server.
+    t.diagnostic(JSON.stringify({ event: 'owned-closed-input-readiness-failure', elapsedMs: Date.now() - launchedAt,
+      nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
+      fixturePidRecorded: (await subject.pids()).length > 0,
+      startupEvents: (await subject.messages()).map(message => message.event).slice(0, 4),
+      stderr: stderr().subarray(0, 1024).toString('utf8') }))
+    throw error
+  }
   const pids = await subject.pids()
   assert.equal(pids.length, 1)
   assert.ok(pids.every(pid => !dead(pid)), 'closed-input fixture must remain alive before the failed write')
