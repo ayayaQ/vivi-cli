@@ -35,6 +35,7 @@ function expectCompiledCreator(content: string | undefined): void { assert.equal
 const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-memory-'))
 const mcpMethods: string[] = []
 let mcpBadOutput = false
+let mcpCancellationHost: CliHost | undefined
 // Compiler/runtime acceptance uses an owned in-memory invocation peer, never a live server.
 const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, transportFactory: () => {
   const transport: Transport = { start: async () => {}, close: async () => transport.onclose?.(),
@@ -42,6 +43,7 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
       if (!('method' in message)) return
       mcpMethods.push(message.method)
       if (!('id' in message)) return
+      if (message.method === 'tools/call' && mcpCancellationHost) { mcpCancellationHost.cancel(); return }
       const result = message.method === 'initialize'
         ? { resultType: 'complete', protocolVersion: '2025-11-25', capabilities: { tools: {}, resources: {} },
           serverInfo: { name: 'Owned compiled peer', version: '1' } }
@@ -102,6 +104,32 @@ try {
   assert.equal(mcpMethods.filter(method => method === 'tools/list').length, 1)
   await mcp.disconnect('compiled')
   assert.equal(mcp.statuses()[0]!.state, 'disabled')
+  // A real compiled host must retain the attempted outcome when the shared runner cancels.
+  mcpBadOutput = false
+  assert.equal(await mcp.connect('compiled', async () => true, new AbortController().signal), true)
+  const cancelledStore = new FileSessionStore(directory)
+  let cancelledRounds = 0, cancelledApprovals = 0
+  const beforeCancellation = mcpMethods.filter(method => method === 'tools/call').length
+  mcpCancellationHost = await CliHost.create({ mcp, store: cancelledStore,
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => { cancelledApprovals++; return true },
+    provider: { async generate() { return ++cancelledRounds === 1
+      ? { content: '', toolCalls: [{ id: 'compiled-cancelled', name: alias, arguments: { query: 'cancelled' } }] }
+      : { content: 'No retry', toolCalls: [] } } } })
+  const cancelled = await mcpCancellationHost.send('Cancel after the owned compiled request frame')
+  assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelledApprovals, 1)
+  assert.equal(mcpMethods.filter(method => method === 'tools/call').length, beforeCancellation + 1)
+  for (const history of [cancelled.history, (await cancelledStore.load(mcpCancellationHost.session.id)).history]) {
+    const result = history.find(message => message.kind === 'tool_result' && message.callId === 'compiled-cancelled')
+    assert(result?.kind === 'tool_result'); assert.equal(result.name, alias)
+    const outcome = JSON.parse(result.content)
+    assert.equal(outcome.unknownOutcome, true); assert.equal(outcome.doNotRetry, true); assert.notEqual(outcome.requestSent, false)
+  }
+  const resumed = await CliHost.resume({ store: cancelledStore, id: mcpCancellationHost.session.id,
+    provider: { async generate() { return { content: 'Compiled recovery does not replay', toolCalls: [] } } } })
+  assert.equal((await resumed.send('Continue without repeating the uncertain operation')).status, 'completed')
+  assert.equal(mcpMethods.filter(method => method === 'tools/call').length, beforeCancellation + 1)
+  await resumed.shutdown(); await mcpCancellationHost.shutdown(); mcpCancellationHost = undefined
+  await mcp.disconnect('compiled')
   const memory = new FileMemoryStore(directory)
   await memory.commit(await memory.prepareCreate('Prefer compiled test fixtures', 'user'))
   const host = await CliHost.create({ memory, enableMemory: true, enableTools: false,
@@ -224,5 +252,5 @@ try {
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/unknown-outcome boundaries and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

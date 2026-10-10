@@ -163,7 +163,7 @@ for (const protocol of ['legacy', '2026-07-28']) for (const kind of ['tools', 'r
   })
 }
 
-for (const mode of ['malformed', 'bad-output', 'missing-structured', 'oversize-result', 'many-items', 'drift', 'input-required', 'header-mismatch', 'secret-result']) test(`post-send ${mode} fails closed with an unknown outcome and no automatic retry`, async t => {
+for (const mode of ['malformed', 'bad-output', 'missing-structured', 'oversize-result', 'many-items', 'input-required', 'secret-result']) test(`post-send ${mode} fails closed with an unknown outcome and no automatic retry`, async t => {
   const subject = await fixture(t, mode, '2026-07-28'), [snapshot] = await subject.manager.captureCatalogs(signal())
   const result = await invoke(subject.manager, operation(subject.manager, snapshot)), projected = content(result)
   assert.equal(result.isError, true); assert.equal(projected.unknownOutcome, true)
@@ -173,6 +173,17 @@ for (const mode of ['malformed', 'bad-output', 'missing-structured', 'oversize-r
   assert.equal((await requests(subject, 'tools/list')).length, 1)
   assert(!(await subject.log()).some(message => JSON.stringify(message).includes('inputResponses')))
   assert.equal((await subject.manager.captureCatalogs(signal())).length, 0)
+})
+
+for (const mode of ['drift', 'header-mismatch']) test(`post-send ${mode} preserves a confirmed bounded outcome without retry`, async t => {
+  const subject = await fixture(t, mode, '2026-07-28'), [snapshot] = await subject.manager.captureCatalogs(signal())
+  const result = await invoke(subject.manager, operation(subject.manager, snapshot)), projected = content(result)
+  assert.equal(projected.confirmedOutcome, true); assert.equal(projected.requestSent, true)
+  assert.equal(projected.doNotRetry, true); assert.equal(projected.unknownOutcome, undefined)
+  assert.equal(result.isError, mode === 'header-mismatch' ? true : undefined)
+  assert(!result.content.includes('Owned header mismatch'))
+  assert.equal((await requests(subject, 'tools/call')).length, 1)
+  assert.equal((await requests(subject, 'tools/list')).length, 1)
 })
 
 test('post-send cancellation reports unknown outcome and disables the owned connection', async t => {

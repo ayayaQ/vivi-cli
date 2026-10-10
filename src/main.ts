@@ -361,7 +361,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       } } : {}),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
-    await store.save(host.session)
+    await host.initialize()
     io.setApprovalMode?.('manual')
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)

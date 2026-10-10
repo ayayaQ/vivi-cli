@@ -511,7 +511,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           isAvailable: () => io.canAutoReview === true && !io.isClosed
         } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
-      await store.save(nextHost.session)
+      await nextHost.initialize()
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
       if (io.isClosed) { await nextRelease(); return false }
       activeSettings = { ...settings, provider: session.provider, model: session.model,
