@@ -12,7 +12,9 @@ export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
 export type CliProviderName = 'openai' | 'openrouter'
 export interface CliSession {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
+  /** Schema-2 points to an existing shadow anchor; it grants no replay/send authority. */
+  recordAnchor?: { version: 1; eventId: string }
   id: string
   provider: CliProviderName
   model: string
@@ -83,8 +85,14 @@ export function validateSession(value: unknown): CliSession {
   json(value)
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
-    'history', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision'])
-  check(value.schemaVersion === 1, 'unsupported schema version')
+    'history', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
+  check(value.schemaVersion === 1 || value.schemaVersion === 2, 'unsupported schema version')
+  if (value.schemaVersion === 1) check(!('recordAnchor' in value), 'schema-1 must not contain a record anchor')
+  else {
+    check(object(value.recordAnchor), 'schema-2 requires a record anchor')
+    keys(value.recordAnchor, ['version', 'eventId'])
+    check(value.recordAnchor.version === 1 && identifier(value.recordAnchor.eventId), 'invalid record anchor')
+  }
   check(isSessionId(value.id), 'invalid id')
   check(value.provider === 'openai' || value.provider === 'openrouter', 'unsupported provider')
   check(identifier(value.model), 'invalid model')

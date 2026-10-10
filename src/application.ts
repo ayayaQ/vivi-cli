@@ -518,7 +518,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       if (io.isClosed) { await discardCandidate(); return false }
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await discardCandidate(); return false }
-      nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
+      nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,

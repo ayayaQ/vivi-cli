@@ -347,7 +347,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+    host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
       enableTools, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,

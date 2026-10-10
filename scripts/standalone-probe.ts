@@ -15,6 +15,7 @@ import { FileSkillStore } from '../src/skills.js'
 import { skillCreatorSource, parseSkillDocument } from '@ayayaq/vivi/extensions/skills'
 import { FileMemoryStore } from '../src/memory.js'
 import { FileSessionStore } from '../src/session.js'
+import { FileCliConversationStore, replayCliConversationDocument } from '../src/conversation-records.js'
 import { CliHost } from '../src/host.js'
 import { ReadOnlyWorkspace, createWorkspaceExtension } from '../src/workspace.js'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
@@ -142,6 +143,14 @@ try {
   const result = await host.send('Use opted-in memory')
   assert.deepEqual(result.history.map(message => message.content), ['Use opted-in memory', 'Compiled memory works'])
   assert.deepEqual((await new FileSessionStore(directory).load(host.session.id)).history, result.history)
+  assert.equal(host.conversationRecords.state, 'shadow')
+  assert.deepEqual(host.conversationRecords.projection!.history.map(entry => entry.message), result.history)
+  const storedRecords = await new FileCliConversationStore(directory).read(host.session.id)
+  assert.deepEqual(replayCliConversationDocument(storedRecords!.value).projection, host.conversationRecords.projection)
+  const recordResume = await CliHost.resume({ store: new FileSessionStore(directory), id: host.session.id,
+    provider: { async generate() { assert.fail('Compiled replay cannot execute') } } })
+  assert.deepEqual(recordResume.conversationRecords.projection, host.conversationRecords.projection)
+  await recordResume.shutdown()
   await host.drainMemory()
   const skills = new FileSkillStore(join(directory, 'agent-skills'))
   const catalog = await skills.snapshot()

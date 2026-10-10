@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { runAgent } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
-import type { AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
+import type { AgentAcceptedUpdate, AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
 import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
@@ -13,6 +13,8 @@ import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { FileSessionStore, newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
+import { CliConversationRecords, FileCliConversationStore } from './conversation-records.js'
+import type { CliConversationStore, CliConversationView } from './conversation-records.js'
 import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES, WorkspaceError } from './workspace.js'
 import type { ReadOnlyWorkspace } from './workspace.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
@@ -176,6 +178,9 @@ export interface CliHostOptions {
   /** Durable evidence sink; FileSessionStore receives a standalone sink automatically. */
   mcpOutcomes?: McpOutcomeStore
   onMcpNotice?(message: string): void
+  /** Optional shadow storage. File sessions get private sidecars automatically. */
+  conversationStore?: CliConversationStore
+  onConversationNotice?(message: string): void
   /** A host can omit tools when the selected model's tool support is undeclared. */
   enableTools?: boolean
   secrets?: readonly string[]
@@ -196,6 +201,7 @@ export type MemoryChangeRequest =
 /** Thin application host: the shared core is the only provider/tool conversation loop. */
 export class CliHost {
   private current: CliSession
+  private readonly records: CliConversationRecords
   private controller: AbortController | undefined
   private persistence: Promise<void> = Promise.resolve()
   private enabledMemory: boolean
@@ -232,6 +238,9 @@ export class CliHost {
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
+    this.records = new CliConversationRecords(this.current.id, options.conversationStore ??
+      (options.store instanceof FileSessionStore ? new FileCliConversationStore(options.store.directory) : undefined),
+      options.secrets ?? [], options.onConversationNotice)
     this.mcpRecoveryCalls = this.current.history.flatMap(message => message.kind === 'assistant' ? structuredClone(message.toolCalls) : [])
     this.commandAccount = options.commandApproval?.accountRevision()
     if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
@@ -258,7 +267,18 @@ export class CliHost {
     if (this.running) throw new Error('Wait for the current turn before initializing the session')
     await this.recoverMcpOutcomes()
     await this.checkpoint(this.current)
+    await this.initializeRecords()
   }
+  private async initializeRecords(): Promise<void> {
+    await this.records.initialize(this.current, this.safeMcpRows())
+    const eventId = this.records.anchorEventId
+    if (eventId && !this.current.recordAnchor && this.records.view.durability === 'disk') {
+      const next = validateSession({ ...this.current, schemaVersion: 2, recordAnchor: { version: 1, eventId } })
+      await this.checkpoint(next)
+      this.current = next
+    }
+  }
+  get conversationRecords(): CliConversationView { return this.records.view }
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
   get approvalMode(): ApprovalMode { return this.reviews.mode }
@@ -538,6 +558,7 @@ export class CliHost {
     }
     while (this.mcpJobs.size || this.eventJobs.size) await Promise.allSettled([...this.mcpJobs, ...this.eventJobs])
     await this.mcpOutcomes?.drain?.()
+    await this.records.drain()
     await this.persistence
   }
   private executeMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager, ownerSignal: AbortSignal): Promise<ToolResult> {
@@ -832,6 +853,8 @@ export class CliHost {
     let mcpContents: readonly McpCatalogSnapshot[] = []
     const pendingMcpDisplay = new Map<string, ToolCall>()
     const enteredMcpCalls = new Set<string>()
+    const recordRows = new Map<string, McpOutcomeRecord>()
+    const captureRecordRows = (): void => { for (const row of this.safeMcpRows()) recordRows.set(row.id, row) }
     let failed = false, primaryFailure: unknown
     try {
       const memory = this.enabledMemory && enableTools ? createMemoryExtension({
@@ -847,6 +870,7 @@ export class CliHost {
       // replace a newly accepted prompt while the initial checkpoint waits.
       await this.persistence
       await this.recoverMcpOutcomes()
+      await this.initializeRecords()
       const mcpManager = enableTools ? this.options.mcp : undefined
       let mcp: ToolExtension | undefined
       if (mcpManager) {
@@ -914,6 +938,7 @@ export class CliHost {
       }
       try { await this.save() }
       catch (error) { if (!(error instanceof SessionCommitError)) this.current = previous; throw error }
+      await this.records.begin(this.toolsetRevision, this.current)
       const generate = this.options.provider.generate.bind(this.options.provider)
       const result = await runAgent({
         provider: { generate: async (input, signal, options) => {
@@ -958,6 +983,7 @@ export class CliHost {
           }
           // Reject session-wide overflow before this response enters canonical history.
           aggregateUsage([...priorUsage, ...roundUsage, output.usage])
+          this.records.assertOutput(output, input.messages.slice(prefix.length))
           return output
         } }, messages: [...prefix, ...this.current.history],
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
@@ -996,6 +1022,16 @@ export class CliHost {
             return safe
           }
           return isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
+        },
+        onAccepted: (update: AgentAcceptedUpdate) => {
+          if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return
+          // Frozen canonical acceptance precedes legacy display/checkpoint callbacks.
+          // It is an observation seam, never an MCP checkpoint acknowledgement.
+          const message = this.reconcileMcpHistory([...this.current.history, structuredClone(update.message)]).at(-1)!
+          const work = this.records.accept(this.toolsetRevision, { ...update, message } as AgentAcceptedUpdate)
+          this.eventJobs.add(work)
+          void work.then(() => this.eventJobs.delete(work), error => { eventFailures.push(error); this.eventJobs.delete(work) })
+          return work
         },
         onEvent: (event) => {
           // Retained callbacks from a sealed owner cannot enter a replacement run.
@@ -1048,7 +1084,7 @@ export class CliHost {
           if (controller.signal.aborted || owner.state !== 'open' || this.activeTurn?.scope !== owner) return
           const safeHistory = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
-          if (admittedEvent.type === 'tool_completed') await this.retireMcpOutcomes(this.current.history)
+          if (admittedEvent.type === 'tool_completed') { captureRecordRows(); await this.retireMcpOutcomes(this.current.history) }
           })()
           // Core may stop awaiting any callback on abort, even ordinary chat.
           // Keep admitted checkpoints and deliveries owned until they settle.
@@ -1070,6 +1106,7 @@ export class CliHost {
       await this.drainMcp()
       await this.drainMemory()
       await this.drainSkills()
+      captureRecordRows()
       // Core abort cleanup intentionally skips callbacks. Always use its final canonical transcript.
       // The per-turn prefix is provider context only. Persisting it would revive
       // deleted preferences on resume and accumulate stale snapshots each turn.
@@ -1116,6 +1153,8 @@ export class CliHost {
           canonicalResult.history = structuredClone(this.current.history)
         }
       }
+      captureRecordRows()
+      await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()])
       await this.retireMcpOutcomes(canonicalResult.history)
       const safeFinal = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
       if (safeFinal !== this.current.history) { this.current.history = safeFinal; await this.save() }
