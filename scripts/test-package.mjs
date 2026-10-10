@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.8.0'
-const coreIntegrity = 'sha512-8uyVIES42ZYSYKvmrU53WdVVFpu6TtWACBR1DVDv4p6hvvbRLkxRRHJlInT6virfrowhl4gYcIqbvSbny3Cjog=='
+const coreVersion = '0.9.0'
+const coreIntegrity = 'sha512-UkM7KUCydEPtcALkfFVtZaJD/h7mZSHoNk3nIt0obVuzLmF1WhfleVs0aqU8AWm9B99AG2iTKBAnJ731t9eN6g=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.8.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.9.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -102,7 +102,7 @@ try {
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
-  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content']) {
+  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes']) {
     for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
       assert(paths.has(path), `Missing ${path}`)
     }
@@ -121,6 +121,9 @@ try {
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
     'docs/DECISIONS.md', 'src/decisions.ts', 'dist/decisions.js', 'dist/decisions.d.ts',
     'dist/cjs/decisions.js', 'dist/cjs/decisions.d.ts', 'examples/decisions.mjs',
+    'docs/MCP.md', 'src/extensions/mcp.ts', 'dist/extensions/mcp.js', 'dist/extensions/mcp.d.ts',
+    'dist/cjs/extensions/mcp.js', 'dist/cjs/extensions/mcp.d.ts',
+    'src/extensions/mcp/catalog.ts', 'src/extensions/mcp/operations.ts', 'src/extensions/mcp/content.ts',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
@@ -462,7 +465,7 @@ try {
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
-  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation } from '@ayayaq/vivi-cli'
+  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
@@ -494,7 +497,10 @@ const mcp: McpManager = new McpManager({ store: new McpConfigStore('/tmp/fake-ty
 const catalogs: Promise<readonly McpCatalogSnapshot[]> = mcp.captureCatalogs(new AbortController().signal)
 let operation: McpPreparedOperation | undefined
 void catalogs; void operation; void createMcpExtension
-const options: CliHostOptions = { provider, session, store, mcp, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
+const outcomes: McpOutcomeStore = new FileMcpOutcomeStore('/tmp/fake-types-only')
+let lifecycle: McpInvocationLifecycle | undefined
+void lifecycle
+const options: CliHostOptions = { provider, session, store, mcp, mcpOutcomes: outcomes, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')

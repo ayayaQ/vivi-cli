@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { test } from 'node:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -12,6 +14,7 @@ import { McpManager } from '../dist/mcp-manager.js'
 import { McpConfigStore } from '../dist/mcp-config.js'
 import { mcpAlias } from '../dist/mcp-catalog.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
+import { FileMcpOutcomeStore } from '../dist/mcp-outcomes.js'
 import { mcpContainsSecret } from '../dist/mcp-content.js'
 
 const answer = (content = 'Done', toolCalls = []) => ({ content, toolCalls })
@@ -58,7 +61,7 @@ async function fixture(t, input = {}) {
   if (input.resources) await manager.refresh('docs', ['resources', 'resourceTemplates'], signal())
   const capture = manager.captureCatalogs.bind(manager)
   manager.captureCatalogs = async signal => { state.captures++; return capture(signal) }
-  const options = { mcp: manager, secrets, session: input.session ?? newSession({ provider: 'openai', model: 'fixture' }),
+  const options = { mcp: manager, mcpOutcomes: new FileMcpOutcomeStore(directory, secrets), secrets, session: input.session ?? newSession({ provider: 'openai', model: 'fixture' }),
     store: { async save(session) { await input.save?.(session) } },
     async approve(request, signal) { approvals.push(request); return input.approve ? input.approve(request, signal, subject) : input.approved ?? true },
     onMcpNotice(message) { notices.push(message) }, onReviewNotice(message) { notices.push(message) },
@@ -592,4 +595,35 @@ test('large admitted numeric MCP catalogs keep ordinary chat available without i
   assert.equal(result.status, 'completed'); assert.equal(subject.state.generations, 1)
   assert(subject.providerInputs[0].tools.some(tool => tool.name.startsWith('mcp_')))
   assert.equal(subject.approvals.length, 0); assert.equal(subject.invocations().length, 0)
+})
+
+test('custom session persistence without an owned outcome sink fails closed before remote approval or send', async t => {
+  const subject = await fixture(t, { options: { mcpOutcomes: undefined } })
+  const result = await subject.host.send('Use the fixture tool')
+  const response = resultOf(result), body = JSON.parse(response.content)
+  assert.equal(body.requestSent, false); assert.equal(body.unknownOutcome, undefined)
+  assert.equal(subject.invocations().length, 0); assert.equal(subject.approvals.length, 0)
+})
+
+
+test('retained outcome capacity blocks new owned calls with exact no-send history and never evicts old evidence', async t => {
+  let retained = [], saved = []
+  const outcomes = {
+    async load(sessionId) {
+      retained = Array.from({ length: 128 }, (_, index) => {
+        const call = { id: `retained-call-${index}`, name: alias, arguments: { query: 'Earlier retained request' } }
+        return { id: randomUUID(), sessionId, runId: randomUUID(), callId: call.id, toolName: call.name,
+          callDigest: mcpDigest(call), bindingDigest: mcpDigest({ retained: index }), state: 'intent' }
+      })
+      return structuredClone(retained)
+    },
+    async save(_sessionId, rows, options) { options?.assertCurrent?.(); saved = structuredClone(rows) }
+  }
+  const subject = await fixture(t, { options: { mcpOutcomes: outcomes } })
+  const result = await subject.host.send('Use the fixture tool')
+  const body = JSON.parse(resultOf(result).content)
+  assert.equal(body.requestSent, false); assert.equal(body.unknownOutcome, undefined)
+  assert.equal(subject.invocations().length, 0); assert.equal(subject.approvals.length, 0)
+  assert.deepEqual(saved, retained); assert.equal(saved.length, 128)
+  assert.equal(JSON.parse(subject.host.session.history.find(message => message.kind === 'tool_result').content).requestSent, false)
 })

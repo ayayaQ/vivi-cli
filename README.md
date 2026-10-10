@@ -148,7 +148,10 @@ Every remote tool call and resource read requires human approval, including in A
 review. Reads use exact discovered resource URIs; templates are metadata only.
 Unsupported schemas are quarantined; stale catalogs and changed connections block
 calls. Results are bounded, untrusted data; uncertain outcomes disable the connection
-without retry. OAuth, HTTP, credential environment values, repository auto-discovery,
+without retry. Send intent and outcomes are persisted separately from transcript
+checkpoints; interrupted sessions recover the known or uncertain result without
+replaying the operation. Requests cancelled before sending stay marked as not sent.
+OAuth, HTTP, credential environment values, repository auto-discovery,
 package installation and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
 FullLanguage for owned Job Object cleanup.

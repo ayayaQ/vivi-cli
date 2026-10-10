@@ -9,7 +9,7 @@ import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 import { createBuiltinToolset } from './tools.js'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
-import { newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
+import { FileSessionStore, newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
 import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES, WorkspaceError } from './workspace.js'
@@ -27,6 +27,9 @@ import type { McpManager, McpPreparedOperation } from './mcp-manager.js'
 import type { McpCatalogSnapshot } from './mcp-catalog.js'
 import { createMcpExtension, MCP_GUIDANCE } from './mcp-tools.js'
 import { mcpContainsSecret } from './mcp-content.js'
+import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
+import { MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOutcomeResult, reconcileMcpOutcomes, unattemptedMcpResult, unresolvedMcpResult, validateMcpOutcomes } from './mcp-outcomes.js'
+import type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
@@ -63,12 +66,17 @@ function withholdMcpResult<T extends ToolResult>(result: T, secrets: readonly st
   if (!mcpContainsSecret([result.content, body ?? null], secrets)) return result
   const record = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : undefined
   const localListing = record?.source === 'mcp' && record.localMetadataOnly === true && Array.isArray(record.servers)
-  const confirmed = localListing || record?.source === 'mcp' && typeof record.success === 'boolean' && Array.isArray(record.content) &&
-    ['tools/call', 'resources/read'].includes(String(record.method)) && record.unknownOutcome !== true
+  const notSent = !localListing && record?.requestSent === false && record.unknownOutcome !== true
+  const confirmed = localListing || record?.unknownOutcome !== true && (record?.confirmedOutcome === true && record.requestSent === true && record.doNotRetry === true ||
+    record?.source === 'mcp' && typeof record.success === 'boolean' && Array.isArray(record.content) &&
+    ['tools/call', 'resources/read'].includes(String(record.method)))
   const succeeded = localListing || record?.success === true
-  const projection = confirmed
+  const projection = notSent
+    ? { success: false, source: 'mcp', untrusted: true, contentWithheld: true, requestSent: false,
+      error: { code: 'mcp_content_withheld', message: 'MCP request was not sent; its diagnostic content was withheld because it contains a known credential' } }
+    : confirmed
     ? { success: succeeded, source: 'mcp', untrusted: true, contentWithheld: true, confirmedOutcome: true,
-      ...(localListing ? { localMetadataOnly: true, requestSent: false } : { doNotRetry: true }),
+      ...(localListing ? { localMetadataOnly: true, requestSent: false } : { requestSent: true, doNotRetry: true }),
       message: localListing ? 'The local MCP metadata listing completed, but its content was withheld because it contains a known credential. No remote request was sent'
         : 'MCP returned a confirmed response; its content was withheld because it contains a known credential. Do not repeat the operation to recover withheld content' }
     : { success: false, source: 'mcp', untrusted: true, contentWithheld: true, unknownOutcome: true, doNotRetry: true,
@@ -164,6 +172,8 @@ export interface CliHostOptions {
   extensions?: readonly ToolExtension[]
   /** Only human-connected launch-local catalogs can become reviewed model tools. */
   mcp?: McpManager
+  /** Durable evidence sink; FileSessionStore receives a standalone sink automatically. */
+  mcpOutcomes?: McpOutcomeStore
   onMcpNotice?(message: string): void
   /** A host can omit tools when the selected model's tool support is undeclared. */
   enableTools?: boolean
@@ -193,6 +203,13 @@ export class CliHost {
   private readonly workspaceScopeRevision = randomUUID()
   private toolsetRevision = 'idle'
   private readonly mcpManagerRevision = randomUUID()
+  private readonly mcpOutcomes: McpOutcomeStore | undefined
+  private readonly mcpRows = new Map<string, McpOutcomeRecord>()
+  private readonly mcpCalls = new Map<string, ToolCall>()
+  private readonly mcpRecoveryCalls: readonly ToolCall[]
+  private mcpOutcomeLoading: Promise<void> | undefined
+  private readonly mcpJobs = new Set<Promise<ToolResult>>()
+  private readonly mcpEventJobs = new Set<Promise<void>>()
   private readonly mcpIdentityReplacements: McpIdentityReplacements = { callIds: new Map(), toolNames: new Map() }
   private readonly commandAccount: string | undefined
   private readonly commandLaunchId = randomUUID()
@@ -202,6 +219,8 @@ export class CliHost {
   private enabledSkills: boolean
   private lastSkillsDiagnostics = ''
   constructor(private readonly options: CliHostOptions) {
+    this.mcpOutcomes = options.mcpOutcomes ?? (options.store instanceof FileSessionStore
+      ? new FileMcpOutcomeStore(options.store.directory, options.secrets ?? []) : undefined)
     this.enabledMemory = options.enableMemory ?? false
     this.enabledSkills = options.enableSkills ?? false
     if (this.enabledSkills && !options.skills) throw new Error('Skills require a host-owned skill store')
@@ -209,25 +228,32 @@ export class CliHost {
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
+    this.mcpRecoveryCalls = this.current.history.flatMap(message => message.kind === 'assistant' ? structuredClone(message.toolCalls) : [])
     this.commandAccount = options.commandApproval?.accountRevision()
     if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
       throw new Error('Decision review must use this session’s selected provider; cross-provider review is unavailable')
     }
-    this.current.history = closeInterruptedHistory(this.current.history)
+    this.current.history = withholdMcpHistory(closeInterruptedHistory(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
     validateSession(this.current)
   }
   static async create(options: Omit<CliHostOptions, 'session'> & {
     settings: Parameters<typeof newSession>[0]
   }): Promise<CliHost> {
     const host = new CliHost({ ...options, session: newSession(options.settings) })
-    await host.checkpoint(host.current)
+    await host.initialize()
     return host
   }
   static async resume(options: Omit<CliHostOptions, 'session'> & { id: string }): Promise<CliHost> {
     const host = new CliHost({ ...options, session: await options.store.load(options.id) })
     // Persist recovered unknown-outcome results before the next model request.
-    await host.checkpoint(host.current)
+    await host.initialize()
     return host
+  }
+  /** Finish evidence recovery and the guarded startup checkpoint before display. */
+  async initialize(): Promise<void> {
+    if (this.running) throw new Error('Wait for the current turn before initializing the session')
+    await this.recoverMcpOutcomes()
+    await this.checkpoint(this.current)
   }
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
@@ -306,7 +332,7 @@ export class CliHost {
   }
   /** Cancels children before releasing a session or closing its approval surface. */
   async shutdown(): Promise<void> { this.shutdownStarted = true; this.commandSetupEpoch++; this.commandOpening = undefined
-    this.cancel(); await this.options.commandWorkspace?.shutdown(); await this.drainMemory(); await this.drainSkills() }
+    this.cancel(); await this.options.commandWorkspace?.shutdown(); await this.drainMcp(); await this.drainMemory(); await this.drainSkills() }
   get skillsEnabled(): boolean { return this.enabledSkills }
   get skillsDiagnostics(): readonly string[] { return this.options.skills?.diagnostics ?? [] }
   setSkillsEnabled(enabled: boolean): void {
@@ -467,10 +493,113 @@ export class CliHost {
         message: redactSecrets(error instanceof Error ? error.message : 'Memory change failed', this.options.secrets ?? []) } }), isError: true }
     }
   }
+  private acceptMcpCalls(calls: readonly ToolCall[], names: ReadonlySet<string>, catalogs: readonly McpCatalogSnapshot[]): void {
+    const catalogDigests = catalogs.map(catalog => mcpDigest(catalog))
+    for (const call of calls) {
+      if (!names.has(call.name)) continue
+      if (this.mcpRows.size >= MAX_MCP_OUTCOME_ROWS) throw new Error('MCP outcome capacity reached; no new MCP request was sent')
+      const id = randomUUID(), callDigest = mcpDigest(call)
+      this.mcpCalls.set(id, structuredClone(call))
+      this.mcpRows.set(id, { id, sessionId: this.current.id, runId: this.toolsetRevision,
+        callId: call.id, toolName: call.name, callDigest,
+        bindingDigest: mcpDigest({ callDigest, catalogDigests }), state: 'accepted' })
+    }
+  }
+  private acceptedMcpRow(call: ToolCall): McpOutcomeRecord | undefined {
+    return [...this.mcpRows.values()].find(row => row.runId === this.toolsetRevision && row.callId === call.id &&
+      row.toolName === call.name && row.callDigest === mcpDigest(call))
+  }
+  /** Await the host-owned operations the core may stop awaiting when cancelled. */
+  async drainMcp(): Promise<void> {
+    while (this.mcpJobs.size || this.mcpEventJobs.size) await Promise.allSettled([...this.mcpJobs, ...this.mcpEventJobs])
+    await this.mcpOutcomes?.drain?.()
+    await this.persistence
+  }
+  private executeMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager): Promise<ToolResult> {
+    const job = this.performMcp(operation, signal, manager)
+    this.mcpJobs.add(job)
+    void job.then(() => this.mcpJobs.delete(job), () => this.mcpJobs.delete(job))
+    return job
+  }
+  private safeMcpRows(): McpOutcomeRecord[] {
+    return [...this.mcpRows.values()].map(row => {
+      const original = this.mcpCalls.get(row.id)
+      const call = original ? withholdMcpCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements) : undefined
+      const next = { ...row, ...(call ? { callId: call.id, toolName: call.name, callDigest: mcpDigest(call),
+        ...(row.recoveryCallDigest || mcpDigest(call) !== row.callDigest ? { recoveryCallDigest: row.recoveryCallDigest ?? row.callDigest } : {}) } : {
+        callId: withholdMcpIdentity(row.callId, this.options.secrets ?? [], this.mcpIdentityReplacements.callIds),
+        toolName: withholdMcpIdentity(row.toolName, this.options.secrets ?? [], this.mcpIdentityReplacements.toolNames, 'mcp_withheld_') }),
+        ...(row.result ? { result: withholdMcpResult(row.result, this.options.secrets ?? []) } : {}) }
+      if (mcpContainsSecret(next, this.options.secrets ?? [])) throw new Error('A canonical MCP identity contains a newly known credential; outcome persistence was blocked')
+      return next
+    })
+  }
+  private async persistMcpOutcomes(): Promise<void> {
+    if (!this.mcpOutcomes) return
+    for (;;) {
+      const rows = this.safeMcpRows()
+      this.mcpOutcomes.addSecrets?.(this.options.secrets ?? [])
+      await this.mcpOutcomes.save(this.current.id, rows, { assertCurrent: () => {
+        if (mcpContainsSecret(rows, this.options.secrets ?? [])) throw new Error('MCP outcome evidence contains a newly known credential; persistence was blocked')
+      } })
+      if (JSON.stringify(rows) === JSON.stringify(this.safeMcpRows())) return
+    }
+  }
+  private async recoverMcpOutcomes(): Promise<void> {
+    if (!this.mcpOutcomeLoading) this.mcpOutcomeLoading = (async () => {
+      if (!this.mcpOutcomes) return
+      const rows = validateMcpOutcomes(this.current.id, await this.mcpOutcomes.load(this.current.id))
+      const calls = this.mcpRecoveryCalls
+      for (const row of rows) {
+        // A nonmatching row is retained as evidence, never adopted from result.source.
+        const call = calls.find(call => mcpOutcomeMatchesCall(row, call))
+        if (call) this.mcpCalls.set(row.id, structuredClone(call))
+        this.mcpRows.set(row.id, row)
+      }
+      this.current.history = this.reconcileMcpHistory(this.current.history)
+      if (rows.length) await this.persistMcpOutcomes()
+    })()
+    const loading = this.mcpOutcomeLoading
+    try { await loading }
+    catch (error) { if (this.mcpOutcomeLoading === loading) this.mcpOutcomeLoading = undefined; throw error }
+  }
+  private reconcileMcpHistory(history: readonly HistoryMessage[]): HistoryMessage[] {
+    const safe = withholdMcpHistory(structuredClone(history) as HistoryMessage[], this.options.secrets ?? [], this.mcpIdentityReplacements)
+    const rows = this.safeMcpRows()
+    return rows.length ? reconcileMcpOutcomes(safe, this.current.id, rows) : safe
+  }
+  private async retireMcpOutcomes(history: readonly HistoryMessage[]): Promise<void> {
+    const matched = new Set<string>()
+    const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
+    for (const row of this.safeMcpRows()) {
+      if (calls.some(call => mcpOutcomeMatchesCall(row, call)) &&
+        history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
+          message.content === mcpOutcomeResult(row).content)) matched.add(row.id)
+    }
+    if (!matched.size || !this.mcpOutcomes) return
+    const remaining = this.safeMcpRows().filter(row => !matched.has(row.id))
+    try {
+      this.mcpOutcomes.addSecrets?.(this.options.secrets ?? [])
+      await this.mcpOutcomes.save(this.current.id, remaining, { assertCurrent: () => {
+        if (mcpContainsSecret(remaining, this.options.secrets ?? [])) throw new Error('MCP outcome evidence contains a newly known credential')
+      } })
+      for (const id of matched) { this.mcpRows.delete(id); this.mcpCalls.delete(id) }
+    } catch { /* A failed cleanup retains evidence and cannot cause replay. */ }
+  }
   /** MCP annotations cannot prove effects or authorize automatic review. */
-  private async executeMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager): Promise<ToolResult> {
+  private async performMcp(operation: McpPreparedOperation, signal: AbortSignal, manager: McpManager): Promise<ToolResult> {
+    const call = structuredClone(operation.call)
+    const accepted = this.acceptedMcpRow(call)
+    if (!accepted && this.mcpRows.size >= MAX_MCP_OUTCOME_ROWS) return unattemptedMcpResult('mcp_outcome_capacity')
+    const rowId = accepted?.id ?? randomUUID()
+    const row: McpOutcomeRecord = { id: rowId, sessionId: this.current.id, runId: this.toolsetRevision,
+      callId: call.id, toolName: call.name, callDigest: mcpDigest(call), bindingDigest: mcpDigest(operation.binding),
+      ...(accepted?.recoveryCallDigest ? { recoveryCallDigest: accepted.recoveryCallDigest } : {}), state: 'accepted' }
+    this.mcpCalls.set(rowId, call); this.mcpRows.set(rowId, row)
+    let outcome: ToolResult = unattemptedMcpResult(), settled: ToolResult | undefined
     try {
       signal.throwIfAborted()
+      if (!this.mcpOutcomes) throw new Error('Durable MCP outcome persistence is unavailable; no request was sent')
       const toolset = this.toolsetRevision
       const resourceId = `cli-mcp:${operation.serverId}`
       const affectedData = { serverId: operation.serverId, catalogKind: operation.catalogKind,
@@ -502,14 +631,34 @@ export class CliHost {
       }, signal, async assertCurrent => {
         assertCurrent()
         assertSecretFree()
-        return manager.invoke(operation, signal, () => { assertCurrent(); assertSecretFree() })
+        return manager.invoke(operation, signal, () => { assertCurrent(); assertSecretFree() }, {
+          beforeSend: async () => {
+            // Conservatively retain intent even if its durability acknowledgement fails.
+            this.mcpRows.set(rowId, { ...row, state: 'intent' })
+            await this.persistMcpOutcomes()
+          },
+          settle: async result => {
+            settled = result
+            this.mcpRows.set(rowId, { ...row, state: 'settled', result: withholdMcpResult(result, this.options.secrets ?? []) })
+            await this.persistMcpOutcomes()
+          }
+        })
       })
-      return result ?? { content: JSON.stringify({ success: false, error: { code: 'approval_denied',
-        message: 'This MCP operation was not approved' } }), isError: true }
-    } catch (error) {
-      return { content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'mcp_operation_failed',
-        message: redactSecrets(error instanceof Error ? error.message : 'MCP operation failed', this.options.secrets ?? []) } }), isError: true }
+      // The trusted manager's settled result outranks generic review cancellation.
+      outcome = settled ?? (this.mcpRows.get(rowId)?.state === 'intent' ? unresolvedMcpResult()
+        : result ? { ...result, content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
+          error: { code: 'approval_denied', message: 'This MCP operation was not approved' } }), isError: true } : unattemptedMcpResult('approval_denied'))
+    } catch {
+      outcome = settled ?? (this.mcpRows.get(rowId)?.state === 'intent' ? unresolvedMcpResult()
+        : unattemptedMcpResult(signal.aborted ? 'cancelled' : 'mcp_operation_failed'))
+    } finally {
+      if (this.mcpRows.get(rowId)?.state !== 'intent') {
+        this.mcpRows.set(rowId, { ...row, state: 'settled', result: withholdMcpResult(outcome, this.options.secrets ?? []) })
+      }
+      // The live exact outcome stays available even if its durable update fails.
+      try { await this.persistMcpOutcomes() } catch { /* Prior intent survives; no replay. */ }
     }
+    return withholdMcpResult(outcome, this.options.secrets ?? [])
   }
   cancel(): void { this.controller?.abort() }
   /** Repeat privacy checks at the durable store's last admission guard as well as queue entry. */
@@ -642,11 +791,14 @@ export class CliHost {
     let memoryContents: readonly string[] = []
     let skillContents: readonly unknown[] = []
     let mcpContents: readonly McpCatalogSnapshot[] = []
+    const pendingMcpDisplay = new Map<string, ToolCall>()
+    const enteredMcpCalls = new Set<string>()
     try {
       // A metadata commit already admitted while idle must settle before this
       // turn mutates current history. Otherwise its pre-turn snapshot could
       // replace a newly accepted prompt while the initial checkpoint waits.
       await this.persistence
+      await this.recoverMcpOutcomes()
       const mcpManager = enableTools ? this.options.mcp : undefined
       let mcp: ToolExtension | undefined
       if (mcpManager) {
@@ -680,6 +832,7 @@ export class CliHost {
         }
       }) : undefined
       const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp)
+      const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name) ?? [])
       if (catalog) {
         if (!this.options.skills?.writable) {
           try { this.options.onSkillsNotice?.('Automatic skill saving is disabled on every platform. The creator can draft standard SKILL.md text for manual saving') }
@@ -761,6 +914,7 @@ export class CliHost {
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: async (call, context) => {
+          if (ownedMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
           if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
             return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
               error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true }
@@ -781,17 +935,37 @@ export class CliHost {
           if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
             return { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }
           }
+          const accepted = ownedMcpNames.has(call.name) ? this.acceptedMcpRow(call) : undefined
+          if (accepted?.state === 'accepted') {
+            let body: unknown
+            try { body = JSON.parse(result.content) } catch { /* Local diagnostics may be plain text. */ }
+            const safe = withholdMcpResult({ ...result, content: JSON.stringify({
+              ...(body && typeof body === 'object' && !Array.isArray(body) ? body : { success: false, error: { code: 'mcp_unavailable', message: 'The captured MCP request was unavailable' } }), requestSent: false
+            }) }, this.options.secrets ?? [])
+            this.mcpRows.set(accepted.id, { ...accepted, state: 'settled', result: safe })
+            try { await this.persistMcpOutcomes() } catch { /* Accepted evidence still proves no send. */ }
+            return safe
+          }
           return isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
         },
-        onEvent: async (event) => {
+        onEvent: (event) => {
+          const work = (async (): Promise<void> => {
           let admittedEvent = event
           if (event.type === 'assistant' || event.type === 'tool_completed') {
-            const safe = withholdMcpHistory([...this.current.history, structuredClone(event.message)], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
+            const safe = this.reconcileMcpHistory([...this.current.history, structuredClone(event.message)]).at(-1)!
             admittedEvent = { ...event, message: safe } as AgentEvent
           } else if (event.type === 'tool_started' && isMcpTool(event.call.name) && mcpContainsSecret(event.call, this.options.secrets ?? [])) {
             admittedEvent = { ...event, call: withholdMcpCall(event.call, this.options.secrets ?? [], this.mcpIdentityReplacements) }
           }
           if (admittedEvent.type === 'assistant') {
+            // Register all owned calls before any tool_started callback can abort,
+            // including later calls the core never enters in a cancelled batch.
+            const acceptedCalls = event.type === 'assistant' ? event.message.toolCalls : []
+            for (const call of acceptedCalls) if (ownedMcpNames.has(call.name)) pendingMcpDisplay.set(call.id, structuredClone(call))
+            this.acceptMcpCalls(acceptedCalls, ownedMcpNames, mcpContents)
+            if (admittedEvent.message.toolCalls.some(call => ownedMcpNames.has(call.name))) {
+              try { await this.persistMcpOutcomes() } catch { /* No send can occur without a later durable intent. */ }
+            }
             this.current.history.push(structuredClone(admittedEvent.message))
             // This checkpoint precedes round telemetry. A crash here cannot leave
             // a stale cache sum looking like a complete aggregate of the new history.
@@ -812,14 +986,28 @@ export class CliHost {
               const safe = withholdMcpHistory([...this.current.history, admittedEvent.message], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
               admittedEvent = { ...admittedEvent, message: safe } as AgentEvent
             }
+            if (admittedEvent.type === 'tool_completed') for (const [id, original] of pendingMcpDisplay) {
+              const call = withholdMcpCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements)
+              if (call.id === admittedEvent.message.callId && call.name === admittedEvent.message.name) pendingMcpDisplay.delete(id)
+            }
             await this.options.onEvent?.(admittedEvent)
           }
           const safeHistory = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
+          if (admittedEvent.type === 'tool_completed') await this.retireMcpOutcomes(this.current.history)
+          })()
+          // The runner may stop awaiting an event on abort. Keep MCP admission and
+          // result checkpoints owned until their complete callback has settled.
+          if (mcp) {
+            this.mcpEventJobs.add(work)
+            void work.then(() => this.mcpEventJobs.delete(work), () => this.mcpEventJobs.delete(work))
+          }
+          return work
         }
       })
       // Await any in-flight atomic write, including a committed note whose result raced abort.
       await this.persistence
+      await this.drainMcp()
       await this.drainMemory()
       await this.drainSkills()
       // Core abort cleanup intentionally skips callbacks. Always use its final canonical transcript.
@@ -828,13 +1016,50 @@ export class CliHost {
       if (prefix.some((message, index) => JSON.stringify(result.history[index]) !== JSON.stringify(message))) {
         throw new Error('Agent returned an unexpected ephemeral context prefix')
       }
-      const canonicalResult = { ...result, history: withholdMcpHistory(structuredClone(result.history.slice(prefix.length)), this.options.secrets ?? [], this.mcpIdentityReplacements) }
+      const rawHistory = structuredClone(result.history.slice(prefix.length))
+      let terminalHistory = this.reconcileMcpHistory(rawHistory)
+      const canonicalCalls = new Map(terminalHistory.flatMap(message => message.kind === 'assistant'
+        ? message.toolCalls.map(call => [call.id, call] as const) : []))
+      // Capacity or a cancelled admission callback can prevent creating a row.
+      // Only exact current-turn captured calls whose execution never entered are
+      // eligible for this zero-send fallback; retained historical rows stay intact.
+      const unentered = [...pendingMcpDisplay.values()].filter(call => !enteredMcpCalls.has(mcpDigest(call)))
+        .map(call => withholdMcpCall(call, this.options.secrets ?? [], this.mcpIdentityReplacements))
+      terminalHistory = terminalHistory.map(message => {
+        if (message.kind !== 'tool_result') return message
+        const captured = unentered.find(call => call.id === message.callId && call.name === message.name &&
+          canonicalCalls.has(message.callId) && mcpDigest(call) === mcpDigest(canonicalCalls.get(message.callId)))
+        return captured ? { kind: 'tool_result', callId: message.callId, name: message.name, ...unattemptedMcpResult() } : message
+      })
+      const canonicalResult = { ...result, history: terminalHistory }
       this.current.history = canonicalResult.history
       // Reconcile from the original baseline, never add final usage to event sums.
       // A cancelled/unaccepted response contributes no round and preserves prior metrics.
       this.current.usage = aggregateUsage([...priorUsage, ...(result.rounds > 0 ? [result.usage] : [])])
       await this.save()
       canonicalResult.history = withholdMcpHistory(structuredClone(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
+      // Cancellation suppresses core tool_completed events. Display only the exact
+      // corrected, checkpointed results so a generic cancellation cannot hide effects.
+      for (let index = 0; index < canonicalResult.history.length; index++) {
+        const message = canonicalResult.history[index]
+        if (message?.kind !== 'tool_result') continue
+        const pending = [...pendingMcpDisplay].find(([_id, original]) => {
+          const call = withholdMcpCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          return call.id === message.callId && call.name === message.name
+        })
+        if (pending) {
+          pendingMcpDisplay.delete(pending[0])
+          await this.options.onEvent?.({ type: 'tool_completed', message: structuredClone(message) })
+          // This corrected event is another credential-registration boundary.
+          const safe = this.reconcileMcpHistory(this.current.history)
+          if (JSON.stringify(safe) !== JSON.stringify(this.current.history)) { this.current.history = safe; await this.save() }
+          canonicalResult.history = structuredClone(this.current.history)
+        }
+      }
+      await this.retireMcpOutcomes(canonicalResult.history)
+      const safeFinal = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+      if (safeFinal !== this.current.history) { this.current.history = safeFinal; await this.save() }
+      canonicalResult.history = structuredClone(this.current.history)
       if (historyUsesMcp(canonicalResult.history) &&
         mcpContainsSecret(canonicalResult.content, this.options.secrets ?? [])) {
         canonicalResult.content = '[MCP response content withheld: known credential]'
@@ -843,7 +1068,7 @@ export class CliHost {
     } finally {
       // runAgent aborts uncooperative tools without awaiting their I/O. A save
       // already admitted by memory still owns its commit and lease until settled.
-      try { await this.options.commandWorkspace?.endRun(); await this.drainMemory(); await this.drainSkills() }
+      try { await this.options.commandWorkspace?.endRun(); await this.drainMcp(); await this.drainMemory(); await this.drainSkills() }
       finally {
         signal?.removeEventListener('abort', abort)
         this.controller = undefined

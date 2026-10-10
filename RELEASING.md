@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.8.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.9.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,15 +12,23 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.8.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.9.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
-The verified registry tarball is 182,588 bytes (206 files), SHA-256
-`bc1f4426f2a4de8706a751caffec8db09d52ad856e26f49ae94dc0e8b27a7225`.
-The new optional Decisions module is consumed from the registry; no archived or
-vendored replacement is used. Its exact `yaml@2.9.1` dependency and unchanged
+The verified registry tarball is 233,863 bytes (262 files), SHA-256
+`50ce7d16682214ce2053f79dbb3d6a01f0a8ea6cb495b263009463121e4fe88e`.
+The shared MCP catalog, preparation and result projection helpers are consumed
+from the registry. Its exact `yaml@2.9.1` dependency and unchanged
 reviewed integrity are bundled transitively and checked alongside the core.
+
+MCP startup, exact human approval, transport writes and recovery remain host-owned.
+`FileSessionStore` uses bounded, private per-session outcome evidence to preserve
+cancellation and uncertain sends across failed transcript checkpoints. A custom
+session store must supply `mcpOutcomes: McpOutcomeStore` before external MCP sends;
+otherwise the host fails closed. Embedders constructing `CliHost` directly should
+await `initialize()` before displaying recovered history; `create()` and `resume()`
+do this themselves.
 
 Auto review is a separate host opt-in with Manual as the launch/session default.
 Its fixed-provider numeric gates are initial host heuristics, not calibrated model
@@ -240,7 +248,7 @@ authorized operations.
 
 ## Agent Skills adoption checks
 
-Skills use the pinned vivi 0.8.0 extension without changes to its shared agent loop.
+Skills use the pinned vivi 0.9.0 extension without changes to its shared agent loop.
 Run ordinary skills store, host, manager, native headless UI, package, and standalone checks
 with the current main checks. Automatic saving is disabled on every platform. Confirm
 only list/read tools are exposed, creator drafts describe manual saving, and all sources

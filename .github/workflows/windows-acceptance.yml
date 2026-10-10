@@ -66,7 +66,7 @@ jobs:
       - run: npm run build
       # Owned local MCP fixtures only. Serial files avoid unrelated native-startup contention;
       # every existing per-operation deadline remains unchanged.
-      - run: node --test --test-concurrency=1 test/mcp-config.test.mjs test/mcp-transport.test.mjs test/mcp-controls.test.mjs test/mcp-discovery.test.mjs test/mcp-lifecycle.test.mjs test/mcp-integration.test.mjs test/mcp-invocation.test.mjs test/mcp-host.test.mjs test/mcp-windows.test.mjs test/mcp-windows-real.test.mjs test/mcp-windows-node-env.test.mjs
+      - run: node --test --test-concurrency=1 test/mcp-config.test.mjs test/mcp-transport.test.mjs test/mcp-controls.test.mjs test/mcp-discovery.test.mjs test/mcp-lifecycle.test.mjs test/mcp-integration.test.mjs test/mcp-invocation.test.mjs test/mcp-host.test.mjs test/mcp-outcomes.test.mjs test/mcp-outcome-host.test.mjs test/mcp-windows.test.mjs test/mcp-windows-real.test.mjs test/mcp-windows-node-env.test.mjs
       # Harmless owned process fixtures plus mocks. No native UI, live keys or providers.
       - run: node --test test/commands.test.mjs test/commands-host.test.mjs test/command-process.test.mjs test/command-windows.test.mjs test/command-windows-real.test.mjs
       # Fake runners only: no native credential store, live keys, model calls or TTY automation.

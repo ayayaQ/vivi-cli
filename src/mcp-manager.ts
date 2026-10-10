@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { randomUUID } from 'node:crypto'
-import { Client, CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from '@modelcontextprotocol/client'
+import { Client, isSpecType, CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from '@modelcontextprotocol/client'
 import type { JSONRPCMessage, JsonSchemaType, Tool, Transport } from '@modelcontextprotocol/client'
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv'
+import { prepareMcpOperation, mcpOperationRevisions as sharedOperationRevisions, assertMcpOperationCurrent as sharedAssertCurrent } from '@ayayaq/vivi/extensions/mcp'
+import type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
+import { validateMcpSchema } from './mcp-schema.js'
 import type { JsonObject, ToolCall, ToolResult } from '@ayayaq/vivi'
 import { McpConfigStore, mcpDigest, mcpDisplayJson, mcpFreeze, prepareMcpLaunch } from './mcp-config.js'
 import type { McpConfiguration, McpLaunchIdentity, McpServerConfig } from './mcp-config.js'
@@ -11,21 +14,24 @@ import type { McpCatalogEntry, McpCatalogKind, McpCatalogSnapshot } from './mcp-
 import { McpStdioTransport } from './mcp-transport.js'
 import { assertMcpOperationResult, MCP_OPERATION_LIMITS, mcpContainsSecret, mcpFailure, projectMcpResult } from './mcp-content.js'
 
-export interface McpPreparedOperation {
-  readonly call: ToolCall
-  readonly serverId: string
-  readonly catalogKind: 'tools' | 'resources'
-  readonly remoteKey: string
-  readonly descriptor: Readonly<Record<string, unknown>>
-  readonly snapshot: McpCatalogSnapshot
-  readonly binding: JsonObject
+export type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
+/** Trusted host persistence hooks; never provided by server metadata or a model extension. */
+export interface McpInvocationLifecycle {
+  beforeSend(): Promise<void>
+  settle(result: ToolResult): Promise<void>
 }
 interface PendingOperation {
   readonly operation: McpPreparedOperation
   readonly signal: AbortSignal
   readonly assertCurrent: () => void
+  readonly lifecycle?: McpInvocationLifecycle
+  boundaryStarted: boolean
+  boundaryWork?: Promise<void>
+  boundaryFinished: boolean
   sent: boolean
   requestId?: string | number
+  responseObserved: boolean
+  confirmed?: ToolResult
 }
 
 export interface McpServerStatus {
@@ -148,37 +154,44 @@ export class McpManager {
     const owned = (this.options.transportFactory ?? (value => new McpStdioTransport(value)))(launch)
     // Keep the guard at the actual transport boundary, including SDK async setup.
     // The SDK may attach only its fixed modern protocol envelope to our params.
-    const transport: Transport = { start: () => owned.start(), close: () => owned.close(), send: async (message, options) => {
-      if ('method' in message && ['tools/call', 'resources/read'].includes(message.method)) {
-        const pending = connection.pending
-        if (!pending || pending.sent || !('id' in message)) throw new Error('MCP operation has no one-shot approval')
-        // SDK call setup is asynchronous. Re-read persisted configuration here,
-        // after that setup, rather than trusting the earlier cached revision.
+    const transport: Transport = { start: () => owned.start(), close: () => owned.close(), send: (message, options) => {
+      if (!('method' in message) || !['tools/call', 'resources/read'].includes(message.method)) return owned.send(message, options)
+      const pending = connection.pending
+      if (!pending || pending.boundaryStarted || !('id' in message)) return Promise.reject(new Error('MCP operation has no one-shot approval'))
+      pending.boundaryStarted = true
+      // Protocol.request may reject on abort before its detached send continuation settles.
+      // Own that continuation so the host cannot release its lease while it can still write.
+      const task = (async (): Promise<void> => {
         await this.reload()
-        if (connection.pending !== pending) throw new Error('MCP operation approval changed before send')
-        pending.signal.throwIfAborted(); pending.assertCurrent(); this.assertOperationCurrent(pending.operation)
-        const operation = pending.operation
-        const expected: Record<string, unknown> = operation.catalogKind === 'tools'
-          ? { name: operation.remoteKey, arguments: operation.call.arguments } : { uri: operation.remoteKey }
-        if (operation.snapshot.protocolVersion === '2026-07-28') expected._meta = {
-          [PROTOCOL_VERSION_META_KEY]: operation.snapshot.protocolVersion,
-          [CLIENT_INFO_META_KEY]: { name: 'vivi-cli-discovery', version: '0.1.0-dev.0' }, [CLIENT_CAPABILITIES_META_KEY]: {} }
-        if (message.method !== (operation.catalogKind === 'tools' ? 'tools/call' : 'resources/read') ||
-          mcpDigest(message.params) !== mcpDigest(expected)) throw new Error('MCP outgoing request differs from approval')
-        this.assertOperationPrivacy(operation)
+        this.assertSendCurrent(connection, pending, message)
+        await pending.lifecycle?.beforeSend()
+        // Persisting the intent is asynchronous; repeat every authority/privacy check after it.
+        await this.reload()
+        this.assertSendCurrent(connection, pending, message)
         pending.sent = true; pending.requestId = message.id
-      }
-      await owned.send(message, options)
+        await owned.send(message, options)
+      })()
+      pending.boundaryWork = task.finally(() => { pending.boundaryFinished = true })
+      // The SDK attaches its own rejection handler; retain ours without an unhandled rejection.
+      void pending.boundaryWork.catch(() => undefined)
+      return pending.boundaryWork
     } }
     const connection: Connection = { client, transport, launch, controller: new AbortController(), generation: randomUUID(), catalogGeneration: 0, state: 'connecting' }
     owned.onclose = () => transport.onclose?.()
     owned.onerror = error => transport.onerror?.(error)
     owned.onmessage = (message: JSONRPCMessage) => {
       const pending = connection.pending
-      if (pending?.sent && 'id' in message && message.id === pending.requestId && 'result' in message) {
-        try { assertMcpOperationResult(pending.operation.catalogKind === 'tools' ? 'tools/call' : 'resources/read', message.result) }
-        catch { transport.onmessage?.({ jsonrpc: '2.0', id: message.id,
-          error: { code: -32603, message: 'MCP result envelope is unavailable or exceeded its bounds' } }); return }
+      if (pending?.sent && 'id' in message && message.id === pending.requestId && !('method' in message) &&
+        ('result' in message || 'error' in message)) {
+        // The first response is authoritative evidence. A duplicate cannot overwrite it
+        // or turn a malformed first response into a later apparent success.
+        if (pending.responseObserved) return
+        pending.responseObserved = true
+        try { pending.confirmed = this.confirmResponse(pending.operation, message) }
+        catch {
+          transport.onmessage?.({ jsonrpc: '2.0', id: message.id,
+            error: { code: -32603, message: 'MCP result envelope is unavailable or exceeded its bounds' } }); return
+        }
       }
       transport.onmessage?.(message)
     }
@@ -268,78 +281,156 @@ export class McpManager {
   }
   prepareOperation(snapshot: McpCatalogSnapshot, entry: McpCatalogEntry, catalogKind: 'tools' | 'resources',
     call: ToolCall, remoteKey = entry.remoteKey): McpPreparedOperation {
-    assertMcpJson(call, MCP_OPERATION_LIMITS.argumentBytes + 1024)
-    if (catalogKind !== 'tools' && catalogKind !== 'resources' || remoteKey !== entry.remoteKey ||
-      entry.state !== 'available' || snapshot.categories[catalogKind].state !== 'ready' ||
-      !snapshot.categories[catalogKind].entries.some(value => value === entry)) throw new Error('MCP catalog entry is unavailable')
+    if (remoteKey !== entry.remoteKey) throw new Error('MCP resource selection differs from the captured URI')
     const connection = this.connections.get(snapshot.serverId)
-    const captured = { call: structuredClone(call), serverId: snapshot.serverId, catalogKind, remoteKey,
-      descriptor: entry.descriptor, snapshot }
-    const binding: JsonObject = { serverId: snapshot.serverId, configRevision: snapshot.configRevision,
-      connectionGeneration: snapshot.connectionGeneration, protocolVersion: snapshot.protocolVersion,
-      catalogGeneration: snapshot.catalogGeneration, categoryDigest: snapshot.categories[catalogKind].digest,
-      descriptorDigest: mcpDigest(entry.descriptor), launchDigest: connection?.launch.digest ?? '',
-      operationDigest: mcpDigest(captured) }
-    const operation = mcpFreeze({ ...captured, binding })
+    const operation = prepareMcpOperation(snapshot, entry, catalogKind, call, connection?.launch.digest ?? '', validateMcpSchema)
     this.assertOperationCurrent(operation); this.assertOperationPrivacy(operation)
-    if (catalogKind === 'tools') {
-      const validate = new AjvJsonSchemaValidator().getValidator(entry.descriptor.inputSchema as JsonSchemaType)
-      if (!validate(operation.call.arguments).valid) throw new Error('MCP arguments do not match the captured input schema')
-    } else if (Object.keys(call.arguments).sort().join(',') !== 'serverId,uri' ||
-      call.arguments.serverId !== snapshot.serverId || call.arguments.uri !== entry.remoteKey) throw new Error('MCP resource selection differs from the captured URI')
     return operation
   }
   operationRevisions(operation: McpPreparedOperation): JsonObject {
-    const connection = this.connections.get(operation.serverId), snapshot = connection?.snapshot
-    const category = snapshot?.categories[operation.catalogKind]
-    const entry = category?.entries.find(value => value.remoteKey === operation.remoteKey)
-    return { serverId: operation.serverId, configRevision: this.configuration.revision,
-      connectionGeneration: connection?.generation ?? '', protocolVersion: snapshot?.protocolVersion ?? '',
-      catalogGeneration: snapshot?.catalogGeneration ?? -1, categoryDigest: category?.digest ?? '',
-      descriptorDigest: mcpDigest(entry?.descriptor ?? null), launchDigest: connection?.launch.digest ?? '',
-      operationDigest: mcpDigest({ call: operation.call, serverId: operation.serverId, catalogKind: operation.catalogKind,
-        remoteKey: operation.remoteKey, descriptor: operation.descriptor, snapshot: operation.snapshot }),
-      connected: connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed,
-      categoryReady: category?.state === 'ready', bindingDigest: mcpDigest(operation.binding) }
+    const connection = this.connections.get(operation.serverId)
+    return sharedOperationRevisions(operation, connection?.snapshot, connection?.launch.digest ?? '',
+      connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision)
   }
   private assertOperationCurrent(operation: McpPreparedOperation): void {
     this.assertOpen()
-    const current = this.operationRevisions(operation)
-    if (!current.connected || !current.categoryReady || Object.entries(operation.binding).some(([key, value]) => current[key] !== value)) {
-      throw new Error('MCP operation became stale; request fresh approval after metadata refresh')
+    const connection = this.connections.get(operation.serverId)
+    sharedAssertCurrent(operation, connection?.snapshot, connection?.launch.digest ?? '',
+      connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision)
+  }
+  private assertSendCurrent(connection: Connection, pending: PendingOperation, message: JSONRPCMessage): void {
+    if (connection.pending !== pending || pending.sent || !('method' in message)) throw new Error('MCP operation approval changed before send')
+    pending.signal.throwIfAborted(); pending.assertCurrent(); this.assertOperationCurrent(pending.operation)
+    const operation = pending.operation
+    const expected: Record<string, unknown> = operation.catalogKind === 'tools'
+      ? { name: operation.remoteKey, arguments: operation.call.arguments } : { uri: operation.remoteKey }
+    if (operation.snapshot.protocolVersion === '2026-07-28') expected._meta = {
+      [PROTOCOL_VERSION_META_KEY]: operation.snapshot.protocolVersion,
+      [CLIENT_INFO_META_KEY]: { name: 'vivi-cli-discovery', version: '0.1.0-dev.0' }, [CLIENT_CAPABILITIES_META_KEY]: {} }
+    if (message.method !== (operation.catalogKind === 'tools' ? 'tools/call' : 'resources/read') ||
+      mcpDigest(message.params) !== mcpDigest(expected)) throw new Error('MCP outgoing request differs from approval')
+    this.assertOperationPrivacy(operation)
+  }
+  private confirmResponse(operation: McpPreparedOperation, message: JSONRPCMessage): ToolResult {
+    if ('result' in message && 'error' in message) throw new Error('Ambiguous MCP response')
+    if ('error' in message) {
+      assertMcpJson(message, MCP_OPERATION_LIMITS.resultBytes)
+      if (!isSpecType.JSONRPCErrorResponse(message)) throw new Error('Invalid MCP protocol error')
+      return this.withOutcome(mcpFailure('mcp_protocol_error', 'The server confirmed a protocol error; no automatic retry is permitted'), true, true)
     }
+    if (!('result' in message)) throw new Error('Missing MCP result')
+    if (!isSpecType.JSONRPCResultResponse(message)) throw new Error('Invalid MCP response envelope')
+    const result = message.result
+    const method = operation.catalogKind === 'tools' ? 'tools/call' : 'resources/read'
+    assertMcpOperationResult(method, result)
+    if (!(operation.catalogKind === 'tools' ? isSpecType.CallToolResult(result) : isSpecType.ReadResourceResult(result))) throw new Error('Invalid MCP result schema')
+    const body = result as Record<string, unknown>
+    if (operation.snapshot.protocolVersion === '2026-07-28') {
+      if (body.resultType !== 'complete') throw new Error('Unsupported MCP result type')
+      if (operation.catalogKind === 'resources' && (!Number.isSafeInteger(body.ttlMs) || (body.ttlMs as number) < 0 ||
+        !['private', 'public'].includes(body.cacheScope as string))) throw new Error('Invalid MCP resource cache metadata')
+    } else {
+      if (body.structuredContent !== undefined && (!body.structuredContent || typeof body.structuredContent !== 'object' || Array.isArray(body.structuredContent))) throw new Error('Invalid legacy structured content')
+      if (body._meta !== undefined && !isSpecType.RequestMeta(body._meta)) throw new Error('Invalid legacy result metadata')
+    }
+    if (operation.catalogKind === 'tools' && operation.descriptor.outputSchema && body.isError !== true) {
+      if (body.structuredContent === undefined) throw new Error('Missing structured output')
+      const validate = new AjvJsonSchemaValidator().getValidator(operation.descriptor.outputSchema as JsonSchemaType)
+      if (!validate(body.structuredContent).valid) throw new Error('Structured output does not match the captured schema')
+    }
+    // Privacy and URI checks are host-owned and run even when SDK abort wins the race.
+    if (mcpContainsSecret(result, this.secrets)) throw new Error('MCP result contains a known credential')
+    if (operation.catalogKind === 'resources' && (body.contents as Record<string, unknown>[]).some(item => item.uri !== operation.remoteKey)) throw new Error('MCP resource URI differs from approval')
+    let projection: ToolResult
+    try { projection = projectMcpResult(operation.serverId, method, operation.remoteKey, result, this.secrets) }
+    catch {
+      // The raw SDK result is fully validated above. Projection envelope overhead
+      // may exceed its separate budget; withhold content while retaining status.
+      projection = { content: JSON.stringify({ success: body.isError !== true, source: 'mcp', untrusted: true, contentWithheld: true }),
+        ...(body.isError === true ? { isError: true } : {}) }
+    }
+    return this.withOutcome(projection, true, true)
+  }
+  private withOutcome(result: ToolResult, requestSent: boolean, confirmedOutcome = false): ToolResult {
+    const body = JSON.parse(result.content) as Record<string, unknown>
+    const projection = { ...body, requestSent, ...(requestSent ? { doNotRetry: true } : {}), ...(confirmedOutcome ? { confirmedOutcome: true } : {}) }
+    try { assertMcpJson(projection, MCP_OPERATION_LIMITS.resultBytes) }
+    catch {
+      // Adding outcome evidence can exceed the otherwise valid projection budget.
+      // Preserve the confirmed status without clipping JSON or changing success into failure.
+      const withheld = { success: body.success === true, source: 'mcp', untrusted: true, requestSent,
+        ...(requestSent ? { doNotRetry: true } : {}), ...(confirmedOutcome ? { confirmedOutcome: true } : {}), contentWithheld: true }
+      return { content: JSON.stringify(withheld), ...(result.isError ? { isError: true } : {}) }
+    }
+    return { ...result, content: JSON.stringify(projection) }
   }
   private assertOperationPrivacy(operation: McpPreparedOperation): void {
     if (mcpContainsSecret([operation.call, operation.descriptor], this.secrets)) throw new Error('MCP request contains a known credential')
   }
   /** One exact approved request, never an SDK retry or cache-served resource body. */
-  async invoke(operation: McpPreparedOperation, signal: AbortSignal, assertCurrent: () => void): Promise<ToolResult> {
+  async invoke(operation: McpPreparedOperation, signal: AbortSignal, assertCurrent: () => void,
+    lifecycle?: McpInvocationLifecycle): Promise<ToolResult> {
     let pending: PendingOperation | undefined, connection: Connection | undefined
+    const invocation = new AbortController()
+    let result: ToolResult
     try {
       signal.throwIfAborted(); await this.reload(); signal.throwIfAborted(); assertCurrent()
       this.assertOperationCurrent(operation); this.assertOperationPrivacy(operation)
       connection = this.connections.get(operation.serverId)!
       if (connection.pending) throw new Error('MCP server already has an operation in flight')
-      const combined = AbortSignal.any([signal, connection.controller.signal, AbortSignal.timeout(MCP_OPERATION_LIMITS.operationMs)])
-      pending = { operation, signal: combined, assertCurrent, sent: false }; connection.pending = pending
+      const combined = AbortSignal.any([signal, invocation.signal, connection.controller.signal, AbortSignal.timeout(MCP_OPERATION_LIMITS.operationMs)])
+      pending = { operation, signal: combined, assertCurrent, ...(lifecycle ? { lifecycle } : {}), sent: false, boundaryStarted: false, boundaryFinished: false, responseObserved: false }
+      connection.pending = pending
       const options = { signal: combined, timeout: MCP_OPERATION_LIMITS.operationMs, maxTotalTimeout: MCP_OPERATION_LIMITS.operationMs }
-      const result = operation.catalogKind === 'tools'
-        ? await connection.client.callTool({ name: operation.remoteKey, arguments: operation.call.arguments },
-          { ...options, toolDefinition: operation.descriptor as unknown as Tool })
-        : await connection.client.readResource({ uri: operation.remoteKey }, { ...options, cacheMode: 'bypass' })
-      combined.throwIfAborted(); assertCurrent(); this.assertOperationCurrent(operation)
-      // Check persisted configuration after a request as well; output from a revoked connection is withheld.
-      await this.reload(); combined.throwIfAborted(); assertCurrent(); this.assertOperationCurrent(operation)
-      return projectMcpResult(operation.serverId, operation.catalogKind === 'tools' ? 'tools/call' : 'resources/read', operation.remoteKey, result, this.secrets)
+      if (operation.catalogKind === 'tools') await connection.client.callTool({ name: operation.remoteKey, arguments: operation.call.arguments },
+        { ...options, toolDefinition: operation.descriptor as unknown as Tool })
+      else await connection.client.readResource({ uri: operation.remoteKey }, { ...options, cacheMode: 'bypass' })
+      // A response may arrive while an underlying write is backpressured. Keep the
+      // write owned, but let cancellation/deadline close it rather than deadlock.
+      await this.drainBoundary(pending, combined)
+      if (!pending.confirmed) throw new Error('MCP result could not be confirmed')
+      result = pending.confirmed
     } catch {
-      if (pending?.sent && connection) {
-        connection.state = 'error'; connection.message = 'MCP operation outcome is unconfirmed; do not retry automatically. Disable before reconnecting with fresh approval'
+      // Stop detached SDK setup before draining it: it must never send after return.
+      invocation.abort()
+      if (pending && connection && (pending.sent && !pending.confirmed || pending.boundaryStarted && !pending.boundaryFinished)) {
+        connection.state = 'error'; connection.message = 'MCP operation interrupted; disable before reconnecting with fresh approval'
         connection.catalogGeneration++; delete connection.snapshot; connection.controller.abort()
         try { await connection.transport.close() } catch { connection.message += '; owned process cleanup remains unverified' }
-        return mcpFailure('mcp_unknown_outcome', 'The MCP operation was sent, but its outcome could not be confirmed. Do not retry automatically; check the external resource before reconnecting', true)
       }
-      return mcpFailure(signal.aborted ? 'cancelled' : 'mcp_unavailable', 'MCP request was not sent: approval, catalog, configuration, connection or arguments became unavailable')
-    } finally { if (connection && connection.pending === pending) delete connection.pending }
+      await pending?.boundaryWork?.catch(() => undefined)
+      if (pending?.confirmed) result = pending.confirmed
+      else if (pending?.sent) result = this.withOutcome(mcpFailure('mcp_unknown_outcome',
+        'The MCP operation was attempted, but its outcome could not be confirmed. Do not retry automatically; check the external resource before reconnecting', true), true)
+      else result = this.withOutcome(mcpFailure(signal.aborted ? 'cancelled' : 'mcp_unavailable',
+        'MCP request was not sent: approval, catalog, configuration, connection or arguments became unavailable'), false)
+    } finally {
+      invocation.abort()
+      if (connection && connection.pending === pending) delete connection.pending
+    }
+    // Newly known credentials can be registered by result/review callbacks. Keep
+    // exact outcome evidence while withholding now-sensitive content.
+    if (mcpContainsSecret(result, this.secrets)) {
+      const evidence = JSON.parse(result.content) as Record<string, unknown>
+      result = { content: JSON.stringify({ success: evidence.success === true, source: 'mcp', untrusted: true,
+        requestSent: evidence.requestSent === true, ...(evidence.confirmedOutcome ? { confirmedOutcome: true } : {}),
+        ...(evidence.unknownOutcome ? { unknownOutcome: true } : {}), ...(evidence.doNotRetry ? { doNotRetry: true } : {}), contentWithheld: true }),
+        ...(result.isError ? { isError: true } : {}) }
+    }
+    // A persistence acknowledgement failure cannot erase already observed outcome
+    // evidence. The host separately retains its prior intent and checkpoint result.
+    try { await lifecycle?.settle(result) } catch { /* Return the trusted in-memory outcome. */ }
+    return result
+  }
+  private async drainBoundary(pending: PendingOperation, signal: AbortSignal): Promise<void> {
+    if (!pending.boundaryWork) return
+    signal.throwIfAborted()
+    let abort: (() => void) | undefined
+    try {
+      await Promise.race([pending.boundaryWork, new Promise<never>((_, reject) => {
+        abort = () => reject(signal.reason); signal.addEventListener('abort', abort, { once: true })
+      })])
+    } finally { if (abort) signal.removeEventListener('abort', abort) }
   }
   async disconnect(id: string): Promise<void> {
     const connection = this.connections.get(id)
