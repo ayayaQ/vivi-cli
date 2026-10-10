@@ -47,6 +47,8 @@ export class McpStdioTransport implements Transport {
         if (result.error) this.onerror?.(new Error('MCP Windows process cleanup could not be verified'))
         void this.close().catch(() => this.onerror?.(new Error('MCP process cleanup could not be verified')))
       })
+      await owned.ready
+      if (this.closed) throw new Error('MCP connection closed during startup')
       return
     }
     const child = spawn(this.launch.server.executable, [...this.launch.server.args], {
@@ -94,11 +96,17 @@ export class McpStdioTransport implements Transport {
   }
   private async dispose(): Promise<void> {
     this.closed = true
-    await this.starting?.catch(() => undefined)
-    const child = this.child, pid = child?.pid
+    const windowsAtClose = this.windows
+    let child = this.child
     try {
+      // Startup may be awaiting the native acknowledgment. Stop its helper
+      // before draining startup so cancellation cannot wait on itself.
+      if (windowsAtClose) await windowsAtClose.stop()
+      await this.starting?.catch(() => undefined)
+      child = this.child
+      const pid = child?.pid
       if (this.windows) {
-        await this.windows.stop()
+        if (this.windows !== windowsAtClose) await this.windows.stop()
         const result = await this.windows.completed
         if (result.error) throw new Error('MCP Windows process cleanup could not be verified')
       }

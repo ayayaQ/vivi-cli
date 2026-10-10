@@ -7,18 +7,19 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { McpConfigStore } from '../dist/mcp-config.js'
+import { MCP_LIMITS } from '../dist/mcp-catalog.js'
 import { McpManager } from '../dist/mcp-manager.js'
 import { manageMcp } from '../dist/mcp-controls.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 
 // Replace only the owned-process startup boundary. Real start/send/receive/close/dispose run;
 // no process, Windows helper, network, model or provider is used by this fixture.
-function injectedOwnedTransport(launch, stop) {
+function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart = () => {}) {
   const transport = new McpStdioTransport(launch), stdout = new PassThrough(), stderr = new PassThrough()
   const methods = []
   let complete, starts = 0
   const completed = new Promise(resolve => { complete = resolve })
-  const owned = { stdout, stderr, completed, stop: async () => {
+  const owned = { stdout, stderr, ready, completed, stop: async () => {
     await stop(); stdout.end(); stderr.end(); complete({ exitCode: 0 })
   }, write: async bytes => {
     const message = JSON.parse(bytes.toString('utf8'))
@@ -26,21 +27,26 @@ function injectedOwnedTransport(launch, stop) {
     if (message.id === undefined) return
     const result = message.method === 'initialize' ? { resultType: 'complete', protocolVersion: '2025-11-25',
       capabilities: { tools: {} }, serverInfo: { name: 'Owned inert peer', version: '1' } }
-      : { resultType: 'complete', tools: [{ name: 'never-show-revoked-metadata', inputSchema: { type: 'object' } }] }
+      : message.method === 'server/discover' ? { resultType: 'complete', supportedVersions: ['2026-07-28'],
+        capabilities: { tools: {} }, ttlMs: 0, cacheScope: 'private' }
+      : { resultType: 'complete', tools: [{ name: 'never-show-revoked-metadata', inputSchema: { type: 'object' } }], ttlMs: 0, cacheScope: 'private' }
     queueMicrotask(() => stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\n'))
   } }
   transport.beginStart = async () => {
     starts++; transport.windows = owned
     stdout.on('data', chunk => transport.receive(chunk))
+    onStart()
+    await ready
+    if (transport.closed) throw new Error('Owned inert startup was cancelled')
   }
   return { transport, owned, methods, starts: () => starts }
 }
 
-async function managerFixture(t) {
+async function managerFixture(t, { protocol = 'legacy', ready, onStart, onStop } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-final-validation-')), store = new McpConfigStore(directory)
   const transports = []
   const manager = new McpManager({ store, env: {}, transportFactory: launch => {
-    const subject = injectedOwnedTransport(launch, async () => {})
+    const subject = injectedOwnedTransport(launch, async () => { onStop?.() }, ready, onStart)
     transports.push(subject); return subject.transport
   } })
   t.after(async () => {
@@ -49,9 +55,42 @@ async function managerFixture(t) {
   })
   const script = fileURLToPath(new URL('./fixtures/mcp-discovery-server.mjs', import.meta.url))
   await manager.configure({ id: 'docs', label: 'Owned inert peer', executable: process.execPath,
-    args: [...(process.versions.bun ? ['--no-install'] : []), script], cwd: directory, protocol: 'legacy', environment: [] })
+    args: [...(process.versions.bun ? ['--no-install'] : []), script], cwd: directory, protocol, environment: [] })
   return { manager, store, transports }
 }
+
+for (const protocol of ['legacy', '2026-07-28']) test(`owned startup readiness precedes the SDK handshake deadline (${protocol})`, async t => {
+  let release, entered
+  const ready = new Promise(resolve => { release = resolve }), started = new Promise(resolve => { entered = resolve })
+  t.after(() => release())
+  const subject = await managerFixture(t, { protocol, ready, onStart: entered, onStop: release })
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  const outcome = pending.then(value => ({ value }), error => ({ error }))
+  await started
+  assert.deepEqual(subject.transports[0].methods, [])
+  // A cold native setup can exceed one RPC deadline without using the whole
+  // existing category deadline. Neither deadline is extended by transport.start.
+  await new Promise(resolve => setTimeout(resolve, MCP_LIMITS.pageMs + 100))
+  assert.deepEqual(subject.transports[0].methods, [])
+  release()
+  const result = await outcome
+  assert.equal(result.error, undefined); assert.equal(result.value, true)
+  assert.equal(subject.transports[0].methods[0], protocol === 'legacy' ? 'initialize' : 'server/discover')
+  assert.equal(subject.transports[0].starts(), 1)
+})
+
+test('close stops an owned Windows helper while startup is awaiting acknowledgment', { timeout: 1000 }, async t => {
+  let rejectReady, stops = 0
+  const ready = new Promise((_, reject) => { rejectReady = reject })
+  const subject = injectedOwnedTransport({}, async () => { stops++; rejectReady(new Error('Owned inert startup was cancelled')) }, ready)
+  t.after(() => rejectReady(new Error('Owned inert fixture final cleanup')))
+  const started = subject.transport.start(), rejected = assert.rejects(started, /startup was cancelled/)
+  await Promise.resolve()
+  await subject.transport.close()
+  await rejected
+  assert.equal(stops, 1); assert.deepEqual(subject.methods, [])
+  await assert.rejects(subject.transport.send({ jsonrpc: '2.0', id: 1, method: 'initialize' }), /closed/)
+})
 
 for (const cleanup of ['reject', 'throw']) test(`failed legacy handshake observes SDK cleanup while retaining strict host cleanup failures (${cleanup})`, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-sdk-cleanup-'))

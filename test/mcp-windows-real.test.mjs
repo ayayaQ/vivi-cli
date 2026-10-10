@@ -103,7 +103,7 @@ async function sandbox(t) {
     async launch(mode, args = [], env = fixtureEnv) {
       return subject.launchTarget(process.execPath, [fixtureFile, mode, log, pidFile, ...args], env)
     },
-    async launchTarget(executable, args, env = {}) {
+    async launchTarget(executable, args, env = {}, waitForReady = false) {
       const owned = await launchWindowsMcp({ executable, args, cwd: directory, env }, {
         hostEnv: { ...process.env, PSModulePath: directory, NODE_OPTIONS: '--invalid-owned-fixture-option' },
         cleanupTimeoutMs: 5_000,
@@ -115,6 +115,7 @@ async function sandbox(t) {
         },
       })
       closers.push(() => owned.stop())
+      if (waitForReady) await bounded(owned.ready, 'owned target startup acknowledgment')
       return { owned, stdout: collect(owned.stdout), stderr: collect(owned.stderr) }
     },
     async manager(mode = 'pages', protocol = 'legacy') {
@@ -171,6 +172,15 @@ nativeTest('stdin preserves binary and Unicode bytes up to the frame limit', asy
   await bounded(owned.stop(), 'stdin fixture stop')
   assert.equal((await owned.completed).signal, 'SIGTERM')
   await assert.rejects(owned.write(Buffer.from('late')), /unavailable/)
+  await subject.assertDead()
+})
+
+nativeTest('startup acknowledgment precedes immediate output backpressure without attached readers', async t => {
+  const subject = await sandbox(t)
+  const { owned, stdout, stderr } = await subject.launchTarget(process.execPath,
+    [fixtureFile, 'native-flood', subject.log, subject.pidFile], fixtureEnv, true)
+  assert.deepEqual(await bounded(owned.completed, 'immediate output fixture cleanup'), { exitCode: 0 })
+  assert.deepEqual(stdout(), Buffer.alloc(65_536, 97)); assert.equal(stderr().length, 0)
   await subject.assertDead()
 })
 
