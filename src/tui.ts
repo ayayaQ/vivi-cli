@@ -219,6 +219,7 @@ export class OpenTuiIO implements ChatIO {
   private readonly collapsedTools = new Set<string>()
   private liveToolCalls = new Map<string, { call: ToolCall; index: number; key: string; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
   private liveHistoryIndex = 0
+  private displaySequence = 0
   private resultNotices: DisplayEntry[] = []
   private reviewNotices: DisplayEntry[] = []
   private historyLength = 0
@@ -1274,7 +1275,7 @@ export class OpenTuiIO implements ChatIO {
       const key = entry.tool.key, collapsed = this.collapsedTools.has(key)
       const view = cliToolPresentationView(entry.tool.encoded, collapsed, 8192, this.secrets)
       for (const line of view.header) box.add(new TextRenderable(this.renderer,
-        { content: this.safe(line), fg: TUI_THEME.muted, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+        { content: this.safe(line), fg: bodyColor, flexShrink: 0, width: '100%', wrapMode: 'word' }))
       // Safety and provenance are sibling rows, never part of the detail container/budget.
       for (const warning of view.warnings) box.add(new TextRenderable(this.renderer,
         { content: this.safe(`Warning: ${warning}`), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
@@ -1308,7 +1309,7 @@ export class OpenTuiIO implements ChatIO {
   /** Inert display sink for shared versioned data; it contains no action handlers. */
   toolPresentation(encoded: string): void {
     this.appendEntry({ category: 'activity', label: 'Tool presentation', content: '', markdown: false,
-      tool: { encoded, key: `display-${this.liveHistoryIndex++}` } })
+      tool: { encoded, key: `display-${this.displaySequence++}` } })
   }
   private toolKey(index: number, callId: string): string {
     // No user-controlled ID is a renderable ID or an executable link.
@@ -1362,7 +1363,7 @@ export class OpenTuiIO implements ChatIO {
     for (let index = history.length - 1; index >= 0 && entries.length < MAX_ENTRIES - 1 && budget > 0; index--) {
       const message = history[index]!
       const label = message.kind === 'message' ? message.role === 'user' ? 'You' : 'System'
-        : message.kind === 'assistant' ? 'Assistant' : `Tool ${message.name} · ${message.isError ? 'error' : 'done'}`
+        : message.kind === 'assistant' ? 'Assistant' : `Tool ${message.name} · ${message.isError ? 'error result' : 'result'}`
       const tools = message.kind === 'assistant' && message.toolCalls.length
         ? `\nTools requested: ${message.toolCalls.map((call) => call.name).join(', ')}` : ''
       const safeLabel = this.safe(label, 4096)
@@ -1381,7 +1382,7 @@ export class OpenTuiIO implements ChatIO {
         const key = this.toolKey(requestIndex, message.callId)
         const view = cliToolPresentationView(encoded, false, Math.max(0, Math.min(8192, budget)), this.secrets)
         entries.unshift({ category: 'activity', label: safeLabel, content: '', markdown: false, historyIndex: index,
-          attention: view.warnings.length > 0, tool: { encoded, key } })
+          attention: !!message.isError, tool: { encoded, key } })
         // Whole-history retention may omit old complete cards, never slice their safety rows.
         budget -= safeLabel.length + [...view.header, ...view.warnings, ...view.details.map(section => section.text)].join('\n').length
         continue
@@ -1504,7 +1505,8 @@ export class OpenTuiIO implements ChatIO {
     const key = context ? JSON.stringify([context.sessionId, context.runId, context.callId]) : undefined
     const previous = key === undefined ? undefined : this.reviewNotices.find(entry => entry.reviewKey === key)
     if (previous?.review && reviewNoticeSettled(previous.review)) return
-    if (context) {
+    if (context && (previous?.historyStart ?? this.turnHistoryStart) === this.turnHistoryStart &&
+      this.liveToolCalls.get(context.callId)?.call.name === context.toolName) {
       const state: Record<ReviewNotice['state'], readonly [ToolPresentationStatus, ToolPresentationEffect]> = {
         reviewing: ['running', 'not_attempted'], needs_review: ['approval_required', 'not_attempted'],
         saving: ['running', 'unknown'], saved: ['succeeded', 'confirmed'], denied: ['denied', 'not_attempted'],
@@ -1592,8 +1594,8 @@ export class OpenTuiIO implements ChatIO {
       try { encoded = JSON.stringify(cliHistoryToolPresentation(history, 1, this.sessionId, undefined, this.secrets)) }
       catch { encoded = '' }
       const old = this.entries.find(entry => entry.tool?.key === this.liveToolCalls.get(event.message.callId)?.key)
-      const entry: DisplayEntry = { category: 'activity', attention: true,
-        label: this.safe(`Tool ${event.message.name} · ${event.message.isError ? 'error' : 'done'}`, 4096), content: '', markdown: false,
+      const entry: DisplayEntry = { category: 'activity', attention: !!event.message.isError,
+        label: this.safe(`Tool ${event.message.name} · ${event.message.isError ? 'error result' : 'result'}`, 4096), content: '', markdown: false,
         historyIndex: this.liveHistoryIndex++, tool: { encoded, key: this.liveToolCalls.get(event.message.callId)?.key ?? this.toolKey(this.liveHistoryIndex, event.message.callId) } }
       if (old) this.entries[this.entries.indexOf(old)] = entry
       else this.entries.push(entry)

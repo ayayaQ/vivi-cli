@@ -8,7 +8,16 @@ import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus, 
 import { mcpContainsSecret } from './mcp-content.js'
 
 /** Host-observed evidence only. A replay, result body or source string supplies no authority. */
-export interface CliToolEvidence { readonly sessionId: string; readonly projection?: AgentProjection }
+export interface CliToolDecision {
+  readonly requestIndex: number
+  readonly callId: string
+  readonly name: string
+  readonly argumentsDigest: string
+  readonly status: 'denied' | 'cancelled'
+  readonly effect: 'not_attempted'
+  readonly source: ToolPresentation['source']
+}
+export interface CliToolEvidence { readonly sessionId: string; readonly projection?: AgentProjection; readonly decisions?: readonly CliToolDecision[] }
 export interface CliToolPresentationInput {
   readonly call: ToolCall
   readonly source: ToolPresentation['source']
@@ -66,18 +75,20 @@ export function cliHistoryToolPresentation(history: readonly HistoryMessage[], i
   evidence?: CliToolEvidence, secrets: readonly string[] = []): ToolPresentation {
   const result = history[index]
   if (result?.kind !== 'tool_result') throw new Error('Expected canonical tool result')
-  let call: ToolCall | undefined
+  let call: ToolCall | undefined, requestIndex = -1
   for (let previous = index - 1; previous >= 0; previous--) {
     const message = history[previous]!
     if (message.kind === 'message' && message.role === 'user') break
-    if (message.kind === 'assistant') { call = message.toolCalls.find(item => item.id === result.callId && item.name === result.name); if (call) break }
+    if (message.kind === 'assistant') { call = message.toolCalls.find(item => item.id === result.callId && item.name === result.name); if (call) { requestIndex = previous; break } }
   }
   const exactCall = call ?? { id: result.callId, name: result.name, arguments: {} }
   const exact = evidence && evidence.sessionId === sessionId && call &&
     JSON.stringify(evidence.projection?.history[index]?.message) === JSON.stringify(result)
     ? cliToolOutcome(call, history, evidence) : undefined
-  return createCliToolPresentation({ call: exactCall, result, status: exact?.status ?? 'unknown', effect: exact?.effect ?? 'unreported',
-    source: exact?.source ?? cliToolSource(sessionId, index, result), secrets,
+  const decision = evidence && evidence.sessionId === sessionId && call ? evidence.decisions?.find(item => item.requestIndex === requestIndex &&
+    item.callId === call.id && item.name === call.name && item.argumentsDigest === agentArgumentsDigest(call.arguments)) : undefined
+  return createCliToolPresentation({ call: exactCall, result, status: exact?.status ?? decision?.status ?? 'unknown', effect: exact?.effect ?? decision?.effect ?? 'unreported',
+    source: exact?.source ?? decision?.source ?? cliToolSource(sessionId, index, result), secrets,
     ...(!call ? { warnings: ['Legacy tool arguments are unavailable; no approval or effect evidence was restored.'] } : {}) })
 }
 /** Invalid foreign/legacy data gets a fixed visible error. It is never hidden or relabeled as success. */
