@@ -408,7 +408,7 @@ test('pink and lavender colors are configured and present in native frame spans'
 })
 
 test('renders session header, canonical roles, tools, usage and command hints', async () => {
-  const { io, frame } = await fixture()
+  const { io, setup, frame } = await fixture({ height: 40 })
   const session = newSession({ provider: 'openai', model: 'mock-model', reasoning: 'high' })
   session.history = [...history('## A heading\n\nA **bold** response'),
     { kind: 'tool_result', callId: 'tool-1', name: 'calculate', content: '{"result":2}' }]
@@ -416,7 +416,8 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   io.setSession(session)
   const output = await frame()
   expect(output).toContain('openai / mock-model')
-  expect(output).not.toContain(session.id)
+  expect((setup.renderer.root.findDescendantById('vivi-header') as TextRenderable).plainText).not.toContain(session.id)
+  expect(output).toContain(`cli-session:${session.id}:history:2`)
   expect(output).toContain('reasoning high')
   expect(output).toContain('You')
   expect(output).toContain('Assistant')
@@ -1484,7 +1485,7 @@ test('canonical transcript loading is display-bounded without changing persisted
 })
 
 test('packaged Markdown grammars initialize and conceal markup without using a global cache', async () => {
-  const { io, setup, frame } = await fixture()
+  const { io, setup, frame } = await fixture({ height: 40 })
   const session = newSession({ provider: 'openai', model: 'mock-model' })
   session.history = history('## Parsed heading\n\nA **parsed bold** response')
   io.setSession(session)
@@ -1566,7 +1567,7 @@ test('workspace status keeps search results, editor and refresh hints visible in
 })
 
 test('native transcript differentiates user, assistant and activity without changing content or selection', async () => {
-  const { io, setup, frame } = await fixture({ width: 120, height: 40 })
+  const { io, setup, frame } = await fixture({ width: 120, height: 80 })
   const session = newSession({ provider: 'openai', model: 'fixture' })
   session.history = [
     { kind: 'message', role: 'user', content: 'Selectable user text' },

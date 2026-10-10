@@ -34,3 +34,5 @@ export type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
 
 export { CliConversationRecords, CliConversationCommitError, FileCliConversationStore, CLI_CONVERSATION_LIMITS, replayCliConversationDocument, cliMcpRecordEvidence } from './conversation-records.js'
 export type { CliConversationStore, CliConversationView, CliConversationDocument, CliConversationStored, CliConversationQuarantine } from './conversation-records.js'
+export { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView } from './tool-presentation.js'
+export type { CliToolDecision, CliToolEvidence, CliToolPresentationInput } from './tool-presentation.js'

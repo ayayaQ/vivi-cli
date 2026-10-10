@@ -86,7 +86,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
-Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
+Mouse: click action buttons, picker rows, tool detail toggles and dialog choices; wheel scrolls. Ctrl+O toggles the latest tool details. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
 Keys are masked and saved only in an available OS credential store, or used for this launch after your choice.
@@ -545,6 +545,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
     activeSettings = nextSettings; candidate = undefined
     await previousRelease?.().catch(report)
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setSession(host.session)
     io.setApprovalMode?.('manual')
     io.write('Approval mode: Manual\n')

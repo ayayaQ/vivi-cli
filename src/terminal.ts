@@ -14,8 +14,11 @@ import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { autoReviewSharingScope } from './auto-review.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
+import type { CliToolEvidence } from './tool-presentation.js'
 
 export interface ChatIO {
+  /** Display-only host evidence, re-screened by the consumer before rendering. */
+  setToolEvidence?(evidence: CliToolEvidence): void
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
@@ -40,8 +43,10 @@ export interface ChatIO {
 export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal): Promise<AgentResult> {
   let outcome: RunOutcome = 'error'
   try {
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     io.runStarted?.()
     const result = await host.send(content, signal)
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     outcome = result.status
     return result
   } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }

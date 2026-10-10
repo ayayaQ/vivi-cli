@@ -33,6 +33,8 @@ import { mcpContainsSecret } from './mcp-content.js'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOutcomeResult, reconcileMcpOutcomes, unattemptedMcpResult, unresolvedMcpResult, validateMcpOutcomes } from './mcp-outcomes.js'
 import type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
+import type { CliToolDecision, CliToolEvidence } from './tool-presentation.js'
+import { agentArgumentsDigest } from '@ayayaq/vivi/events'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
@@ -206,6 +208,8 @@ export class CliHost {
   private persistence: Promise<void> = Promise.resolve()
   private enabledMemory: boolean
   private readonly reviews: AutoReviewController
+  private readonly presentationDecisions: CliToolDecision[] = []
+  private presentationTurnStart = 0
   private readonly memoryStoreRevision = randomUUID()
   private readonly sessionStoreRevision = randomUUID()
   private readonly workspaceScopeRevision = randomUUID()
@@ -234,7 +238,8 @@ export class CliHost {
     this.enabledMemory = options.enableMemory ?? false
     this.enabledSkills = options.enableSkills ?? false
     if (this.enabledSkills && !options.skills) throw new Error('Skills require a host-owned skill store')
-    this.reviews = new AutoReviewController(options.decisionReview, options.secrets ?? [], options.approve ?? (async () => false), options.onReviewNotice)
+    this.reviews = new AutoReviewController(options.decisionReview, options.secrets ?? [],
+      (request, signal) => this.approveWithPresentation(request, signal), options.onReviewNotice)
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
@@ -279,6 +284,34 @@ export class CliHost {
     }
   }
   get conversationRecords(): CliConversationView { return this.records.view }
+  /** Read-only exact host evidence. Rendering it cannot approve, execute or repair a tool. */
+  get toolPresentationEvidence(): CliToolEvidence {
+    const projection = this.conversationRecords.projection
+    return { sessionId: this.current.id, ...(projection ? { projection } : {}), decisions: structuredClone(this.presentationDecisions) }
+  }
+  private async approveWithPresentation(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+    const owner = this.controller, revision = this.toolsetRevision
+    const allowed = await (this.options.approve?.(request, signal) ?? false)
+    // Only these owned writes review before every effect. Imported tools and MCP
+    // results cannot supply no-effect evidence; MCP keeps its exact outcome ledger.
+    const owned = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_MUTATION_TOOL_NAMES].includes(request.call.name)
+    if (!allowed && owned && owner && this.controller === owner && this.toolsetRevision === revision) {
+      let requestIndex = -1
+      for (let index = this.current.history.length - 1; index >= this.presentationTurnStart; index--) {
+        const message = this.current.history[index]!
+        if (message.kind === 'assistant' && message.toolCalls.some(call => call.id === request.call.id && call.name === request.call.name &&
+          reviewDigest(call.arguments) === reviewDigest(request.call.arguments))) { requestIndex = index; break }
+      }
+      if (requestIndex >= 0) {
+        const decision: CliToolDecision = { requestIndex, callId: request.call.id, name: request.call.name,
+          argumentsDigest: agentArgumentsDigest(request.call.arguments), status: signal.aborted ? 'cancelled' : 'denied', effect: 'not_attempted',
+          source: { reference: `cli-review:${this.current.id}:${revision}:history:${requestIndex}`, revision: reviewDigest({ allowed: false, cancelled: signal.aborted }) } }
+        this.presentationDecisions.push(decision)
+        if (this.presentationDecisions.length > 256) this.presentationDecisions.shift()
+      }
+    }
+    return allowed
+  }
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
   get approvalMode(): ApprovalMode { return this.reviews.mode }
@@ -818,6 +851,7 @@ export class CliHost {
     this.activeTurn = { scope: owner, settled }
     this.controller = controller
     this.toolsetRevision = randomUUID()
+    this.presentationTurnStart = this.current.history.length
     const commandRunId = randomUUID()
     this.reviews.beginTurn(this.current.id, content)
     const eventFailures: unknown[] = []
@@ -1005,7 +1039,7 @@ export class CliHost {
           readNotes: () => this.notes(),
           commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
           reviewNote: (call, before, key, value, signal) => this.reviewNote(call, before, key, value, signal, controller.signal),
-          approve: this.options.approve ?? (async () => false)
+          approve: (request, signal) => this.approveWithPresentation(request, signal)
           })
           if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
             return { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }

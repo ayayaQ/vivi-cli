@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.10.0'
-const coreIntegrity = 'sha512-oK3NY4hpzlOIuW7/YkIonTVaFjVzEAkjEtYV24KjE6Ei48e5vJ9bx7kLtKTrHOeK0/+XgwQRLUsh87kn2v7epQ=='
+const coreVersion = '0.11.0'
+const coreIntegrity = 'sha512-n0YkJ1Ji7EPR2pKkJcdjKnj58MHsb0K2DALjX3rrJRVWg+Up7GR8q2KYzljIMq5Ije2ET35+XAERU+pEfjyu/Q=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.10.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.11.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -98,6 +98,7 @@ try {
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
     'src/conversation-records.ts', 'dist/conversation-records.js', 'dist/conversation-records.d.ts',
+    'src/tool-presentation.ts', 'dist/tool-presentation.js', 'dist/tool-presentation.d.ts',
     'src/commands.ts', 'dist/commands.js', 'dist/commands.d.ts',
     'src/command-process.ts', 'dist/command-process.js', 'dist/command-process.d.ts',
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
@@ -125,6 +126,8 @@ try {
     'docs/MCP.md', 'src/extensions/mcp.ts', 'dist/extensions/mcp.js', 'dist/extensions/mcp.d.ts',
     'dist/cjs/extensions/mcp.js', 'dist/cjs/extensions/mcp.d.ts',
     'src/extensions/mcp/catalog.ts', 'src/extensions/mcp/operations.ts', 'src/extensions/mcp/content.ts',
+    'src/presentation.ts', 'dist/presentation.js', 'dist/presentation.d.ts', 'dist/cjs/presentation.js',
+    'dist/cjs/presentation.d.ts', 'docs/TOOL_PRESENTATION.md', 'examples/tool-presentation.mjs',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
@@ -221,7 +224,20 @@ import { createDecisionRequest, evaluateDecision, isDecisionCurrent, createOpenA
 import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
 import { McpConfigStore } from './dist/mcp-config.js'
 import { McpManager } from './dist/mcp-manager.js'
+import { decodeToolPresentation, toolPresentationView } from '@ayayaq/vivi/presentation'
+import { createCliToolPresentation, cliToolPresentationView } from './dist/tool-presentation.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
+const presentation = createCliToolPresentation({ call: { id: 'packed-presentation', name: 'offline_tool', arguments: {} },
+  source: { reference: 'owned://packed/presentation', revision: 'packed-1' }, status: 'approval_required', effect: 'unknown' })
+const cjsPresentation = createRequire(import.meta.url)('@ayayaq/vivi/presentation')
+for (const module of [{ decodeToolPresentation, toolPresentationView }, cjsPresentation]) {
+  const view = module.toolPresentationView(module.decodeToolPresentation(JSON.stringify(presentation)), { collapsed: true, detailBytes: 0 })
+  assert(view.header.some(line => line.includes('owned://packed/presentation')))
+  assert(view.warnings.some(line => line.includes('Approval required')))
+  assert(view.warnings.some(line => line.includes('External effects are unknown')))
+  assert.equal(view.details.length, 0)
+}
+assert(cliToolPresentationView('{').warnings.some(line => line.includes('Invalid or oversized')))
 const cjsModels = createRequire(import.meta.url)('@ayayaq/vivi/providers/models')
 const cjsDecisions = createRequire(import.meta.url)('@ayayaq/vivi/decisions')
 assert.equal(createOpenAIDecisionProvider({ apiKey: 'fake' }).model, 'gpt-6-luna')
@@ -495,7 +511,7 @@ try {
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
-  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView } from '@ayayaq/vivi-cli'
+  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
@@ -538,6 +554,12 @@ const options: CliHostOptions = { provider, session, store, mcp, mcpOutcomes: ou
 const host = new CliHost(options)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
+const toolEvidence: CliToolEvidence = host.toolPresentationEvidence
+let toolDecision: CliToolDecision | undefined
+io.setToolEvidence?.(toolEvidence)
+const presentationView = cliToolPresentationView(JSON.stringify(createCliToolPresentation({ call: { id: 'typed', name: 'offline', arguments: {} },
+  source: { reference: 'owned://type-fixture' }, status: 'unknown', effect: 'unreported' })))
+void presentationView; void toolDecision
 void result; void io; void usageText; void selection; void createBuiltinToolset(false, [extension])
 `)
   const typeRoots = join(root, 'node_modules/@types')
@@ -548,7 +570,7 @@ void result; void io; void usageText; void selection; void createBuiltinToolset(
     await writeFile(join(installed, 'tui-consumer.ts'), `
 import assert from 'node:assert/strict'
 import { createTestRenderer } from '@opentui/core/testing'
-import { CodeRenderable } from '@opentui/core'
+import { CodeRenderable, TextRenderable } from '@opentui/core'
 import { OpenTuiIO } from './dist/tui.js'
 import { WindowsInputDecoder } from './dist/windows-input.js'
 import { newSession } from './dist/session.js'
@@ -585,6 +607,16 @@ try {
   await setup.mockInput.typeText('PROVIDER model 1499')
   setup.mockInput.pressEnter()
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
+  io.toolPresentation(JSON.stringify({ version: 1, callId: 'packed-card', name: 'offline_tool', status: 'failed', effect: 'unknown',
+    source: { reference: 'owned://packed/presentation', revision: 'packed-1' }, arguments: { kind: 'text', text: 'review arguments' },
+    result: { kind: 'future-card', text: 'Packed safe fallback', data: { approved: true, execute: 'NEVER_EXECUTE' } } }))
+  setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
+  const allText = node => [node instanceof TextRenderable ? node.plainText : '', ...node.getChildren().map(allText)].join(String.fromCharCode(10))
+  const card = allText(setup.renderer.root.findDescendantById('vivi-transcript'))
+  assert(card.includes('Tool failed')); assert(card.includes('External effects are unknown'))
+  assert(card.includes('owned://packed/presentation')); assert(card.includes('unsupported presentation kind'))
+  assert(card.includes('Details collapsed.')); assert(!card.includes('NEVER_EXECUTE'))
+  assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0').getChildren().length, 0)
   const request = { call: { id: 'packed-approval', name: 'memory_create', arguments: {} },
     description: 'Packed fake approval only', currentRevision: 'new memory' }
   const approve = io.approve(request, new AbortController().signal)
