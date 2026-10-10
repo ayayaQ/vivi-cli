@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, opendir, rename, unlink } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentAcceptedUpdate, AgentResult, HistoryMessage, ProviderResult } from '@ayayaq/vivi'
@@ -19,7 +19,8 @@ import type { McpOutcomeRecord } from './mcp-outcomes.js'
 
 /** Complete-chain shadow storage. Canonical sessions and exact MCP receipts remain authoritative. */
 export const CLI_CONVERSATION_LIMITS = Object.freeze({ bytes: 64 * 1024 * 1024,
-  activeHistoryBytes: 384 * 1024, terminalReserveBytes: 3 * 1024 * 1024 })
+  activeHistoryBytes: 384 * 1024, terminalReserveBytes: 3 * 1024 * 1024,
+  directoryEntries: 4096, stagingFiles: 128 })
 export interface CliConversationDocument {
   readonly schemaVersion: 1
   readonly sessionId: string
@@ -36,6 +37,8 @@ export interface CliConversationQuarantine {
 }
 export type CliConversationStored = CliConversationDocument | CliConversationQuarantine
 export interface CliConversationStore {
+  /** Startup/quarantine cleanup of this host's unpublished per-session staging copies. */
+  scrubStaging?(sessionId: string): Promise<void>
   read(sessionId: string): Promise<{ readonly value: unknown; readonly digest: string } | undefined>
   /** The host serializes operations and supplies an exact stored-byte lease. */
   write(sessionId: string, value: CliConversationStored, expectedDigest: string | null,
@@ -163,7 +166,7 @@ export class CliConversationRecords {
   }
   get anchorEventId(): string | undefined { return this.state === 'shadow' ? this.document?.records[0]?.eventId : undefined }
   get view(): CliConversationView {
-    if (this.document && containsSecret(this.document, this.secrets)) {
+    if (containsSecret([this.document ?? null, this.projection, this.runs], this.secrets)) {
       this.state = 'quarantined'
       void this.enqueue(() => this.quarantine()).catch(() => undefined)
     }
@@ -195,6 +198,7 @@ export class CliConversationRecords {
     const tombstone: CliConversationQuarantine = { schemaVersion: 1, sessionId: this.sessionId,
       state: 'quarantined', previousDigest: current?.digest ?? this.digest }
     this.digest = await this.store.write(this.sessionId, tombstone, current?.digest ?? null, () => {})
+    await this.store.scrubStaging?.(this.sessionId)
     this.document = undefined; this.runs = []; this.quarantineComplete = true
   }
   private async commit(next: CliConversationDocument): Promise<void> {
@@ -227,14 +231,24 @@ export class CliConversationRecords {
   initialize(session: CliSession, rows: readonly McpOutcomeRecord[]): Promise<void> {
     return this.enqueue(async () => {
       if (this.document) return
+      // The canonical host's session lease owns startup; no live turn is admitted yet.
+      await this.store?.scrubStaging?.(this.sessionId)
       const stored = await this.store?.read(this.sessionId)
       if (!stored && session.recordAnchor) { await this.quarantine(); return }
       if (stored) {
         this.digest = stored.digest
         try { assertMcpJson(stored.value, CLI_CONVERSATION_LIMITS.bytes, { nodes: 8 * 1024 * 1024, depth: 40 }) }
         catch { await this.quarantine(); return }
-        if (object(stored.value) && stored.value.state === 'quarantined') { this.state = 'quarantined'; this.quarantineComplete = true; return }
         if (containsSecret(stored.value, this.secrets)) { await this.quarantine(); return }
+        if (object(stored.value) && stored.value.state === 'quarantined') {
+          try {
+            keys(stored.value, ['schemaVersion', 'sessionId', 'state', 'previousDigest'])
+            if (stored.value.schemaVersion !== 1 || stored.value.sessionId !== this.sessionId ||
+              stored.value.previousDigest !== null && (typeof stored.value.previousDigest !== 'string' ||
+                !/^[a-f0-9]{64}$/.test(stored.value.previousDigest))) throw new Error('Invalid quarantine marker')
+          } catch { await this.quarantine(); return }
+          this.state = 'quarantined'; this.quarantineComplete = true; return
+        }
         let restored
         try { restored = replayCliConversationDocument(stored.value) } catch { await this.quarantine(); return }
         if (restored.document.sessionId !== this.sessionId || session.recordAnchor &&
@@ -294,6 +308,7 @@ export class CliConversationRecords {
   /** A separate final-envelope budget, before provider output can advertise effects. */
   assertOutput(output: ProviderResult, history: readonly HistoryMessage[]): void {
     if (this.state !== 'shadow') return
+    assertMcpJson(output, AGENT_RECORD_LIMITS.bytes, { nodes: AGENT_RECORD_LIMITS.nodes, depth: AGENT_RECORD_LIMITS.depth })
     const closed = closeInterruptedHistory([...history, { kind: 'assistant', content: output.content, toolCalls: output.toolCalls,
       ...(output.providerState ? { providerState: output.providerState } : {}) }])
     // Keep the canonical store's established history-overflow recovery/error path.
@@ -301,6 +316,14 @@ export class CliConversationRecords {
     if (closed.length > MAX_HISTORY_MESSAGES) return
     const safeEntries = closed.map((message, index) => ({ id: `cli-history:${index}`,
       source: { reference: `cli-session:${this.sessionId}:history:${index}`, revision: hash(message) }, message }))
+    // Exercise the actual enclosed terminal shape, including optional error/cache
+    // fields, rather than a shallower/smaller snapshot-only approximation.
+    const structuralUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
+      cachedInputTokens: 0, cacheWriteInputTokens: 0 }
+    decodeAgentRecord({ ...this.envelope(), type: 'run_settled', runId: 'cli-terminal-preflight',
+      inputHistoryLength: history.length, settlement: { status: 'error', content: output.content,
+        rounds: 1, usage: structuralUsage, error: { code: 'event_error', message: '' } },
+      snapshot: { history: safeEntries, outcomes: this.projection.outcomes, usage: structuralUsage } })
     if (bytes(safeEntries) > CLI_CONVERSATION_LIMITS.activeHistoryBytes ||
       bytes(safeEntries) + Buffer.byteLength(output.content) * 2 + 256 * 1024 > AGENT_RECORD_LIMITS.bytes ||
       (this.document && bytes(this.document) + bytes(output) + CLI_CONVERSATION_LIMITS.terminalReserveBytes > CLI_CONVERSATION_LIMITS.bytes)) throw new Error('Conversation record final headroom exhausted; start a new session')
@@ -364,6 +387,36 @@ export class FileCliConversationStore implements CliConversationStore {
     if (!info.isDirectory() || info.isSymbolicLink() || process.platform !== 'win32' &&
       ((info.mode & 0o077) !== 0 || info.uid !== process.getuid?.())) throw new Error('Conversation directory must be private and owned')
   }
+  async scrubStaging(sessionId: string): Promise<void> {
+    this.path(sessionId)
+    await this.prepare()
+    const prefix = `.${sessionId}.`, suffix = '.records.tmp'
+    const names: string[] = []
+    let examined = 0
+    const directory = await opendir(this.directory)
+    for await (const entry of directory) {
+      if (++examined > CLI_CONVERSATION_LIMITS.directoryEntries) throw new Error('Conversation staging cleanup enumeration limit exceeded')
+      if (!entry.name.startsWith(prefix) || !entry.name.endsWith(suffix) ||
+        !isSessionId(entry.name.slice(prefix.length, -suffix.length))) continue
+      if (names.length >= CLI_CONVERSATION_LIMITS.stagingFiles) throw new Error('Conversation staging cleanup count limit exceeded')
+      names.push(entry.name)
+    }
+    for (const name of names) {
+      const path = join(this.directory, name)
+      let info
+      try { info = await lstat(path) } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue
+        throw error
+      }
+      if (!info.isFile() || info.isSymbolicLink() || process.platform !== 'win32' &&
+        ((info.mode & 0o077) !== 0 || info.uid !== process.getuid?.())) throw new Error('Conversation staging cleanup requires private owned regular files')
+      await unlink(path)
+    }
+    if (names.length && process.platform !== 'win32') {
+      const directory = await open(this.directory, constants.O_RDONLY)
+      try { await directory.sync() } finally { await directory.close() }
+    }
+  }
   async read(sessionId: string): Promise<{ value: unknown; digest: string } | undefined> {
     await this.prepare()
     const path = this.path(sessionId)
@@ -388,7 +441,7 @@ export class FileCliConversationStore implements CliConversationStore {
       if (offset > info.size) throw new Error('Conversation file changed during read')
       const body = buffer.subarray(0, offset)
       let value: unknown
-      try { value = JSON.parse(body.toString('utf8')) as unknown } catch { value = { invalidConversationJson: true } }
+      try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body)) as unknown } catch { value = { invalidConversationJson: true } }
       return { value, digest: hashBytes(body) }
     } finally { await file.close() }
   }

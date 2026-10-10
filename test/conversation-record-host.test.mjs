@@ -2,9 +2,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { test as nodeTest } from 'node:test'
-import { applyAgentRecord, createAgentProjection, projectAgentRecords } from '@ayayaq/vivi/events'
+import { AGENT_RECORD_LIMITS, applyAgentRecord, createAgentProjection, projectAgentRecords } from '@ayayaq/vivi/events'
 import { applyAgentRunRecord, createAgentRunProjection, projectAgentRunRecords } from '@ayayaq/vivi/events/stream'
-import { emptyMcpCategory, mcpAlias, mcpDigest, mcpOperationRevisions, prepareMcpOperation } from '@ayayaq/vivi/extensions/mcp'
+import { assertMcpJson, emptyMcpCategory, mcpAlias, mcpDigest, mcpOperationRevisions, prepareMcpOperation } from '@ayayaq/vivi/extensions/mcp'
 import { CliHost } from '../dist/host.js'
 import { CLI_CONVERSATION_LIMITS, replayCliConversationDocument } from '../dist/conversation-records.js'
 import { createMcpSchemaValidator } from '../dist/mcp-schema.js'
@@ -568,4 +568,39 @@ test('actual CLI simulated interrupted accepted run recovers canonical closures 
   const next = await resumed.send('Continue with a fresh run and no historical executor')
   assert.equal(next.status, 'completed'); assert.equal(generations, 1); assert.equal(executions, 0); assert.equal(approvals, 0)
   await assertPaired(t, { host: resumed, store: recoveredStore, records: recoveredRecords, live: [], options: {} }, next)
+})
+
+
+for (const budget of ['depth', 'nodes']) test(`actual CLI enclosed terminal ${budget} preflight rejects ordinary provider state before acceptance, review or dispatch`, async t => {
+  let executions = 0, approvals = 0
+  const ordinaryCall = call('owned_headroom', {}, `ordinary-${budget}-call`)
+  const noteCall = call('note_set', { key: 'owned', value: 'Must stay unreviewed', expectedRevision: 0 }, `unreviewed-${budget}-note`)
+  let nested = { leaf: 'ordinary opaque provider state' }
+  for (let index = 0; index < 27; index++) nested = { next: nested }
+  const candidate = { ...answer('Execute the inert fixture and review its note', [ordinaryCall, noteCall], counts),
+    providerState: { provider: 'owned-fixture', items: budget === 'depth' ? [nested] : Array(AGENT_RECORD_LIMITS.nodes - 24).fill(null) } }
+  assert.doesNotThrow(() => assertMcpJson(candidate, AGENT_RECORD_LIMITS.bytes, {
+    nodes: AGENT_RECORD_LIMITS.nodes, depth: AGENT_RECORD_LIMITS.depth
+  }), 'The ordinary provider payload fits the isolated JSON budget')
+  assert(Buffer.byteLength(JSON.stringify(candidate)) < CLI_CONVERSATION_LIMITS.activeHistoryBytes,
+    'This regression exercises terminal structure rather than byte headroom')
+  const subject = await fixture(t, { options: { enableNotes: true,
+    extensions: [extension('owned_headroom', () => { executions++; return { content: 'Must stay undispatched' } })],
+    async approve() { approvals++; return true } }, generate() { return candidate } })
+  const result = await subject.host.send(`Reject the ordinary candidate that overflows enclosed terminal ${budget}`)
+  assert.equal(subject.generations(), 1); assert.equal(result.status, 'error'); assert.equal(result.error.code, 'provider_error')
+  assert.match(result.error.message, budget === 'depth'
+    ? /Event JSON complexity limit exceeded/ : /Event (?:JSON complexity limit exceeded|array must be bounded plain JSON)/)
+  assert.equal(result.rounds, 0); assert.equal(result.content, '')
+  assert.equal(executions, 0); assert.equal(approvals, 0)
+  assert.equal(subject.host.session.noteRevision, 0); assert.deepEqual(subject.host.session.notes, {})
+  assert.equal(subject.live.filter(item => ['assistant', 'tool_started', 'tool_completed'].includes(item.event.type)).length, 0)
+  assert.equal(result.history.filter(message => message.kind === 'assistant').length, 0)
+  assert.equal(toolResults(result.history).length, 0)
+  const { document, replay } = await assertPaired(t, subject, result)
+  assert.deepEqual(document.runs[0].records.map(record => record.type), ['run_started', 'run_settled'])
+  assert.deepEqual(replay.projection.outcomes, [])
+  assert.deepEqual(replay.projection.usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 })
+  assert(!JSON.stringify(document).includes('ordinary opaque provider state'))
+  assert(!JSON.stringify(document).includes('Must stay unreviewed'))
 })

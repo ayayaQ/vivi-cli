@@ -56,6 +56,24 @@ class MemoryConversationStore {
   }
 }
 
+function gateNextReplacement(store) {
+  let enter, release, first = true
+  const ready = new Promise(resolve => { enter = resolve })
+  const held = new Promise(resolve => { release = resolve })
+  const write = store.write.bind(store)
+  store.write = async (...args) => {
+    const digest = await write(...args)
+    if (first) {
+      first = false
+      enter()
+      await held
+      args[3]()
+    }
+    return digest
+  }
+  return { ready, release }
+}
+
 async function initialized(session = legacySession(), store = new MemoryConversationStore(), secrets = []) {
   const notices = []
   const owner = new CliConversationRecords(session.id, store, secrets, message => notices.push(message))
@@ -151,6 +169,101 @@ test('late storage guard rejection leaves the original checkpoint and cleans its
   assert.ok(guards >= 3)
   assert.deepEqual(await store.read(session.id), original)
   assert.deepEqual(await readdir(directory), [`${session.id}.records.json`])
+})
+
+async function ownedCrashFiles(directory, sessionId, body) {
+  const stale = [`.${sessionId}.${randomUUID()}.records.tmp`, `.${sessionId}.${randomUUID()}.records.tmp`]
+  const retained = [`.${sessionId}.ordinary-note.records.tmp`,
+    `.${sessionId}.${randomUUID()}.records.tmp.keep`,
+    `${sessionId}.${randomUUID()}.records.tmp`,
+    `.${sessionId}.${randomUUID()}.unrelated.tmp`,
+    `.${randomUUID()}.${randomUUID()}.records.tmp`]
+  for (const filename of stale) await writeFile(join(directory, filename), body, { mode: 0o600 })
+  for (const filename of retained) await writeFile(join(directory, filename), 'Owned unrelated fixture bytes', { mode: 0o600 })
+  return { stale, retained }
+}
+
+async function assertCrashFilesCleaned(directory, sessionId, files) {
+  const names = await readdir(directory)
+  assert.deepEqual(names.sort(), [`${sessionId}.records.json`, ...files.retained].sort())
+  for (const filename of files.stale) assert.equal(names.includes(filename), false)
+  for (const filename of files.retained) {
+    assert.equal(await readFile(join(directory, filename), 'utf8'), 'Owned unrelated fixture bytes')
+  }
+}
+
+test('ordinary owned crash staging copies are removed on restart while unrelated names and other sessions are retained', async t => {
+  const { directory, store } = await privateFiles(t)
+  const { session } = await initialized(legacySession(), store)
+  const original = await store.read(session.id)
+  const files = await ownedCrashFiles(directory, session.id, encoded(original.value))
+  const restarted = new CliConversationRecords(session.id, new FileCliConversationStore(directory))
+  await restarted.initialize(session, [])
+  assert.equal(restarted.view.state, 'shadow')
+  assert.deepEqual(await store.read(session.id), original)
+  await assertCrashFilesCleaned(directory, session.id, files)
+})
+
+test('a newly known dummy secret in an owned staging crash copy is removed at restart before safe projection publication', async t => {
+  const { directory, store } = await privateFiles(t)
+  const { session } = await initialized(legacySession(), store)
+  const original = await store.read(session.id)
+  const stale = copy(original.value)
+  stale.legacy.notes.project = secret
+  const files = await ownedCrashFiles(directory, session.id, encoded(stale))
+  const restarted = new CliConversationRecords(session.id, new FileCliConversationStore(directory), [secret])
+  await restarted.initialize(session, [])
+  assert.equal(restarted.view.state, 'shadow')
+  assert.equal(JSON.stringify(restarted.view).includes(secret), false)
+  assert.deepEqual(await store.read(session.id), original)
+  await assertCrashFilesCleaned(directory, session.id, files)
+})
+
+test('privacy quarantine physically scrubs owned current and stale staging copies while retaining unrelated regular files', async t => {
+  const { directory, store } = await privateFiles(t)
+  const secrets = []
+  const session = legacySession({ notes: { project: secret } })
+  const { owner } = await initialized(session, store, secrets)
+  const original = await store.read(session.id)
+  const files = await ownedCrashFiles(directory, session.id, encoded(original.value))
+  secrets.push(secret)
+  assertWithheld(owner)
+  await owner.drain()
+  assert.deepEqual((await store.read(session.id)).value, { schemaVersion: 1, sessionId: session.id,
+    state: 'quarantined', previousDigest: original.digest })
+  await assertCrashFilesCleaned(directory, session.id, files)
+  for (const filename of await readdir(directory)) {
+    assert.equal((await readFile(join(directory, filename), 'utf8')).includes(secret), false)
+  }
+  const restarted = new CliConversationRecords(session.id, store, secrets)
+  await restarted.initialize(session, [])
+  assertWithheld(restarted)
+})
+
+test('malformed UTF-8 in an ordinary owned record file is withheld and quarantined with its exact raw-byte digest', async t => {
+  const { directory, store } = await privateFiles(t)
+  const { session } = await initialized(legacySession(), store)
+  const original = await store.read(session.id)
+  const raw = Buffer.from(encoded(original.value))
+  const titleOffset = raw.indexOf(Buffer.from('Original display title'))
+  assert.ok(titleOffset >= 0)
+  raw[titleOffset] = 0x80
+  // Replacement decoding would yield structurally valid but changed metadata.
+  // The host must not silently adopt that replacement character as original data.
+  assert.doesNotThrow(() => replayCliConversationDocument(JSON.parse(raw.toString('utf8'))))
+  await writeFile(join(directory, `${session.id}.records.json`), raw, { mode: 0o600 })
+  const read = await store.read(session.id)
+  assert.deepEqual(read.value, { invalidConversationJson: true })
+  assert.equal(read.digest, sha256(raw))
+  const restarted = new CliConversationRecords(session.id, store)
+  await restarted.initialize(session, [])
+  assertWithheld(restarted)
+  assert.equal(restarted.view.committedSequence, 0)
+  assert.deepEqual((await store.read(session.id)).value, { schemaVersion: 1, sessionId: session.id,
+    state: 'quarantined', previousDigest: sha256(raw) })
+  const again = new CliConversationRecords(session.id, store)
+  await again.initialize(session, [])
+  assertWithheld(again)
 })
 
 test('schema-1 import retains metadata, original identities, opaque state and aggregate omission/zero', async () => {
@@ -567,6 +680,71 @@ test('a newly known immutable run identity cannot leak through committed-run wat
   assert.equal(store.current.value.state, 'quarantined')
 })
 
+for (const stage of ['initial import', 'accepted record', 'terminal record']) {
+  test(`newly known dummy secret during an admitted ${stage} write is withheld immediately and physically scrubbed on drain`, async () => {
+    const secrets = [], store = new MemoryConversationStore()
+    const session = legacySession()
+    const owner = new CliConversationRecords(session.id, store, secrets)
+    let runId, input, work, oldCommitted = 0
+    if (stage === 'initial import') {
+      session.history[0].content = secret
+    } else {
+      await owner.initialize(session, [])
+      runId = randomUUID()
+      input = { ...session, history: [...session.history,
+        { kind: 'message', role: 'user', content: 'Ordinary gated-write input' }] }
+      await owner.begin(runId, input)
+      oldCommitted = owner.view.committedSequence
+    }
+    // The inert replacement has happened, but its acknowledgement is still held.
+    // Only the older document is committed in the owner at this point.
+    const gate = gateNextReplacement(store)
+    if (stage === 'initial import') {
+      work = owner.initialize(session, [])
+    } else {
+      const message = { kind: 'assistant', content: secret, toolCalls: [] }
+      if (stage === 'accepted record') {
+        work = owner.accept(runId, { type: 'assistant_accepted', message, round: 1,
+          usage: usage(), aggregateUsage: usage() })
+      } else {
+        const result = { status: 'completed', history: [...input.history, message],
+          content: secret, rounds: 1, usage: usage() }
+        const canonical = { ...input, history: result.history,
+          usage: { inputTokens: 11, outputTokens: 5, totalTokens: 22, cachedInputTokens: 0 } }
+        work = owner.settle(runId, result, canonical, [])
+      }
+    }
+    await gate.ready
+    try {
+      assert.equal(owner.view.state, 'shadow')
+      assert.equal(owner.view.committedSequence, oldCommitted)
+      assert.ok(encoded(store.current.value).includes(secret))
+      secrets.push(secret)
+      const view = owner.view
+      assert.equal(view.state, 'quarantined')
+      for (const field of ['projection', 'runs', 'committedRuns']) assert.equal(Object.hasOwn(view, field), false)
+      assert.equal(owner.anchorEventId, undefined)
+      assert.equal(JSON.stringify(view).includes(secret), false)
+      assert.equal(view.committedSequence, oldCommitted)
+    } finally {
+      gate.release()
+      await work
+      await owner.drain()
+    }
+    assertWithheld(owner)
+    assert.equal(owner.view.committedSequence, oldCommitted)
+    assert.equal(store.current.value.state, 'quarantined')
+    assert.equal(encoded(store.current.value).includes(secret), false)
+    assert.equal(Object.hasOwn(store.current.value, 'records'), false)
+    assert.equal(Object.hasOwn(store.current.value, 'legacy'), false)
+    const checkpoint = copy(store.current)
+    const restored = new CliConversationRecords(session.id, store, secrets)
+    await restored.initialize(session, [])
+    assertWithheld(restored)
+    assert.deepEqual(store.current, checkpoint)
+  })
+}
+
 test('secret rejected at initial admission never publishes a projection or persists the secret', async () => {
   const session = legacySession({ title: secret })
   const store = new MemoryConversationStore()
@@ -577,6 +755,33 @@ test('secret rejected at initial admission never publishes a projection or persi
   assert.equal(encoded(store.current.value).includes(secret), false)
   assert.equal(store.current.value.state, 'quarantined')
 })
+
+for (const malformed of ['unknown version', 'extra field']) {
+  test(`a quarantine marker with ${malformed} and a known dummy secret is screened and replaced by an exact safe tombstone`, async () => {
+    const session = legacySession()
+    const marker = { schemaVersion: 1, sessionId: session.id, state: 'quarantined', previousDigest: null }
+    if (malformed === 'unknown version') {
+      marker.schemaVersion = 99
+      marker.previousDigest = secret
+    } else marker.extra = secret
+    const store = new MemoryConversationStore(marker)
+    const previousDigest = store.current.digest
+    const owner = new CliConversationRecords(session.id, store, [secret])
+    await owner.initialize(session, [])
+    assertWithheld(owner)
+    assert.equal(owner.view.committedSequence, 0)
+    assert.equal(store.writeCalls, 1)
+    assert.deepEqual(store.current.value, { schemaVersion: 1, sessionId: session.id,
+      state: 'quarantined', previousDigest })
+    assert.equal(encoded(store.current.value).includes(secret), false)
+    const checkpoint = copy(store.current)
+    const restored = new CliConversationRecords(session.id, store, [secret])
+    await restored.initialize(session, [])
+    assertWithheld(restored)
+    assert.deepEqual(store.current, checkpoint)
+    assert.equal(store.writeCalls, 1)
+  })
+}
 
 test('escaped dummy-secret payload is screened using its JSON spelling before publication', async () => {
   const escapedSecret = 'owned-dummy-quote"and\\slash\nsecret'
