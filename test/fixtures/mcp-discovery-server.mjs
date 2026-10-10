@@ -18,6 +18,10 @@ if (mode === 'native-stdin') {
   await new Promise(resolve => process.stdin.on('end', resolve))
   process.exit(0)
 }
+if (mode === 'native-flood') {
+  await new Promise((resolve, reject) => process.stdout.write(Buffer.alloc(65_536, 97), error => error ? reject(error) : resolve()))
+  process.exit(0)
+}
 if (mode === 'native-stdin-closed') {
   if (process.platform === 'win32') throw new Error('Use the owned Windows HANDLE fixture; fs.closeSync(0) does not close Windows stdin')
   // Close fd 0 before materializing process.stdin. A stdio stream can retain a

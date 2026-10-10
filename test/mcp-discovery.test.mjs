@@ -22,7 +22,38 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
   const store = new McpConfigStore(directory, ['fixture-secret'])
   const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory, protocol, environment: fixtureEnvironment }
   let starts = 0
-  const manager = new McpManager({ store, env: { ...fixtureEnv, OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--invalid', PATH: '/unexpected' }, secrets: ['fixture-secret'], transportFactory: launch => { starts++; return new McpStdioTransport(launch) } })
+  const manager = new McpManager({ store, env: { ...fixtureEnv, OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--invalid', PATH: '/unexpected' }, secrets: ['fixture-secret'], transportFactory: launch => {
+    starts++
+    const transport = new McpStdioTransport(launch)
+    if (process.platform === 'win32') {
+      // Fixture-only diagnostics: production transport still drains server stderr privately.
+      const startedAt = Date.now(), start = transport.start.bind(transport), close = transport.close.bind(transport)
+      let nativeResult, completedAfterMs, reported = false
+      transport.start = async () => {
+        try { await start() }
+        finally {
+          void transport.windows?.completed.then(result => { nativeResult = result; completedAfterMs = Date.now() - startedAt })
+        }
+      }
+      transport.close = async () => {
+        try { await close() }
+        catch (error) {
+          if (!reported) {
+            reported = true
+            const pidText = await readFile(join(directory, 'pid'), 'utf8').catch(() => '')
+            const logText = await readFile(join(directory, 'log'), 'utf8').catch(() => '')
+            t.diagnostic(JSON.stringify({ event: 'owned-windows-discovery-cleanup-failure', mode, protocol,
+              elapsedMs: Date.now() - startedAt, completedAfterMs,
+              nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
+              fixturePidRecorded: /^\d+(?:\n\d+)*\s*$/.test(pidText),
+              fixtureStartRecorded: logText.split('\n').some(line => line.includes('"event":"start"')) }))
+          }
+          throw error
+        }
+      }
+    }
+    return transport
+  } })
   t.after(async () => { await manager.close(); await rm(directory, { recursive: true, force: true }) })
   await manager.reload(); await manager.configure(server)
   return { directory, store, server, manager, starts: () => starts,

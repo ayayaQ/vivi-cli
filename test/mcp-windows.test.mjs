@@ -30,6 +30,52 @@ const frame = value => JSON.stringify(value) + '\r\n'
 const dataFrame = (type, bytes) => frame({ type, data: Buffer.from(bytes).toString('base64') })
 function collect(stream) { const chunks = []; stream.on('data', chunk => chunks.push(chunk)); return () => Buffer.concat(chunks) }
 
+test('native readiness waits for acknowledgment before unsolicited output applies backpressure', async () => {
+  const fake = fixture(), owned = await launchWindowsMcp(input, fake.runtime)
+  let ready = false
+  void owned.ready.then(() => { ready = true })
+  await Promise.resolve(); assert.equal(ready, false)
+  const bytes = Buffer.alloc(4096, 97)
+  fake.child.stdout.write(frame({ type: 'started' }) + dataFrame('stdout', bytes).repeat(12) + frame({ type: 'exit', exitCode: 0, stopped: false }))
+  await owned.ready
+  assert.equal(ready, true); assert.equal(fake.child.stdout.isPaused(), true)
+  const out = collect(owned.stdout); collect(owned.stderr)
+  fake.child.emit('close', 0, null)
+  assert.deepEqual(await owned.completed, { exitCode: 0 })
+  assert.deepEqual(out(), Buffer.alloc(12 * bytes.length, 97))
+})
+
+test('readiness rejects cancellation while verified prelaunch cleanup remains successful', async () => {
+  const fake = fixture(), owned = await launchWindowsMcp(input, fake.runtime)
+  const rejected = assert.rejects(owned.ready, /startup was cancelled/)
+  const stopped = owned.stop()
+  // A launch already racing with cancellation may still acknowledge startup.
+  fake.child.stdout.write(frame({ type: 'started' }) + frame({ type: 'exit', exitCode: null, stopped: true }))
+  fake.child.emit('close', 0, null)
+  await rejected; await stopped
+  assert.deepEqual(await owned.completed, { exitCode: null, signal: 'SIGTERM' })
+})
+
+for (const failure of ['native-error', 'close', 'terminal', 'malformed', 'duplicate']) test(`startup acknowledgment fails closed: ${failure}`, async () => {
+  const fake = fixture(), owned = await launchWindowsMcp(input, fake.runtime)
+  if (failure === 'duplicate') {
+    fake.child.stdout.write(frame({ type: 'started' }))
+    await owned.ready
+    fake.child.stdout.write(frame({ type: 'started' }))
+  } else {
+    const rejected = assert.rejects(owned.ready, /Windows MCP/)
+    if (failure === 'native-error') fake.child.stdout.write(dataFrame('error', 'Owned launch failed'))
+    if (failure === 'terminal') fake.child.stdout.write(frame({ type: 'exit', exitCode: 0, stopped: false }))
+    if (failure === 'malformed') fake.child.stdout.write(frame({ type: 'started', extra: true }))
+    fake.child.emit('close', 0, null)
+    await rejected
+  }
+  if (failure === 'duplicate') fake.child.emit('close', 0, null)
+  const result = await owned.completed
+  if (failure === 'terminal') assert.deepEqual(result, { exitCode: 0 })
+  else assert.ok(result.error)
+})
+
 test('Windows wrapper source is fixed, short enough, and request argv only travels as JSON data', async () => {
   const fake = fixture()
   const command = await launchWindowsMcp(input, fake.runtime)

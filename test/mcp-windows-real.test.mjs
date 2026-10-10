@@ -103,7 +103,7 @@ async function sandbox(t) {
     async launch(mode, args = [], env = fixtureEnv) {
       return subject.launchTarget(process.execPath, [fixtureFile, mode, log, pidFile, ...args], env)
     },
-    async launchTarget(executable, args, env = {}) {
+    async launchTarget(executable, args, env = {}, waitForReady = false) {
       const owned = await launchWindowsMcp({ executable, args, cwd: directory, env }, {
         hostEnv: { ...process.env, PSModulePath: directory, NODE_OPTIONS: '--invalid-owned-fixture-option' },
         cleanupTimeoutMs: 5_000,
@@ -115,6 +115,7 @@ async function sandbox(t) {
         },
       })
       closers.push(() => owned.stop())
+      if (waitForReady) await bounded(owned.ready, 'owned target startup acknowledgment')
       return { owned, stdout: collect(owned.stdout), stderr: collect(owned.stderr) }
     },
     async manager(mode = 'pages', protocol = 'legacy') {
@@ -174,6 +175,15 @@ nativeTest('stdin preserves binary and Unicode bytes up to the frame limit', asy
   await subject.assertDead()
 })
 
+nativeTest('startup acknowledgment precedes immediate output backpressure without attached readers', async t => {
+  const subject = await sandbox(t)
+  const { owned, stdout, stderr } = await subject.launchTarget(process.execPath,
+    [fixtureFile, 'native-flood', subject.log, subject.pidFile], fixtureEnv, true)
+  assert.deepEqual(await bounded(owned.completed, 'immediate output fixture cleanup'), { exitCode: 0 })
+  assert.deepEqual(stdout(), Buffer.alloc(65_536, 97)); assert.equal(stderr().length, 0)
+  await subject.assertDead()
+})
+
 nativeTest('closed target stdin reports failure and cleans up without a manual stop', async t => {
   const subject = await sandbox(t)
   // Windows libuv deliberately does not close CRT fd 0-2. Compile this one
@@ -207,8 +217,25 @@ nativeTest('closed target stdin reports failure and cleans up without a manual s
     windowsHide: true, timeout: 15_000, maxBuffer: 16_384 })
   const compiled = await lstat(executable)
   assert.ok(compiled.isFile() && !compiled.isSymbolicLink() && compiled.size > 0, 'Owned console fixture was not compiled')
+  const launchedAt = Date.now()
   const { owned, stderr } = await subject.launchTarget(executable, [subject.log, subject.pidFile], env)
-  await until(() => stderr().includes(Buffer.from('native-stdin-closed\n')), 'closed stdin fixture readiness')
+  let nativeResult
+  void owned.completed.then(result => { nativeResult = result })
+  try {
+    await until(() => {
+      if (stderr().includes(Buffer.from('native-stdin-closed\n'))) return true
+      assert.equal(nativeResult, undefined, 'closed stdin fixture ended before readiness')
+      return false
+    }, 'closed stdin fixture readiness')
+  } catch (error) {
+    // These bytes come only from the fixed owned fixture, never a user's server.
+    t.diagnostic(JSON.stringify({ event: 'owned-closed-input-readiness-failure', elapsedMs: Date.now() - launchedAt,
+      nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
+      fixturePidRecorded: (await subject.pids()).length > 0,
+      startupEvents: (await subject.messages()).map(message => message.event).slice(0, 4),
+      stderr: stderr().subarray(0, 1024).toString('utf8') }))
+    throw error
+  }
   const pids = await subject.pids()
   assert.equal(pids.length, 1)
   assert.ok(pids.every(pid => !dead(pid)), 'closed-input fixture must remain alive before the failed write')
