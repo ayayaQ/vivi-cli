@@ -785,6 +785,10 @@ export class CliHost {
     this.toolsetRevision = randomUUID()
     const commandRunId = randomUUID()
     this.reviews.beginTurn(this.current.id, content)
+    const lateEventFailures: unknown[] = []
+    owner.defer(() => {
+      if (lateEventFailures.length) throw new AggregateError(lateEventFailures, 'Admitted CLI callback failed after cancellation')
+    })
     // Every admitted domain effect outlives core cancellation until its drain settles.
     owner.defer(() => this.drainSkills())
     owner.defer(() => this.drainMemory())
@@ -1020,6 +1024,9 @@ export class CliHost {
             }
             await this.options.onEvent?.(admittedEvent)
           }
+          // Already-entered delivery is drained, but its obsolete continuation
+          // cannot admit another effect. Terminal reconciliation below owns recovery.
+          if (controller.signal.aborted || owner.state !== 'open' || this.activeTurn?.scope !== owner) return
           const safeHistory = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
           if (admittedEvent.type === 'tool_completed') await this.retireMcpOutcomes(this.current.history)
@@ -1027,7 +1034,12 @@ export class CliHost {
           // Core may stop awaiting any callback on abort, even ordinary chat.
           // Keep admitted checkpoints and deliveries owned until they settle.
           this.eventJobs.add(work)
-          void work.then(() => this.eventJobs.delete(work), () => this.eventJobs.delete(work))
+          void work.then(() => this.eventJobs.delete(work), error => {
+            // Ordinary awaited event failures retain runAgent's canonical error.
+            // Cancellation can detach that await, so retain the rejected owner work.
+            if (controller.signal.aborted || owner.state !== 'open') lateEventFailures.push(error)
+            this.eventJobs.delete(work)
+          })
           return work
         }
       })

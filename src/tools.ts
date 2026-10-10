@@ -143,6 +143,7 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
     }
     return error('unavailable_tool', 'Tool is unavailable')
   } catch (failure) {
+    signal.throwIfAborted()
     return error('invalid_arguments', failure instanceof Error ? failure.message : 'Tool request failed')
   }
 }

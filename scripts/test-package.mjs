@@ -258,6 +258,22 @@ const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
   definition: { name: 'packed_fixture', description: 'Packed extension', parameters: { type: 'object' } },
   validateArguments() {}, execute() { return { content: 'packed extension works' } }
 }] }
+const scopedTools = createBuiltinToolset(true, [fixture]), scopedCleanup = []
+scopedTools.defer(() => { scopedCleanup.push('first') })
+scopedTools.defer(async () => { await Promise.resolve(); scopedCleanup.push('last') })
+const scopedHost = { enableNotes: true, readNotes() { assert.fail('Closed note dispatch') },
+  async commitNote() { assert.fail('Closed note commit') }, async approve() { assert.fail('Closed approval') } }
+assert.equal((await scopedTools.executeTool({ id: 'packed-scoped', name: 'packed_fixture', arguments: {} },
+  new AbortController().signal, scopedHost)).content, 'packed extension works')
+const scopedDisposal = scopedTools.dispose()
+assert.equal(scopedTools.signal.aborted, true)
+assert.equal(scopedTools.dispose(), scopedDisposal)
+await scopedDisposal
+assert.deepEqual(scopedCleanup, ['last', 'first'])
+for (const name of ['packed_fixture', 'current_time', 'note_read']) {
+  await assert.rejects(scopedTools.executeTool({ id: 'packed-closed', name, arguments: {} },
+    new AbortController().signal, scopedHost), { name: 'AbortError' })
+}
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
 const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
 const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
