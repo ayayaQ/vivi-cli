@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { TextRenderable, MarkdownRenderable, BoxRenderable, ScrollBoxRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
@@ -8,7 +10,10 @@ import { toolPresentationView, decodeToolPresentation } from '@ayayaq/vivi/prese
 import type { ToolPresentation } from '@ayayaq/vivi/presentation'
 import { OpenTuiIO, TUI_THEME } from '../src/tui.js'
 import { CliHost } from '../src/host.js'
-import { newSession } from '../src/session.js'
+import { FileSessionStore, newSession, validateSession } from '../src/session.js'
+import { McpManager } from '../src/mcp-manager.js'
+import { McpConfigStore } from '../src/mcp-config.js'
+import { mcpAlias } from '../src/mcp-catalog.js'
 import { sendChatTurn } from '../src/terminal.js'
 import type { ApprovalRequest } from '../src/tools.js'
 
@@ -201,4 +206,99 @@ for (const late of [false, true]) test(`encoded private tool identities and summ
   f.io.setSession(session); await f.frame()
   expect(contents(f.transcript())).not.toContain(encoded)
   expect(session).toEqual(original)
+})
+
+test('interrupted mixed batch still reports the exact canonical MCP result source', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-review-mixed-cancel-'))
+  const setup = await createTestRenderer({ width: 110, height: 55, kittyKeyboard: true, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer)
+  let peer: any, pending = false, rounds = 0, sends = 0
+  const manager = new McpManager({ store: new McpConfigStore(directory), env: {}, transportFactory: () => peer = {
+    async start() {}, async close() { peer.onclose?.() }, async send(message: any) {
+      if (!message.method || message.id === undefined) return
+      let result: any
+      if (message.method === 'tools/call') { sends++; result = { content: [{ type: 'text', text: 'owned' }] } }
+      else if (message.method === 'initialize') result = { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'Owned fake', version: '1' } }
+      else if (message.method === 'tools/list') result = { tools: [{ name: 'fixture', inputSchema: { type: 'object' } }] }
+      else { queueMicrotask(() => peer.onmessage?.({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Unsupported owned fixture' } })); return }
+      queueMicrotask(() => peer.onmessage?.({ jsonrpc: '2.0', id: message.id, result: { ...result, resultType: 'complete' } }))
+    } } })
+  // The injected owned transport never starts an executable or uses a network.
+  const ownedScript = join(directory, 'owned-peer.mjs')
+  await writeFile(ownedScript, 'export {}\n')
+  await manager.configure({ id: 'fixture', label: 'Owned fake', executable: process.execPath,
+    args: ['--no-install', ownedScript], cwd: directory, protocol: 'legacy', environment: [] })
+  await manager.connect('fixture', async () => true, new AbortController().signal)
+  let observed: { actualIndex: number; sourceIndex: number; text: string } | undefined
+  const host = await CliHost.create({ store: new FileSessionStore(join(directory, 'sessions')), enableNotes: true, mcp: manager,
+    settings: { provider: 'openai', model: 'offline' },
+    provider: { async generate() { return ++rounds === 1 ? { content: 'Before mixed batch', toolCalls: [
+      { id: 'cancel-note', name: 'note_set', arguments: { key: 'color', value: 'pink', expectedRevision: 0 } },
+      { id: 'unstarted-mcp', name: mcpAlias('fixture', 'tools', 'fixture'), arguments: {} }] } : { content: 'After', toolCalls: [] } } },
+    approve(request, signal) { pending = true; return io.approve(request, signal) },
+    onEvent(event) {
+      io.event(event)
+      if (event.type === 'tool_completed' && event.message.callId === 'unstarted-mcp') {
+        const actualIndex = host.session.history.findIndex(message => message.kind === 'tool_result' && message.callId === 'unstarted-mcp')
+        const cards = (io as any).entries.filter((entry: any) => entry.tool)
+        const presentation = JSON.parse(cards.find((entry: any) => JSON.parse(entry.tool.encoded).callId === 'unstarted-mcp').tool.encoded)
+        const sourceIndex = Number(presentation.source.reference.match(/history:(\d+)$/)[1])
+        observed = { actualIndex, sourceIndex, text: contents(setup.renderer.root.findDescendantById('vivi-transcript')!) }
+      }
+    } })
+  const dispose = io.onCancel(() => host.cancel())
+  try {
+    io.setSession(host.session)
+    const running = sendChatTurn(host, io, 'Set a note then use the owned fake')
+    for (let i = 0; i < 1000 && !pending; i++) { await new Promise(resolve => setTimeout(resolve, 3)); await setup.renderOnce(); await setup.renderOnce() }
+    expect(pending).toBe(true); await new Promise(resolve => setTimeout(resolve, 5)); await setup.renderOnce(); await setup.renderOnce()
+    setup.mockInput.pressEscape(); const result = await running
+    expect(result.status).toBe('cancelled'); expect(sends).toBe(0); expect(observed).toBeDefined()
+    expect(observed!.actualIndex).toBe(3)
+    expect(observed!.sourceIndex).toBe(observed!.actualIndex)
+    expect(host.session.noteRevision).toBe(0)
+  } finally { dispose(); io.close(); await host.shutdown(); await manager.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test('pending exact review cannot displace its current presentation warning/source', async () => {
+  const setup = await createTestRenderer({ width: 100, height: 50, kittyKeyboard: true, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer)
+  try {
+    const session = newSession({ provider: 'openai', model: 'offline' }); io.setSession(session); io.runStarted()
+    const call = { id: 'large-review', name: 'owned_fixture', arguments: { text: 'ordinary '.repeat(1300) } }
+    io.event({ type: 'assistant', message: { kind: 'assistant', content: 'Before review', toolCalls: [call] } })
+    const answer = io.approve({ call, description: 'd'.repeat(60 * 1024 - 1), currentRevision: 0 }, new AbortController().signal)
+    await new Promise(resolve => setTimeout(resolve, 5)); await setup.renderOnce(); await setup.renderOnce()
+    const text = contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
+    expect(text).toContain('Approval required. This display grants no permission to execute.')
+    expect(text).toContain(`cli-session:${session.id}:history:1`)
+    expect(text).toContain('d'.repeat(60 * 1024 - 1))
+    setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
+    expect(contents(setup.renderer.root.findDescendantById('vivi-transcript')!)).toContain('Approval required. This display grants no permission to execute.')
+    setup.mockInput.pressEnter(); expect(await answer).toBe(false)
+  } finally { io.close() }
+})
+test('long final response preserves the latest tool result safety/source', async () => {
+  const setup = await createTestRenderer({ width: 100, height: 50, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer)
+  try {
+    const session = newSession({ provider: 'openai', model: 'offline' })
+    const call = { id: 'long-answer', name: 'owned_fixture', arguments: { text: 'a'.repeat(12000) } }
+    session.history = [{ kind: 'message', role: 'user', content: 'ordinary' }, { kind: 'assistant', content: 'Before', toolCalls: [call] },
+      { kind: 'tool_result', callId: call.id, name: call.name, content: 'ordinary result' },
+      { kind: 'assistant', content: 'Another owned call', toolCalls: [{ ...call, id: 'later-card', arguments: {} }] },
+      { kind: 'tool_result', callId: 'later-card', name: call.name, content: 'later result', isError: true },
+      { kind: 'assistant', content: 'z'.repeat(60000), toolCalls: [] }]
+    validateSession(session); io.setSession(session); await setup.renderOnce(); await setup.renderOnce()
+    const text = contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
+    expect(text).toContain('External effects are unreported. Do not infer that no effects occurred.')
+    expect(text).toContain(`cli-session:${session.id}:history:2`)
+    expect(text).toContain(`cli-session:${session.id}:history:4`)
+    expect(text).toContain('z'.repeat(60000))
+    setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
+    const collapsed = contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
+    expect(collapsed).toContain(`cli-session:${session.id}:history:2`)
+    expect(collapsed).toContain(`cli-session:${session.id}:history:4`)
+    expect(collapsed).toContain('External effects are unreported. Do not infer that no effects occurred.')
+  } finally { io.close() }
 })

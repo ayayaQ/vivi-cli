@@ -121,7 +121,8 @@ interface DisplayEntry {
   reviewKey?: string
   review?: ReviewNotice
   historyStart?: number
-  tool?: { encoded: string; key: string }
+  approval?: object
+  tool?: { encoded: string; key: string; detailBytes?: number; retained?: boolean }
 }
 interface SearchPicker {
   choices: readonly Choice<unknown>[]
@@ -218,8 +219,9 @@ export class OpenTuiIO implements ChatIO {
   private entries: DisplayEntry[] = []
   private toolEvidence: CliToolEvidence | undefined
   private readonly collapsedTools = new Set<string>()
-  private liveToolCalls = new Map<string, { call: ToolCall; index: number; key: string; source: ToolPresentation['source']; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
+  private liveToolCalls = new Map<string, { call: ToolCall; index: number; resultIndex?: number; key: string; source: ToolPresentation['source']; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
   private liveHistoryIndex = 0
+  private activeApproval: { token: object; toolKey: string | undefined } | undefined
   private displaySequence = 0
   private resultNotices: DisplayEntry[] = []
   private reviewNotices: DisplayEntry[] = []
@@ -1190,9 +1192,11 @@ export class OpenTuiIO implements ChatIO {
     const enrollment = request.call.name === 'enroll_auto_review'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
     this.showTool(request.call.id, 'approval_required', 'not_attempted', 'Exact action needs human review')
+    const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
+    this.activeApproval = approval
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     this.appendEntry({ category: 'activity', attention: true, label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
-      content: this.safe(request.description), markdown: false })
+      content: this.safe(request.description), markdown: false, approval: approval.token })
     const title = enrollment ? 'Enable Auto review? (default: cancel)' : 'Review this change (default: deny)'
     this.updateStatus(enrollment ? 'Enable Auto review? · Cancel is the default' : `Approval required · ${scope} · denial is the default`)
     const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Auto' } : undefined)
@@ -1206,6 +1210,7 @@ export class OpenTuiIO implements ChatIO {
         reply === 'allow' && !signal.aborted && !this.closed ? 'unreported' : 'not_attempted')
       return reply === 'allow' && !signal.aborted && !this.closed
     } finally {
+      if (this.activeApproval === approval) this.activeApproval = undefined
       this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
       if (!this.closed && !this.runStatus.running) this.updateStatus('Ready')
     }
@@ -1217,6 +1222,7 @@ export class OpenTuiIO implements ChatIO {
     // The host accepts this turn's user message before its first assistant event.
     this.liveHistoryIndex = this.historyLength + 1
     this.liveToolCalls.clear()
+    for (const entry of this.entries) if (entry.tool) entry.tool.retained = false
     this.runStatus.start()
     this.updateStatus('Working · Escape / Ctrl+C cancels')
   }
@@ -1278,7 +1284,7 @@ export class OpenTuiIO implements ChatIO {
     box.add(new TextRenderable(this.renderer, { content: entry.label, fg: headerColor, flexShrink: 0, wrapMode: 'word' }))
     if (entry.tool) {
       const key = entry.tool.key, collapsed = this.collapsedTools.has(key)
-      const view = cliToolPresentationView(entry.tool.encoded, collapsed, 8192, this.secrets)
+      const view = cliToolPresentationView(entry.tool.encoded, collapsed, entry.tool.detailBytes ?? 8192, this.secrets)
       for (const line of view.header) box.add(new TextRenderable(this.renderer,
         { content: this.safe(line), fg: bodyColor, flexShrink: 0, width: '100%', wrapMode: 'word' }))
       // Safety and provenance are sibling rows, never part of the detail container/budget.
@@ -1331,20 +1337,39 @@ export class OpenTuiIO implements ChatIO {
     catch { encoded = '' }
     const old = this.entries.find(entry => entry.tool?.key === live.key)
     const entry: DisplayEntry = { category: 'activity', label: this.safe(`Tool ${live.call.name}`, 4096), content: '',
-      markdown: false, tool: { encoded, key: live.key }, historyIndex: live.index }
+      markdown: false, tool: { encoded, key: live.key, retained: true }, historyIndex: live.index }
     if (old) this.entries[this.entries.indexOf(old)] = entry
     else this.entries.push(entry)
     this.rebuild()
   }
   private trimEntries(): void {
+    // The generic transcript budget bounds bodies, not required semantic/source rows.
+    // The separate entry cap bounds whole-card retention across long conversations.
     const size = (entry: DisplayEntry): number => {
-      if (!entry.tool) return entry.label.length + entry.content.length
-      const view = cliToolPresentationView(entry.tool.encoded, false, 8192, this.secrets)
-      return entry.label.length + [...view.header, ...view.warnings, ...view.details.map(section => section.text)].join('\n').length
+      if (!entry.tool) return entry.content.length
+      const view = cliToolPresentationView(entry.tool.encoded, false, entry.tool.detailBytes ?? 8192, this.secrets)
+      return view.details.reduce((sum, section) => sum + section.text.length, 0)
     }
     let total = this.entries.reduce((sum, entry) => sum + size(entry), 0)
+    // Reduce noisy detail first. Persist that exact budget through addEntry/toggle,
+    // rather than restoring 8 KiB after history retention computed a smaller view.
+    for (const entry of this.entries) {
+      if (total <= MAX_DISPLAY) break
+      if (!entry.tool) continue
+      const previous = size(entry)
+      entry.tool.detailBytes = 0
+      total -= previous
+    }
     while (this.entries.length > 1 && (this.entries.length > MAX_ENTRIES || total > MAX_DISPLAY)) {
-      const first = this.entries.shift()!
+      // Current-turn cards survive body pressure, including early unknown effects
+      // followed by later cards. Old complete turns may be omitted as whole cards.
+      const required = (entry: DisplayEntry): boolean => this.activeApproval !== undefined &&
+        (entry.approval === this.activeApproval.token || this.activeApproval.toolKey !== undefined && entry.tool?.key === this.activeApproval.toolKey)
+      let index = this.entries.findIndex(entry => !required(entry) && !entry.tool?.retained)
+      if (index < 0) index = this.entries.findIndex(entry => !required(entry))
+      if (index < 0) break // Never remove the exact pending review or its card.
+      const [first] = this.entries.splice(index, 1)
+      if (!first) break
       total -= size(first)
     }
   }
@@ -1365,7 +1390,12 @@ export class OpenTuiIO implements ChatIO {
   private historyEntries(history: readonly HistoryMessage[]): DisplayEntry[] {
     const entries: DisplayEntry[] = []
     let budget = MAX_DISPLAY
-    for (let index = history.length - 1; index >= 0 && entries.length < MAX_ENTRIES - 1 && budget > 0; index--) {
+    let latestTurn = 0
+    for (let index = history.length - 1; index >= 0; index--) {
+      const message = history[index]!
+      if (message.kind === 'message' && message.role === 'user') { latestTurn = index; break }
+    }
+    for (let index = history.length - 1; index >= 0 && entries.length < MAX_ENTRIES - 1 && (budget > 0 || index >= latestTurn); index--) {
       const message = history[index]!
       const label = message.kind === 'message' ? message.role === 'user' ? 'You' : 'System'
         : message.kind === 'assistant' ? 'Assistant' : `Tool ${message.name} · ${message.isError ? 'error result' : 'result'}`
@@ -1385,13 +1415,15 @@ export class OpenTuiIO implements ChatIO {
           }
         }
         const key = this.toolKey(requestIndex, message.callId)
-        const view = cliToolPresentationView(encoded, false, Math.max(0, Math.min(8192, budget)), this.secrets)
+        const detailBytes = Math.max(0, Math.min(8192, budget))
+        const view = cliToolPresentationView(encoded, false, detailBytes, this.secrets)
         entries.unshift({ category: 'activity', label: safeLabel, content: '', markdown: false, historyIndex: index,
-          attention: !!message.isError, tool: { encoded, key } })
+          attention: !!message.isError, tool: { encoded, key, detailBytes, retained: index >= latestTurn } })
         // Whole-history retention may omit old complete cards, never slice their safety rows.
-        budget -= safeLabel.length + [...view.header, ...view.warnings, ...view.details.map(section => section.text)].join('\n').length
+        budget -= view.details.reduce((sum, section) => sum + section.text.length, 0)
         continue
       }
+      if (budget <= 0) continue
       const content = this.safe(message.content + tools, Math.max(0, budget - safeLabel.length))
       entries.unshift({ category: message.kind === 'message' && message.role === 'user' ? 'user' : message.kind === 'assistant' ? 'assistant' : 'activity',
         label: safeLabel, content, markdown: message.kind === 'assistant', historyIndex: index })
@@ -1582,8 +1614,11 @@ export class OpenTuiIO implements ChatIO {
       this.clearStream()
       this.appendEntry({ category: 'assistant', label: 'Assistant', content: event.message.content, markdown: true })
       const index = this.liveHistoryIndex++
-      for (const call of event.message.toolCalls) {
-        this.liveToolCalls.set(call.id, { call, index, key: this.toolKey(index, call.id), source: cliToolSource(this.sessionId, index, event.message) })
+      for (const [ordinal, call] of event.message.toolCalls.entries()) {
+        // Canonical results occupy ordered batch slots even when cancellation
+        // closes a generic tool without delivering its tool_completed callback.
+        this.liveToolCalls.set(call.id, { call, index, resultIndex: index + 1 + ordinal,
+          key: this.toolKey(index, call.id), source: cliToolSource(this.sessionId, index, event.message) })
         this.showTool(call.id, 'requested', 'not_attempted')
       }
     } else if (event.type === 'tool_started') {
@@ -1594,18 +1629,26 @@ export class OpenTuiIO implements ChatIO {
       this.showTool(event.call.id, 'running', 'unreported', `${event.call.name} · running`)
     } else if (event.type === 'tool_completed') {
       this.updateStatus('Working')
-      const call = this.liveToolCalls.get(event.message.callId)?.call ?? { id: event.message.callId, name: event.message.name, arguments: {} }
+      const candidate = this.liveToolCalls.get(event.message.callId)
+      const live = candidate?.call.name === event.message.name ? candidate : undefined
+      const call = live?.call ?? { id: event.message.callId, name: event.message.name, arguments: {} }
+      const resultIndex = live?.resultIndex
+      const source = resultIndex === undefined
+        ? { ...cliToolSource(undefined, 0, event.message), reference: 'cli-live:unreported-result' }
+        : cliToolSource(this.sessionId, resultIndex, event.message)
       let encoded: string
       try { encoded = JSON.stringify(createCliToolPresentation({ call, result: event.message, status: 'unknown', effect: 'unreported',
-        source: cliToolSource(this.sessionId, this.liveHistoryIndex, event.message), secrets: this.secrets })) }
+        source, secrets: this.secrets })) }
       catch { encoded = '' }
-      const old = this.entries.find(entry => entry.tool?.key === this.liveToolCalls.get(event.message.callId)?.key)
+      const old = this.entries.find(entry => entry.tool?.key === live?.key)
       const entry: DisplayEntry = { category: 'activity', attention: !!event.message.isError,
         label: this.safe(`Tool ${event.message.name} · ${event.message.isError ? 'error result' : 'result'}`, 4096), content: '', markdown: false,
-        historyIndex: this.liveHistoryIndex++, tool: { encoded, key: this.liveToolCalls.get(event.message.callId)?.key ?? this.toolKey(this.liveHistoryIndex, event.message.callId) } }
+        ...(resultIndex === undefined ? {} : { historyIndex: resultIndex }),
+        tool: { encoded, key: live?.key ?? `display-${this.displaySequence++}`, retained: true } }
       if (old) this.entries[this.entries.indexOf(old)] = entry
       else this.entries.push(entry)
       this.liveToolCalls.delete(event.message.callId)
+      if (resultIndex !== undefined) this.liveHistoryIndex = Math.max(this.liveHistoryIndex, resultIndex + 1)
       this.rebuild()
     } else if (event.type === 'round_completed') {
       this.usage = aggregateUsage([event.usage])
