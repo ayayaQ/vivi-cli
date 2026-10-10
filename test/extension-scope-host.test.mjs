@@ -428,6 +428,101 @@ test('actual CLI rejected admitted non-MCP display work remains observable after
   assert.equal(getEventListeners(caller.signal, 'abort').length, 0)
 })
 
+test('actual CLI drains detached progress rejection after provider failure while its turn owner remains open', async t => {
+  const held = gate(t), caller = new AbortController(), displayed = []
+  const displayFailure = new Error('Owned detached progress display failure')
+  const providerFailure = new Error('Owned provider failure while display work remains pending')
+  const prompt = 'Owned detached progress fixture'
+  let providerSignal
+  const { host, store } = await fixture(t, { provider: { async generate(_input, signal, options) {
+    providerSignal = signal
+    // This provider's failure closes its round and detaches the progress wait,
+    // without cancelling the CLI turn or releasing already admitted display work.
+    void options.onProgress({ type: 'text_delta', text: 'Owned uncommitted progress' }).catch(() => {})
+    await held.entered
+    throw providerFailure
+  } }, async onEvent(event) {
+    displayed.push(structuredClone(event))
+    if (event.type === 'text_delta') { held.enter(); await held.wait; throw displayFailure }
+  } })
+  const sending = observe(host.send(prompt, caller.signal))
+  await held.entered
+  await tick()
+  assert.equal(providerSignal.aborted, true, 'Only the failed provider round has closed')
+  assert.equal(caller.signal.aborted, false)
+  assert.equal(host.running, true)
+  assert.equal(sending.settled, false, 'The host still owns the detached display callback')
+  assert.deepEqual(host.session.history, [{ kind: 'message', role: 'user', content: prompt }])
+  held.release(); await sending.done
+  assert(includesError(sending.error, displayFailure), 'An admitted callback failure must survive provider-round closure')
+  assert(sending.error.errors.some(error => error.errors?.some(error =>
+    error.code === 'provider_error' && error.message === providerFailure.message)),
+  'The detached callback cleanup error must retain the stronger canonical core failure too')
+  assert.equal(host.running, false)
+  assert.equal(getEventListeners(caller.signal, 'abort').length, 0)
+  assert.deepEqual(displayed, [{ type: 'text_delta', text: 'Owned uncommitted progress' }])
+  const persisted = await store.load(host.session.id)
+  assert.deepEqual(persisted.history, [{ kind: 'message', role: 'user', content: prompt }])
+  assert.deepEqual(persisted.history, host.session.history)
+  assert.deepEqual(persisted.usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 })
+  assert.equal(store.snapshots.length, 3, 'Initialization, prompt and unchanged canonical terminal state are checkpointed')
+})
+
+for (const action of ['shutdown', 'drainMcp']) {
+  test(`actual CLI rejects an event callback awaiting its own ${action} without deadlocking`, async t => {
+    let subject, attempted = false, callbackFailure
+    const caller = new AbortController()
+    subject = await fixture(t, { async onEvent(event) {
+      if (event.type !== 'assistant' || attempted) return
+      attempted = true
+      try { await subject.host[action]() }
+      catch (error) { callbackFailure = error; throw error }
+    } })
+    const result = await promptly(subject.host.send('Owned reentrant callback fixture', caller.signal),
+      `CLI callback awaiting its own ${action}`)
+    assert(callbackFailure instanceof Error)
+    assert.match(callbackFailure.message, /cannot await its own/i)
+    assert.equal(result.status, 'error'); assert.equal(result.error.code, 'event_error')
+    assert.equal(result.error.message, callbackFailure.message)
+    assert.equal(result.rounds, 1)
+    assert.equal(subject.host.running, false)
+    assert.equal(getEventListeners(caller.signal, 'abort').length, 0)
+    assert.deepEqual((await subject.store.load(subject.host.session.id)).history, result.history)
+    assert.equal(result.history.filter(message => message.kind === 'assistant').length, 1)
+    assert.equal((await subject.host.send('A fresh turn remains available')).status, 'completed',
+      'Rejected self-drain must not mutate shutdown state or seal a future turn')
+  })
+}
+
+test('actual CLI permits delayed callback descendants to shut down after delivery and send settle', async t => {
+  const delayed = gate(t)
+  let subject, descendant, scheduled = false
+  subject = await fixture(t, { onEvent(event) {
+    if (event.type !== 'assistant' || scheduled) return
+    scheduled = true
+    descendant = observe(new Promise((resolve, reject) => {
+      // The inherited delivery context becomes inactive when this callback returns.
+      setImmediate(async () => {
+        delayed.enter(); await delayed.wait
+        try {
+          assert.equal(subject.host.running, false)
+          await subject.host.shutdown()
+          resolve()
+        } catch (error) { reject(error) }
+      })
+    }))
+  } })
+  const result = await subject.host.send('Owned delayed callback descendant fixture')
+  assert.equal(result.status, 'completed')
+  await delayed.entered
+  assert.equal(descendant.settled, false)
+  delayed.release()
+  await promptly(descendant.done, 'Delayed descendant shutdown after delivery settled')
+  assert.equal(descendant.error, undefined)
+  assert.deepEqual((await subject.store.load(subject.host.session.id)).history, result.history)
+  await assert.rejects(subject.host.send('The delayed shutdown completed'), /host is shut down/i)
+})
+
 test('actual CLI turn cleanup attempts every independent domain after an earlier cleanup failure', async t => {
   const failure = new Error('Owned command endRun failure'), calls = [], caller = new AbortController()
   const commandWorkspace = { isEnabledFor: () => false, async endRun() { calls.push('commands'); throw failure },

@@ -3,6 +3,7 @@ import { runAgent } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
 import { createHash, randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
@@ -183,6 +184,7 @@ export interface CliHostOptions {
   decisionReview?: AutoReviewConfiguration
   onReviewNotice?(message: string, context?: ReviewNotice): void
   onMemoryNotice?(message: string): void
+  /** May cancel the turn. Await shutdown/event drains only after this callback settles. */
   onEvent?(event: AgentEvent): void | Promise<void>
 }
 
@@ -214,6 +216,7 @@ export class CliHost {
   private readonly commandAccount: string | undefined
   private readonly commandLaunchId = randomUUID()
   private activeTurn: { readonly scope: ExtensionScope; readonly settled: Promise<void> } | undefined
+  private readonly eventContext = new AsyncLocalStorage<{ active: boolean }>()
   private shutdownStarted = false
   private commandOpening: Promise<TrustedCommandWorkspace> | undefined
   private commandSetupEpoch = 0
@@ -333,6 +336,9 @@ export class CliHost {
   }
   /** Cancels children before releasing a session or closing its approval surface. */
   async shutdown(): Promise<void> {
+    if (this.eventContext.getStore()?.active) {
+      throw new Error('An event callback cannot await its own CLI host shutdown; cancel the turn, then shut down after send settles')
+    }
     this.shutdownStarted = true; this.commandSetupEpoch++; this.commandOpening = undefined
     this.cancel()
     const active = this.activeTurn, errors: unknown[] = []
@@ -527,6 +533,9 @@ export class CliHost {
   }
   /** Await the host-owned operations the core may stop awaiting when cancelled. */
   async drainMcp(): Promise<void> {
+    if (this.eventContext.getStore()?.active) {
+      throw new Error('An event callback cannot await its own CLI event drain; let the callback settle first')
+    }
     while (this.mcpJobs.size || this.eventJobs.size) await Promise.allSettled([...this.mcpJobs, ...this.eventJobs])
     await this.mcpOutcomes?.drain?.()
     await this.persistence
@@ -677,6 +686,11 @@ export class CliHost {
     return withholdMcpResult(outcome, this.options.secrets ?? [])
   }
   cancel(): void { this.controller?.abort() }
+  private async deliverEvent(event: AgentEvent): Promise<void> {
+    const delivery = { active: true }
+    try { await this.eventContext.run(delivery, () => this.options.onEvent?.(event)) }
+    finally { delivery.active = false }
+  }
   /** Repeat privacy checks at the durable store's last admission guard as well as queue entry. */
   private async checkpoint(snapshot: CliSession, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<void> {
     if (!historyUsesMcp(snapshot.history)) {
@@ -785,9 +799,13 @@ export class CliHost {
     this.toolsetRevision = randomUUID()
     const commandRunId = randomUUID()
     this.reviews.beginTurn(this.current.id, content)
-    const lateEventFailures: unknown[] = []
+    const eventFailures: unknown[] = []
+    let acknowledgedEventError = false
+    let coreFailure: AgentResult['error']
     owner.defer(() => {
-      if (lateEventFailures.length) throw new AggregateError(lateEventFailures, 'Admitted CLI callback failed after cancellation')
+      const unreported = eventFailures.slice(acknowledgedEventError ? 1 : 0)
+      if (unreported.length) throw new AggregateError(coreFailure ? [coreFailure, ...unreported] : unreported,
+        'Admitted CLI callback failed after its core await ended')
     })
     // Every admitted domain effect outlives core cancellation until its drain settles.
     owner.defer(() => this.drainSkills())
@@ -1022,7 +1040,7 @@ export class CliHost {
               const call = withholdMcpCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements)
               if (call.id === admittedEvent.message.callId && call.name === admittedEvent.message.name) pendingMcpDisplay.delete(id)
             }
-            await this.options.onEvent?.(admittedEvent)
+            await this.deliverEvent(admittedEvent)
           }
           // Already-entered delivery is drained, but its obsolete continuation
           // cannot admit another effect. Terminal reconciliation below owns recovery.
@@ -1035,14 +1053,17 @@ export class CliHost {
           // Keep admitted checkpoints and deliveries owned until they settle.
           this.eventJobs.add(work)
           void work.then(() => this.eventJobs.delete(work), error => {
-            // Ordinary awaited event failures retain runAgent's canonical error.
-            // Cancellation can detach that await, so retain the rejected owner work.
-            if (controller.signal.aborted || owner.state !== 'open') lateEventFailures.push(error)
+            // A failed provider can close only its round's progress wait while the
+            // host remains open. Retain every rejection until the core outcome
+            // establishes whether it already acknowledged this callback failure.
+            eventFailures.push(error)
             this.eventJobs.delete(work)
           })
           return work
         }
       })
+      coreFailure = result.error
+      acknowledgedEventError = result.error?.code === 'event_error' && eventFailures.length > 0
       // Await any in-flight atomic write, including a committed note whose result raced abort.
       await this.persistence
       await this.drainMcp()
@@ -1087,7 +1108,7 @@ export class CliHost {
         })
         if (pending) {
           pendingMcpDisplay.delete(pending[0])
-          await this.options.onEvent?.({ type: 'tool_completed', message: structuredClone(message) })
+          await this.deliverEvent({ type: 'tool_completed', message: structuredClone(message) })
           // This corrected event is another credential-registration boundary.
           const safe = this.reconcileMcpHistory(this.current.history)
           if (JSON.stringify(safe) !== JSON.stringify(this.current.history)) { this.current.history = safe; await this.save() }
