@@ -11,8 +11,9 @@ import type { AgentHistoryEntry, AgentOutcomeEvidence, AgentProjection, DurableA
 import { AGENT_RUN_RECORD_LIMITS, applyAgentRunRecord, assertAgentRunCurrent, createAgentAcceptedRecord,
   createAgentRunProjection, createAgentRunStart, createAgentRunTerminal } from '@ayayaq/vivi/events/stream'
 import type { AgentRunProjection, AgentRunRecord } from '@ayayaq/vivi/events/stream'
-import { isSessionId, validateSession } from './session.js'
+import { isSessionId, validateSession, MAX_HISTORY_MESSAGES } from './session.js'
 import type { CliSession } from './session.js'
+import { assertMcpJson } from '@ayayaq/vivi/extensions/mcp'
 import { mcpOutcomeMatchesCall } from './mcp-outcomes.js'
 import type { McpOutcomeRecord } from './mcp-outcomes.js'
 
@@ -46,6 +47,7 @@ export interface CliConversationView {
   /** This is a host storage acknowledgement, distinct from a core projection cursor. */
   readonly committedSequence: number
   readonly durability: 'memory' | 'disk'
+  readonly committedRuns?: readonly { readonly runId: string; readonly sequence: number; readonly eventId: string | null }[]
   readonly projection?: AgentProjection
   readonly runs?: readonly AgentRunProjection[]
 }
@@ -110,6 +112,7 @@ export function cliMcpRecordEvidence(session: CliSession, rows: readonly McpOutc
 
 export function replayCliConversationDocument(value: unknown): { document: CliConversationDocument;
   projection: AgentProjection; runs: readonly AgentRunProjection[] } {
+  assertMcpJson(value, CLI_CONVERSATION_LIMITS.bytes, { nodes: 8 * 1024 * 1024, depth: 40 })
   if (!object(value)) throw new Error('Invalid conversation envelope')
   keys(value, ['schemaVersion', 'sessionId', 'legacy', 'records', 'runs'])
   if (value.schemaVersion !== 1 || !isSessionId(value.sessionId) || bytes(value) > CLI_CONVERSATION_LIMITS.bytes) throw new Error('Unsupported or oversized conversation envelope')
@@ -153,6 +156,7 @@ export class CliConversationRecords {
   private committed = 0
   private state: CliConversationView['state'] = 'shadow'
   private tail: Promise<void> = Promise.resolve()
+  private quarantineComplete = false
   constructor(private readonly sessionId: string, private readonly store?: CliConversationStore,
     private readonly secrets: readonly string[] = [], private readonly notice?: (message: string) => void) {
     this.projection = createAgentProjection(sessionId)
@@ -165,6 +169,8 @@ export class CliConversationRecords {
     }
     return { state: this.state, durability: this.store ? 'disk' : 'memory',
       observedSequence: this.projection.sequence, committedSequence: this.committed,
+      ...(this.state === 'shadow' && this.store && this.document ? { committedRuns: this.document.runs.map(run => ({ runId: run.runId,
+        sequence: run.records.at(-1)?.sequence ?? 0, eventId: run.records.at(-1)?.eventId ?? null })) } : {}),
       ...(this.state === 'shadow' ? { projection: structuredClone(this.projection), runs: structuredClone(this.runs) } : {}) }
   }
   async drain(): Promise<void> { await this.tail }
@@ -182,28 +188,39 @@ export class CliConversationRecords {
   }
   private async quarantine(): Promise<void> {
     this.state = 'quarantined'
-    if (!this.store) { this.document = undefined; this.runs = []; return }
+    if (this.quarantineComplete) return
+    try { this.notice?.('Conversation record shadow quarantined; canonical session and exact MCP receipts remain authoritative') } catch { /* Data-only notice. */ }
+    if (!this.store) { this.document = undefined; this.runs = []; this.quarantineComplete = true; return }
     const current = await this.store.read(this.sessionId)
     const tombstone: CliConversationQuarantine = { schemaVersion: 1, sessionId: this.sessionId,
       state: 'quarantined', previousDigest: current?.digest ?? this.digest }
     this.digest = await this.store.write(this.sessionId, tombstone, current?.digest ?? null, () => {})
-    this.document = undefined; this.runs = []
+    this.document = undefined; this.runs = []; this.quarantineComplete = true
   }
   private async commit(next: CliConversationDocument): Promise<void> {
     const assertCurrent = (): void => {
       if (containsSecret(next, this.secrets)) throw new Error('Conversation privacy rejection')
     }
     if (containsSecret(next, this.secrets)) { await this.quarantine(); throw new Error('Conversation privacy rejection') }
-    replayCliConversationDocument(next)
-    if (this.store) {
-      try { this.digest = await this.store.write(this.sessionId, next, this.digest, assertCurrent) }
-      catch (error) {
-        // Ambiguous append is acknowledged only after exact identity/byte readback.
-        const stored = await this.store.read(this.sessionId)
-        if (!stored || !same(stored.value, next)) throw error
-        assertCurrent(); replayCliConversationDocument(stored.value); this.digest = stored.digest
+    try {
+      replayCliConversationDocument(next)
+      if (this.store) {
+        try { this.digest = await this.store.write(this.sessionId, next, this.digest, assertCurrent) }
+        catch (error) {
+          // Ambiguous append is acknowledged only after exact identity/byte readback.
+          if (error instanceof CliConversationCommitError) throw error
+          const stored = await this.store.read(this.sessionId)
+          if (!stored || !same(stored.value, next)) {
+            if ((stored?.digest ?? null) !== this.digest) await this.quarantine()
+            throw error
+          }
+          assertCurrent(); replayCliConversationDocument(stored.value); this.digest = stored.digest
+        }
+        assertCurrent(); this.committed = this.projection.sequence
       }
-      assertCurrent(); this.committed = this.projection.sequence
+    } catch (error) {
+      if (containsSecret(next, this.secrets)) await this.quarantine()
+      throw error
     }
     this.document = next
   }
@@ -214,16 +231,27 @@ export class CliConversationRecords {
       if (!stored && session.recordAnchor) { await this.quarantine(); return }
       if (stored) {
         this.digest = stored.digest
-        if (object(stored.value) && stored.value.state === 'quarantined') { this.state = 'quarantined'; return }
+        try { assertMcpJson(stored.value, CLI_CONVERSATION_LIMITS.bytes, { nodes: 8 * 1024 * 1024, depth: 40 }) }
+        catch { await this.quarantine(); return }
+        if (object(stored.value) && stored.value.state === 'quarantined') { this.state = 'quarantined'; this.quarantineComplete = true; return }
         if (containsSecret(stored.value, this.secrets)) { await this.quarantine(); return }
         let restored
         try { restored = replayCliConversationDocument(stored.value) } catch { await this.quarantine(); return }
         if (restored.document.sessionId !== this.sessionId || session.recordAnchor &&
-          session.recordAnchor.eventId !== restored.document.records[0]?.eventId || !same(restored.projection.history.map(item => item.message), session.history) || !same(restored.projection.usage, session.usage)) {
-          // Never invent a sequence-N anchor, silently drop a changed prefix or treat live acceptance as disk commit.
-          await this.quarantine(); return
-        }
+          session.recordAnchor.eventId !== restored.document.records[0]?.eventId) { await this.quarantine(); return }
         this.document = restored.document; this.projection = restored.projection; this.runs = restored.runs; this.committed = this.projection.sequence
+        if (!same(this.projection.history.map(item => item.message), session.history) || !same(this.projection.usage, session.usage)) {
+          // Existing canonical recovery owns closure and usage. An exact current incomplete
+          // run can retain that committed recovery as data, without inventing a settlement.
+          const pending = this.runs.filter(run => run.state === 'running' && run.baseSequence === this.projection.sequence).at(-1)
+          if (!pending || !same(pending.history.map(item => item.message), session.history.slice(0, pending.history.length)) ||
+            session.history.length < pending.history.length) { await this.quarantine(); return }
+          const record = decodeAgentRecord({ ...this.envelope(), type: 'session_snapshot', reason: 'reconciliation',
+            snapshot: { history: entries(session, pending.history), usage: session.usage,
+              outcomes: cliMcpRecordEvidence(session, rows, this.projection.outcomes) } })
+          this.projection = applyAgentRecord(this.projection, record)
+          await this.commit({ ...this.document, records: [...this.document.records, record] })
+        }
         return
       }
       const legacy = validateSession(session)
@@ -244,12 +272,14 @@ export class CliConversationRecords {
   private async assertStoredCurrent(): Promise<void> {
     if (!this.store) return
     const current = await this.store.read(this.sessionId)
-    if (!current || current.digest !== this.digest || containsSecret(current.value, this.secrets)) throw new Error('Stored conversation cursor changed')
-    replayCliConversationDocument(current.value)
+    if (!current || current.digest !== this.digest) { await this.quarantine(); throw new Error('Stored conversation cursor changed') }
+    try { replayCliConversationDocument(current.value) } catch { await this.quarantine(); throw new Error('Stored conversation prefix changed') }
+    if (containsSecret(current.value, this.secrets)) { await this.quarantine(); throw new Error('Stored conversation privacy changed') }
   }
   begin(runId: string, session: CliSession): Promise<void> {
     return this.enqueue(async () => {
       if (!this.document) throw new Error('Missing conversation anchor')
+      if (this.projection.sequence >= AGENT_RECORD_LIMITS.records) throw new Error('Final session record slot exhausted')
       await this.assertStoredCurrent()
       const input = entries(session, this.projection.history)
       if (!same(input.slice(0, this.projection.history.length), this.projection.history) ||
@@ -266,6 +296,9 @@ export class CliConversationRecords {
     if (this.state !== 'shadow') return
     const closed = closeInterruptedHistory([...history, { kind: 'assistant', content: output.content, toolCalls: output.toolCalls,
       ...(output.providerState ? { providerState: output.providerState } : {}) }])
+    // Keep the canonical store's established history-overflow recovery/error path.
+    // The shadow budget only narrows output that canonical storage could admit.
+    if (closed.length > MAX_HISTORY_MESSAGES) return
     const safeEntries = closed.map((message, index) => ({ id: `cli-history:${index}`,
       source: { reference: `cli-session:${this.sessionId}:history:${index}`, revision: hash(message) }, message }))
     if (bytes(safeEntries) > CLI_CONVERSATION_LIMITS.activeHistoryBytes ||
@@ -283,6 +316,7 @@ export class CliConversationRecords {
       const record = createAgentAcceptedRecord({ envelope: this.runEnvelope(run), update,
         historyId: `cli-history:${run.history.length}`, source })
       const next = applyAgentRunRecord(run, record)
+      if (bytes(next.history) > CLI_CONVERSATION_LIMITS.activeHistoryBytes) throw new Error('Final session history headroom exhausted')
       this.runs = this.runs.map(item => item === run ? next : item)
       const runs = this.document.runs.map(item => item.runId === runId ? { ...item, records: [...item.records, record] } : item)
       if (bytes({ ...this.document, runs }) + CLI_CONVERSATION_LIMITS.terminalReserveBytes > CLI_CONVERSATION_LIMITS.bytes) throw new Error('Conversation terminal headroom exhausted')
@@ -306,6 +340,13 @@ export class CliConversationRecords {
       await this.commit({ ...this.document, records: [...this.document.records, terminal],
         runs: this.document.runs.map(item => item.runId === runId ? { ...item, records: [...item.records, wrapper] } : item) })
     })
+  }
+}
+
+export class CliConversationCommitError extends Error {
+  constructor(cause: unknown) {
+    super('Conversation record replacement succeeded, but durability was not confirmed', { cause })
+    this.name = 'CliConversationCommitError'
   }
 }
 
@@ -353,10 +394,13 @@ export class FileCliConversationStore implements CliConversationStore {
   }
   async write(sessionId: string, value: CliConversationStored, expectedDigest: string | null,
     assertCurrent: () => void): Promise<string> {
+    assertMcpJson(value, CLI_CONVERSATION_LIMITS.bytes, { nodes: 8 * 1024 * 1024, depth: 40 })
     if (value.sessionId !== sessionId) throw new Error('Conversation identity mismatch')
     const body = `${JSON.stringify(value)}\n`
     if (Buffer.byteLength(body) > CLI_CONVERSATION_LIMITS.bytes) throw new Error('Conversation storage limit exceeded')
     if ('state' in value) {
+      keys(value as unknown as Record<string, unknown>, ['schemaVersion', 'sessionId', 'state', 'previousDigest'])
+      if (value.previousDigest !== null && !/^[a-f0-9]{64}$/.test(value.previousDigest)) throw new Error('Invalid conversation quarantine digest')
       if (value.state !== 'quarantined' || value.schemaVersion !== 1) throw new Error('Invalid conversation quarantine')
     } else replayCliConversationDocument(value)
     await this.prepare(); assertCurrent()
@@ -368,15 +412,20 @@ export class FileCliConversationStore implements CliConversationStore {
     await compare()
     const temporary = join(this.directory, `.${sessionId}.${randomUUID()}.records.tmp`)
     const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    let replaced = false
     try {
       await file.writeFile(body, 'utf8'); await file.sync(); await file.close()
       await compare()
       await rename(temporary, this.path(sessionId))
+      replaced = true
       if (process.platform !== 'win32') {
         const directory = await open(this.directory, constants.O_RDONLY)
         try { await directory.sync() } finally { await directory.close() }
       }
       return hashBytes(body)
+    } catch (error) {
+      if (replaced) throw new CliConversationCommitError(error)
+      throw error
     } finally { await file.close().catch(() => undefined); await unlink(temporary).catch(() => undefined) }
   }
 }

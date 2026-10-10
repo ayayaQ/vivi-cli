@@ -97,6 +97,7 @@ try {
     'src/skills.ts', 'dist/skills.js', 'dist/skills.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
+    'src/conversation-records.ts', 'dist/conversation-records.js', 'dist/conversation-records.d.ts',
     'src/commands.ts', 'dist/commands.js', 'dist/commands.d.ts',
     'src/command-process.ts', 'dist/command-process.js', 'dist/command-process.d.ts',
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
@@ -207,7 +208,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
@@ -307,6 +308,11 @@ try {
   assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 2)
   assert.match(JSON.stringify(mcpResult.history), /Echo: packed/)
   assert.match(JSON.stringify(mcpResult.history), /Owned resource 1/)
+  assert.equal(mcpHost.conversationRecords.state, 'shadow')
+  assert.deepEqual(mcpHost.conversationRecords.projection.history.map(entry => entry.message), mcpResult.history)
+  assert(mcpHost.conversationRecords.projection.outcomes.some(item => item.effect === 'confirmed' && item.status === 'succeeded'))
+  const packedRecords = await new FileCliConversationStore(directory).read(mcpHost.session.id)
+  assert.deepEqual(replayCliConversationDocument(packedRecords.value).projection, mcpHost.conversationRecords.projection)
   let denyRounds = 0
   const deniedMcpHost = await CliHost.create({ store: new FileSessionStore(directory), mcp,
     settings: { provider: 'openai', model: 'fake' }, approve: async () => false,
@@ -314,6 +320,8 @@ try {
       ? { content: '', toolCalls: [{ id: 'packed-mcp-denied', name: alias, arguments: { query: 'denied' } }] }
       : { content: 'Packed MCP denied', toolCalls: [] } } } })
   assert.equal((await deniedMcpHost.send('Review the owned echo')).status, 'completed')
+  assert.equal(deniedMcpHost.conversationRecords.state, 'shadow')
+  assert(deniedMcpHost.conversationRecords.projection.outcomes.some(item => item.effect === 'not_attempted'))
   const protocolLog = (await readFile(join(directory, 'mcp-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
   assert.equal(protocolLog.filter(message => message.method === 'tools/call').length, 1)
   assert.equal(protocolLog.filter(message => message.method === 'resources/read').length, 1)
@@ -361,6 +369,12 @@ try {
   const memoryResult = await memoryHost.send('Use opted-in context')
   assert.deepEqual(memoryResult.history.map(message => message.content), ['Use opted-in context', 'Packed context works'])
   assert.deepEqual((await new FileSessionStore(directory).load(memoryHost.session.id)).history, memoryResult.history)
+  assert.deepEqual(memoryHost.conversationRecords.projection.history.map(entry => entry.message), memoryResult.history)
+  assert.deepEqual(memoryHost.conversationRecords.projection.usage, memoryHost.session.usage)
+  const recordResume = await CliHost.resume({ store: new FileSessionStore(directory), id: memoryHost.session.id,
+    provider: { async generate() { assert.fail('Replay must never execute') } } })
+  assert.deepEqual(recordResume.conversationRecords.projection, memoryHost.conversationRecords.projection)
+  await recordResume.shutdown()
   await memoryHost.drainMemory()
   const cjsMemory = createRequire(import.meta.url)('@ayayaq/vivi/extensions/memory')
   assert.equal(cjsMemory.encodeMemories(cjsMemory.decodeMemories('{"version":1,"memories":[]}')), encodeMemories(decodeMemories('{"version":1,"memories":[]}')))
@@ -481,7 +495,7 @@ try {
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
-  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle } from '@ayayaq/vivi-cli'
+  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
@@ -494,6 +508,9 @@ const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
 session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
 const usageText: string = formatUsage(aggregateUsage([session.usage, undefined]))
 const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
+const conversationStore: CliConversationStore = new FileCliConversationStore('/tmp/fake-types-only')
+const conversationView: CliConversationView = { state: 'shadow', observedSequence: 0, committedSequence: 0, durability: 'memory' }
+void conversationStore; void conversationView
 const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
 const skills: CliSkillStore = new FileSkillStore('/tmp/fake-types-only/agent-skills', { readOnlyRoots: [], secrets: [] })
 const catalog: Promise<SkillCatalog> = skills.snapshot()

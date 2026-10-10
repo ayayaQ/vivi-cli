@@ -1030,7 +1030,7 @@ export class CliHost {
           const message = this.reconcileMcpHistory([...this.current.history, structuredClone(update.message)]).at(-1)!
           const work = this.records.accept(this.toolsetRevision, { ...update, message } as AgentAcceptedUpdate)
           this.eventJobs.add(work)
-          void work.finally(() => this.eventJobs.delete(work))
+          void work.then(() => this.eventJobs.delete(work), error => { eventFailures.push(error); this.eventJobs.delete(work) })
           return work
         },
         onEvent: (event) => {
