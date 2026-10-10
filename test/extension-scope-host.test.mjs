@@ -542,6 +542,25 @@ test('actual CLI turn cleanup attempts every independent domain after an earlier
   assert.equal(getEventListeners(caller.signal, 'abort').length, 0)
 })
 
+for (const primary of [undefined, null, false, new Error('Owned prompt checkpoint failure')]) {
+  test(`actual CLI retains primary ${String(primary)} together with failed turn cleanup`, async t => {
+    const cleanup = new Error('Owned cleanup after failed prompt'), caller = new AbortController()
+    const store = memoryStore(session => {
+      if (session.history.length) throw primary
+    })
+    const { host } = await fixture(t, { store,
+      commandWorkspace: { isEnabledFor: () => false, async endRun() { throw cleanup }, async shutdown() {} } })
+    const sending = observe(host.send('Owned failed setup and cleanup', caller.signal))
+    await sending.done
+    assert(sending.error instanceof AggregateError)
+    assert.equal(sending.error.errors[0], primary, 'Falsy thrown setup values remain exact')
+    assert(includesError(sending.error, cleanup), 'Cleanup failure remains observable as well')
+    assert.deepEqual(host.session.history, [])
+    assert.equal(host.running, false)
+    assert.equal(getEventListeners(caller.signal, 'abort').length, 0)
+  })
+}
+
 test('actual CLI shutdown attempts every independent cleanup and exposes all failures', async t => {
   const first = new Error('Owned shutdown command failure'), second = new Error('Owned shutdown memory failure'), calls = []
   const { host } = await fixture(t, {

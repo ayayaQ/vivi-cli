@@ -832,6 +832,7 @@ export class CliHost {
     let mcpContents: readonly McpCatalogSnapshot[] = []
     const pendingMcpDisplay = new Map<string, ToolCall>()
     const enteredMcpCalls = new Set<string>()
+    let failed = false, primaryFailure: unknown
     try {
       const memory = this.enabledMemory && enableTools ? createMemoryExtension({
         listMemories: async ({ signal }) => memoryToolResult(await this.listMemories(signal)),
@@ -1124,10 +1125,17 @@ export class CliHost {
         canonicalResult.content = '[MCP response content withheld: known credential]'
       }
       return canonicalResult
+    } catch (error) {
+      failed = true; primaryFailure = error
+      throw error
     } finally {
       // Scope closure aborts retained dispatch, unsubscribes forwarding listeners,
       // and attempts every owned drain. Arbitrary custom executors are not awaited.
       try { await owner.dispose() }
+      catch (cleanupError) {
+        if (failed) throw new AggregateError([primaryFailure, cleanupError], 'CLI turn failed and cleanup also failed')
+        throw cleanupError
+      }
       finally {
         this.controller = undefined
         this.activeTurn = undefined
