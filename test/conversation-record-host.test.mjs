@@ -229,7 +229,7 @@ function syntheticMcp(input = {}) {
       resources: emptyMcpCategory(), resourceTemplates: emptyMcpCategory()
     } }
   const launchDigest = mcpDigest({ owned: 'synthetic-no-process-launch' })
-  const invocations = [], preparations = []
+  const invocations = [], invokeAttempts = [], preparations = []
   const assertCurrentOperation = operation => assertMcpOperationCurrent(operation, snapshot, launchDigest, true, snapshot.configRevision)
   const manager = { addSecrets() {}, async captureCatalogs(signal) { signal.throwIfAborted(); return [structuredClone(snapshot)] },
     prepareOperation(catalog, entry, kind, requested) {
@@ -238,6 +238,7 @@ function syntheticMcp(input = {}) {
       return operation
     }, operationRevisions(operation) { return mcpOperationRevisions(operation, snapshot, launchDigest, true, snapshot.configRevision) },
     async invoke(operation, signal, assertCurrent, hooks) {
+      invokeAttempts.push(structuredClone(operation.call))
       signal.throwIfAborted(); assertCurrent(); assertCurrentOperation(operation); await hooks.beforeSend()
       signal.throwIfAborted(); assertCurrent(); assertCurrentOperation(operation); invocations.push(structuredClone(operation.call))
       if (input.invoke) return input.invoke(operation, signal, assertCurrent, hooks)
@@ -247,7 +248,7 @@ function syntheticMcp(input = {}) {
       await hooks.settle(result)
       return result
     } }
-  return { manager, alias, invocations, preparations, snapshot,
+  return { manager, alias, invocations, invokeAttempts, preparations, snapshot,
     changeCatalog() {
       entries[0].descriptor.description = 'Owned catalog revised during the simulated pause'
       snapshot.catalogGeneration++; snapshot.categories.tools.digest = mcpDigest(entries)
@@ -490,6 +491,7 @@ for (const scenario of pauseChanges) test(`actual CLI seven-day clock-only appro
   const after = await assertPausedPaired(subject, requested)
   assert.deepEqual(after, before, 'Clock-only elapsed time does not change pending work, sources or either committed cursor')
   assert.equal(sending.settled, false); assert.equal(subject.generations(), 1); assert.equal(mcp.invocations.length, 0)
+  assert.equal(mcp.invokeAttempts.length, 0)
   assert.equal(approvals.length, 1); assert.equal(approvalSignal.aborted, false)
   await scenario.change?.(subject, mcp)
   const currentRevisions = mcp.manager.operationRevisions(mcp.preparations[0])
@@ -506,6 +508,9 @@ for (const scenario of pauseChanges) test(`actual CLI seven-day clock-only appro
   assert.equal(sending.error, undefined)
   assert.equal(sending.value.status, scenario.name === 'cancellation' ? 'cancelled' : 'completed')
   assert.equal(approvals.length, 1); assert.equal(mcp.invocations.length, scenario.sends)
+  assert.equal(mcp.invokeAttempts.length, scenario.sends,
+    'The production review must reject stale scope/revisions before even entering the synthetic manager')
+  assert.deepEqual(mcp.invokeAttempts, scenario.sends ? [requested] : [])
   assert.deepEqual(mcp.invocations, scenario.sends ? [requested] : [])
   const finalResult = toolResults(sending.value.history)[0], body = JSON.parse(finalResult.content)
   assert.equal(finalResult.callId, requested.id); assert.equal(finalResult.name, requested.name)
@@ -527,6 +532,7 @@ for (const scenario of pauseChanges) test(`actual CLI seven-day clock-only appro
   assert.equal(evidence.source.revision, digest(settled))
   assert.equal((await outcomes.load(subject.host.session.id)).length, 0)
   assert.equal(mcp.invocations.length, scenario.sends, 'Full, incremental and fresh-host replay never resends the effect')
+  assert.equal(mcp.invokeAttempts.length, scenario.sends, 'Replay cannot attempt an already reconciled operation')
 })
 
 for (const retainReceipt of [true, false]) test(`actual CLI cold copy after seven-day clock-only approval pause retains ${retainReceipt ? 'exact no-send' : 'unknown'} recovery and requires fresh approval`, async t => {
@@ -543,6 +549,7 @@ for (const retainReceipt of [true, false]) test(`actual CLI cold copy after seve
   advanceClock(); await tick()
   const paused = await assertPausedPaired(subject, requested)
   assert.deepEqual(paused, before); assert.equal(sending.settled, false); assert.equal(mcp.invocations.length, 0)
+  assert.equal(mcp.invokeAttempts.length, 0)
   const id = subject.host.session.id, receipt = await outcomes.load(id)
   assert.equal(receipt.length, 1); assert.equal(receipt[0].state, 'accepted')
   // Copy only acknowledged canonical/record/optional receipt data. No original
@@ -575,6 +582,7 @@ for (const retainReceipt of [true, false]) test(`actual CLI cold copy after seve
   const unacknowledged = resumed.conversationRecords
   assert.equal(initializing.settled, false); assert.equal(generations, 0); assert.equal(freshApprovals.length, 0)
   assert.equal(freshMcp.preparations.length, 0); assert.equal(freshMcp.invocations.length, 0); assert.equal(resumed.running, false)
+  assert.equal(freshMcp.invokeAttempts.length, 0); assert.equal(mcp.invokeAttempts.length, 0)
   assert.equal(unacknowledged.observedSequence, 2); assert.equal(unacknowledged.committedSequence, 1,
     'An observed reconciliation is not a checkpoint acknowledgement while its actual store write is held')
   assert.deepEqual(unacknowledged.committedRuns, paused.view.committedRuns)
@@ -616,6 +624,7 @@ for (const retainReceipt of [true, false]) test(`actual CLI cold copy after seve
     assert.deepEqual(full.projection.outcomes, [], 'Absent receipt remains unknown; it is not invented no-send evidence')
   }
   assert.equal(generations, 0); assert.equal(freshApprovals.length, 0); assert.equal(freshMcp.invocations.length, 0)
+  assert.equal(freshMcp.invokeAttempts.length, 0); assert.equal(mcp.invokeAttempts.length, 0)
   const reloaded = await CliHost.resume({ id, store: recoveredStore, conversationStore: recoveredRecords,
     mcp: freshMcp.manager, mcpOutcomes: recoveredOutcomes,
     provider: { async generate() { assert.fail('Cold replay cannot invoke a provider') } },
@@ -623,21 +632,26 @@ for (const retainReceipt of [true, false]) test(`actual CLI cold copy after seve
   t.after(() => reloaded.shutdown())
   assert.deepEqual(reloaded.conversationRecords, restored); assert.deepEqual(reloaded.session.history, resumed.session.history)
   assert.equal(freshMcp.invocations.length, 0)
+  assert.equal(freshMcp.invokeAttempts.length, 0); assert.equal(mcp.invokeAttempts.length, 0)
   subject.host.cancel(); oldApproval.release(); await sending.done
   assert.equal(sending.error, undefined); assert.equal(sending.value.status, 'cancelled'); assert.equal(mcp.invocations.length, 0)
+  assert.equal(mcp.invokeAttempts.length, 0, 'The historical late approval cannot even enter the manager after cancellation')
   const continuing = observe(resumed.send('Approve a later newly proposed exact call'))
   await freshApproval.entered
   assert.equal(continuing.settled, false); assert.equal(generations, 1); assert.equal(freshApprovals.length, 1)
   assert.deepEqual(freshApprovals[0].call, newCall); assert.notEqual(newCall.id, requested.id)
   assert.equal(freshMcp.invocations.length, 0, 'A restored pending call or old human response cannot approve a later call')
+  assert.equal(freshMcp.invokeAttempts.length, 0, 'The new call cannot enter the manager before its fresh approval')
   assert.deepEqual(toolResults(providerInputs[0].messages), [closure])
   freshApproval.release(); await continuing.done
   assert.equal(continuing.error, undefined); assert.equal(continuing.value.status, 'completed')
   assert.deepEqual(freshMcp.invocations, [newCall]); assert.equal(approvals.length, 1); assert.equal(freshApprovals.length, 1)
+  assert.deepEqual(freshMcp.invokeAttempts, [newCall])
   const { replay } = await assertPaired(t, { host: resumed, store: recoveredStore, records: recoveredRecords, live, options }, continuing.value)
   assert.deepEqual(replay.runs[0], paused.run)
   assert.deepEqual(replay.projection.history.slice(0, full.projection.history.length), full.projection.history)
   assert.equal(mcp.invocations.length, 0); assert.deepEqual(freshMcp.invocations, [newCall])
+  assert.equal(mcp.invokeAttempts.length, 0); assert.deepEqual(freshMcp.invokeAttempts, [newCall])
 })
 
 test('actual CLI exact intent without settlement remains unknown and never replays an MCP operation', async t => {
