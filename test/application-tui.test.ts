@@ -349,7 +349,8 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
         return { generate: async input => {
-          expect(input.tools).toHaveLength(10)
+          expect(input.tools).toHaveLength(11)
+          expect(input.tools.some(tool => tool.name === 'fetch_url')).toBe(true)
           expect(input.tools.some(tool => tool.name === 'read_skill')).toBe(true)
           expect(input.tools.some(tool => tool.name === 'save_skill')).toBe(false)
           expect(input.tools.some(tool => tool.name === 'workspace_glob')).toBe(true)

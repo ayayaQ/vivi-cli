@@ -59,7 +59,7 @@ test('native mode picker defaults Manual, shows selected-account disclosure, and
   expect(picker.getSelectedIndex()).toBe(0)
   expect(picker.options.map(option => option.name)).toEqual(['Manual', 'Auto review'])
   const contents = text(f.setup.renderer.root)
-  expect(contents).toContain('Check proposed note, memory and workspace text changes through your selected provider')
+  expect(contents).toContain('Check proposed note, memory, workspace text and public URL GET actions through your selected provider')
   expect(contents).not.toContain('Auto sends your current request')
   f.input.pressEnter()
   await selecting
@@ -86,6 +86,9 @@ test('Auto picker selection cannot enroll before a fresh completed approval fram
   expect(text(f.setup.renderer.root)).toContain('to OpenAI for approval checks')
   expect(text(f.setup.renderer.root)).toContain('including changes you didn’t request')
   expect(text(f.setup.renderer.root)).toContain('extra API charges')
+  expect(text(f.setup.renderer.root)).toContain('full URL including path/query')
+  expect(text(f.setup.renderer.root)).toContain('network limits and redirect scope')
+  expect(text(f.setup.renderer.root)).toContain('GET may have server-side effects or costs')
   expect(text(f.setup.renderer.root)).toContain('Cancel is the default')
   expect(await f.frame()).toContain('› Cancel')
   await f.input.pasteBracketedText('allow')
@@ -212,3 +215,43 @@ for (const toolName of ['mcp_docs_offline_alias', 'list_mcp_resources', 'read_mc
     })
   }
 }
+
+for (const state of ['reviewing', 'needs_review', 'saving'] as const) {
+  test(`interrupted public URL ${state} uses request/result wording without claiming retrieval`, async () => {
+    for (const outcome of ['cancelled', 'error', 'completed'] as const) {
+      const f = await fixture()
+      f.io.runStarted()
+      f.io.reviewNotice('Offline URL review in progress', { sessionId: f.host.session.id,
+        runId: 'offline-url-review', callId: 'offline-url-call', toolName: 'fetch_url', state })
+      f.io.runFinished(outcome)
+      await f.frame()
+      const contents = text(f.setup.renderer.root)
+      expect(contents).not.toContain('Offline URL review in progress')
+      for (const unsupported of ['save was made', 'confirmed save', 'change saved', 'The write outcome', 'successfully fetched']) {
+        expect(contents).not.toContain(unsupported)
+      }
+      if (state === 'saving') {
+        expect(contents).toContain('Public URL admission could not be confirmed')
+        expect(contents).toContain('no fetch result was confirmed')
+      } else if (outcome === 'cancelled') expect(contents).toContain('Review cancelled; this public URL request was not approved')
+      else expect(contents).toContain('Review ended before this public URL request was approved')
+    }
+  })
+}
+
+
+test('native public URL approval displays the exact GET destination and defaults to deny', async () => {
+  const f = await fixture()
+  const pending = f.io.approve({ call: { id: 'public-url-approval', name: 'fetch_url',
+    arguments: { url: 'https://example.com/docs?topic=color' } }, currentRevision: 'opaque-url-revision',
+    description: 'Fetch public page with GET: https://example.com/docs?topic=color\nDestination hostname: example.com\nFull URL/path/query and caller IP are transmitted; GET may have server-side effects' }, new AbortController().signal)
+  const contents = await f.frame()
+  expect(contents).toContain('Review this public URL request (default: deny)')
+  expect(contents).toContain('https://example.com/docs?topic=color')
+  expect(contents).toContain('› Deny')
+  expect(contents).not.toContain('Review this change')
+  await f.input.pasteBracketedText('allow')
+  await tick(); await f.frame()
+  f.input.pressEnter()
+  expect(await pending).toBe(false)
+})

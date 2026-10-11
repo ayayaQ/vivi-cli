@@ -7,6 +7,7 @@ import type { HistoryMessage, Usage } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import { validSessionTitle } from './session-display.js'
 import { FileMcpOutcomeStore, reconcileMcpOutcomes } from './mcp-outcomes.js'
+import { FilePublicUrlOutcomeStore, reconcilePublicUrlOutcomes } from './public-url-outcomes.js'
 
 export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
@@ -249,6 +250,8 @@ export class FileSessionStore implements SessionPersistence {
       if (session.id !== id) throw new Error('Session id does not match its filename')
       session.history = reconcileMcpOutcomes(closeInterruptedHistory(session.history), id,
         await new FileMcpOutcomeStore(this.directory, this.secrets).load(id))
+      session.history = reconcilePublicUrlOutcomes(session.history, id,
+        await new FilePublicUrlOutcomeStore(this.directory, this.secrets).load(id))
       validateSession(session)
       return session
     } finally { await file.close() }

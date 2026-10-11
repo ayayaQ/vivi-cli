@@ -156,6 +156,16 @@ package installation and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
 FullLanguage for owned Job Object cleanup.
 
+## Public page retrieval
+
+`fetch_url` retrieves bounded UTF-8 text, JSON or inert HTML text from one selected
+public HTTPS URL through host review. It sends the full path/query and network
+metadata; GET may have server-side effects. Every redirect is validated, and a
+changed origin needs a fresh decision. Limits are 3 redirects, 15 seconds active
+work, 16 KiB headers, 1 MiB body and 64 KiB text/result. No login, cookies,
+JavaScript, search, downloads or private/local addresses are supported. Returned
+text is untrusted; uncertain sends are recorded and never automatically replayed.
+
 ## Optional Auto review
 
 Manual is always the default. `/mode` opens the current conversation’s mode
@@ -171,14 +181,14 @@ Replacing an API key revokes enrollment immediately, including if the subsequent
 model picker is cancelled; start a new conversation before enrolling again.
 
 When enrolled, only tool calls implementing the current user’s requested
-session `note_set`, app-wide memory create/edit, or selected-workspace text creation/precise edits may be automatically approved.
+session `note_set`, app-wide memory create/edit, selected-workspace text creation/precise edits, or exact public URL GET requests may be automatically approved.
 The corresponding notes/memory/workspace and tool feature gates must already be enabled.
 Delete, `/memories` manager mutations, excluded actions and hard denials remain
 outside Auto review. A model recommendation never relaxes host policy or skips
 the exact proposal’s final freshness and revision checks.
 
 The review sends the exact current user request, tool arguments and prepared
-before/after changed text, workspace-relative paths and full-file hashes to the currently selected existing account: OpenAI
+before/after changed text, workspace-relative paths and full-file hashes, or full URL/destination/method/limits/redirect scope to the currently selected existing account: OpenAI
 `gpt-6-luna`, or OpenRouter routed to TypeSafe `typesafe/jev-1.13`. It uses only
 that account’s existing key, with no copied credential store, account discovery,
 cross-provider fallback or live model selection. The fresh in-app confirmation
@@ -191,7 +201,7 @@ filter cannot reliably identify every private detail. Keep Manual if you do not
 want potentially private text shared. A conversation or provider/account change
 invalidates the versioned consent; this product setting is not global permission
 to transmit credentials or unrelated content. The automatic-save policy remains
-ordinary non-sensitive note/memory create/edit and scoped text creation/precise edits only; the sharing consent does not expand
+ordinary non-sensitive note/memory create/edit, scoped text creation/precise edits and exact public URL GET requests only; the sharing consent does not expand
 which actions may execute automatically. This adds API charges. Review
 is limited to two calls per turn, an eight-second deadline and 16 KiB for the
 full decision request. Larger exact evidence stays Manual without truncation;

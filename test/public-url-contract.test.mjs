@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Proposed-policy fixtures only. Every approval, DNS answer, response and HTML
-// extraction is injected. These tests do not make HTTP/DNS requests or establish
-// runtime registration, TLS pinning, real HTTP framing or live acceptance.
+// Offline engine fixtures use controlled decisions, DNS and responses. HTML
+// extraction and credential screening are the actual product implementations.
+// These tests make no external DNS/HTTP requests and are not live acceptance.
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { readFileSync, readdirSync } from 'node:fs'
 import { test } from 'node:test'
-import { PROPOSED_URL_LIMITS, proposedContainsSecret, proposedPrepareUrl,
-  proposedPublicAddress, exerciseUrlContract } from './helpers/public-url-contract.mjs'
+import { PUBLIC_URL_LIMITS, publicUrlContainsSecret,
+  preparePublicUrl, fetchPublicUrl } from '../dist/public-url.js'
+import { isPublicUrlAddress } from '../dist/public-url-transport.js'
 
 const url = 'https://example.com/selected?ordinary=one'
 const secret = 'offline-known-secret-marker'
@@ -33,7 +33,6 @@ function fixture(overrides = {}) {
   const state = { approvals: [], lookups: [], requests: [], current: true, responses: [] }
   const adapters = {
     isCurrent: () => state.current,
-    now: () => timestamp,
     async approve(disclosure, signal) {
       state.approvals.push({ disclosure, signal })
       return overrides.approve ? overrides.approve(disclosure, signal, state) : true
@@ -47,73 +46,49 @@ function fixture(overrides = {}) {
       if (overrides.request) return overrides.request(request, state)
       request.onTransmit()
       const result = response(); state.responses.push(result); return result
-    },
-    ...(overrides.extractHtml ? { extractHtml: overrides.extractHtml } : {})
+    }
   }
-  return { adapters, state, run: (input = url, options = {}) => exerciseUrlContract(input, adapters, options) }
+  return { adapters, state, run: (input = url, options = {}) => fetchPublicUrl(input, adapters, { now: () => timestamp, ...options }) }
 }
 function failure(result, code, attempts = 0) {
   assert.equal(result.success, false)
   assert.equal(result.source, 'public_url')
   assert.equal(result.untrusted, true)
-  assert.deepEqual(result.error, { code, message: 'Public URL contract did not complete' })
+  assert.deepEqual(result.error, { code, message: 'Public URL retrieval did not complete' })
   assert.equal(result.requests.length, attempts)
   assert.equal(result.serverEffects, attempts ? 'unknown' : 'not_attempted')
+  assert.equal(result.doNotRetry, attempts ? true : undefined)
   assert.equal(result.text, undefined)
   assert.equal(result.httpStatus, undefined)
 }
 function preparedFailure(input, code, secrets = []) {
-  assert.throws(() => proposedPrepareUrl(input, secrets), error => error.code === code)
+  assert.throws(() => preparePublicUrl(input, secrets), error => error.code === code)
 }
 
-test('proposed limits are bounded and immutable; the suite uses injected callbacks only', () => {
-  assert.deepEqual(PROPOSED_URL_LIMITS, { redirects: 3, milliseconds: 15_000,
-    bodyBytes: 1024 * 1024, textBytes: 64 * 1024, headerBytes: 16 * 1024, addresses: 16, urlBytes: 4096 })
-  assert(Object.isFrozen(PROPOSED_URL_LIMITS))
-})
-
-test('offline policy checkpoint leaves every product source, package, workflow and historical exclusion unchanged', () => {
-  const root = new URL('../', import.meta.url)
-  const baseline = JSON.parse(readFileSync(new URL('fixtures/public-url-offline-baseline.json', import.meta.url), 'utf8'))
-  for (const [path, digest] of Object.entries(baseline.files)) {
-    assert.equal(createHash('sha256').update(readFileSync(new URL(path, root))).digest('hex'), digest, path)
-  }
-  for (const directory of ['src', '.github/workflows']) {
-    const current = readdirSync(new URL(`${directory}/`, root), { recursive: true, withFileTypes: true })
-      .filter(entry => entry.isFile()).map(entry => `${directory}/${entry.name}`).sort()
-    assert.deepEqual(current, Object.keys(baseline.files).filter(path => path.startsWith(`${directory}/`)).sort())
-  }
-  const index = readFileSync(new URL('src/index.ts', root), 'utf8')
-  const tools = readFileSync(new URL('src/tools.ts', root), 'utf8')
-  for (const source of [index, tools]) assert(!/fetch_url|public-url-contract|exerciseUrlContract|proposedPrepareUrl/.test(source))
-  const helper = readFileSync(new URL('helpers/public-url-contract.mjs', import.meta.url), 'utf8')
-  assert.deepEqual([...helper.matchAll(/^import .* from ['"]([^'"]+)['"]/gm)].map(match => match[1]).sort(),
-    ['node:crypto', 'node:net'])
-  assert.match(helper, /import \{ isIP \} from 'node:net'/)
-  assert(!/\b(?:fetch|https?\.request|dns\.lookup|connect|createConnection|XMLHttpRequest)\s*\(/.test(helper))
-  const historical = readFileSync(new URL('test/skills-store.test.mjs', root), 'utf8')
-  assert.equal([...historical.matchAll(/^excludedAssessment\(/gm)].length, 7)
-  assert.match(historical, /Restricted\/adversarial filesystem assessment excluded and unrun/)
+test('product limits are bounded and immutable; the suite uses controlled network callbacks', () => {
+  assert.deepEqual(PUBLIC_URL_LIMITS, { redirects: 3, milliseconds: 15_000,
+    bodyBytes: 1024 * 1024, textBytes: 64 * 1024, headerBytes: 16 * 1024, addresses: 16, urlBytes: 4096, resultBytes: 64 * 1024 })
+  assert(Object.isFrozen(PUBLIC_URL_LIMITS))
 })
 
 test('canonicalization selects one HTTPS URL, removes only a screened fragment and keeps query disclosure', () => {
-  assert.deepEqual(proposedPrepareUrl('https://ExAmPlE.com:443/a/../b?ordinary=hello%20world#section'), {
+  assert.deepEqual(preparePublicUrl('https://ExAmPlE.com:443/a/../b?ordinary=hello%20world#section'), {
     url: 'https://example.com/b?ordinary=hello%20world', hostname: 'example.com', origin: 'https://example.com' })
-  assert.deepEqual(proposedPrepareUrl('https://bücher.example/路径?term=☃'), {
+  assert.deepEqual(preparePublicUrl('https://bücher.example/路径?term=☃'), {
     url: 'https://xn--bcher-kva.example/%E8%B7%AF%E5%BE%84?term=%E2%98%83',
     hostname: 'xn--bcher-kva.example', origin: 'https://xn--bcher-kva.example' })
-  assert.deepEqual(proposedPrepareUrl('https://EXAMPLE.COM./x'), {
+  assert.deepEqual(preparePublicUrl('https://EXAMPLE.COM./x'), {
     url: 'https://example.com./x', hostname: 'example.com.', origin: 'https://example.com.' })
-  assert(Object.isFrozen(proposedPrepareUrl(url)))
+  assert(Object.isFrozen(preparePublicUrl(url)))
 })
 test('canonical URL byte budget also rejects UTF-8 paths which expand beyond the raw input budget', () => {
   const input = `https://example.com/${'雪'.repeat(1_000)}`
-  assert(Buffer.byteLength(input) < PROPOSED_URL_LIMITS.urlBytes)
+  assert(Buffer.byteLength(input) < PUBLIC_URL_LIMITS.urlBytes)
   preparedFailure(input, 'invalid_url')
 })
 
 for (const input of [null, undefined, {}, [], 42, 'not a URL',
-  `https://example.com/${'a'.repeat(PROPOSED_URL_LIMITS.urlBytes)}`,
+  `https://example.com/${'a'.repeat(PUBLIC_URL_LIMITS.urlBytes)}`,
   ' https://example.com/', 'https://example.com/a b', 'https://example.com/\npath',
   'https://example.com/\u0000path', 'https://example.com/\u007fpath', 'https://example.com/\\path']) {
   test(`admission rejects invalid URL ${JSON.stringify(input)?.slice(0, 70)}`, () => preparedFailure(input, 'invalid_url'))
@@ -143,11 +118,11 @@ test('known-secret screening catches raw, percent, repeated percent, escaped Uni
   for (const value of [secret, encoded(secret), encoded(encoded(secret)),
     [...secret].map(point => `\\u${point.charCodeAt(0).toString(16).padStart(4, '0')}`).join(''),
     `%GG${encoded(secret)}%`, `%FF${encoded(secret)}%Q0`, { metadata: encoded(encoded(secret)) }]) {
-    assert.equal(proposedContainsSecret(value, [secret]), true, JSON.stringify(value))
+    assert.equal(publicUrlContainsSecret(value, [secret]), true, JSON.stringify(value))
   }
-  assert.equal(proposedContainsSecret('ordinary %GG %FF data', [secret]), false)
-  assert.equal(proposedContainsSecret('ordinary data', ['', secret]), false)
-  assert.equal(proposedContainsSecret(encoded('雪秘密'), ['雪秘密']), true)
+  assert.equal(publicUrlContainsSecret('ordinary %GG %FF data', [secret]), false)
+  assert.equal(publicUrlContainsSecret('ordinary data', ['', secret]), false)
+  assert.equal(publicUrlContainsSecret(encoded('雪秘密'), ['雪秘密']), true)
 })
 for (const [label, marker] of [['slash', 'offline/api/credential'], ['backslash', 'offline\\api\\credential'],
   ['quote', 'offline"credential'], ['backspace', 'offline\bcredential'], ['form feed', 'offline\fcredential'],
@@ -158,9 +133,9 @@ for (const [label, marker] of [['slash', 'offline/api/credential'], ['backslash'
     // Parsing here is only fixture validation and grants the source no rights.
     assert.equal(JSON.parse(json).credential, marker)
     assert(!json.includes(marker))
-    assert.equal(proposedContainsSecret(json, [marker]), true)
-    assert.equal(proposedContainsSecret(encoded(json), [marker]), true)
-    assert.equal(proposedContainsSecret({ 'x-payload': json }, [marker]), true)
+    assert.equal(publicUrlContainsSecret(json, [marker]), true)
+    assert.equal(publicUrlContainsSecret(encoded(json), [marker]), true)
+    assert.equal(publicUrlContainsSecret({ 'x-payload': json }, [marker]), true)
     const body = Buffer.from(json), owned = response({ headers: { 'content-type': 'application/json' }, chunks: [body] })
     const result = await fixture({ request: () => owned }).run(url, { secrets: [marker], limits: { textBytes: 1 } })
     failure(result, 'known_secret', 1); assert.equal(result.bytesRead, body.length)
@@ -210,19 +185,19 @@ const nonPublicAddresses = [
   '8.8.8.999', '008.008.008.008', '[2001:4860::8888]', '', null, undefined, 123
 ]
 for (const address of nonPublicAddresses) {
-  test(`proposed IP policy rejects private, special, transition or invalid ${JSON.stringify(address)}`, () => {
-    assert.equal(proposedPublicAddress(address), false)
+  test(`conservative IP policy rejects private, special, transition or invalid ${JSON.stringify(address)}`, () => {
+    assert.equal(isPublicUrlAddress(address), false)
   })
 }
 const publicAddresses = ['1.1.1.1', '8.8.8.8', '9.9.9.9', '100.63.255.255', '100.128.0.0',
   '172.15.255.255', '172.32.0.0', '223.255.255.255', '2001:4860:4860::8888',
   '2606:4700:4700::1111', '2a00:1450:4001:830::200e']
 for (const address of publicAddresses) {
-  test(`proposed IP snapshot admits public ${address}`, () => assert.equal(proposedPublicAddress(address), true))
+  test(`conservative IP snapshot admits public ${address}`, () => assert.equal(isPublicUrlAddress(address), true))
 }
 for (const answers of [[], null, {}, ['bad-address'], ['127.0.0.1'], [publicAddress, '10.0.0.1'],
   ['10.0.0.1', publicAddress], [publicAddress, '::ffff:8.8.8.8'], [publicAddress, '2001:db8::1'],
-  Array(PROPOSED_URL_LIMITS.addresses + 1).fill(publicAddress)]) {
+  Array(PUBLIC_URL_LIMITS.addresses + 1).fill(publicAddress)]) {
   test(`all DNS candidates must be valid public answers ${JSON.stringify(answers).slice(0, 80)}`, async () => {
     const subject = fixture({ resolve: () => answers }), result = await subject.run()
     failure(result, 'non_public_address'); assert.equal(subject.state.requests.length, 0)
@@ -235,7 +210,7 @@ test('approval discloses exact canonical destination and fixed method before loo
   const result = await subject.run(`${url}#safe-fragment`)
   assert.equal(result.success, true)
   const { disclosure, signal } = subject.state.approvals[0]
-  assert.deepEqual(disclosure, { ...proposedPrepareUrl(url), method: 'GET', limits: { ...PROPOSED_URL_LIMITS }, redirects: [] })
+  assert.deepEqual(disclosure, { ...preparePublicUrl(url), method: 'GET', limits: { ...PUBLIC_URL_LIMITS }, redirects: [] })
   assert.equal(subject.state.lookups[0].hostname, 'example.com')
   const request = subject.state.requests[0]
   assert.equal(request.url, url); assert.equal(request.origin, 'https://example.com')
@@ -245,7 +220,7 @@ test('approval discloses exact canonical destination and fixed method before loo
   assert.equal(subject.state.requests.length, 1); assert.equal(subject.state.lookups.length, 1)
   assert.equal(subject.state.responses[0].state.closes, 1)
   assert.deepEqual(result.requests, [{ url, transmission: 'observed' }])
-  assert.equal(result.serverEffects, 'unknown')
+  assert.equal(result.serverEffects, 'unknown'); assert.equal(result.doNotRetry, true)
 })
 test('an initial denial does not reveal the hostname to DNS or enter transport', async () => {
   const subject = fixture({ approve: () => false }), result = await subject.run()
@@ -293,7 +268,7 @@ for (const [location, code] of [
   ['https://example.com/ space', 'invalid_redirect'], ['/line\nfeed', 'invalid_redirect'],
   ['/bad\\slash', 'invalid_redirect'], ['https://127.0.0.1/', 'non_public_host'], ['http://example.com/', 'unsupported_origin'],
   ['https://user:pass@example.com/', 'credential_url'], ['https://other.example/?token=value', 'credential_query'],
-  [`https://other.example/#${encoded(secret)}`, 'known_secret'], [`/${'a'.repeat(PROPOSED_URL_LIMITS.urlBytes)}`, 'invalid_redirect']
+  [`https://other.example/#${encoded(secret)}`, 'known_secret'], [`/${'a'.repeat(PUBLIC_URL_LIMITS.urlBytes)}`, 'invalid_redirect']
 ]) {
   test(`redirect rejects ${code} destination ${JSON.stringify(location).slice(0, 65)}`, async () => {
     const first = response({ status: 302, headers: { location } })
@@ -389,7 +364,7 @@ for (const stage of ['DNS', 'headers', 'body']) {
     assert.equal(paused.late.state.closes, stage === 'DNS' ? 0 : 1)
   })
 }
-test('human approval time does not consume the proposed active-network budget', async t => {
+test('decision pause does not consume the cumulative active-work budget', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const paused = pausedStage('approval'), pending = paused.subject.run(url, { limits: { milliseconds: 50 } })
   await paused.entered.promise; t.mock.timers.tick(50_000)
@@ -599,7 +574,7 @@ const rejectedResponses = [
   [{ headers: { 'content-type': 'text/plain', 'content-length': '-1' } }, 'body_limit'],
   [{ headers: { 'content-type': 'text/plain', 'content-length': '1.5' } }, 'body_limit'],
   [{ headers: { 'content-type': 'text/plain', 'content-length': 'NaN' } }, 'body_limit'],
-  [{ headers: { 'content-type': 'text/plain', 'content-length': String(PROPOSED_URL_LIMITS.bodyBytes + 1) } }, 'body_limit'],
+  [{ headers: { 'content-type': 'text/plain', 'content-length': String(PUBLIC_URL_LIMITS.bodyBytes + 1) } }, 'body_limit'],
   [{ headers: { 'content-type': 'text/plain', 'x-secret': encoded(encoded(secret)) } }, 'known_secret']
 ]
 for (const [fields, code] of rejectedResponses) {
@@ -628,31 +603,19 @@ for (const type of ['text/plain', 'Text/Plain; CHARSET="UTF-8"', 'application/js
     assert.equal(result.mimeType, type.toLowerCase().split(';')[0]); assert.equal(result.bytesRead, body.length)
     assert.equal(result.bodySha256, createHash('sha256').update(body).digest('hex'))
     assert.equal(result.representation, 'utf8_source'); assert.equal(result.truncated, false)
-    assert.equal(result.representationVersion, 'offline-prototype-v1')
+    assert.equal(result.representationVersion, 'public-url-utf8-v1')
     assert.equal(result.untrusted, true); assert.equal(owned.state.closes, 1)
   })
 }
-test('HTML requires an injected inert extractor and marks the mock representation explicitly', async () => {
+test('HTML uses the real inert extractor and identifies its representation', async () => {
   const markup = '<p>ordinary 雪</p><script>untrusted()</script>'
-  let calls = 0
   const owned = response({ headers: { 'content-type': 'text/html; charset=utf-8' }, chunks: [Buffer.from(markup)] })
-  const subject = fixture({ request: () => owned, extractHtml(source, signal) {
-    calls++; assert.equal(source, markup); assert.equal(signal.aborted, false); return 'ordinary 雪'
-  } })
-  const result = await subject.run()
+  const result = await fixture({ request: () => owned }).run()
   assert.equal(result.success, true); assert.equal(result.text, 'ordinary 雪')
-  assert.equal(result.representation, 'mock_html_extraction'); assert.equal(calls, 1)
-  assert.equal(result.representationVersion, 'offline-prototype-v1')
+  assert.equal(result.representation, 'inert_html_text')
+  assert.equal(result.representationVersion, 'inert-html-text-v1-common-named-entities-subset')
   assert.equal(result.bodySha256, createHash('sha256').update(markup).digest('hex'))
   assert.equal(owned.state.closes, 1)
-  const missing = response({ headers: { 'content-type': 'text/html' } })
-  failure(await fixture({ request: () => missing }).run(), 'html_extractor_missing', 1)
-  assert.equal(missing.state.closes, 1)
-})
-test('non-text HTML extraction is rejected as invalid extraction with no source or thrown-data leak', async () => {
-  const owned = response({ headers: { 'content-type': 'text/html' } })
-  const result = await fixture({ request: () => owned, extractHtml: () => ({ text: 'untrusted' }) }).run()
-  failure(result, 'invalid_extraction', 1); assert.equal(owned.state.closes, 1)
 })
 test('complete body byte limit applies across chunks and stops before further reads', async () => {
   const owned = response({ chunks: [Buffer.from('1234'), Buffer.from('5678'), Buffer.from('must not be pulled')] })
@@ -693,15 +656,14 @@ test('UTF-8 clipping never splits a code point and scans the full body before cl
     assert.equal(owned.state.closes, 1); assert(!JSON.stringify(result).includes(secret))
   }
 })
-test('HTML source is screened before extraction and extracted output is screened before clipping', async () => {
-  let calls = 0
-  const source = response({ headers: { 'content-type': 'text/html' }, chunks: [Buffer.from(`<p>safe</p><!--${encoded(secret)}-->`)] })
-  failure(await fixture({ request: () => source, extractHtml() { calls++; return 'safe' } }).run(url, { secrets: [secret] }), 'known_secret', 1)
-  assert.equal(calls, 0); assert.equal(source.state.closes, 1)
-  const extracted = response({ headers: { 'content-type': 'text/html' }, chunks: [Buffer.from('<p>safe</p>')] })
-  failure(await fixture({ request: () => extracted, extractHtml: () => `safe ${encoded(secret)}` }).run(url,
-    { secrets: [secret], limits: { textBytes: 4 } }), 'known_secret', 1)
-  assert.equal(extracted.state.closes, 1)
+test('full HTML source including inert comments and entity-decoded text is screened before clipping', async () => {
+  for (const markup of [`<p>safe</p><!--${encoded(secret)}-->`,
+    `<p>safe ${[...secret].map(char => `&#${char.charCodeAt(0)};`).join('')}</p>`,
+    `<script>${[...secret].map(char => `&#x${char.charCodeAt(0).toString(16)};`).join('')}</script>`]) {
+    const owned = response({ headers: { 'content-type': 'text/html' }, chunks: [Buffer.from(markup)] })
+    failure(await fixture({ request: () => owned }).run(url, { secrets: [secret], limits: { textBytes: 4 } }), 'known_secret', 1)
+    assert.equal(owned.state.closes, 1); assert(!JSON.stringify(owned).includes('result.text'))
+  }
 })
 test('newly known URL credentials at a pending body chunk withhold historical URL evidence and all content', async () => {
   const entered = deferred(), release = deferred(), secrets = []
@@ -719,21 +681,15 @@ test('newly known URL credentials at a pending body chunk withhold historical UR
   assert.equal(owned.state.closes, 1)
   assert(!JSON.stringify(result).includes(secret)); assert(!JSON.stringify(result).includes(encoded(secret)))
 })
-for (const sourceOnly of [true, false]) {
-  test(`newly known ${sourceOnly ? 'full HTML source' : 'extracted text'} secrets during extraction are rescanned before return`, async () => {
-    const entered = deferred(), release = deferred(), secrets = []
-    const markup = sourceOnly ? `<p>ordinary</p><!--${encoded(secret)}-->` : '<p>ordinary</p>'
-    const owned = response({ headers: { 'content-type': 'text/html' }, chunks: [Buffer.from(markup)] })
-    const subject = fixture({ request: () => owned, extractHtml() { entered.resolve(); return release.promise } })
-    const pending = subject.run(url, { secrets, limits: { textBytes: 4 } })
-    await entered.promise; secrets.push(secret)
-    release.resolve(sourceOnly ? 'ordinary' : `ordinary ${encoded(secret)}`)
-    const result = await pending
-    failure(result, 'known_secret', 1); assert.equal(owned.state.closes, 1)
-    assert(!JSON.stringify(result).includes(secret)); assert(!JSON.stringify(result).includes(encoded(secret)))
-    assert.equal(result.requestedUrl, undefined); assert.equal(result.finalUrl, undefined)
-  })
-}
+test('newly learned HTML source credentials are rescanned after final closure', async () => {
+  const secrets = []
+  const markup = `<p>ordinary</p><!--${encoded(secret)}-->`
+  const owned = response({ headers: { 'content-type': 'text/html' }, chunks: [Buffer.from(markup)] })
+  owned.close = () => { owned.state.closes++; secrets.push(secret) }
+  const result = await fixture({ request: () => owned }).run(url, { secrets, limits: { textBytes: 4 } })
+  failure(result, 'known_secret', 1); assert.equal(owned.state.closes, 1)
+  assert(!JSON.stringify(result).includes(secret)); assert(!JSON.stringify(result).includes(encoded(secret)))
+})
 test('credentials learned during final closure rescreen complete source beyond clipping and redact prior redirect URLs', async () => {
   const secrets = [], input = `https://example.com/${encoded(secret)}`
   const first = response({ status: 302, headers: { location: '/safe-final' } })

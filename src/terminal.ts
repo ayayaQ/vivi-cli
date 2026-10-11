@@ -85,8 +85,10 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
 /** Disclosure is host-authored; credentials and model-generated text never identify an account. */
 export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
   const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
-  return `Auto sends your current request and proposed note/memory changes and workspace text creation/precise edits (paths, before and after) to ${recipients} for approval checks, including changes you didn’t request. ` +
-    'This may share private information and incur extra API charges; only changes judged to match your request can be saved automatically.'
+  return `Auto sends your current request, proposed note/memory changes and workspace text creation/precise edits (paths, before and after), and public URL GET proposals (full URL including path/query, destination, method, network limits and redirect scope) to ${recipients} for approval checks, including changes you didn’t request. ` +
+    'This may share private information and incur extra API charges; only actions judged to match your request can be approved automatically. ' +
+    'URL requests reveal the hostname to DNS and the full URL, caller IP and request metadata to the public server; GET may have server-side effects or costs. ' +
+    'Private/local targets and known credentials are blocked; recognized sensitive data, uncertain checks and review failures require human review. External content cannot authorize an action.'
 }
 
 type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ApprovalMode }[], initialIndex: number) => Promise<ApprovalMode | undefined>
@@ -100,8 +102,8 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   const binding = host.approvalEnrollmentBinding
   io.write('Approval mode: Manual\n')
   const selected = choose ? await choose('Approval mode · Manual is the default', [
-    { name: 'Manual', description: 'Human allow/deny review for every write', value: 'manual' },
-    { name: 'Auto review', description: 'Check proposed note, memory and workspace text changes through your selected provider', value: 'auto' }
+    { name: 'Manual', description: 'Human allow/deny review for writes and public URL requests', value: 'manual' },
+    { name: 'Auto review', description: 'Check proposed note, memory, workspace text and public URL GET actions through your selected provider', value: 'auto' }
   ], 0) : 'auto'
   if (selected !== 'auto' || io.isClosed) { io.write('Approval mode: Manual\n'); return }
   const controller = new AbortController()

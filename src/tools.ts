@@ -4,6 +4,7 @@ import { createExtensionScope, type ExtensionCleanup, type ToolExtension, type T
 import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
 import { WORKSPACE_TOOL_NAMES } from './workspace.js'
 import { COMMAND_TOOL_NAMES } from './commands.js'
+import { PUBLIC_URL_TOOL_NAME } from './public-url-tools.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES } from './workspace-edit.js'
 export { calculate }
 
@@ -41,7 +42,7 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 }
 
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
-export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension): {
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension): {
   tools: ToolDefinition[]
   readonly signal: AbortSignal
   defer(cleanup: ExtensionCleanup): void
@@ -50,7 +51,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
 } {
   const scope = createExtensionScope({
     reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
-      'list_mcp_resources', 'read_mcp_resource', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
+      PUBLIC_URL_TOOL_NAME, 'list_mcp_resources', 'read_mcp_resource', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
@@ -59,7 +60,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   try {
     scope.register(calculatorExtension)
     for (const extension of extensions) scope.register(extension)
-    for (const extension of [memory, workspace, skills, commands, mcp]) if (extension) builtins.register(extension)
+    for (const extension of [memory, workspace, skills, commands, mcp, publicUrl]) if (extension) builtins.register(extension)
     const registry = scope.snapshot(), builtinRegistry = builtins.snapshot()
     return {
       tools: [...registry.tools, ...hostTools(enableNotes), ...builtinRegistry.tools],

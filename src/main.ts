@@ -97,7 +97,8 @@ Workspace tools omit symlinks and private/ignored files; text writes require rev
 /commands on enables separate trusted, unsandboxed commands for this launch/session. Every process requires human approval, even in Auto; piped approval is denied.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual or optional Auto review for the current conversation and selected account.
-Auto review adds API charges; only eligible current-request note/memory changes and scoped text creation/precise-edit tool calls can use it.
+Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
+Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
 /mcp configures trusted installed stdio servers; fresh human startup approval is required.
 MCP connections start disabled each launch. Connected catalogs can expose model tools and exact resource reads; every remote operation needs human approval, even in Auto. Credentials are unsupported.

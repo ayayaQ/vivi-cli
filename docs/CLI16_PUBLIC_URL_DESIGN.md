@@ -1,88 +1,105 @@
-# CLI-16: public URL retrieval design checkpoint
+# CLI-16: bounded public-page retrieval
 
-Status: proposed policy and offline contract fixtures only. No runtime tool,
-network adapter, catalog registration, dependency, or public API is added here.
-The privacy/network decision is still pending. This is not live acceptance.
+The user accepted the public-pages-only scope and Auto decision checker with
+manual fallback on uncertainty or failure on 2026-10-10. This implements one
+`fetch_url` CLI tool, with no reusable core change or search provider. The earlier
+[draft design receipt](https://github.com/ayayaQ/vivi-cli/pull/37#issuecomment-6103264611)
+is historical offline evidence, not production proof.
 
-## Small first slice
+## Fixed first slice
 
-One `fetch_url` tool retrieves one explicitly selected URL, using a fixed GET.
-There is no search provider, account login, cookie jar, caller-supplied header,
-JavaScript execution, browser automation, recursive crawl, or workspace upload.
-Provider-backed search is a separate later choice with its own disclosure/costs.
+- One explicit URL and fixed HTTPS GET on port 443; no caller headers, cookies,
+  browser login, JavaScript, proxy routing, crawl, upload, search or downloads
+- Manual is the default; freshly enrolled Auto can review eligible ordinary
+  non-sensitive exact requests through the selected existing provider
+- Hard URL/address/credential policy blocks cannot be overridden by a judge or
+  human confirmation; uncertain, sensitive or failed review stays manual
+- Three redirects maximum, every target revalidated and freshly resolved; a
+  changed origin requires a distinct exact-destination host admission
+- 15 seconds cumulative active work, excluding decision pauses; 16 KiB headers,
+  1 MiB body and at most 64 KiB UTF-8 extracted text **and complete JSON result**
+- Identity encoding only; compressed responses and unsupported MIME/charsets
+  fail closed. Supported types are UTF-8 plain text, JSON and inert HTML text
 
-Proposed defaults, requiring a product decision before exposure:
+Approval discloses the complete transmitted URL, method, destination, redirect
+scope and limits. Paths and queries may reveal private data; DNS receives the
+hostname, and the destination observes caller IP and request metadata. GET can
+have server-side effects or costs. The public-address filter is conservative
+admission policy, not OS network isolation or a guarantee about external routing.
 
-- HTTPS on port 443 only; no certificate-warning bypass or proxy routing
-- Human review for every initial request, including Auto; this is a proposal,
-  not a claim that the existing Auto policy already authorizes URL requests
-- At most three redirects; revalidate every destination and freshly resolve
-  it; a change of origin requires another exact-destination human approval
-- 15 seconds cumulative active lookup/response work; human approval pauses do
-  not consume it, and every resumed request rechecks ownership/admission
-- 16 KiB response headers, 1 MiB body, 64 KiB extracted UTF-8 text
-- Initially request identity encoding and reject compressed responses; supporting
-  compression later requires separate compressed and expanded stream budgets
-- UTF-8 `text/plain`, `application/json`, and `text/html`; HTML extraction needs
-  a reviewed inert parser, not regex stripping; binary/PDF/XML/downloads deferred
+## Real admission and transport
 
-If synchronous extraction can outrun cancellation, use one fixed reviewed,
-deadline-owned extractor worker; external content supplies data, never code.
+The fixed extension name is reserved even while disabled. It is advertised only
+with tool support and a durable outcome sink. CLI file sessions supply a private
+sidecar automatically; custom hosts must supply their own sink. Trusted fixture
+adapters are host options, never model arguments or recovered settings.
 
-The approval discloses the full transmitted URL, method, redirect rule and limits.
-Queries and paths may reveal private data; DNS reveals the host, and a web server
-can observe the caller's IP and request metadata. GET is not a guarantee of no
-server-side effect. Private/sensitive URL transmission needs the appropriate
-specific authorization; credential-bearing URLs remain blocked.
+The host binds the exact captured tool call, session/run, tool availability,
+transport references, selected account, enrolled policy/sharing revisions and
+host-prepared network effect. It repeats ownership, secrets and the reviewed
+receipt before DNS, queued durable intent replacement and socket admission.
+Same-origin redirects are covered only by the disclosed bounded rule. Cross-origin
+admission uses a new ID bound to the original occurrence and exact destination.
 
-## Admission and transport boundaries
+Reject userinfo, dotless/local names, non-public/special IP ranges, conventional
+credential query keys and known secrets in raw and repeatedly decoded URLs.
+Fragments are screened before removal. Resolve bounded A/AAAA answers using one
+owned cancellable resolver; mixed public/private, empty or oversized results are
+blocked. Pin one admitted IP with no fallback lookup, retaining original Host/SNI
+and certificate identity. TLS trust remains mandatory; IP identities use IP SANs.
+No retry, automatic redirect or environment proxy can bypass this direct adapter.
 
-Reject userinfo, local/dotless hostnames, non-public/special addresses, and known
-credentials before DNS or approval display. Check raw and repeatedly decoded
-URLs, redirect locations, admitted response metadata and complete bounded body
-before clipping. Conventional credential query names are a conservative extra
-block, not complete secret detection. Fragments are screened before removal.
+The real HTTP parser enforces header bounds and rejects ambiguous singleton
+headers/framing. The stream and extractor are bounded, deadline-owned and closed
+on failure/cancellation. Closed errors expose no native error, URL, header or body.
+Complete metadata/source/extracted content is screened before output clipping;
+new credentials invalidate pending admission and withhold canonical content.
+Detection is conservative and incomplete, not a guarantee of finding all secrets.
 
-After approval, check the current session/run, enabled-tool state, exact argument
-digest and policy revision again at actual admission. Resolve all candidate
-addresses; reject an empty, invalid, oversized, or mixed public/private answer.
-Pin the connection to one admitted IP while retaining the original hostname for
-Host/SNI and certificate validation. A separate second lookup is not sufficient.
-No global fetch, environment proxy, address fallback, authentication retry,
-automatic request retry, or implicit redirect following may evade this boundary.
-Destroy sockets/streams on cancellation, deadline, invalid headers/type or budget
-failure. DNS work that cannot be physically cancelled must never enter transport
-after ownership/deadline loss. An IP filter alone is not network isolation or a
-claim about hostile routing, operating-system resolver behavior or arbitrary sites.
+## Text, provenance and outcomes
 
-Result fields include requested/final URL, redirect chain, HTTP status, MIME,
-retrieval timestamp, bytes read, body digest, representation/extraction version,
-text truncation and untrusted-source marking. Keep request transmission evidence
-separate from successful retrieval and from unknown server effects. Closed
-host-authored errors must not expose thrown URLs, headers or response bodies.
-Source text, embedded instructions, redirects and result metadata grant no rights.
+HTML uses a linear inert tokenizer, not browser rendering or a full HTML5 DOM.
+It does not execute or fetch anything. Script/style/raw suppressed elements,
+comments and templates are omitted; malformed unfinished suppressed regions stay
+omitted. Common named entities plus numeric entities are decoded; unknown names
+and missing semicolons remain literal. The explicit representation version records
+this subset. Fixed work quanta yield and recheck cancellation/deadline. The entire
+bounded extraction is screened before its transcript-sized prefix is returned.
 
-## Integration and remaining proof
+Success records requested/final URL, redirects, HTTP status, MIME, timestamp,
+bytes read, body SHA-256, representation/version and truncation. Source text,
+headers, links and approval-shaped payloads remain untrusted data, never authority.
+Transmission evidence is separate from retrieval success and unknown server
+side effects. A local completed write is `observed`, not proof of remote effects.
 
-Use the existing run-owned extension scope, host approval controller and shared
-presentation/event contracts. Reserve the name even while disabled. A concrete
-CLI adapter is enough; demonstrate a reusable need before moving anything to core.
-Do not enlarge Auto's enrolled sharing/policy scope without an explicit decision
-and new consent. Session changes/exit must revoke pending admission and drain
-owned network work. Recovery must not restore approval or replay requests.
+A private fsynced sidecar records send intent before HTTP admission and the exact
+settled result afterward. Missing settlement recovers as unknown with `doNotRetry`;
+no receipt is persisted or restored. Cancelled runs drain their owned operations
+before final history reconciliation. Any attempted result carries `doNotRetry`,
+and repeated same-URL attempts in one run are blocked. A new explicit user turn
+needs a fresh admission. Evidence is retired only after a matching transcript
+checkpoint; a cleanup failure retains evidence without enabling replay.
 
-The test-only prototype injects approval, resolver, transport and optional HTML
-extraction. Fixtures exercise proposed URL/IP checks, redirects, stale ownership,
-known-secret screening, deadline/cancellation, bounded text and honest outcomes.
-Its generic current-owner predicate is not real session/run/digest/policy binding.
-They do not verify DNS pinning, real TLS, HTTP framing, HTML parsing, durable host
-outcomes, proxy behavior or real providers. Those require the final adapter,
-actual-host tests, independent exact-tree review, full package/types/native CI,
-and separately recorded live/manual acceptance after policy confirmation.
+## Verification boundaries
+
+The former mock helper and product-hash freeze are removed. Contract fixtures now
+exercise the actual product engine; separate suites test the tokenizer, real
+DNS/TLS/HTTP adapter with controlled dependencies, actual host admission, Auto
+fallback/enrollment, durable outcomes and recovery. They run on Node and Bun, with
+explicit Windows Node/Bun fixture lanes. No live keys, external-site requests,
+private-network bypass or historical excluded filesystem assessments are needed.
+
+Final completion requires fresh independent exact-tree review, full tests/types,
+installed package/declarations/bin, standalone/native CI and guarded merge with
+post-main checks. Controlled TLS/socket and provider fixtures do not establish
+external-site behavior, real-model judgment accuracy, hostile OS/network isolation,
+or interactive native vault/TTY acceptance. Those remain separately recorded
+coverage, rather than claims inferred from fixture success.
 
 Sources: [CLI-16 card](https://chatgpt.com/space/page_2b5f7c8515848191985cc32f01cd94c8),
 [Node HTTPS](https://nodejs.org/api/https.html#httpsrequesturl-options-callback),
-[Node DNS](https://nodejs.org/api/dns.html#dnslookuphostname-options-callback),
+[Node DNS resolver](https://nodejs.org/api/dns.html#class-dnspromisesresolver),
+[Node TLS identity](https://nodejs.org/api/tls.html#tlscheckserveridentityhostname-cert),
 [IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/),
 [IANA IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/),
 [HTTP semantics](https://httpwg.org/specs/rfc9110.html#safe.methods).

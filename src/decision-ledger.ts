@@ -13,7 +13,7 @@ const LOCK_RETRY_MS = 25
 const PRIMARY = 'decision-ledger.json'
 const LOCK = `${PRIMARY}.lock`
 
-export type DecisionLedgerToolName = 'note_set' | 'create_memory' | 'edit_memory' | 'delete_memory' | 'workspace_create_text' | 'workspace_edit_text'
+export type DecisionLedgerToolName = 'note_set' | 'create_memory' | 'edit_memory' | 'delete_memory' | 'workspace_create_text' | 'workspace_edit_text' | 'fetch_url'
 export type DecisionLedgerSource = 'automatic' | 'human-once' | 'human-deny'
 export type DecisionLedgerState = 'reviewed' | 'commit_started' | 'committed' | 'denied' | 'cancelled' | 'failed' | 'unknown'
 export type DecisionLedgerReasonCode = 'requirements_met' | 'provider_recommended_reject' | 'uncertain' |
@@ -44,6 +44,8 @@ export interface DecisionLedgerRecord {
   readonly runId: string
   readonly callId: string
   readonly toolName: DecisionLedgerToolName
+  /** fetch_url rows audit approval admission, never network transmission or retrieval. */
+  readonly actionKind?: 'network-admission'
   readonly policyRevision: string
   readonly provider: 'openai' | 'openrouter'
   readonly model: string
@@ -76,7 +78,7 @@ export class DecisionLedgerCommitError extends DecisionLedgerError {
   }
 }
 
-const toolNames: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'workspace_create_text', 'workspace_edit_text']
+const toolNames: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'workspace_create_text', 'workspace_edit_text', 'fetch_url']
 const sources: readonly string[] = ['automatic', 'human-once', 'human-deny']
 const states: readonly string[] = ['reviewed', 'commit_started', 'committed', 'denied', 'cancelled', 'failed', 'unknown']
 const reasons: readonly string[] = ['requirements_met', 'provider_recommended_reject', 'uncertain', 'refusal',
@@ -88,9 +90,9 @@ const predicateNames: readonly string[] = ['exact_action_requested', 'effects_wi
 const checkReasons: readonly string[] = ['allow_threshold_met', 'deny_threshold_met', 'between_thresholds']
 const usageFields = ['inputTokens', 'outputTokens', 'totalTokens', 'cachedTokens', 'cacheWriteTokens', 'reasoningTokens', 'costUsd']
 const recordFields = ['id', 'sessionId', 'runId', 'callId', 'toolName', 'policyRevision', 'provider', 'model',
-  'snapshotDigest', 'source', 'reasonCode', 'checks', 'usage', 'createdAt', 'updatedAt', 'state', 'resultRevision']
+  'snapshotDigest', 'source', 'reasonCode', 'checks', 'usage', 'createdAt', 'updatedAt', 'state', 'resultRevision', 'actionKind']
 const identityFields = ['id', 'sessionId', 'runId', 'callId', 'toolName', 'policyRevision', 'provider', 'model',
-  'snapshotDigest', 'createdAt'] as const
+  'snapshotDigest', 'createdAt', 'actionKind'] as const
 
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw new DecisionLedgerError(`Invalid decision audit metadata: ${message}`)
@@ -139,6 +141,8 @@ export function validateDecisionLedgerRecord(value: unknown): DecisionLedgerReco
   for (const field of ['id', 'sessionId', 'runId']) check(uuid(record[field]), 'invalid opaque UUID')
   for (const field of ['callId', 'policyRevision', 'model']) check(identifier(record[field]), 'invalid bounded identifier')
   check(member(record.toolName, toolNames), 'unknown tool')
+  check(record.toolName === 'fetch_url' ? record.actionKind === 'network-admission' : !Object.hasOwn(record, 'actionKind'), 'invalid action kind')
+  check(record.toolName !== 'fetch_url' || !Object.hasOwn(record, 'resultRevision'), 'network admission has no retrieval revision')
   check(record.provider === 'openai' || record.provider === 'openrouter', 'unknown provider')
   check(typeof record.snapshotDigest === 'string' && /^[0-9a-f]{64}$/.test(record.snapshotDigest), 'invalid snapshot digest')
   check(member(record.source, sources), 'unknown decision source')
