@@ -30,6 +30,13 @@ otherwise the host fails closed. Embedders constructing `CliHost` directly shoul
 await `initialize()` before displaying recovered history; `create()` and `resume()`
 do this themselves.
 
+Public URL GET tools similarly require durable `publicUrlOutcomes` evidence; file
+sessions supply a private sidecar automatically. Recovery never restores approval
+or replays a send. URL fixtures exercise the real host, bounded extractor and
+controlled DNS/TLS/HTTP dependencies on Node and Bun, including Windows CI;
+external-site routing, real model judgments and native terminal acceptance remain
+separate evidence.
+
 Auto review is a separate host opt-in with Manual as the launch/session default.
 Its fixed-provider numeric gates are initial host heuristics, not calibrated model
 accuracy or equivalent cross-provider probabilities. Offline adversarial fixtures

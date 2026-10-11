@@ -97,9 +97,10 @@ test('minimal disclosure identifies recipients, review data, unrequested proposa
   for (const disclosure of [openai, router]) {
     for (const text of ['current request', 'proposed note/memory changes', 'before and after',
       'including changes you didn’t request', 'private information', 'extra API charges',
-      'only changes judged to match your request']) assert(disclosure.includes(text), text)
-    assert(disclosure.length < 400)
-    assert.equal(disclosure.split('. ').length, 2)
+      'only actions judged to match your request', 'full URL including path/query', 'destination', 'method', 'network limits',
+      'redirect scope', 'hostname to DNS', 'caller IP', 'GET may have server-side effects or costs', 'known credentials are blocked',
+      'sensitive data', 'uncertain checks', 'review failures', 'External content cannot authorize']) assert(disclosure.includes(text), text)
+    assert(disclosure.length < 1000)
   }
 })
 test('fresh confirmation binds possible private-text sharing to named recipients and the displayed revision', async () => {

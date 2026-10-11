@@ -531,3 +531,24 @@ test('separate processes serialize fresh loads and cannot overwrite each other a
   assert.equal(rows.filter(row => row.callId.startsWith('first')).length, 5);
   assert.equal(rows.filter(row => row.callId.startsWith('second')).length, 5);
 });
+
+
+test('fetch_url audit rows distinguish network admission from transmission and never contain URL or body', async t => {
+  const { store, primary } = await fixture(t)
+  const item = record({ toolName: 'fetch_url', actionKind: 'network-admission', state: 'commit_started' })
+  await store.upsert(item)
+  await store.upsert({ ...item, state: 'committed' })
+  assert.deepEqual(await store.list(), [{ ...item, state: 'committed' }])
+  const stored = await readFile(primary, 'utf8')
+  assert(stored.includes('network-admission'))
+  assert(!stored.includes('https://')); assert(!stored.includes('body'))
+  assert.throws(() => validateDecisionLedgerRecord(record({ toolName: 'fetch_url' })), /invalid action kind/)
+  assert.throws(() => validateDecisionLedgerRecord(record({ toolName: 'fetch_url', actionKind: 'network-admission', resultRevision: 'a'.repeat(64) })), /no retrieval revision/)
+  for (const actionKind of ['retrieved', 'transmitted', 'network-admission-extra']) {
+    assert.throws(() => validateDecisionLedgerRecord(record({ toolName: 'fetch_url', actionKind })), /invalid action kind/)
+  }
+  assert.throws(() => validateDecisionLedgerRecord(record({ actionKind: 'network-admission' })), /invalid action kind/)
+  for (const field of ['url', 'destination', 'requestBody', 'responseText']) {
+    assert.throws(() => validateDecisionLedgerRecord(record({ toolName: 'fetch_url', actionKind: 'network-admission', [field]: 'private' })), /unexpected field/)
+  }
+})

@@ -35,11 +35,19 @@ import { MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOu
 import type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
 import type { CliToolDecision, CliToolEvidence } from './tool-presentation.js'
 import { agentArgumentsDigest } from '@ayayaq/vivi/events'
+import { fetchPublicUrl, preparePublicUrl, publicUrlContainsSecret, PUBLIC_URL_LIMITS } from './public-url.js'
+import type { PublicUrlAdapters } from './public-url.js'
+import { createPublicUrlExtension, PUBLIC_URL_GUIDANCE } from './public-url-tools.js'
+import { FilePublicUrlOutcomeStore, MAX_PUBLIC_URL_OUTCOME_ROWS, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult, reconcilePublicUrlOutcomes, unresolvedPublicUrlResult, unattemptedPublicUrlResult, validatePublicUrlOutcomes } from './public-url-outcomes.js'
+import type { PublicUrlOutcomeRecord, PublicUrlOutcomeStore } from './public-url-outcomes.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
 const commandToolNames = new Set<string>(COMMAND_TOOL_NAMES)
 const isMcpTool = (name: string): boolean => name.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource'].includes(name)
+const isPublicUrlTool = (name: string): boolean => name === 'fetch_url' || name.startsWith('public_url_withheld_')
+const historyUsesPublicUrl = (history: readonly HistoryMessage[]): boolean => history.some(message =>
+  message.kind === 'tool_result' && isPublicUrlTool(message.name) || message.kind === 'assistant' && message.toolCalls.some(call => isPublicUrlTool(call.name)))
 const historyUsesMcp = (history: readonly HistoryMessage[]): boolean => history.some(message =>
   message.kind === 'tool_result' && isMcpTool(message.name) || message.kind === 'assistant' && message.toolCalls.some(call => isMcpTool(call.name)))
 import { createSkillsExtension, formatSkillCatalogContext } from '@ayayaq/vivi/extensions/skills'
@@ -135,6 +143,71 @@ function withholdMcpHistory(history: HistoryMessage[], secrets: readonly string[
   return changed ? next : history
 }
 
+/** Complete credential screening precedes canonical or display projection. */
+function withholdPublicUrlResult<T extends ToolResult>(result: T, secrets: readonly string[]): T {
+  if (!publicUrlContainsSecret(result.content, secrets)) return result
+  let body: Record<string, unknown> = {}
+  try { body = JSON.parse(result.content) as Record<string, unknown> } catch { /* Unknown remains unknown. */ }
+  const notAttempted = body.serverEffects === 'not_attempted' && body.unknownOutcome !== true
+  return { ...result, isError: true, content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,
+    contentWithheld: true, transmission: notAttempted ? 'not_attempted' : 'unknown',
+    serverEffects: notAttempted ? 'not_attempted' : 'unknown', ...(notAttempted ? {} : { doNotRetry: true }),
+    error: { code: 'public_url_content_withheld', message: 'Public URL content was withheld because it contains a known credential. Do not repeat a transmitted request to recover withheld content' } }) }
+}
+function withholdPublicUrlIdentity(value: string, secrets: readonly string[], replacements: Map<string, string>, prefix = ''): string {
+  const previous = replacements.get(value)
+  if (previous && !publicUrlContainsSecret(previous, secrets)) return previous
+  if (!previous && !publicUrlContainsSecret(value, secrets)) return value
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const replacement = prefix + randomUUID().replaceAll('-', '')
+    if (publicUrlContainsSecret(replacement, secrets)) continue
+    const obsolete = previous ?? value
+    for (const [key, candidate] of replacements) if (candidate === obsolete) replacements.set(key, replacement)
+    replacements.set(obsolete, replacement)
+    replacements.set(value, replacement)
+    return replacement
+  }
+  throw new Error('A safe public URL identity could not be generated')
+}
+function withholdPublicUrlCall(call: ToolCall, secrets: readonly string[], replacements: McpIdentityReplacements): ToolCall {
+  const id = withholdPublicUrlIdentity(call.id, secrets, replacements.callIds)
+  const name = withholdPublicUrlIdentity(call.name, secrets, replacements.toolNames, 'public_url_withheld_')
+  const withheld = publicUrlContainsSecret(call.arguments, secrets)
+  return id === call.id && name === call.name && !withheld ? call : { ...call, id, name,
+    arguments: withheld ? { publicUrlRequestWithheld: true, reason: 'known_credential' } : call.arguments }
+}
+function withholdRemoteHistory(history: HistoryMessage[], secrets: readonly string[], replacements: McpIdentityReplacements): HistoryMessage[] {
+  const safeMcp = withholdMcpHistory(history, secrets, replacements)
+  let changed = false, seen = false
+  const urlContext = historyUsesPublicUrl(safeMcp)
+  const safe = safeMcp.map(message => {
+    if (message.kind === 'message' && urlContext && publicUrlContainsSecret(message.content, secrets)) {
+      changed = true
+      return { ...message, content: '[Public URL context withheld: known credential]' }
+    }
+    if (message.kind === 'tool_result' && isPublicUrlTool(message.name)) {
+      seen = true
+      const result = withholdPublicUrlResult(message, secrets)
+      const callId = withholdPublicUrlIdentity(message.callId, secrets, replacements.callIds)
+      const name = withholdPublicUrlIdentity(message.name, secrets, replacements.toolNames, 'public_url_withheld_')
+      if (result !== message || callId !== message.callId || name !== message.name) changed = true
+      return callId === result.callId && name === result.name ? result : { ...result, callId, name }
+    }
+    if (message.kind !== 'assistant') return message
+    if (message.toolCalls.some(call => isPublicUrlTool(call.name))) seen = true
+    if (!seen) return message
+    const toolCalls = message.toolCalls.map(call => isPublicUrlTool(call.name) ? withholdPublicUrlCall(call, secrets, replacements) : call)
+    const contentWithheld = publicUrlContainsSecret(message.content, secrets)
+    const stateWithheld = publicUrlContainsSecret(message.providerState ?? null, secrets)
+    if (!contentWithheld && !stateWithheld && toolCalls.every((call, index) => call === message.toolCalls[index])) return message
+    changed = true
+    const { providerState, ...ordinary } = message
+    return { ...ordinary, content: contentWithheld ? '[Public URL assistant content withheld: known credential]' : message.content,
+      toolCalls, ...(!stateWithheld && providerState ? { providerState } : {}) }
+  })
+  return changed ? safe : safeMcp
+}
+
 /** Stored legacy extras/revision bytes remain intact; tools expose a bounded whitelist. */
 function memoryToolResult(result: MemoryCommitResult, committed = false): ToolResult {
   const projection = {
@@ -180,6 +253,11 @@ export interface CliHostOptions {
   /** Durable evidence sink; FileSessionStore receives a standalone sink automatically. */
   mcpOutcomes?: McpOutcomeStore
   onMcpNotice?(message: string): void
+  /** Public-page tools are available only with durable outcome evidence and tool support. */
+  enablePublicUrl?: boolean
+  publicUrlOutcomes?: PublicUrlOutcomeStore
+  /** Trusted host fixture dependencies, captured and bound per turn; never model arguments. */
+  publicUrlTransport?: Pick<PublicUrlAdapters, 'resolve' | 'request'>
   /** Optional shadow storage. File sessions get private sidecars automatically. */
   conversationStore?: CliConversationStore
   onConversationNotice?(message: string): void
@@ -215,6 +293,13 @@ export class CliHost {
   private readonly workspaceScopeRevision = randomUUID()
   private toolsetRevision = 'idle'
   private readonly mcpManagerRevision = randomUUID()
+  private readonly publicUrlOutcomes: PublicUrlOutcomeStore | undefined
+  private readonly publicUrlRows = new Map<string, PublicUrlOutcomeRecord>()
+  private readonly publicUrlCalls = new Map<string, ToolCall>()
+  private publicUrlOutcomeLoading: Promise<void> | undefined
+  private readonly publicUrlAttempted = new Set<string>()
+  private readonly publicUrlJobs = new Set<Promise<ToolResult>>()
+  private readonly publicUrlPolicyRevision = 'vivi-cli-public-url-v1'
   private readonly mcpOutcomes: McpOutcomeStore | undefined
   private readonly mcpRows = new Map<string, McpOutcomeRecord>()
   private readonly mcpCalls = new Map<string, ToolCall>()
@@ -233,25 +318,27 @@ export class CliHost {
   private enabledSkills: boolean
   private lastSkillsDiagnostics = ''
   constructor(private readonly options: CliHostOptions) {
+    this.publicUrlOutcomes = options.publicUrlOutcomes ?? (options.store instanceof FileSessionStore
+      ? new FilePublicUrlOutcomeStore(options.store.directory, options.secrets ?? []) : undefined)
     this.mcpOutcomes = options.mcpOutcomes ?? (options.store instanceof FileSessionStore
       ? new FileMcpOutcomeStore(options.store.directory, options.secrets ?? []) : undefined)
     this.enabledMemory = options.enableMemory ?? false
     this.enabledSkills = options.enableSkills ?? false
     if (this.enabledSkills && !options.skills) throw new Error('Skills require a host-owned skill store')
-    this.reviews = new AutoReviewController(options.decisionReview, options.secrets ?? [],
+    this.reviews = new AutoReviewController(options.decisionReview, () => this.options.secrets ?? [],
       (request, signal) => this.approveWithPresentation(request, signal), options.onReviewNotice)
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
     this.records = new CliConversationRecords(this.current.id, options.conversationStore ??
       (options.store instanceof FileSessionStore ? new FileCliConversationStore(options.store.directory) : undefined),
-      options.secrets ?? [], options.onConversationNotice)
+      () => this.options.secrets ?? [], options.onConversationNotice)
     this.mcpRecoveryCalls = this.current.history.flatMap(message => message.kind === 'assistant' ? structuredClone(message.toolCalls) : [])
     this.commandAccount = options.commandApproval?.accountRevision()
     if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
       throw new Error('Decision review must use this session’s selected provider; cross-provider review is unavailable')
     }
-    this.current.history = withholdMcpHistory(closeInterruptedHistory(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
+    this.current.history = withholdRemoteHistory(closeInterruptedHistory(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
     validateSession(this.current)
   }
   static async create(options: Omit<CliHostOptions, 'session'> & {
@@ -271,6 +358,7 @@ export class CliHost {
   async initialize(): Promise<void> {
     if (this.running) throw new Error('Wait for the current turn before initializing the session')
     await this.recoverMcpOutcomes()
+    await this.recoverPublicUrlOutcomes()
     await this.checkpoint(this.current)
     await this.initializeRecords()
   }
@@ -402,7 +490,7 @@ export class CliHost {
     }
     // Keep domain-owned retry records intact and attempt every independent drain.
     for (const cleanup of [() => this.options.commandWorkspace?.shutdown(), () => this.drainMcp(),
-      () => this.drainMemory(), () => this.drainSkills()]) {
+      () => this.drainMemory(), () => this.drainSkills(), () => this.drainPublicUrls()]) {
       try { await cleanup() } catch (error) { errors.push(error) }
     }
     if (errors.length === 1) throw errors[0]
@@ -643,9 +731,11 @@ export class CliHost {
     catch (error) { if (this.mcpOutcomeLoading === loading) this.mcpOutcomeLoading = undefined; throw error }
   }
   private reconcileMcpHistory(history: readonly HistoryMessage[]): HistoryMessage[] {
-    const safe = withholdMcpHistory(structuredClone(history) as HistoryMessage[], this.options.secrets ?? [], this.mcpIdentityReplacements)
+    const safe = withholdRemoteHistory(structuredClone(history) as HistoryMessage[], this.options.secrets ?? [], this.mcpIdentityReplacements)
     const rows = this.safeMcpRows()
-    return rows.length ? reconcileMcpOutcomes(safe, this.current.id, rows) : safe
+    const reconciled = rows.length ? reconcileMcpOutcomes(safe, this.current.id, rows) : safe
+    const urlRows = this.safePublicUrlRows()
+    return urlRows.length ? reconcilePublicUrlOutcomes(reconciled, this.current.id, urlRows) : reconciled
   }
   private async retireMcpOutcomes(history: readonly HistoryMessage[]): Promise<void> {
     const matched = new Set<string>()
@@ -739,23 +829,187 @@ export class CliHost {
     }
     return withholdMcpResult(outcome, this.options.secrets ?? [])
   }
+  /** URL approval receipts never outlive their run or restore execution on resume. */
+  private executePublicUrl(call: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
+    const job = this.performPublicUrl(call, signal, ownerSignal)
+    this.publicUrlJobs.add(job)
+    void job.then(() => this.publicUrlJobs.delete(job), () => this.publicUrlJobs.delete(job))
+    return job
+  }
+  async drainPublicUrls(): Promise<void> {
+    if (this.eventContext.getStore()?.active) throw new Error('An event callback cannot await its own public URL drain')
+    while (this.publicUrlJobs.size) await Promise.allSettled([...this.publicUrlJobs])
+    await this.publicUrlOutcomes?.drain?.()
+  }
+  private safePublicUrlRows(): PublicUrlOutcomeRecord[] {
+    return [...this.publicUrlRows.values()].map(row => {
+      const original = this.publicUrlCalls.get(row.id)
+      const call = original ? withholdPublicUrlCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements) : undefined
+      const next = { ...row, ...(call ? { callId: call.id, toolName: call.name, callDigest: mcpDigest(call),
+        ...(row.recoveryCallDigest || mcpDigest(call) !== row.callDigest ? { recoveryCallDigest: row.recoveryCallDigest ?? row.callDigest } : {}) } : {
+        callId: withholdPublicUrlIdentity(row.callId, this.options.secrets ?? [], this.mcpIdentityReplacements.callIds),
+        toolName: withholdPublicUrlIdentity(row.toolName, this.options.secrets ?? [], this.mcpIdentityReplacements.toolNames, 'public_url_withheld_') }),
+        ...(row.result ? { result: withholdPublicUrlResult(row.result, this.options.secrets ?? []) } : {}) }
+      if (publicUrlContainsSecret(next, this.options.secrets ?? [])) throw new Error('Public URL evidence contains a newly known credential')
+      return next
+    })
+  }
+  private async persistPublicUrlOutcomes(assertCurrent?: () => void): Promise<void> {
+    if (!this.publicUrlOutcomes) throw new Error('Durable public URL outcomes are unavailable')
+    for (;;) {
+      const rows = this.safePublicUrlRows()
+      this.publicUrlOutcomes.addSecrets?.(this.options.secrets ?? [])
+      await this.publicUrlOutcomes.save(this.current.id, rows, { assertCurrent: () => {
+        assertCurrent?.()
+        if (publicUrlContainsSecret(rows, this.options.secrets ?? [])) throw new Error('Public URL evidence contains a newly known credential')
+      } })
+      if (JSON.stringify(rows) === JSON.stringify(this.safePublicUrlRows())) return
+    }
+  }
+  private async recoverPublicUrlOutcomes(): Promise<void> {
+    if (!this.publicUrlOutcomeLoading) this.publicUrlOutcomeLoading = (async () => {
+      if (!this.publicUrlOutcomes) return
+      const rows = validatePublicUrlOutcomes(this.current.id, await this.publicUrlOutcomes.load(this.current.id))
+      for (const row of rows) {
+        const call = this.mcpRecoveryCalls.find(call => publicUrlOutcomeMatchesCall(row, call))
+        if (call) this.publicUrlCalls.set(row.id, structuredClone(call))
+        this.publicUrlRows.set(row.id, row)
+      }
+      this.current.history = this.reconcileMcpHistory(this.current.history)
+      if (rows.length) await this.persistPublicUrlOutcomes()
+    })()
+    const loading = this.publicUrlOutcomeLoading
+    try { await loading }
+    catch (error) { if (this.publicUrlOutcomeLoading === loading) this.publicUrlOutcomeLoading = undefined; throw error }
+  }
+  private async retirePublicUrlOutcomes(history: readonly HistoryMessage[]): Promise<void> {
+    if (!this.publicUrlOutcomes) return
+    const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
+    const matched = new Set(this.safePublicUrlRows().filter(row => calls.some(call => publicUrlOutcomeMatchesCall(row, call)) &&
+      history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
+        message.content === publicUrlOutcomeResult(row).content)).map(row => row.id))
+    if (!matched.size) return
+    const remaining = this.safePublicUrlRows().filter(row => !matched.has(row.id))
+    try {
+      this.publicUrlOutcomes.addSecrets?.(this.options.secrets ?? [])
+      await this.publicUrlOutcomes.save(this.current.id, remaining, { assertCurrent: () => {
+        if (publicUrlContainsSecret(remaining, this.options.secrets ?? [])) throw new Error('Public URL evidence contains a newly known credential')
+      } })
+      for (const id of matched) { this.publicUrlRows.delete(id); this.publicUrlCalls.delete(id) }
+    } catch { /* A failed cleanup retains evidence and never permits replay. */ }
+  }
+  private async performPublicUrl(callReference: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
+    const call = structuredClone(callReference), callDigest = reviewDigest(call), toolset = this.toolsetRevision
+    const store = this.options.store, transport = this.options.publicUrlTransport
+    const resolve = transport?.resolve, request = transport?.request
+    const explicitSink = this.options.publicUrlOutcomes
+    let admissionGuard: (() => void) | undefined, admittedOrigin: string | undefined, approvals = 0
+    let row: PublicUrlOutcomeRecord | undefined
+    const owned = (): boolean => !this.shutdownStarted && this.controller?.signal === ownerSignal &&
+      this.toolsetRevision === toolset && this.options.enableTools !== false && this.options.enablePublicUrl !== false &&
+      this.options.store === store && this.options.publicUrlOutcomes === explicitSink &&
+      this.options.publicUrlTransport === transport && transport?.resolve === resolve && transport?.request === request &&
+      reviewDigest(callReference) === callDigest
+    const assertOwned = (): void => {
+      signal.throwIfAborted()
+      if (!owned()) throw new Error('Public URL request became stale')
+      if (publicUrlContainsSecret(call, this.options.secrets ?? [])) throw new Error('Public URL request contains a known credential')
+    }
+    let outcome: ToolResult = unattemptedPublicUrlResult()
+    try {
+      assertOwned()
+      if (!this.publicUrlOutcomes || this.publicUrlRows.size >= MAX_PUBLIC_URL_OUTCOME_ROWS) return unattemptedPublicUrlResult('public_url_outcome_unavailable')
+      const prepared = preparePublicUrl(call.arguments.url, this.options.secrets ?? [])
+      if (this.publicUrlAttempted.has(reviewDigest(prepared.url))) return unattemptedPublicUrlResult('public_url_retry_blocked')
+      row = { id: randomUUID(), sessionId: this.current.id, runId: toolset, callId: call.id, toolName: call.name,
+        callDigest: mcpDigest(call), bindingDigest: reviewDigest({ call, prepared, limits: PUBLIC_URL_LIMITS,
+          policyRevision: this.publicUrlPolicyRevision }), state: 'accepted' }
+      this.publicUrlCalls.set(row.id, call); this.publicUrlRows.set(row.id, row)
+      const result = await fetchPublicUrl(call.arguments.url, {
+        ...(resolve ? { resolve } : {}), ...(request ? { request } : {}),
+        isCurrent: owned,
+        assertCurrent: () => { assertOwned(); admissionGuard?.() },
+        approve: async (disclosure, reviewSignal) => {
+          assertOwned()
+          const exact = preparePublicUrl(disclosure.url, this.options.secrets ?? [])
+          if (exact.url !== disclosure.url || disclosure.method !== 'GET' || reviewDigest(disclosure.limits) !== reviewDigest(PUBLIC_URL_LIMITS)) throw new Error('Invalid public URL preparation')
+          const sequence = approvals++
+          const approvalCall = sequence === 0 ? call : { id: `url-redirect-${reviewDigest({ callId: call.id, sequence })}`,
+            name: 'fetch_url', arguments: { url: exact.url } }
+          const resourceId = `cli-public-url:${this.publicUrlPolicyRevision}:${reviewDigest(exact)}`
+          const affectedData = { url: exact.url, hostname: exact.hostname, origin: exact.origin, method: 'GET',
+            limits: { ...PUBLIC_URL_LIMITS }, redirects: disclosure.redirects.map(redirect => ({ from: redirect.from, to: redirect.to, status: redirect.status })),
+            transmits: 'Full URL path/query; hostname to DNS; caller IP and fixed headers to server',
+            serverEffects: 'unknown', followsLinks: false, sameOriginRedirectScope: 'At most three validated redirects' }
+          const action = (): PreparedActionMetadata => ({ complete: true, effects: [{ kind: 'external', resourceId,
+            scope: 'external', affectedData, review: 'model-review' }] })
+          const revisions = (): JsonObject => {
+            assertOwned()
+            if (publicUrlContainsSecret([exact, affectedData], this.options.secrets ?? [])) throw new Error('Public URL request contains a newly known credential')
+            return { [resourceId]: reviewDigest(exact), callDigest: reviewDigest(callReference),
+            policyRevision: this.publicUrlPolicyRevision, limitsDigest: reviewDigest(PUBLIC_URL_LIMITS),
+            toolsEnabled: this.options.enableTools !== false, publicUrlEnabled: this.options.enablePublicUrl !== false,
+            toolsetRevision: this.toolsetRevision, sessionId: this.current.id, sessionStoreRevision: this.sessionStoreRevision,
+            transportCurrent: this.options.publicUrlTransport === transport && transport?.resolve === resolve && transport?.request === request }
+          }
+          const allowed = await this.reviews.execute({ approval: { call: approvalCall, currentRevision: reviewDigest(exact),
+            description: `Fetch public page with GET: ${exact.url}\nDestination hostname: ${exact.hostname}\n` +
+              'The full path and query will be sent. DNS sees the hostname; the server sees caller IP and fixed request headers. GET may have server-side effects.\n' +
+              'One initial request and at most three validated redirects; changed origins require a separate decision. No login, cookies, JavaScript, linked-page crawling or downloads.\n' +
+              '15 seconds active work, 16 KiB headers, 1 MiB body, at most 64 KiB text/result. Returned text enters the local transcript and selected provider context as untrusted data.' },
+            eligible: true, operationLabel: 'public URL request', inputData: affectedData,
+            preparedAction: action(), currentPreparedAction: action, resourceRevisions: revisions(), currentResourceRevisions: revisions,
+            isActive: owned }, reviewSignal, async assertCurrent => {
+              assertCurrent(); assertOwned(); admissionGuard = assertCurrent; admittedOrigin = exact.origin; return true
+            })
+          return allowed === true
+        },
+        onBeforeRequest: async (disclosure, requestSignal) => {
+          requestSignal.throwIfAborted(); assertOwned(); admissionGuard?.()
+          const exact = preparePublicUrl(disclosure.url, this.options.secrets ?? [])
+          if (!admissionGuard || exact.origin !== admittedOrigin || disclosure.method !== 'GET' ||
+            reviewDigest(disclosure.limits) !== reviewDigest(PUBLIC_URL_LIMITS) || disclosure.redirects.length > PUBLIC_URL_LIMITS.redirects) throw new Error('Public URL admission is unavailable')
+          if (this.publicUrlAttempted.has(reviewDigest(exact.url))) throw new Error('A public URL retry needs a new user turn')
+          this.publicUrlRows.set(row!.id, { ...row!, state: 'intent' })
+          await this.persistPublicUrlOutcomes(() => { requestSignal.throwIfAborted(); assertOwned(); admissionGuard!() })
+          requestSignal.throwIfAborted(); assertOwned(); admissionGuard()
+          this.publicUrlAttempted.add(reviewDigest(exact.url))
+        }
+      }, { signal, secrets: () => this.options.secrets ?? [] })
+      outcome = withholdPublicUrlResult({ content: JSON.stringify(result), ...(!result.success ? { isError: true } : {}) }, this.options.secrets ?? [])
+    } catch {
+      outcome = row && this.publicUrlRows.get(row.id)?.state === 'intent' ? unresolvedPublicUrlResult()
+        : unattemptedPublicUrlResult(signal.aborted ? 'cancelled' : 'public_url_blocked')
+    }
+    if (row) {
+      this.publicUrlRows.set(row.id, { ...row, state: 'settled', result: withholdPublicUrlResult(outcome, this.options.secrets ?? []) })
+      try { await this.persistPublicUrlOutcomes() } catch { /* A prior intent survives; no automatic retry. */ }
+    }
+    return withholdPublicUrlResult(outcome, this.options.secrets ?? [])
+  }
   cancel(): void { this.controller?.abort() }
   private async deliverEvent(event: AgentEvent): Promise<void> {
     const delivery = { active: true }
     try { await this.eventContext.run(delivery, () => this.options.onEvent?.(event)) }
     finally { delivery.active = false }
   }
+  private withholdPublicUrlTitle(session: CliSession): void {
+    if (historyUsesPublicUrl(session.history) && session.title && publicUrlContainsSecret(session.title, this.options.secrets ?? [])) {
+      session.title = '[Title withheld: known credential]'
+    }
+  }
   /** Repeat privacy checks at the durable store's last admission guard as well as queue entry. */
   private async checkpoint(snapshot: CliSession, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<void> {
-    if (!historyUsesMcp(snapshot.history)) {
+    if (!historyUsesMcp(snapshot.history) && !historyUsesPublicUrl(snapshot.history)) {
       if (options) await this.options.store.save(snapshot, options)
       else await this.options.store.save(snapshot)
       return
     }
-    snapshot.history = withholdMcpHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    snapshot.history = withholdRemoteHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    this.withholdPublicUrlTitle(snapshot)
     const assertIdentitiesSafe = (): void => {
       for (const replacements of Object.values(this.mcpIdentityReplacements)) for (const replacement of replacements.values()) {
-        if (mcpContainsSecret(replacement, this.options.secrets ?? [])) throw new Error('A canonical MCP identity contains a newly known credential; checkpoint was blocked')
+        if (mcpContainsSecret(replacement, this.options.secrets ?? []) || historyUsesPublicUrl(snapshot.history) && publicUrlContainsSecret(replacement, this.options.secrets ?? [])) throw new Error('A canonical remote identity contains a newly known credential; checkpoint was blocked')
       }
     }
     let committed = false
@@ -765,7 +1019,10 @@ export class CliHost {
         await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
           options?.assertCurrent?.()
           assertIdentitiesSafe()
-          const safe = withholdMcpHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          if (historyUsesPublicUrl(snapshot.history) && snapshot.title && publicUrlContainsSecret(snapshot.title, this.options.secrets ?? [])) {
+            throw new Error('Public URL title contains a newly known credential; checkpoint was blocked')
+          }
+          const safe = withholdRemoteHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
           if (safe !== snapshot.history && JSON.stringify(safe) !== JSON.stringify(snapshot.history)) {
             throw new Error('MCP transcript contains a newly known credential; checkpoint was blocked')
           }
@@ -779,19 +1036,22 @@ export class CliHost {
       }
       // A store hook may register a credential after its replacement guard. Keep
       // withholding monotonically until the successful checkpoint returns stable.
-      const safe = withholdMcpHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
-      if (safe === snapshot.history || JSON.stringify(safe) === JSON.stringify(snapshot.history)) return
+      const previousTitle = snapshot.title
+      this.withholdPublicUrlTitle(snapshot)
+      const safe = withholdRemoteHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+      if (previousTitle === snapshot.title && (safe === snapshot.history || JSON.stringify(safe) === JSON.stringify(snapshot.history))) return
       snapshot.history = safe
     }
   }
   private async save(): Promise<void> {
     this.current.updatedAt = new Date().toISOString()
-    this.current.history = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    this.withholdPublicUrlTitle(this.current)
     const snapshot = structuredClone(this.current)
     const operation = this.persistence.then(() => this.checkpoint(snapshot))
     this.persistence = operation.catch(() => undefined)
     try { await operation }
-    finally { this.current.history = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements) }
+    finally { this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements); this.withholdPublicUrlTitle(this.current) }
   }
   private notes(): NoteSnapshot {
     return { revision: this.current.noteRevision, notes: structuredClone(this.current.notes) }
@@ -851,6 +1111,7 @@ export class CliHost {
     this.activeTurn = { scope: owner, settled }
     this.controller = controller
     this.toolsetRevision = randomUUID()
+    this.publicUrlAttempted.clear()
     this.presentationTurnStart = this.current.history.length
     const commandRunId = randomUUID()
     this.reviews.beginTurn(this.current.id, content)
@@ -866,6 +1127,7 @@ export class CliHost {
     owner.defer(() => this.drainSkills())
     owner.defer(() => this.drainMemory())
     owner.defer(() => this.drainMcp())
+    owner.defer(() => this.drainPublicUrls())
     owner.defer(() => this.options.commandWorkspace?.endRun())
     const abort = (): void => controller.abort()
     owner.signal.addEventListener('abort', abort, { once: true })
@@ -904,6 +1166,7 @@ export class CliHost {
       // replace a newly accepted prompt while the initial checkpoint waits.
       await this.persistence
       await this.recoverMcpOutcomes()
+      await this.recoverPublicUrlOutcomes()
       await this.initializeRecords()
       const mcpManager = enableTools ? this.options.mcp : undefined
       let mcp: ToolExtension | undefined
@@ -937,7 +1200,10 @@ export class CliHost {
           return this.enabledSkills && !memoryContextContainsSecret(catalog.document(request.name), this.options.secrets ?? [])
         }
       }) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp)
+      const publicUrl = enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes
+        ? createPublicUrlExtension((call, signal) => this.executePublicUrl(call, signal, controller.signal)) : undefined
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl)
+      if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: PUBLIC_URL_GUIDANCE })
       owner.defer(() => toolset.dispose())
       const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name) ?? [])
       if (catalog) {
@@ -1006,6 +1272,9 @@ export class CliHost {
           if (memoryContextContainsSecret([memoryContents, skillContents, memoryToolContext], this.options.secrets ?? [])) {
             throw new Error('Saved memory, skills or workspace context contains a known credential; provider request was blocked')
           }
+          if (historyUsesPublicUrl(input.messages) && publicUrlContainsSecret(input, this.options.secrets ?? [])) {
+            throw new Error('Public URL provider context contains a known credential; the request was blocked before admission')
+          }
           if (mcpContainsSecret([mcpContents, toolset.tools.filter(tool => isMcpTool(tool.name)), mcpToolContext], this.options.secrets ?? [])) {
             throw new Error('MCP context contains a known credential; provider request was blocked')
           }
@@ -1014,6 +1283,10 @@ export class CliHost {
             output.toolCalls.filter(call => isMcpTool(call.name)), output.content, output.providerState ?? null
           ], this.options.secrets ?? [])) {
             throw new Error('MCP provider response contains a known credential; assistant request was blocked before admission')
+          }
+          if ((historyUsesPublicUrl(input.messages) || output.toolCalls.some(call => isPublicUrlTool(call.name))) &&
+            publicUrlContainsSecret([output.toolCalls.filter(call => isPublicUrlTool(call.name)), output.content, output.providerState ?? null], this.options.secrets ?? [])) {
+            throw new Error('Public URL provider response contains a known credential; the assistant request was blocked before admission')
           }
           // Reject session-wide overflow before this response enters canonical history.
           aggregateUsage([...priorUsage, ...roundUsage, output.usage])
@@ -1075,6 +1348,8 @@ export class CliHost {
           if (event.type === 'assistant' || event.type === 'tool_completed') {
             const safe = this.reconcileMcpHistory([...this.current.history, structuredClone(event.message)]).at(-1)!
             admittedEvent = { ...event, message: safe } as AgentEvent
+          } else if (event.type === 'tool_started' && isPublicUrlTool(event.call.name) && publicUrlContainsSecret(event.call, this.options.secrets ?? [])) {
+            admittedEvent = { ...event, call: withholdPublicUrlCall(event.call, this.options.secrets ?? [], this.mcpIdentityReplacements) }
           } else if (event.type === 'tool_started' && isMcpTool(event.call.name) && mcpContainsSecret(event.call, this.options.secrets ?? [])) {
             admittedEvent = { ...event, call: withholdMcpCall(event.call, this.options.secrets ?? [], this.mcpIdentityReplacements) }
           }
@@ -1104,7 +1379,7 @@ export class CliHost {
           if (!controller.signal.aborted && owner.state === 'open' && this.activeTurn?.scope === owner) {
             // A persistence hook may register credentials after the event's first scan.
             if (admittedEvent.type === 'assistant' || admittedEvent.type === 'tool_completed') {
-              const safe = withholdMcpHistory([...this.current.history, admittedEvent.message], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
+              const safe = withholdRemoteHistory([...this.current.history, admittedEvent.message], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
               admittedEvent = { ...admittedEvent, message: safe } as AgentEvent
             }
             if (admittedEvent.type === 'tool_completed') for (const [id, original] of pendingMcpDisplay) {
@@ -1116,7 +1391,7 @@ export class CliHost {
           // Already-entered delivery is drained, but its obsolete continuation
           // cannot admit another effect. Terminal reconciliation below owns recovery.
           if (controller.signal.aborted || owner.state !== 'open' || this.activeTurn?.scope !== owner) return
-          const safeHistory = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          const safeHistory = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
           if (admittedEvent.type === 'tool_completed') { captureRecordRows(); await this.retireMcpOutcomes(this.current.history) }
           })()
@@ -1140,6 +1415,7 @@ export class CliHost {
       await this.drainMcp()
       await this.drainMemory()
       await this.drainSkills()
+      await this.drainPublicUrls()
       captureRecordRows()
       // Core abort cleanup intentionally skips callbacks. Always use its final canonical transcript.
       // The per-turn prefix is provider context only. Persisting it would revive
@@ -1168,7 +1444,7 @@ export class CliHost {
       // A cancelled/unaccepted response contributes no round and preserves prior metrics.
       this.current.usage = aggregateUsage([...priorUsage, ...(result.rounds > 0 ? [result.usage] : [])])
       await this.save()
-      canonicalResult.history = withholdMcpHistory(structuredClone(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
+      canonicalResult.history = withholdRemoteHistory(structuredClone(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
       // Cancellation suppresses core tool_completed events. Display only the exact
       // corrected, checkpointed results so a generic cancellation cannot hide effects.
       for (let index = 0; index < canonicalResult.history.length; index++) {
@@ -1190,12 +1466,13 @@ export class CliHost {
       captureRecordRows()
       await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()])
       await this.retireMcpOutcomes(canonicalResult.history)
-      const safeFinal = withholdMcpHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+      await this.retirePublicUrlOutcomes(canonicalResult.history)
+      const safeFinal = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
       if (safeFinal !== this.current.history) { this.current.history = safeFinal; await this.save() }
       canonicalResult.history = structuredClone(this.current.history)
-      if (historyUsesMcp(canonicalResult.history) &&
-        mcpContainsSecret(canonicalResult.content, this.options.secrets ?? [])) {
-        canonicalResult.content = '[MCP response content withheld: known credential]'
+      if (historyUsesMcp(canonicalResult.history) && mcpContainsSecret(canonicalResult.content, this.options.secrets ?? []) ||
+        historyUsesPublicUrl(canonicalResult.history) && publicUrlContainsSecret(canonicalResult.content, this.options.secrets ?? [])) {
+        canonicalResult.content = historyUsesMcp(canonicalResult.history) ? '[MCP response content withheld: known credential]' : '[Public URL response content withheld: known credential]'
       }
       return canonicalResult
     } catch (error) {

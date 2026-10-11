@@ -193,13 +193,14 @@ test('headless TerminalIO cannot approve a text write or enroll expanded Auto', 
   await selectApprovalMode(host, io)
   assert.equal(host.approvalMode, 'manual'); assert.equal(io.canAutoReview, false); assert.deepEqual(await fs.readdir(subject.root), [])
 })
-test('expanded fresh enrollment discloses paths, exact before/after data, named recipients and extra charges in two short sentences', () => {
+test('expanded fresh enrollment discloses exact local and URL data, named recipients, privacy and cost within a concise bound', () => {
   for (const provider of ['openai', 'openrouter']) {
     const disclosure = autoReviewDisclosure(provider), sharing = autoReviewSharingScope(provider)
-    assert.equal(disclosure.split('. ').length, 2); assert(disclosure.length < 400)
+    assert(disclosure.length < 1000)
     assert.match(disclosure, /workspace text creation\/precise edits/); assert.match(disclosure, /paths, before and after/)
     assert.match(disclosure, /private information/); assert.match(disclosure, /extra API charges/)
-    assert.equal(sharing.revision, 'vivi-cli-review-sharing-v3'); assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v4')
+    for (const required of ['full URL including path/query', 'destination', 'method', 'network limits', 'redirect scope', 'hostname to DNS', 'caller IP', 'server-side effects or costs', 'sensitive data']) assert(disclosure.includes(required), required)
+    assert.equal(sharing.revision, AUTO_REVIEW_SHARING_REVISION); assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v5')
     assert(sharing.data.some(item => item.includes('workspace-relative')))
   }
 })

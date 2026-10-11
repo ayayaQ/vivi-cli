@@ -16,6 +16,7 @@ import type { CliSession } from './session.js'
 import { assertMcpJson } from '@ayayaq/vivi/extensions/mcp'
 import { mcpOutcomeMatchesCall } from './mcp-outcomes.js'
 import type { McpOutcomeRecord } from './mcp-outcomes.js'
+import { publicUrlContainsSecret } from './public-url.js'
 
 /** Complete-chain shadow storage. Canonical sessions and exact MCP receipts remain authoritative. */
 export const CLI_CONVERSATION_LIMITS = Object.freeze({ bytes: 64 * 1024 * 1024,
@@ -65,7 +66,10 @@ const keys = (value: Record<string, unknown>, names: readonly string[]): void =>
 }
 function containsSecret(value: unknown, secrets: readonly string[]): boolean {
   const serialized = JSON.stringify(value)
-  return secrets.some(secret => secret && (serialized.includes(secret) || serialized.includes(JSON.stringify(secret).slice(1, -1))))
+  if (secrets.some(secret => secret && (serialized.includes(secret) || serialized.includes(JSON.stringify(secret).slice(1, -1))))) return true
+  // A shadow retains accepted bytes even after the canonical host withholds them.
+  // Screen the same encoded credentials, failing closed if bounded decoding fails.
+  try { return publicUrlContainsSecret(value, secrets) } catch { return true }
 }
 function entries(session: CliSession, previous: readonly AgentHistoryEntry[] = []): AgentHistoryEntry[] {
   return session.history.map((message, index) => {
@@ -161,9 +165,10 @@ export class CliConversationRecords {
   private tail: Promise<void> = Promise.resolve()
   private quarantineComplete = false
   constructor(private readonly sessionId: string, private readonly store?: CliConversationStore,
-    private readonly secrets: readonly string[] = [], private readonly notice?: (message: string) => void) {
+    private readonly secretSource: readonly string[] | (() => readonly string[]) = [], private readonly notice?: (message: string) => void) {
     this.projection = createAgentProjection(sessionId)
   }
+  private get secrets(): readonly string[] { return typeof this.secretSource === 'function' ? this.secretSource() : this.secretSource }
   get anchorEventId(): string | undefined { return this.state === 'shadow' ? this.document?.records[0]?.eventId : undefined }
   get view(): CliConversationView {
     if (containsSecret([this.document ?? null, this.projection, this.runs], this.secrets)) {

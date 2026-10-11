@@ -1194,6 +1194,7 @@ export class OpenTuiIO implements ChatIO {
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
     const enrollment = request.call.name === 'enroll_auto_review'
+    const publicUrl = request.call.name === 'fetch_url'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
     this.showTool(request.call.id, 'approval_required', 'not_attempted', 'Exact action needs human review')
     const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
@@ -1201,7 +1202,8 @@ export class OpenTuiIO implements ChatIO {
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     this.appendEntry({ category: 'activity', attention: true, label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false, approval: approval.token })
-    const title = enrollment ? 'Enable Auto review? (default: cancel)' : 'Review this change (default: deny)'
+    const title = enrollment ? 'Enable Auto review? (default: cancel)' : publicUrl
+      ? 'Review this public URL request (default: deny)' : 'Review this change (default: deny)'
     this.updateStatus(enrollment ? 'Enable Auto review? · Cancel is the default' : `Approval required · ${scope} · denial is the default`)
     const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Auto' } : undefined)
     this.pickerBox.title = title
@@ -1211,7 +1213,7 @@ export class OpenTuiIO implements ChatIO {
     try {
       const reply = await answer
       this.showTool(request.call.id, reply === 'allow' && !signal.aborted && !this.closed ? 'running' : signal.aborted ? 'cancelled' : 'denied',
-        reply === 'allow' && !signal.aborted && !this.closed ? 'unreported' : 'not_attempted')
+        reply === 'allow' && !signal.aborted && !this.closed && !publicUrl ? 'unreported' : 'not_attempted')
       return reply === 'allow' && !signal.aborted && !this.closed
     } finally {
       if (this.activeApproval === approval) this.activeApproval = undefined
@@ -1476,8 +1478,12 @@ export class OpenTuiIO implements ChatIO {
     for (const entry of [...this.reviewNotices]) {
       if (!entry.review || reviewNoticeSettled(entry.review)) continue
       const unknown = entry.review.state === 'saving'
+      const publicUrl = entry.review.toolName === 'fetch_url'
       const mcp = entry.review.toolName.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource'].includes(entry.review.toolName)
-      this.reviewNotice(mcp
+      this.reviewNotice(publicUrl
+        ? unknown ? 'Public URL admission could not be confirmed; no fetch result was confirmed'
+          : outcome === 'cancelled' ? 'Review cancelled; this public URL request was not approved' : 'Review ended before this public URL request was approved'
+        : mcp
         ? unknown ? 'The MCP operation outcome could not be confirmed; check the remote service before retrying'
           : outcome === 'cancelled' ? 'Review cancelled; no MCP operation was started' : 'Review ended before an MCP operation was started'
         : unknown ? 'The write outcome could not be confirmed; check the resource before retrying'
@@ -1552,7 +1558,10 @@ export class OpenTuiIO implements ChatIO {
         reviewing: ['running', 'not_attempted'], needs_review: ['approval_required', 'not_attempted'],
         saving: ['running', 'unknown'], saved: ['succeeded', 'confirmed'], denied: ['denied', 'not_attempted'],
         cancelled: ['cancelled', 'not_attempted'], failed: ['failed', 'not_attempted'], unknown: ['unknown', 'unknown'] }
-      this.showTool(context.callId, ...state[context.state], message)
+      // URL review settles admission only; the owned fetch/result events supply network evidence.
+      const presentation = context.toolName === 'fetch_url' && ['saving', 'saved'].includes(context.state)
+        ? ['running', 'not_attempted'] as const : state[context.state]
+      this.showTool(context.callId, ...presentation, message)
     }
     const content = this.safe(message, 2048)
     if (!context && this.reviewNotices.some(entry => !entry.review && entry.historyStart === this.turnHistoryStart && entry.content === content)) return
