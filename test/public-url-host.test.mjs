@@ -230,9 +230,13 @@ test('durable interrupted intent resumes as unknown and never restores approval 
   t.after(() => resumed.shutdown()); assert.equal(resumed.approvalMode, 'manual')
   await resumed.send('What happened?'); assert.equal(subject.sends.length, 0); assert.equal(subject.humans.length, 0)
 })
-test('existing seven excluded historical filesystem cases stay byte-identical and excluded', () => {
-  const source = readFileSync(new URL('./skills-store.test.mjs', import.meta.url))
-  assert.equal(createHash('sha256').update(source).digest('hex'), 'bd9068e4d8f249220ad890d2edafc8027785614590f7c0512918bde6a2517a4f')
+test('existing seven excluded historical filesystem cases retain exact canonical source and exclusions', () => {
+  // Git's Windows checkout may render CRLF; compare unchanged canonical LF
+  // source bytes without running or changing any excluded assessment.
+  const source = readFileSync(new URL('./skills-store.test.mjs', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
+  for (const checkout of [source, source.replace(/\n/g, '\r\n')]) {
+    assert.equal(createHash('sha256').update(checkout.replace(/\r\n/g, '\n')).digest('hex'), 'bd9068e4d8f249220ad890d2edafc8027785614590f7c0512918bde6a2517a4f')
+  }
   assert.equal([...source.toString().matchAll(/^excludedAssessment\(/gm)].length, 7)
   assert.match(source.toString(), /Restricted\/adversarial filesystem assessment excluded and unrun/)
 })
