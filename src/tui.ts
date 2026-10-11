@@ -1363,7 +1363,7 @@ export class OpenTuiIO implements ChatIO {
     catch { encoded = '' }
     const old = this.entries.find(entry => entry.tool?.key === live.key)
     const entry: DisplayEntry = { category: 'activity', label: this.safe(`Tool ${live.call.name}`, 4096), content: '',
-      markdown: false, tool: { encoded, key: live.key, retained: true, localRead: isCliLocalReadTool(live.call.name) }, historyIndex: live.index }
+      markdown: false, tool: { encoded, key: live.key, retained: true }, historyIndex: live.index }
     if (old) this.entries[this.entries.indexOf(old)] = entry
     else this.entries.push(entry)
     this.rebuild()

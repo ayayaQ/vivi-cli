@@ -660,3 +660,26 @@ test('24-column malformed presentations retain a visible invalid warning and unv
   expect(contents(f.transcript())).toContain('Invalid or oversized tool presentation')
   expect(f.body(header).getChildren()).toHaveLength(0)
 })
+for (const outcome of ['cancelled', 'error'] as const) test(`unfinished live local read remains visibly unverified after ${outcome} before canonical refresh`, async () => {
+  const f = await fixture(24, 24), session = newSession({ provider: 'openai', model: 'offline' })
+  f.io.setSession(session); f.io.runStarted()
+  const call = { id: `unfinished-${outcome}`, name: 'current_time', arguments: {} }
+  f.io.event({ type: 'assistant', message: { kind: 'assistant', content: '', toolCalls: [call] } })
+  f.io.event({ type: 'tool_started', call }); f.io.runFinished(outcome)
+  expect(await f.frame()).toContain('unverified')
+  const header = f.headers()[0]!
+  expect(header.plainText).toContain('unverified')
+  expect(f.body(header).getChildren()).toHaveLength(0)
+  f.input.pressKey('o', { ctrl: true }); await f.frame()
+  expect(contents(f.body(header))).toContain('Status: unknown')
+  expect(contents(f.body(header))).toContain('Effect: unreported')
+  f.input.pressKey('o', { ctrl: true }); expect(await f.frame()).toContain('unverified')
+  // Cold saved-orphan replacement keeps the exact call key and uncertainty.
+  session.history = [{ kind: 'message', role: 'user', content: 'Read the clock' },
+    { kind: 'assistant', content: '', toolCalls: [call] }]
+  f.io.setSession(validateSession(session)); await f.frame()
+  expect(f.headers()).toHaveLength(1)
+  expect(f.headers()[0]!.id).toBe(header.id)
+  expect(f.headers()[0]!.plainText).toContain('unverified')
+  expect(f.body(f.headers()[0]!).getChildren()).toHaveLength(0)
+})

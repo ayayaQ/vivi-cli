@@ -103,7 +103,9 @@ test('only short action targets are selected, with URL credentials, query and fr
     { kind: 'text', text: '{"path":123}' }, { kind: 'text', text: 'null' }]) {
     assert.equal(card({ arguments: arguments_ }).title, 'unverified · workspace_read')
   }
-  assert.equal(card({ name: 'foreign_tool', arguments: { kind: 'text', text: '{"path":"do-not-infer"}' } }).title, 'unverified · foreign_tool')
+  for (const name of ['foreign_tool', 'constructor', '__proto__', 'toString']) {
+    assert.equal(card({ name, arguments: { kind: 'text', text: '{"path":"do-not-infer"}' } }).title, `unverified · ${name}`)
+  }
 })
 
 test('essential custom warnings survive collapse while routine warnings keep their full expanded wording', () => {

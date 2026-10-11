@@ -142,7 +142,7 @@ function targetSummary(snapshot: ToolPresentation): string | undefined {
     try { const url = new URL(values.url); return oneLine(url.hostname + url.pathname) }
     catch { return undefined }
   }
-  const parts = (keys[snapshot.name] ?? []).flatMap(key => typeof values[key] === 'string' && values[key] ? [oneLine(values[key])] : [])
+  const parts = (Object.hasOwn(keys, snapshot.name) ? keys[snapshot.name]! : []).flatMap(key => typeof values[key] === 'string' && values[key] ? [oneLine(values[key])] : [])
   return parts.length ? parts.join(' · ') : undefined
 }
 /** CLI-only compact layout. Shared semantics, sanitizing, bounds and evidence are

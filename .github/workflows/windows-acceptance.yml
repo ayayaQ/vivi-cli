@@ -75,7 +75,7 @@ jobs:
       - run: node --test --test-concurrency=1 test/public-url-contract.test.mjs test/public-url.test.mjs test/public-url-html.test.mjs test/public-url-transport.test.mjs test/public-url-host.test.mjs test/public-url-outcomes.test.mjs
       - run: bun test ./test/public-url-contract.test.mjs ./test/public-url.test.mjs ./test/public-url-html.test.mjs ./test/public-url-transport.test.mjs ./test/public-url-host.test.mjs ./test/public-url-outcomes.test.mjs
       # Windows npm scripts do not expand the shell wildcard used by test:tui.
-      - run: bun test ./test/tui.test.ts ./test/application-tui.test.ts ./test/tui-mouse.test.ts ./test/tui-composer-feedback.test.ts ./test/tui-input-diagnostic.test.ts ./test/session-status-tui.test.ts ./test/auto-review-controls-tui.test.ts ./test/skills-tui.test.ts ./test/tool-presentation-tui.test.ts
+      - run: bun test ./test/tui.test.ts ./test/application-tui.test.ts ./test/tui-mouse.test.ts ./test/tui-composer-feedback.test.ts ./test/tui-input-diagnostic.test.ts ./test/session-status-tui.test.ts ./test/auto-review-controls-tui.test.ts ./test/auto-review-status-tui.test.ts ./test/skills-tui.test.ts ./test/tool-presentation-tui.test.ts
       - run: bun test ./test/mcp-controls-tui.test.ts
       - run: npm run test:package
         env:
