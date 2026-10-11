@@ -408,7 +408,7 @@ test('pink and lavender colors are configured and present in native frame spans'
 })
 
 test('renders session header, canonical roles, tools, usage and command hints', async () => {
-  const { io, setup, frame } = await fixture({ height: 40 })
+  const { io, setup, input, frame } = await fixture({ height: 40 })
   const session = newSession({ provider: 'openai', model: 'mock-model', reasoning: 'high' })
   session.history = [...history('## A heading\n\nA **bold** response'),
     { kind: 'tool_result', callId: 'tool-1', name: 'calculate', content: '{"result":2}' }]
@@ -417,14 +417,27 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   const output = await frame()
   expect(output).toContain('openai / mock-model')
   expect((setup.renderer.root.findDescendantById('vivi-header') as TextRenderable).plainText).not.toContain(session.id)
-  expect(output).toContain(`cli-session:${session.id}:history:2`)
+  const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
+  const cards = transcript.getChildren().flatMap(entry => entry.getChildren())
+    .filter(node => node.id.startsWith('vivi-tool-details-')) as TextRenderable[]
+  expect(cards).toHaveLength(1)
+  expect(cards[0]!.plainText).toBe('▸ unverified · calculate')
+  expect(cards[0]!.selectable).toBe(false)
+  const bodyId = cards[0]!.id.replace('vivi-tool-details-', 'vivi-tool-body-')
+  expect(setup.renderer.root.findDescendantById(bodyId)!.getChildren()).toHaveLength(0)
+  expect(output).not.toContain(`cli-session:${session.id}:history:2`)
   expect(output).toContain('reasoning high')
   expect(output).toContain('You')
   expect(output).toContain('Assistant')
   expect(output).toContain('A heading')
-  expect(output).toContain('Tool calculate')
+  expect(output).toContain('unverified · calculate')
   expect(output).toContain('9 in / 8 out / 17 total')
   expect(output).toContain('/new /resume /mode /memories /skills /mcp /settings /menu /help /exit')
+  input.pressKey('o', { ctrl: true }); await frame()
+  const expanded = renderedText(setup.renderer.root.findDescendantById(bodyId)!)
+  expect(expanded).toContain(`cli-session:${session.id}:history:2`)
+  expect(expanded).toContain('Tool "calculate" (call "tool-1")')
+  expect(expanded).toContain('Result:\n{"result":2}')
 })
 
 test('native status labels round, turn and session cache telemetry without inventing zero', async () => {
@@ -1567,7 +1580,7 @@ test('workspace status keeps search results, editor and refresh hints visible in
 })
 
 test('native transcript differentiates user, assistant and activity without changing content or selection', async () => {
-  const { io, setup, frame } = await fixture({ width: 120, height: 80 })
+  const { io, setup, input, frame } = await fixture({ width: 120, height: 80 })
   const session = newSession({ provider: 'openai', model: 'fixture' })
   session.history = [
     { kind: 'message', role: 'user', content: 'Selectable user text' },
@@ -1578,8 +1591,9 @@ test('native transcript differentiates user, assistant and activity without chan
   ]
   const original = structuredClone(session)
   io.setSession(session)
-  const display = await frame()
-  const entries = setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren() as BoxRenderable[]
+  const collapsed = await frame()
+  const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
+  let entries = transcript.getChildren() as BoxRenderable[]
   const label = (index: number) => entries[index]!.getChildren()[0] as TextRenderable
   const body = (index: number) => entries[index]!.getChildren()[1] as TextRenderable
   expect(entries).toHaveLength(5)
@@ -1590,23 +1604,44 @@ test('native transcript differentiates user, assistant and activity without chan
   expect(body(0).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
   expect(label(1).fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
   expect(entries[1]!.border).toBe(false)
-  for (const index of [2, 3]) {
-    expect(label(index).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
-    expect(body(index).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+  expect(label(3).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+  expect(body(3).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+  expect(entries[3]!.border).toBe(false)
+  const ordinaryHeader = label(2), errorHeader = label(4)
+  expect(ordinaryHeader.id).toStartWith('vivi-tool-details-')
+  expect(errorHeader.id).toStartWith('vivi-tool-details-')
+  expect(ordinaryHeader.plainText).toBe('▸ unverified · Assistant')
+  expect(errorHeader.plainText).toBe('▸ error/unverified · failed_tool')
+  for (const index of [2, 4]) {
+    expect(label(index).fg.equals(RGBA.fromHex(TUI_THEME.attention))).toBe(true)
+    expect(label(index).selectable).toBe(false)
+    expect(entries[index]!.getChildren()[1]!.getChildren()).toHaveLength(0)
     expect(entries[index]!.border).toBe(false)
   }
-  expect(label(4).fg.equals(RGBA.fromHex(TUI_THEME.attention))).toBe(true)
-  expect(body(4).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
+  expect(collapsed).not.toContain('Selectable tool text')
+  expect(collapsed).not.toContain('Action failed')
+  input.pressKey('o', { ctrl: true }); await frame()
+  const ordinary = setup.renderer.root.findDescendantById(ordinaryHeader.id)!
+  await setup.mockMouse.click(ordinary.x + 1, ordinary.y)
+  const display = await frame()
+  entries = transcript.getChildren() as BoxRenderable[]
+  const resultBody = (index: number) => entries[index]!.getChildren()[1]!.getChildren()
+    .find(node => node instanceof TextRenderable && node.plainText.startsWith('Result:\n')) as TextRenderable
+  expect(resultBody(2)).toBeInstanceOf(TextRenderable)
+  expect(resultBody(2).plainText).toBe('Result:\nSelectable tool text')
+  expect(resultBody(2).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+  expect(resultBody(4)).toBeInstanceOf(TextRenderable)
+  expect(resultBody(4).plainText).toBe('Result:\nAction failed')
+  expect(resultBody(4).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
   for (const text of ['Selectable user text', 'Assistant content', 'Selectable tool text', 'System context', 'Action failed']) expect(display).toContain(text)
   const spans = setup.captureSpans().lines.flatMap(line => line.spans)
   expect(spans.some(span => span.text.includes('You') && span.fg.equals(RGBA.fromHex(TUI_THEME.lavender)) &&
     span.bg.equals(RGBA.fromHex(TUI_THEME.userBackground)))).toBe(true)
   expect(spans.some(span => span.text.includes('Selectable tool text') && span.fg.equals(RGBA.fromHex(TUI_THEME.muted)))).toBe(true)
-  for (const index of [0, 2]) {
-    const text = body(index)
-    expect(text.selectable).toBe(true)
-    await setup.mockMouse.drag(text.x, text.y, text.x + text.plainText.length, text.y)
-    expect(setup.renderer.getSelection()?.getSelectedText()).toContain(text.plainText)
+  for (const [node, text, rowOffset] of [[body(0), 'Selectable user text', 0], [resultBody(2), 'Selectable tool text', 1]] as const) {
+    expect(node.selectable).toBe(true)
+    await setup.mockMouse.drag(node.x, node.y + rowOffset, node.x + text.length, node.y + rowOffset)
+    expect(setup.renderer.getSelection()?.getSelectedText()).toContain(text)
     setup.renderer.clearSelection()
   }
   expect(session).toEqual(original)

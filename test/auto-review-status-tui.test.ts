@@ -29,7 +29,17 @@ async function fixture() {
   cleanups.push(async () => { io.close(); await Promise.resolve() })
   const frame = async (): Promise<string> => { await tick(); await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
   const transcript = (): string => contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
-  return { io, setup, frame, transcript, input: setup.mockInput }
+  const toolHeader = (name: string): TextRenderable => {
+    const headers = setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren()
+      .flatMap(entry => entry.getChildren()).filter(node => node instanceof TextRenderable &&
+        node.id.startsWith('vivi-tool-details-') && node.plainText.replace(/^[▸▾] /u, '').split(' · ').includes(name)) as TextRenderable[]
+    expect(headers).toHaveLength(1)
+    const header = headers[0]!
+    expect(header.selectable).toBe(false)
+    expect(setup.renderer.root.findDescendantById(header.id.replace('vivi-tool-details-', 'vivi-tool-body-'))!.getChildren()).toHaveLength(0)
+    return header
+  }
+  return { io, setup, frame, transcript, toolHeader, input: setup.mockInput }
 }
 
 type Phase = { kind: 'choice'; names: string[] } | { kind: 'approval'; request: ApprovalRequest }
@@ -115,8 +125,16 @@ for (const action of ['approve', 'deny', 'cancel'] as const) test(`actual app HT
   expect(text.match(/Review · create_memory/g)?.length).toBe(1)
   const final = action === 'approve' ? 'Approved by you; change saved' : action === 'deny' ? 'Denied by you; no save was made' : 'Review cancelled; no save was made'
   expect(text).toContain(final)
-  expect(text.indexOf(final)).toBeLessThan(text.indexOf('Tool create_memory'))
-  if (action !== 'cancel') expect(text.indexOf(final)).toBeLessThan(text.lastIndexOf('Assistant'))
+  const tool = f.toolHeader('create_memory')
+  const finalIndex = text.indexOf(final), toolIndex = text.indexOf(tool.plainText)
+  expect(finalIndex).toBeGreaterThanOrEqual(0)
+  expect(toolIndex).toBeGreaterThanOrEqual(0)
+  expect(finalIndex).toBeLessThan(toolIndex)
+  if (action !== 'cancel') {
+    const assistantIndex = text.lastIndexOf('Assistant')
+    expect(assistantIndex).toBeGreaterThanOrEqual(0)
+    expect(toolIndex).toBeLessThan(assistantIndex)
+  }
   expect((await new FileMemoryStore(f.directory).list()).memories.length).toBe(action === 'approve' ? 1 : 0)
   const records = await new FileDecisionLedger(f.directory).list()
   expect(records.at(-1)?.state).toBe(action === 'approve' ? 'committed' : action === 'deny' ? 'denied' : 'cancelled')
@@ -140,8 +158,11 @@ test('actual app uncertain estimate stays concise beside the exact tool after un
   expect(text).not.toContain('Reviewing create_memory')
   expect(text).not.toContain('Needs your review')
   expect(text.match(/Review · /g)?.length).toBe(1)
-  expect(text.indexOf('Review · create_memory')).toBeGreaterThan(text.indexOf('Tool current_time'))
-  expect(text.indexOf('Review · create_memory')).toBeLessThan(text.indexOf('Tool create_memory'))
+  const clock = f.toolHeader('current_time'), memory = f.toolHeader('create_memory')
+  const clockIndex = text.indexOf(clock.plainText), reviewIndex = text.indexOf('Review · create_memory'), memoryIndex = text.indexOf(memory.plainText)
+  for (const index of [clockIndex, reviewIndex, memoryIndex]) expect(index).toBeGreaterThanOrEqual(0)
+  expect(reviewIndex).toBeGreaterThan(clockIndex)
+  expect(reviewIndex).toBeLessThan(memoryIndex)
 })
 
 test('actual app retains two distinct call outcomes across repeated turns', async () => {

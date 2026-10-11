@@ -28,7 +28,7 @@ import type { RunClock, RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { reviewNoticeSettled } from './auto-review.js'
-import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolSource } from './tool-presentation.js'
+import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolCardView, cliToolSource, isCliLocalReadTool } from './tool-presentation.js'
 import type { CliToolEvidence } from './tool-presentation.js'
 import { mcpContainsSecret } from './mcp-content.js'
 
@@ -99,6 +99,15 @@ function fitStatusColumns(text: string, columns: number, keepStart = false): str
   }
   return `${left}…${right}`
 }
+function toolHeader(card: { readonly title: string; readonly status: string }, collapsed: boolean, columns: number): string {
+  const chevron = collapsed ? '▸' : '▾'
+  if (!card.status) return fitStatusColumns(`${chevron} ${card.title}`, columns, true)
+  // Required safety words survive narrow terminals; only the target is clipped.
+  const prefix = `${chevron} ${card.status}`
+  const remaining = columns - statusTextColumns(prefix) - 3
+  if (remaining < 3) return prefix
+  return `${prefix} · ${fitStatusColumns(card.title.slice(card.status.length + 3), remaining, true)}`
+}
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
 const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /settings /menu /help /exit'
@@ -122,7 +131,7 @@ interface DisplayEntry {
   review?: ReviewNotice
   historyStart?: number
   approval?: object
-  tool?: { encoded: string; key: string; detailBytes?: number; retained?: boolean }
+  tool?: { encoded: string; key: string; detailBytes?: number; retained?: boolean; localRead?: boolean; resultError?: boolean }
 }
 interface SearchPicker {
   choices: readonly Choice<unknown>[]
@@ -218,7 +227,7 @@ export class OpenTuiIO implements ChatIO {
   private partial: MarkdownRenderable | undefined
   private entries: DisplayEntry[] = []
   private toolEvidence: CliToolEvidence | undefined
-  private readonly collapsedTools = new Set<string>()
+  private readonly expandedTools = new Set<string>()
   private liveToolCalls = new Map<string, { call: ToolCall; index: number; resultIndex?: number; key: string; source: ToolPresentation['source']; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
   private liveHistoryIndex = 0
   private activeApproval: { token: object; toolKey: string | undefined } | undefined
@@ -274,6 +283,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.searchPicker) this.renderSearchPicker(false)
     if (this.completions.length) this.renderCompletions()
     this.updateComposerLayout()
+    this.rebuild()
   }
   private readonly pasteHandler = (event: PasteEvent): void => {
     try { this.handlePaste(event) } catch (error) { this.errorHandler({ error }) }
@@ -1285,30 +1295,40 @@ export class OpenTuiIO implements ChatIO {
     const activity = entry.category === 'activity'
     const headerColor = user ? TUI_THEME.lavender : entry.attention ? TUI_THEME.attention : activity ? TUI_THEME.muted : TUI_THEME.pink
     const bodyColor = activity && !entry.attention ? TUI_THEME.muted : TUI_THEME.foreground
-    const box = new BoxRenderable(this.renderer, { flexDirection: 'column', flexShrink: 0, width: '100%', marginBottom: 1,
+    const box = new BoxRenderable(this.renderer, { flexDirection: 'column', flexShrink: 0, width: '100%', marginBottom: entry.tool ? 0 : 1,
       ...(user ? { backgroundColor: TUI_THEME.userBackground, border: ['left'], borderColor: TUI_THEME.lavender, paddingLeft: 1 } : {}) })
-    box.add(new TextRenderable(this.renderer, { content: entry.label, fg: headerColor, flexShrink: 0, wrapMode: 'word' }))
+    if (!entry.tool) box.add(new TextRenderable(this.renderer, { content: entry.label, fg: headerColor, flexShrink: 0, wrapMode: 'word' }))
     if (entry.tool) {
-      const key = entry.tool.key, collapsed = this.collapsedTools.has(key)
-      const view = cliToolPresentationView(entry.tool.encoded, collapsed, entry.tool.detailBytes ?? 8192, this.secrets)
-      for (const line of view.header) box.add(new TextRenderable(this.renderer,
-        { content: this.safe(line), fg: bodyColor, flexShrink: 0, width: '100%', wrapMode: 'word' }))
-      // Safety and provenance are sibling rows, never part of the detail container/budget.
-      for (const warning of view.warnings) box.add(new TextRenderable(this.renderer,
-        { content: this.safe(`Warning: ${warning}`), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+      const key = entry.tool.key, collapsed = !this.expandedTools.has(key)
+      const card = cliToolCardView(entry.tool.encoded, collapsed, entry.tool.detailBytes ?? 8192, this.secrets, entry.tool)
+      const view = card.expanded
       const button = new TextRenderable(this.renderer, { id: `vivi-tool-details-${key}`,
-        content: `${collapsed ? 'Show' : 'Hide'} details · Ctrl+O latest`, fg: TUI_THEME.lavender,
-        flexShrink: 0, width: '100%', wrapMode: 'word' })
+        content: toolHeader(card, collapsed, Math.max(1, this.renderer.width - 3)),
+        fg: card.attention ? TUI_THEME.attention : TUI_THEME.lavender,
+        flexShrink: 0, width: '100%', height: 1, wrapMode: 'none' })
       button.selectable = false
-      button.onMouse = event => this.mouseActivation.handle(event, button, key, entry.tool, !this.closed && this.entries.includes(entry),
-        () => this.toggleToolDetails(key))
+      button.onMouse = event => {
+        // Wheel events bubble to the transcript; they never toggle a call.
+        if (event.type === 'scroll') { this.mouseActivation.clear(); return }
+        this.mouseActivation.handle(event, button, key, entry.tool, !this.closed && this.entries.includes(entry),
+          () => this.toggleToolDetails(key))
+      }
       box.add(button)
+      // Actionable custom warnings stay outside the detail budget, even when collapsed.
+      for (const warning of collapsed ? card.warnings : []) box.add(new TextRenderable(this.renderer,
+        { content: this.safe(warning), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
       const details = new BoxRenderable(this.renderer, { id: `vivi-tool-body-${key}`, flexDirection: 'column',
         flexShrink: 0, width: '100%' })
+      if (!collapsed) {
+        for (const line of view.header) details.add(new TextRenderable(this.renderer,
+          { content: this.safe(line), fg: bodyColor, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+        for (const warning of view.warnings) details.add(new TextRenderable(this.renderer,
+          { content: this.safe(`Warning: ${warning}`), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+      }
       for (const section of view.details) details.add(new TextRenderable(this.renderer,
         { content: this.safe(`${section.label}:\n${section.text}`), fg: bodyColor, width: '100%', wrapMode: 'word', flexShrink: 0 }))
       box.add(details)
-      if (view.notice) box.add(new TextRenderable(this.renderer,
+      if (!collapsed && view.notice) details.add(new TextRenderable(this.renderer,
         { content: view.notice, fg: TUI_THEME.muted, width: '100%', wrapMode: 'word', flexShrink: 0 }))
     }
     if (entry.content && !entry.tool) box.add(entry.markdown ? this.markdown(entry.content) : new TextRenderable(this.renderer,
@@ -1318,8 +1338,8 @@ export class OpenTuiIO implements ChatIO {
   }
   private toggleToolDetails(key: string): void {
     this.mouseActivation.clear()
-    if (this.collapsedTools.has(key)) this.collapsedTools.delete(key)
-    else this.collapsedTools.add(key)
+    if (this.expandedTools.has(key)) this.expandedTools.delete(key)
+    else this.expandedTools.add(key)
     this.rebuild()
   }
   setToolEvidence(evidence: CliToolEvidence): void { this.toolEvidence = evidence }
@@ -1396,17 +1416,17 @@ export class OpenTuiIO implements ChatIO {
   private historyEntries(history: readonly HistoryMessage[]): DisplayEntry[] {
     const entries: DisplayEntry[] = []
     let budget = MAX_DISPLAY
+    let earliestIndex = history.length, omitted = false
     let latestTurn = 0
     for (let index = history.length - 1; index >= 0; index--) {
       const message = history[index]!
       if (message.kind === 'message' && message.role === 'user') { latestTurn = index; break }
     }
     for (let index = history.length - 1; index >= 0 && entries.length < MAX_ENTRIES - 1 && (budget > 0 || index >= latestTurn); index--) {
+      earliestIndex = index
       const message = history[index]!
       const label = message.kind === 'message' ? message.role === 'user' ? 'You' : 'System'
         : message.kind === 'assistant' ? 'Assistant' : `Tool ${message.name} · ${message.isError ? 'error result' : 'result'}`
-      const tools = message.kind === 'assistant' && message.toolCalls.length
-        ? `\nTools requested: ${message.toolCalls.map((call) => call.name).join(', ')}` : ''
       const safeLabel = this.safe(label, 4096)
       if (message.kind === 'tool_result') {
         let encoded: string
@@ -1424,18 +1444,40 @@ export class OpenTuiIO implements ChatIO {
         const detailBytes = Math.max(0, Math.min(8192, budget))
         const view = cliToolPresentationView(encoded, false, detailBytes, this.secrets)
         entries.unshift({ category: 'activity', label: safeLabel, content: '', markdown: false, historyIndex: index,
-          attention: !!message.isError, tool: { encoded, key, detailBytes, retained: index >= latestTurn } })
+          attention: !!message.isError, tool: { encoded, key, detailBytes, retained: index >= latestTurn,
+            localRead: requestIndex !== index && isCliLocalReadTool(message.name), resultError: !!message.isError } })
         // Whole-history retention may omit old complete cards, never slice their safety rows.
         budget -= view.details.reduce((sum, section) => sum + section.text.length, 0)
         continue
       }
-      if (budget <= 0) continue
-      const content = this.safe(message.content + tools, Math.max(0, budget - safeLabel.length))
+      if (message.kind === 'assistant') {
+        // Incomplete saved turns still expose each unresolved call. A matching
+        // result is already represented once at its canonical chronology slot.
+        const unresolved = message.toolCalls.filter(call => {
+          for (let following = index + 1; following < history.length; following++) {
+            const candidate = history[following]!
+            if (candidate.kind === 'message' && candidate.role === 'user' || candidate.kind === 'assistant') break
+            if (candidate.kind === 'tool_result' && candidate.callId === call.id && candidate.name === call.name) return false
+          }
+          return true
+        }).map(call => {
+          let encoded: string
+          try { encoded = JSON.stringify(createCliToolPresentation({ call, status: 'unknown', effect: 'unreported',
+            source: cliToolSource(this.sessionId, index, message), secrets: this.secrets })) }
+          catch { encoded = '' }
+          return { category: 'activity' as const, label: '', content: '', markdown: false, historyIndex: index,
+            tool: { encoded, key: this.toolKey(index, call.id), detailBytes: Math.max(0, Math.min(8192, budget)), retained: index >= latestTurn } }
+        })
+        entries.unshift(...unresolved)
+      }
+      if (budget <= 0) { if (message.content) omitted = true; continue }
+      const content = this.safe(message.content, Math.max(0, budget - safeLabel.length))
+      if (!content) continue
       entries.unshift({ category: message.kind === 'message' && message.role === 'user' ? 'user' : message.kind === 'assistant' ? 'assistant' : 'activity',
         label: safeLabel, content, markdown: message.kind === 'assistant', historyIndex: index })
       budget -= safeLabel.length + content.length
     }
-    if (entries.length < history.length) entries.unshift({ category: 'activity', label: 'Display limit',
+    if (earliestIndex > 0 || omitted) entries.unshift({ category: 'activity', label: 'Display limit',
       content: 'Earlier transcript is omitted from this bounded view; saved history is unchanged', markdown: false })
     return entries
   }
@@ -1503,7 +1545,7 @@ export class OpenTuiIO implements ChatIO {
     this.resultNotices = []
     this.reviewNotices = []
     this.toolEvidence = undefined
-    this.collapsedTools.clear()
+    this.expandedTools.clear()
     this.liveToolCalls.clear()
     this.historyLength = 0
     this.turnHistoryStart = 0
@@ -1528,7 +1570,7 @@ export class OpenTuiIO implements ChatIO {
       this.reviewNotices = []
       this.turnHistoryStart = 0
       this.clearStream()
-      this.collapsedTools.clear()
+      this.expandedTools.clear()
       this.liveToolCalls.clear()
       this.status = 'Ready'
     }
@@ -1625,7 +1667,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus('Receiving response · partial display only')
     } else if (event.type === 'assistant') {
       this.clearStream()
-      this.appendEntry({ category: 'assistant', label: 'Assistant', content: event.message.content, markdown: true })
+      if (event.message.content) this.appendEntry({ category: 'assistant', label: 'Assistant', content: event.message.content, markdown: true })
       const index = this.liveHistoryIndex++
       for (const [ordinal, call] of event.message.toolCalls.entries()) {
         // Canonical results occupy ordered batch slots even when cancellation
@@ -1657,7 +1699,8 @@ export class OpenTuiIO implements ChatIO {
       const entry: DisplayEntry = { category: 'activity', attention: !!event.message.isError,
         label: this.safe(`Tool ${event.message.name} · ${event.message.isError ? 'error result' : 'result'}`, 4096), content: '', markdown: false,
         ...(resultIndex === undefined ? {} : { historyIndex: resultIndex }),
-        tool: { encoded, key: live?.key ?? `display-${this.displaySequence++}`, retained: true } }
+        tool: { encoded, key: live?.key ?? `display-${this.displaySequence++}`, retained: true,
+          localRead: !!live && isCliLocalReadTool(call.name), resultError: !!event.message.isError } }
       if (old) this.entries[this.entries.indexOf(old)] = entry
       else this.entries.push(entry)
       this.liveToolCalls.delete(event.message.callId)
