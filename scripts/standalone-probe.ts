@@ -262,12 +262,20 @@ try {
   io.toolPresentation(JSON.stringify({ version: 1, callId: 'compiled-card', name: 'offline_tool', status: 'approval_required', effect: 'unknown',
     source: { reference: 'owned://compiled/presentation', revision: 'compiled-1' }, arguments: { kind: 'text', text: 'review arguments' },
     result: { kind: 'future-card', text: 'Compiled safe fallback', data: { approved: true, execute: 'NEVER_EXECUTE' } } }))
-  setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
   const allText = (node: Renderable): string => [node instanceof TextRenderable ? node.plainText : '', ...node.getChildren().map(allText)].join('\n')
+  await setup.renderOnce(); await setup.renderOnce()
+  const collapsed = allText(setup.renderer.root.findDescendantById('vivi-transcript')!)
+  assert(collapsed.includes('approval/unknown'))
+  assert(!collapsed.includes('owned://compiled/presentation')); assert(!collapsed.includes('review arguments'))
+  assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0')!.getChildren().length, 0)
+  setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
   const card = allText(setup.renderer.root.findDescendantById('vivi-transcript')!)
   assert(card.includes('Approval required')); assert(card.includes('External effects are unknown'))
   assert(card.includes('owned://compiled/presentation')); assert(card.includes('unsupported presentation kind'))
-  assert(card.includes('Details collapsed.')); assert(!card.includes('NEVER_EXECUTE'))
+  assert(card.includes('Compiled safe fallback')); assert(!card.includes('NEVER_EXECUTE'))
+  const toolHeader = setup.renderer.root.findDescendantById('vivi-tool-details-display-0')!
+  await setup.mockMouse.click(toolHeader.x + toolHeader.width - 1, toolHeader.y)
+  await setup.renderOnce(); await setup.renderOnce()
   assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0')!.getChildren().length, 0)
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
