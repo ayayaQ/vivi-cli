@@ -213,8 +213,9 @@ for (const [label, make] of [
   ['rejected callback', () => { throw new Error('Owned question callback failed') }]
 ]) test(`malformed or failed host response (${label}) is an ordinary error result for the exact call`, async t => {
   let rounds = 0
+  const requested = label === 'duplicate answers' ? [question(), question('other')] : [question()]
   const { host, store } = await fixture(t, { questionHost: { isAvailable: () => true, ask: make },
-    provider: { async generate() { return ++rounds === 1 ? response([call()]) : response([], 'Question failed') } } })
+    provider: { async generate() { return ++rounds === 1 ? response([call(requested)]) : response([], 'Question failed') } } })
   const result = await host.send('Ask and validate input')
   assert.equal(result.status, 'completed'); assert.equal(results(result)[0].isError, true)
   assert.equal(JSON.parse(results(result)[0].content).error.code, 'tool_error'); assertClosed(result, store)
@@ -246,10 +247,11 @@ for (const mode of ['cancel', 'caller-abort', 'shutdown']) test(`${mode} dismiss
   else assert.equal((await host.send('A new run uses a new owner')).status, 'completed')
 })
 
-for (const changed of ['account', 'capability', 'model-tools', 'host']) test(`changing ${changed} aborts an uncooperative question before its late answer or rejection can leak`, async t => {
+for (const changed of ['account', 'capability', 'account-error', 'capability-error', 'model-tools', 'host']) test(`changing ${changed} aborts an uncooperative question before its late answer or rejection can leak`, async t => {
   const entered = deferred(), pending = deferred()
-  let account = 'first', available = true, request, promptSignal, rounds = 0
-  const options = { questionHost: { isAvailable: () => available, accountRevision: () => account, ask(value, { signal }) {
+  let account = 'first', available = true, accountError = false, capabilityError = false, request, promptSignal, rounds = 0
+  const options = { questionHost: { isAvailable: () => { if (capabilityError) throw new Error('Capability reader revoked'); return available },
+    accountRevision: () => { if (accountError) throw new Error('Account reader revoked'); return account }, ask(value, { signal }) {
     request = value; promptSignal = signal; entered.resolve(); return pending.promise
   } }, provider: { async generate() { return ++rounds === 1 ? response([call()]) : response([], 'No stale answer') } } }
   const store = persistence(), mutable = { ...options, store, session: newSession(settings) }
@@ -261,6 +263,8 @@ for (const changed of ['account', 'capability', 'model-tools', 'host']) test(`ch
   await promptly(entered.promise, 'Question display')
   if (changed === 'account') account = 'replacement'
   if (changed === 'capability') available = false
+  if (changed === 'account-error') accountError = true
+  if (changed === 'capability-error') capabilityError = true
   if (changed === 'model-tools') mutable.enableTools = false
   if (changed === 'host') mutable.questionHost = { isAvailable: () => true, ask() { assert.fail('Replacement host entered an existing run') } }
   const result = await promptly(sending, 'Stale question cancellation')
@@ -357,6 +361,38 @@ for (const where of ['answer', 'error']) test(`known credential in host ${where}
   const result = await host.send('Ask an ordinary preference')
   assert.equal(results(result)[0].isError, true)
   for (const data of [result, events, store.snapshots]) assert.equal(JSON.stringify(data).includes(secret), false)
+})
+
+test('newly registered and encoded answer credentials are re-screened when the live host settles', async t => {
+  const entered = deferred(), pending = deferred(), secrets = []
+  const secret = 'owned-new-answer-credential-marker', encoded = [...secret].map(char => `%${char.charCodeAt(0).toString(16)}`).join('')
+  const events = []
+  let request, rounds = 0
+  const { host, store } = await fixture(t, { secrets, onEvent(event) { events.push(structuredClone(event)) },
+    questionHost: { isAvailable: () => true, ask(value) { request = value; entered.resolve(); return pending.promise } },
+    provider: { async generate({ messages }) {
+      assert.equal(JSON.stringify(messages).includes(encoded), false)
+      return ++rounds === 1 ? response([call()]) : response([], 'Newly known answer withheld')
+    } } })
+  const sending = host.send('Ask and wait for the current answer')
+  await promptly(entered.promise, 'Live credential-screening prompt')
+  secrets.push(secret)
+  pending.resolve(answered(request, [{ id: 'delivery', answer: { kind: 'text', text: encoded } }]))
+  const result = await sending
+  assert.equal(result.status, 'completed'); assert.equal(results(result)[0].isError, true)
+  for (const data of [result, events, store.snapshots]) {
+    assert.equal(JSON.stringify(data).includes(secret), false); assert.equal(JSON.stringify(data).includes(encoded), false)
+  }
+})
+
+test('capability loss before tool admission does not show a prompt or admit a replacement callback', async t => {
+  let available = true, asks = 0, rounds = 0
+  const { host } = await fixture(t, { onEvent(event) { if (event.type === 'tool_started') available = false },
+    questionHost: { isAvailable: () => available, ask() { asks++; assert.fail('Stale pre-admission prompt') } },
+    provider: { async generate() { return ++rounds === 1 ? response([call()]) : response([], 'No stale prompt') } } })
+  const result = await host.send('Recheck capability before asking')
+  assert.equal(result.status, 'completed'); assert.equal(asks, 0)
+  assert.equal(JSON.parse(results(result)[0].content).status, 'cancelled')
 })
 
 test('the application uses its genuine ChatIO question callback and never infers capability from approval UI', async t => {

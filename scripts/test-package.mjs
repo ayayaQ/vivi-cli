@@ -745,6 +745,9 @@ try {
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
   assert(setup.renderer.root.findDescendantById('vivi-questions'))
   assert.equal(setup.renderer.root.findDescendantById('vivi-approve'), undefined)
+  // The preceding mouse approval deliberately disarms new dialog mouse actions
+  // for 600ms, so the next independent human gesture must occur after that guard.
+  await new Promise(resolve => setTimeout(resolve, 650))
   const long = setup.renderer.root.findDescendantById('vivi-question-option-1')
   await setup.mockMouse.click(long.x + 1, long.y)
   await setup.renderOnce(); await setup.renderOnce()

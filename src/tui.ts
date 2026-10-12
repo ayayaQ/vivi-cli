@@ -1087,12 +1087,14 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return
     // Launch-owned managers may keep cancellation armed while a modal is open.
     // Settle that modal too, so Ctrl-C cannot leave a cancelled picker hanging.
-    if (this.pending && (this.pending.kind !== 'chat' || this.cancelCallbacks.size)) this.pending.finish(undefined)
+    const chat = this.pending?.kind === 'chat' ? this.pending : undefined
+    if (this.pending && this.pending.kind !== 'chat') this.pending.finish(undefined)
     this.clearInput()
     if (this.cancelCallbacks.size) {
       this.runStatus.setPhase('cancelling')
       this.updateStatus('Cancelling…')
       for (const callback of [...this.cancelCallbacks]) callback()
+      if (chat && this.pending === chat) chat.finish(undefined)
     } else if (!escape) this.close()
     else this.pending?.finish(undefined)
   }
@@ -1318,6 +1320,7 @@ export class OpenTuiIO implements ChatIO {
       : choices[index] ? { kind: 'selected', value: choices[index]!.value, query: search.query } : undefined
   }
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+    if (this.closed || signal.aborted) return Promise.resolve(false)
     // Preserve the existing approval preemption path, but never reorder a queued dialog.
     if (!this.inputQueue.pending && this.pending && !['chat', 'approval', 'question'].includes(this.pending.kind)) this.pending.finish(undefined)
     return this.queueDialog(signal, () => false, activeSignal => this.showApproval(request, activeSignal))
@@ -1358,7 +1361,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return Promise.resolve(cancelled())
     this.inputQueue.setBlocked(!!this.pending && !['chat', 'approval', 'question'].includes(this.pending.kind))
     const bound = AbortSignal.any([signal, this.dialogOwner.signal])
-    return this.inputQueue.enqueue(bound, cancelled, async activeSignal => {
+    return this.inputQueue.enqueue(bound, () => { if (this.failure) throw this.failure; return cancelled() }, async activeSignal => {
       const token = {}; this.activeDialog = token
       if (this.pending?.kind === 'chat') {
         this.suspendedChat = { pending: this.pending, text: this.composer.plainText,
@@ -1424,20 +1427,20 @@ export class OpenTuiIO implements ChatIO {
       this.pickerBox.visible = false
       if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
       try {
-      this.appendEntry({ category: 'activity', label: 'Questions · answers do not authorize actions', markdown: false,
-        content: this.safe(request.questions.map((question, index) => `${index + 1}. ${question.header}: ${question.question}${question.options ? '\n' + question.options.map(option => `${option.label}${option.description ? ' · ' + option.description : ''}`).join('\n') : ''}`).join('\n\n')) })
-      this.questionDialog = new QuestionDialog(this.renderer, request, {
-        safe: (text, limit) => this.safe(text, limit), clean: stripControls, ready: () => this.pending === pending && this.ready(pending),
-        mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
-        status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
-        accent: TUI_THEME.lavender, background: TUI_THEME.background, selected: TUI_THEME.selectedBackground })
-      this.shell.insertBefore(this.questionDialog.box, this.modelLine)
-      this.hintLine.content = '↑/↓ choose · Enter saves · Tab actions · Ctrl+Enter Submit · Escape cancels questions'
-      this.runStatus.setPhase('waiting_question')
-      this.updateActionBar(); this.updateStatus('Questions need your answer · Submit when ready')
-      signal.addEventListener('abort', abort, { once: true })
-      if (signal.aborted || this.closed) { abort(); return }
-      timer = setTimeout(() => { if (this.pending === pending && !this.closed) pending.armed = true }, 0)
+        this.appendEntry({ category: 'activity', label: 'Questions · answers do not authorize actions', markdown: false,
+          content: this.safe(request.questions.map((question, index) => `${index + 1}. ${question.header}: ${question.question}${question.options ? '\n' + question.options.map(option => `${option.label}${option.description ? ' · ' + option.description : ''}`).join('\n') : ''}`).join('\n\n')) })
+        this.questionDialog = new QuestionDialog(this.renderer, request, {
+          safe: (text, limit) => this.safe(text, limit), clean: stripControls, ready: () => this.pending === pending && this.ready(pending),
+          mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
+          status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
+          accent: TUI_THEME.lavender, background: TUI_THEME.background })
+        this.shell.insertBefore(this.questionDialog.box, this.modelLine)
+        this.hintLine.content = '↑/↓ choose · Enter saves · Tab actions · Ctrl+Enter Submit · Escape cancels questions'
+        this.runStatus.setPhase('waiting_question')
+        this.updateActionBar(); this.updateStatus('Questions need your answer · Submit when ready')
+        signal.addEventListener('abort', abort, { once: true })
+        if (signal.aborted || this.closed) { abort(); return }
+        timer = setTimeout(() => { if (this.pending === pending && !this.closed) pending.armed = true }, 0)
       } catch (error) {
         finish(cancelled())
         if (!this.closed) this.updateStatus(`Question dialog unavailable: ${error instanceof Error ? error.message : 'native setup failed'}`)

@@ -68,57 +68,57 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
 } })
 try {
   {
-  // Real compiled consumer of the published renderer-neutral question API.
-  const option: QuestionOption = { id: 'short', label: 'Short', description: 'Concise' }
-  const question: Question = { id: 'style', header: 'Style', question: 'Which style?', options: [option, { id: 'long', label: 'Long' }] }
-  const questions: readonly Question[] = [question, { id: 'detail', header: 'Details', question: 'Anything else?' },
-    { id: 'skip', header: 'Optional', question: 'Any optional detail?' }]
-  const choice: QuestionAnswer = { kind: 'option', optionId: 'long' }
-  const entries: readonly QuestionAnswerEntry[] = [{ id: 'style', answer: choice },
-    { id: 'detail', answer: { kind: 'text', text: 'Compiled Unicode 你好 🌱\nSecond line' } }, { id: 'skip', answer: { kind: 'skipped' } }]
-  const sample: QuestionRequest = { requestId: 'compiled-types', callId: 'compiled-types', questions }
-  const cancelled: QuestionResponse = { requestId: sample.requestId, status: 'cancelled' }
-  void cancelled
-  assert.equal(QUESTION_LIMITS.questions, 3)
-  let compiledQuestionRequest: QuestionRequest | undefined, questionAsks = 0
-  const ask: QuestionHost = (request, { signal }): QuestionResponse => {
-    assert.equal(signal.aborted, false); questionAsks++; compiledQuestionRequest = request
-    return { requestId: request.requestId, status: 'answered', answers: entries }
-  }
-  const cliQuestionHost: CliQuestionHost = { ask, isAvailable: () => true, accountRevision: () => 'compiled-owned-account' }
-  const registry = createToolRegistry([createQuestionExtension({ ask })])
-  const direct = await registry.executeTool({ id: 'compiled-question-direct', name: 'request_user_input', arguments: { questions: JSON.parse(JSON.stringify(questions)) } },
-    { signal: new AbortController().signal })
-  assert.deepEqual(JSON.parse(direct.content).answers, entries)
-  assert.equal(createQuestionExtension().tools.length, 0)
-  for (const mode of ['execute', 'plan'] as const) {
-    const snapshots: unknown[] = []
-    let rounds = 0, approvals = 0
-    const options: CliHostOptions = { session: newSession({ provider: 'openai', model: 'compiled-offline-questions' }),
-      store: { async save(session) { snapshots.push(structuredClone(session.history)) },
-        async load() { throw new Error('No compiled question session replay') } },
-      questionHost: cliQuestionHost, enableNotes: true, approve: async () => { approvals++; return false },
-      provider: { async generate({ messages, tools }) {
-        assert(tools.some(tool => tool.name === 'request_user_input'))
-        if (++rounds === 1) return { content: '', toolCalls: [{ id: 'compiled-question-host', name: 'request_user_input', arguments: { questions: JSON.parse(JSON.stringify(questions)) } }] }
-        const result = messages.at(-1)!
-        assert.equal(result.kind, 'tool_result')
-        if (result.kind !== 'tool_result') throw new Error('Compiled question result missing')
-        assert.equal(result.callId, 'compiled-question-host'); assert.equal(result.name, 'request_user_input')
-        assert.deepEqual(JSON.parse(result.content), { requestId: compiledQuestionRequest!.requestId, status: 'answered', answers: entries })
-        return { content: 'Compiled questions accepted', toolCalls: [] }
-      } } }
-    const host = new CliHost(options)
-    try {
-      host.setTaskMode(mode)
-      const result = await host.send('Clarify the offline compiled fixture')
-      assert.equal(result.status, 'completed'); assert.equal(approvals, 0)
-      assert.equal(host.approvalMode, 'manual'); assert.equal(host.session.noteRevision, 0)
-      assert.deepEqual(snapshots.at(-1), result.history)
-      assert.equal(result.history.filter(message => message.kind === 'tool_result').length, 1)
-    } finally { await host.shutdown() }
-  }
-  assert.equal(questionAsks, 3)
+    // Real compiled consumer of the published renderer-neutral question API.
+    const option: QuestionOption = { id: 'short', label: 'Short', description: 'Concise' }
+    const question: Question = { id: 'style', header: 'Style', question: 'Which style?', options: [option, { id: 'long', label: 'Long' }] }
+    const questions: readonly Question[] = [question, { id: 'detail', header: 'Details', question: 'Anything else?' },
+      { id: 'skip', header: 'Optional', question: 'Any optional detail?' }]
+    const choice: QuestionAnswer = { kind: 'option', optionId: 'long' }
+    const entries: readonly QuestionAnswerEntry[] = [{ id: 'style', answer: choice },
+      { id: 'detail', answer: { kind: 'text', text: 'Compiled Unicode 你好 🌱\nSecond line' } }, { id: 'skip', answer: { kind: 'skipped' } }]
+    const sample: QuestionRequest = { requestId: 'compiled-types', callId: 'compiled-types', questions }
+    const cancelled: QuestionResponse = { requestId: sample.requestId, status: 'cancelled' }
+    void cancelled
+    assert.equal(QUESTION_LIMITS.questions, 3)
+    let compiledQuestionRequest: QuestionRequest | undefined, questionAsks = 0
+    const ask: QuestionHost = (request, { signal }): QuestionResponse => {
+      assert.equal(signal.aborted, false); questionAsks++; compiledQuestionRequest = request
+      return { requestId: request.requestId, status: 'answered', answers: entries }
+    }
+    const cliQuestionHost: CliQuestionHost = { ask, isAvailable: () => true, accountRevision: () => 'compiled-owned-account' }
+    const registry = createToolRegistry([createQuestionExtension({ ask })])
+    const direct = await registry.executeTool({ id: 'compiled-question-direct', name: 'request_user_input', arguments: { questions: JSON.parse(JSON.stringify(questions)) } },
+      { signal: new AbortController().signal })
+    assert.deepEqual(JSON.parse(direct.content).answers, entries)
+    assert.equal(createQuestionExtension().tools.length, 0)
+    for (const mode of ['execute', 'plan'] as const) {
+      const snapshots: unknown[] = []
+      let rounds = 0, approvals = 0
+      const options: CliHostOptions = { session: newSession({ provider: 'openai', model: 'compiled-offline-questions' }),
+        store: { async save(session) { snapshots.push(structuredClone(session.history)) },
+          async load() { throw new Error('No compiled question session replay') } },
+        questionHost: cliQuestionHost, enableNotes: true, approve: async () => { approvals++; return false },
+        provider: { async generate({ messages, tools }) {
+          assert(tools.some(tool => tool.name === 'request_user_input'))
+          if (++rounds === 1) return { content: '', toolCalls: [{ id: 'compiled-question-host', name: 'request_user_input', arguments: { questions: JSON.parse(JSON.stringify(questions)) } }] }
+          const result = messages.at(-1)!
+          assert.equal(result.kind, 'tool_result')
+          if (result.kind !== 'tool_result') throw new Error('Compiled question result missing')
+          assert.equal(result.callId, 'compiled-question-host'); assert.equal(result.name, 'request_user_input')
+          assert.deepEqual(JSON.parse(result.content), { requestId: compiledQuestionRequest!.requestId, status: 'answered', answers: entries })
+          return { content: 'Compiled questions accepted', toolCalls: [] }
+        } } }
+      const host = new CliHost(options)
+      try {
+        host.setTaskMode(mode)
+        const result = await host.send('Clarify the offline compiled fixture')
+        assert.equal(result.status, 'completed'); assert.equal(approvals, 0)
+        assert.equal(host.approvalMode, 'manual'); assert.equal(host.session.noteRevision, 0)
+        assert.deepEqual(snapshots.at(-1), result.history)
+        assert.equal(result.history.filter(message => message.kind === 'tool_result').length, 1)
+      } finally { await host.shutdown() }
+    }
+    assert.equal(questionAsks, 3)
   }
   await mcp.configure({ id: 'compiled', label: 'Owned compiled fixture', executable: process.execPath,
     args: [], cwd: directory, protocol: 'legacy', environment: [] })

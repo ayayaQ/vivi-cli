@@ -18,18 +18,17 @@ interface DialogOptions {
   foreground: string | import('@opentui/core').RGBA
   accent: string
   background: string
-  selected: string
 }
 
 /** A per-request native editor. Choices are drafts until the human presses Submit. */
 export class QuestionDialog {
   readonly box: BoxRenderable
-  private readonly heading: TextRenderable
-  private readonly choices: BoxRenderable
-  private readonly editorBox: BoxRenderable
-  private readonly editor: TextareaRenderable
-  private readonly actions: BoxRenderable
-  private readonly progress: TextRenderable
+  private readonly heading!: TextRenderable
+  private readonly choices!: BoxRenderable
+  private readonly editorBox!: BoxRenderable
+  private readonly editor!: TextareaRenderable
+  private readonly actions!: BoxRenderable
+  private readonly progress!: TextRenderable
   private readonly mouse = new MouseActivation()
   private readonly drafts: Draft[]
   private page = 0
@@ -46,32 +45,32 @@ export class QuestionDialog {
     this.drafts = request.questions.map(() => ({ text: '' }))
     this.box = new BoxRenderable(renderer, { id: 'vivi-questions', width: '100%', height: 12,
       flexShrink: 0, flexDirection: 'column', border: true, borderColor: options.accent,
-      titleColor: options.accent, title: 'Questions · answers only', paddingX: 1 })
+      titleColor: options.accent, title: 'Questions · answers only', bottomTitle: 'Tab · Enter · ^Enter Submit · Esc', paddingX: 1 })
     try {
-    this.progress = new TextRenderable(renderer, { id: 'vivi-question-progress', height: 1,
-      flexShrink: 0, fg: options.accent, wrapMode: 'none' })
-    this.heading = new TextRenderable(renderer, { id: 'vivi-question-heading', width: '100%',
-      height: 2, flexShrink: 0, fg: options.foreground, wrapMode: 'word' })
-    this.choices = new BoxRenderable(renderer, { id: 'vivi-question-choices', width: '100%',
-      height: 4, flexShrink: 0, flexDirection: 'column' })
-    this.editorBox = new BoxRenderable(renderer, { id: 'vivi-question-editor-box', width: '100%',
-      height: 2, flexShrink: 0 })
-    this.editor = new TextareaRenderable(renderer, { id: 'vivi-question-editor', width: '100%',
-      height: '100%', wrapMode: 'word', backgroundColor: options.background,
-      focusedBackgroundColor: options.background, textColor: options.foreground,
-      focusedTextColor: options.foreground, cursorColor: options.accent,
-      placeholder: 'Your answer · Enter reviews; Ctrl+J adds a newline',
-      keyBindings: ['return', 'kpenter'].flatMap(name => [{ name, action: 'submit' as const },
-        { name, shift: true, action: 'newline' as const }, { name, meta: true, action: 'newline' as const }]),
-      onSubmit: () => this.reviewText(), onContentChange: () => this.changed() })
-    this.editor.onMouse = event => {
-      if (event.type === 'down' && event.button === 0 && this.live()) { this.focus = 'text'; this.editor.focus() }
-    }
-    this.editorBox.add(this.editor)
-    this.actions = new BoxRenderable(renderer, { id: 'vivi-question-actions', height: 1,
-      flexShrink: 0, flexDirection: 'row', gap: 1 })
-    for (const child of [this.progress, this.heading, this.choices, this.editorBox, this.actions]) this.box.add(child)
-    this.render()
+      this.progress = new TextRenderable(renderer, { id: 'vivi-question-progress', height: 1,
+        flexShrink: 0, fg: options.accent, wrapMode: 'none' })
+      this.heading = new TextRenderable(renderer, { id: 'vivi-question-heading', width: '100%',
+        height: 2, flexShrink: 0, fg: options.foreground, wrapMode: 'word' })
+      this.choices = new BoxRenderable(renderer, { id: 'vivi-question-choices', width: '100%',
+        height: 4, flexShrink: 0, flexDirection: 'column' })
+      this.editorBox = new BoxRenderable(renderer, { id: 'vivi-question-editor-box', width: '100%',
+        height: 2, flexShrink: 0 })
+      this.editor = new TextareaRenderable(renderer, { id: 'vivi-question-editor', width: '100%',
+        height: '100%', wrapMode: 'word', backgroundColor: options.background,
+        focusedBackgroundColor: options.background, textColor: options.foreground,
+        focusedTextColor: options.foreground, cursorColor: options.accent,
+        placeholder: 'Your answer · Enter reviews; Ctrl+J adds a newline',
+        keyBindings: ['return', 'kpenter'].flatMap(name => [{ name, action: 'submit' as const },
+          { name, shift: true, action: 'newline' as const }, { name, meta: true, action: 'newline' as const }]),
+        onSubmit: () => this.reviewText(), onContentChange: () => this.changed() })
+      this.editor.onMouse = event => {
+        if (event.type === 'down' && event.button === 0 && this.live()) { this.focus = 'text'; this.editor.focus() }
+      }
+      this.editorBox.add(this.editor)
+      this.actions = new BoxRenderable(renderer, { id: 'vivi-question-actions', height: 1,
+        flexShrink: 0, flexDirection: 'row', gap: 1 })
+      for (const child of [this.progress, this.heading, this.choices, this.editorBox, this.actions]) this.box.add(child)
+      this.render()
     } catch (error) {
       // Construction may fail before a child is attached to the dialog root.
       for (const node of [this.editor, this.editorBox, this.heading, this.choices, this.actions, this.progress, this.box]) {
@@ -112,7 +111,7 @@ export class QuestionDialog {
     if (text !== raw) {
       this.changing = true
       try { this.editor.setText(text); this.editor.gotoBufferEnd() } finally { this.changing = false }
-      this.options.status(raw.length > MAX_ANSWER ? `Answer limit: ${MAX_ANSWER} characters` : 'Terminal control text removed from the answer editor')
+      this.options.status('Terminal control text removed from the answer editor')
     }
     this.current().text = text
     if (text.trim()) this.current().answer = { kind: 'text', text }
