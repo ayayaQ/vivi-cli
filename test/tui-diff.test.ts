@@ -198,3 +198,29 @@ test('coloring retains the native Unicode glyph frame and exact copied content a
     } finally { setup.renderer.destroy() }
   }
 })
+
+test('scrolling long diffs never paints the fixed header, footer or transcript margins', async () => {
+  const f = await fixture(palettes[1], 40, 16)
+  const r = request('old\n', Array.from({ length: 80 }, (_, i) => `new ${i} ` + 'word '.repeat(30)).join('\n') + '\n')
+  const answer = f.io.approve(r, new AbortController().signal); await f.frame()
+  const transcript = f.setup.renderer.root.findDescendantById('vivi-transcript') as ScrollBoxRenderable
+  for (const [width, height] of [[40, 16], [28, 12], [100, 40]] as const) {
+    f.setup.resize(width, height); await f.frame()
+    for (const position of [0, 15, transcript.scrollHeight]) {
+      transcript.scrollTo(position); await f.frame()
+      const viewport = transcript.viewport
+      for (const [y, line] of f.setup.captureSpans().lines.entries()) {
+        let x = 0
+        for (const span of line.spans) {
+          const end = x + span.width
+          if (y < viewport.y || y >= viewport.y + viewport.height || end <= viewport.x || x >= viewport.x + viewport.width) {
+            expect(span.bg.equals(RGBA.fromHex(WORKSPACE_DIFF_COLORS.addedBackground)) ||
+              span.bg.equals(RGBA.fromHex(WORKSPACE_DIFF_COLORS.removedBackground))).toBe(false)
+          }
+          x = end
+        }
+      }
+    }
+  }
+  f.input.pressEscape(); expect(await answer).toBe(false)
+})

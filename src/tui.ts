@@ -1377,7 +1377,7 @@ export class OpenTuiIO implements ChatIO {
       const options = { ...TEXT_SELECTION, content: entry.content, fg: bodyColor, attributes: bodyAttributes,
         width: '100%' as const, wrapMode: 'word' as const, flexShrink: 0 }
       box.add(entry.markdown ? this.markdown(entry.content) : entry.workspaceDiff
-        ? new WorkspaceDiffRenderable(this.renderer, options, entry.workspaceDiff) : new TextRenderable(this.renderer, options))
+        ? new WorkspaceDiffRenderable(this.renderer, options, entry.workspaceDiff, this.transcript.viewport) : new TextRenderable(this.renderer, options))
     }
     this.transcript.add(box)
     return box

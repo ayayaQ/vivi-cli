@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { RGBA, StyledText, TextAttributes, TextRenderable } from '@opentui/core'
-import type { OptimizedBuffer, RenderContext, TextOptions } from '@opentui/core'
+import type { OptimizedBuffer, Renderable, RenderContext, TextOptions } from '@opentui/core'
 
 // Localized opaque rows have explicit contrasting text on any terminal palette.
 export const WORKSPACE_DIFF_COLORS = { addedBackground: '#173f2a', addedForeground: '#d5f7dc',
@@ -26,7 +26,7 @@ function rowColors(kind: RowKind): { fg: RGBA; bg: RGBA } | undefined {
 /** One native text buffer keeps exact selection/copy and wrapping across all review lines. */
 export class WorkspaceDiffRenderable extends TextRenderable {
   private readonly kinds: RowKind[]
-  constructor(context: RenderContext, options: TextOptions & { content: string }, diff: string) {
+  constructor(context: RenderContext, options: TextOptions & { content: string }, diff: string, private readonly viewport?: Renderable) {
     const kinds = rowKinds(options.content, diff)
     const rows = options.content.split('\n')
     const content = new StyledText(rows.map((row, index) => ({ __isChunk: true as const,
@@ -39,7 +39,13 @@ export class WorkspaceDiffRenderable extends TextRenderable {
     super.renderSelf(buffer)
     // Native visual-line sources follow word wrapping and Unicode column widths.
     // Recolor only visible cells, retaining native glyphs, attributes and selections.
-    const first = Math.max(0, -this.y), count = Math.max(0, Math.min(this.height, buffer.height - this.y) - first)
+    // Raw color views do not apply the native scissor stack. Bound them to the
+    // current public transcript viewport so scrolling cannot tint fixed chrome.
+    const top = Math.max(0, this.y, this.viewport?.y ?? 0)
+    const bottom = Math.min(buffer.height, this.y + this.height, this.viewport ? this.viewport.y + this.viewport.height : buffer.height)
+    const left = Math.max(0, this.x, this.viewport?.x ?? 0)
+    const right = Math.min(buffer.width, this.x + this.width, this.viewport ? this.viewport.x + this.viewport.width : buffer.width)
+    const first = top - this.y, count = Math.max(0, bottom - top)
     const sources = this.getLineSources(this.scrollY + first, count)
     const { fg, bg } = buffer.buffers
     const selected = this.hasSelection() ? this.selectionBg : undefined
@@ -47,7 +53,7 @@ export class WorkspaceDiffRenderable extends TextRenderable {
       const colors = rowColors(this.kinds[source])
       if (!colors) continue
       const y = this.y + first + offset
-      for (let x = Math.max(0, this.x); x < Math.min(buffer.width, this.x + this.width); x++) {
+      for (let x = left; x < right; x++) {
         const cell = (y * buffer.width + x) * 4
         if (selected?.equals(RGBA.fromArray(bg.subarray(cell, cell + 4)))) continue
         fg.set(colors.fg.buffer, cell); bg.set(colors.bg.buffer, cell)
