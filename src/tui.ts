@@ -32,9 +32,13 @@ import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentat
 import type { CliToolEvidence } from './tool-presentation.js'
 import { mcpContainsSecret } from './mcp-content.js'
 import { WorkspaceDiffRenderable } from './tui-diff.js'
+import { createTerminalTitleSink, TerminalTitleController } from './terminal-title.js'
+import type { TerminalTitleSink } from './terminal-title.js'
 
 export type { Choice } from './picker.js'
-export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
+export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
+  /** Trusted production wiring or an offline test sink; omitted on directly constructed test surfaces. */
+  terminalTitle?: TerminalTitleSink }
 
 // Ordinary surfaces and text inherit the terminal palette. Dark localized
 // highlights need their own foreground, including native text selections.
@@ -276,6 +280,7 @@ export class OpenTuiIO implements ChatIO {
   private cancelCallbacks = new Set<() => void>()
   private status = 'Ready'
   private readonly runStatus: RunStatus
+  private readonly terminalTitle: TerminalTitleController
   private workspaceDirectory: string | undefined
   private workspaceStatus = false
   private sessionTitle = 'Untitled conversation'
@@ -323,6 +328,12 @@ export class OpenTuiIO implements ChatIO {
   }
   private readonly signalHandler = (): void => this.cancelOrClose()
   private readonly exitHandler = (): void => this.close()
+  private readonly processExitHandler = (): void => {
+    this.close()
+    // Synchronous process exit cannot await a destroy deferred during a render.
+    // Native suspend/cleanup has already run; no later JS finalizer can follow.
+    this.restoreTerminalTitle()
+  }
   private readonly errorHandler = (event: { error?: unknown }): void => {
     // Hidden-input failures can contain only part of the entered key. Suppress their
     // diagnostics entirely rather than trying to match one currently complete value.
@@ -342,6 +353,9 @@ export class OpenTuiIO implements ChatIO {
     this.parser = undefined
     this.parserDirectory = undefined
     queueMicrotask(() => {
+      // Directly constructed surfaces have no factory onDestroy callback. The
+      // DESTROY event precedes native cleanup, so restore after its stack returns.
+      this.restoreTerminalTitle()
       style?.destroy()
       // An IO owns its parser worker; closing a surface must not keep the CLI alive.
       // Only a private, disposable directory is used. Never touch OpenTUI's global cache.
@@ -352,7 +366,8 @@ export class OpenTuiIO implements ChatIO {
     })
   }
 
-  constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}) {
+  constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}, terminalTitle?: TerminalTitleController) {
+    this.terminalTitle = terminalTitle ?? new TerminalTitleController(options.terminalTitle)
     this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
     this.secrets = [...new Set(options.secrets ?? [])].filter(Boolean).sort((a, b) => b.length - a.length)
     this.stream = options.stream ?? true
@@ -451,7 +466,8 @@ export class OpenTuiIO implements ChatIO {
       process.on('SIGINT', this.signalHandler)
       process.on('SIGTERM', this.exitHandler)
       process.on('SIGHUP', this.exitHandler)
-      process.on('exit', this.exitHandler)
+      process.on('exit', this.processExitHandler)
+      this.updateTerminalTitle()
     } catch (error) {
       // Construction can fail before a widget is attached to the renderer's root.
       // Destroy detached widgets too; renderer.destroy only owns attached children.
@@ -470,6 +486,8 @@ export class OpenTuiIO implements ChatIO {
 
   static async create(options: OpenTuiOptions = {}): Promise<OpenTuiIO> {
     let renderer: CliRenderer | undefined
+    let terminalTitle: TerminalTitleController | undefined
+    let io: OpenTuiIO | undefined
     const windowsInput = process.platform === 'win32' && process.stdin.isTTY
       ? createWindowsInputBridge(process.stdin, text => { process.stdout.write(text) }, () => {
         renderer?.emit(CliRenderEvents.HANDLER_ERROR, { error: new Error('Windows console input failed') })
@@ -477,12 +495,17 @@ export class OpenTuiIO implements ChatIO {
     // The official factory rolls back a failed async terminal setup.
     try {
       renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [],
+        // Unlike DESTROY, the supported callback follows native output cleanup,
+        // including a destruction request deferred until the current render ends.
+        onDestroy: () => { if (io) io.restoreTerminalTitle(); else terminalTitle?.close() },
         ...(windowsInput ? { stdin: windowsInput.stdin } : {}),
         screenMode: 'alternate-screen', consoleMode: 'disabled', openConsoleOnError: false,
         externalOutputMode: 'passthrough', useKittyKeyboard: { disambiguate: true, alternateKeys: true },
         useMouse: true, backgroundColor: TUI_THEME.background })
       if (windowsInput?.failure) throw windowsInput.failure
-      const io = new OpenTuiIO(renderer, options)
+      const titleSink = options.terminalTitle ?? createTerminalTitleSink(title => renderer!.setTerminalTitle(title), process.stdout, process.env.TERM)
+      terminalTitle = new TerminalTitleController(titleSink)
+      io = new OpenTuiIO(renderer, options, terminalTitle)
       io.windowsInput = windowsInput
       windowsInput?.start()
       return io
@@ -726,6 +749,13 @@ export class OpenTuiIO implements ChatIO {
     this.statusLine.content = fitStatusColumns(summary.replace(/[\t\n]+/g, ' '), columns)
     this.updateHeader()
     this.updateFooter()
+    this.updateTerminalTitle()
+  }
+  private updateTerminalTitle(): void {
+    if (this.closed) return
+    const input = this.pending !== undefined && ['text', 'secret', 'approval', 'choice', 'search'].includes(this.pending.kind)
+    this.terminalTitle.update(this.sessionTitle, input ? 'input'
+      : this.runStatus.running || this.cancelCallbacks.size ? 'working' : 'idle', this.secrets)
   }
   private updateHeader(): void {
     if (this.closed || !this.headerBox) return
@@ -760,6 +790,7 @@ export class OpenTuiIO implements ChatIO {
     const mode = this.approvalMode === 'auto' ? 'Auto review' : 'Manual'
     const modelWidth = columns - statusTextColumns(` · ${mode}`)
     this.modelLine.content = modelWidth > 0 ? `${fitStatusColumns(this.sessionModel, modelWidth, true)} · ${mode}` : fitStatusColumns(mode, columns, true)
+    this.updateTerminalTitle()
   }
   private disableComposer(): void {
     this.composer?.blur()
@@ -1107,6 +1138,7 @@ export class OpenTuiIO implements ChatIO {
         ...(approvalLabels ? { approvalLabels } : {}), finish: (value, aborted = false): void => {
         if (this.pending !== pending) return
         this.pending = undefined
+        this.updateTerminalTitle()
         this.mouseActivation.clear()
         if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
         this.updateActionBar()
@@ -1130,6 +1162,7 @@ export class OpenTuiIO implements ChatIO {
         else resolve(value)
       } }
       this.pending = pending
+      this.updateTerminalTitle()
       this.approvalIndex = 0
       this.updateApprovalLayout()
       this.updateActionBar()
@@ -1314,6 +1347,7 @@ export class OpenTuiIO implements ChatIO {
     return () => {
       this.cancelCallbacks.delete(callback)
       this.updateActionBar()
+      this.updateTerminalTitle()
       if (!this.closed && !this.cancelCallbacks.size && !this.runStatus.running &&
         (this.status === 'Running · Escape / Ctrl+C cancels' || this.status === 'Cancelling…')) this.updateStatus('Ready')
     }
@@ -1806,7 +1840,6 @@ export class OpenTuiIO implements ChatIO {
     process.off('SIGINT', this.signalHandler)
     process.off('SIGTERM', this.exitHandler)
     process.off('SIGHUP', this.exitHandler)
-    process.off('exit', this.exitHandler)
     this.streamed = ''
     this.entries = []
     this.clearSecret()
@@ -1816,6 +1849,12 @@ export class OpenTuiIO implements ChatIO {
     this.windowsInput = undefined
     if (destroyRenderer && !this.renderer.isDestroyed) this.renderer.destroy()
     this.finishDiagnostic?.()
+  }
+  private restoreTerminalTitle(): void {
+    this.terminalTitle.close()
+    // Keep this finalizer while native destruction is deferred. A synchronous
+    // exit immediately after close still needs the final title-stack pop.
+    process.off('exit', this.processExitHandler)
   }
   close(): void { this.dispose(true) }
 }
