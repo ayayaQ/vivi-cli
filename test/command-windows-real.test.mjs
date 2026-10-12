@@ -144,13 +144,23 @@ test('ordinary unqualified PowerShell completes an explicitly approved bounded w
   const signal = new AbortController().signal
   assert.equal(await workspace.enable(context, signal), true)
   const owner = 'native-fixture-launch:native-fixture-session:native-fixture-run'
+  const startedAt = performance.now()
+  let polls = 0
   let result = JSON.parse((await workspace.start({ id: 'native-ordinary-start', name: 'command_start',
     arguments: { executable: powershell, args, timeoutMs, yieldMs: 0 } }, context, signal)).content)
   let output = result.output
   while (result.state === 'running') {
+    polls++
     result = JSON.parse((await workspace.poll(result.executionId, owner, 2000)).content)
     output += result.output
   }
+  // Only fixed owned-fixture state is reported. No request argv, environment
+  // values, arbitrary output, or helper/runtime behavior is changed.
+  t.diagnostic(JSON.stringify({ event: 'ordinary-powershell-terminal', node: process.version,
+    elapsedMs: Math.round(performance.now() - startedAt), polls, state: result.state,
+    exitCode: result.exitCode ?? null, truncated: result.truncated,
+    outputBytes: Buffer.byteLength(output), fixedStdoutObserved: output.includes('ordinary-powershell-fixture\r\n'),
+    validOwnedOutput: ordinaryPowerShellOutput(output) }))
   assert.equal(approvals.length, 2)
   assert.equal(result.state, 'exited')
   assert.equal(result.exitCode, 0)
