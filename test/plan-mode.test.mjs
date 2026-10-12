@@ -94,6 +94,7 @@ test('Plan uses enabled local reads, blocks every mutation/remote/extension befo
 })
 
 test('fixed Plan dispatcher denies omitted and later-injected tools before validators or approvals', async () => {
+  assert.throws(() => createBuiltinToolset(false, [], undefined, undefined, undefined, undefined, undefined, undefined, 'unknown'), /Unknown task mode/)
   let effects = 0
   const mutate = extension('create_memory', () => { effects++; return { content: 'mutation' } }, () => { effects++ })
   const imported = extension('custom_read', () => { effects++; return { content: 'external' } }, () => { effects++ })

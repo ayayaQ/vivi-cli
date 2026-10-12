@@ -35,6 +35,7 @@ function fakeIO({ lines = [], approvals = [], choices = [], interactive } = {}) 
     },
     async askText() {}, async askSecret() { return choices.shift() }, addSecrets() {},
     setSession(session) { this.sessions.push(session) }, setDraft() {},
+    taskModes: [], setTaskMode(mode) { this.taskModes.push(mode) },
     setApprovalMode(mode) { this.modes.push(mode) },
     onCancel(callback) { this.cancel = callback; return () => { this.cancel = undefined } },
     close() { this.closed = true }
@@ -244,7 +245,7 @@ test('account replacement revokes enrollment even when model selection cancels, 
   assert.equal((await store.load(io.sessions[0].id)).provider, 'openai')
 })
 
-test('interactive /mode cycle bypasses the picker, requires enrollment and toggles back to Manual', async t => {
+test('interactive /mode cycle bypasses the picker, enrolls Auto then enters Plan and revokes Auto', async t => {
   const directory = await fixture(t)
   await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, model: 'gpt-5.1', enableTools: true })
   const io = fakeIO({ interactive: true, lines: ['/mode cycle', '/mode cycle', '/exit'], approvals: [true] })
@@ -254,5 +255,27 @@ test('interactive /mode cycle bypasses the picker, requires enrollment and toggl
   assert.equal(io.requests[0].call.name, 'enroll_auto_review')
   assert.equal(io.choices.length, 0)
   assert.equal(io.modes.at(-1), 'manual')
+  assert.equal(io.taskModes.at(-1), 'plan')
   assert.match(io.output, /enrolled for this conversation/)
+})
+
+test('full-screen Plan selection and direct command require no enrollment; a new conversation resets its display', async t => {
+  const directory = await fixture(t)
+  await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, model: 'gpt-5.1', enableTools: true })
+  const io = fakeIO({ interactive: true, lines: ['/mode', 'Investigate', '/mode', '/session', '/mode manual', '/mode plan', '/new', '/session', '/exit'],
+    choices: ['plan', undefined] })
+  let generates = 0
+  assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io,
+    providerFactory: () => ({ async generate({ tools, messages }) {
+      generates++
+      assert(!tools.some(tool => ['note_set', 'create_memory', 'command_start', 'fetch_url'].includes(tool.name)))
+      assert(messages.some(message => message.role === 'system' && message.content.startsWith('Plan mode is active')))
+      return answer()
+    } }), decisionProviderFactory: () => { throw new Error('Plan must not construct a decision provider') } }), 0)
+  assert.equal(generates, 1); assert.equal(io.requests.length, 0)
+  assert.deepEqual(io.choices[0].values.map(choice => choice.value), ['manual', 'auto', 'plan'])
+  assert.equal(io.choices[1].initialIndex, 2)
+  assert.match(io.output, /Mode: Plan/); assert.match(io.output, /Mode: Manual/)
+  assert.equal(io.taskModes.at(-1), 'execute')
+  assert.equal(io.sessions.length, 3) // Initial, post-turn refresh, new conversation.
 })
