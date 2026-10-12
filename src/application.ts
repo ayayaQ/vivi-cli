@@ -119,6 +119,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   const decisions = new FileDecisionLedger(options.sessionDirectory, secrets)
   const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io.write(`${message}\n`) })
   let activeSkills = options.enableSkills
+  let activeCommands = options.enableCommands
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
   io.setWorkspace?.(workspace?.directory)
   const knownModels = new Map<string, ModelEntry>()
@@ -531,7 +532,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await discardCandidate(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableCommands: options.enableCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
           isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),
@@ -667,7 +668,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         if (command === '/memories') { await manageMemories(); continue }
         if (/^\/commands(?:\s|$)/.test(command)) {
           if (!host) { io.write('Choose a provider and model before enabling trusted commands\n'); continue }
-          await runCommandControl(host, io, command); continue
+          await runCommandControl(host, io, command)
+          if (/^\/commands\s+off$/.test(command)) activeCommands = false
+          else if (/^\/commands\s+on$/.test(command) && host.commandsEnabled) activeCommands = true
+          continue
         }
         if (/^\/mode(?:\s|$)/.test(command)) {
           if (command !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }

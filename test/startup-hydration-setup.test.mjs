@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { main } from '../dist/main.js'
@@ -253,4 +253,24 @@ test('a cancelled replacement-key setup cannot reuse the old account catalog for
   assert(!io.output.includes(key)); assert(!io.output.includes(replacement)); assert(!io.output.includes('private-denied-body'))
   assert.equal((await new PreferenceStore(directory).load()).model, id)
   assert(!(await readdir(directory)).some(file => file.endsWith('.lock')))
+})
+
+test('commands off remains a launch-local opt-out across new conversations until explicitly restored', async t => {
+  const root = await fixture(t), directory = join(root, 'state'), workspace = join(root, 'project')
+  await mkdir(workspace)
+  const supplied = services(), io = fakeIO([], ['First', '/commands off', 'Disabled', '/new', 'Still disabled', '/commands on', 'Restored', '/exit'])
+  io.canAutoReview = true
+  const advertised = [], guidance = []
+  assert.equal(await main(['--workspace', workspace, ...selections], { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
+    tuiIO: io, catalog: supplied.catalog, credentials: supplied.credentials,
+    providerFactory: () => ({ async generate(input) {
+      advertised.push(input.tools.some(tool => tool.name === 'command_start'))
+      guidance.push(input.messages.some(message => message.role === 'system' && message.content.includes('Trusted command tools')))
+      return { content: 'Done', toolCalls: [] }
+    } })
+  }), 0)
+  assert.deepEqual(advertised, [true, false, false, true])
+  assert.deepEqual(guidance, advertised)
+  assert.equal(io.sessions.length, 2)
+  assert.equal(io.choices.length, 0)
 })
