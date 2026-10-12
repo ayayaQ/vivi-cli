@@ -30,14 +30,14 @@ async function fixture(t, input = {}) {
   t.after(async () => { await host.shutdown(); await rm(root, { recursive: true, force: true }) })
   return { root, host, options, commandWorkspace, state, approvals }
 }
-test('host command capability stays absent until separately enrolled and cannot be enabled by a model tool', async t => {
+test('host advertises command proposals from startup but a model cannot grant execution authority', async t => {
   const subject = await fixture(t, { generate({ tools, state }) {
-    assert(!tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name)))
+    assert(tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name)))
     return state.rounds === 1 ? { content: '', toolCalls: [{ id: 'invalid-enable', name: 'enable_trusted_commands', arguments: {} }] }
       : { content: 'Fixture done', toolCalls: [] }
   } })
   const result = await subject.host.send('Fixture request')
-  assert.equal(subject.host.commandsEnabled, false); assert.equal(subject.approvals.length, 0)
+  assert.equal(subject.host.commandsEnabled, true); assert.equal(subject.commandWorkspace.isEnabled, false); assert.equal(subject.approvals.length, 0)
   assert(result.history.find(message => message.kind === 'tool_result').isError)
 })
 for (const mode of ['manual', 'auto']) test(`actual ${mode} host always uses human approval for every command and supports bounded polling`, async t => {
@@ -55,8 +55,8 @@ for (const mode of ['manual', 'auto']) test(`actual ${mode} host always uses hum
   assert.equal(await subject.host.enableCommands(), true)
   subject.host.setApprovalMode(mode)
   assert.equal((await subject.host.send('Run the fixture')).status, 'completed')
-  assert.equal(subject.state.judges, 0); assert.equal(subject.approvals.length, 2)
-  assert.deepEqual(subject.approvals.map(request => request.call.name), ['enable_trusted_commands', 'command_start'])
+  assert.equal(subject.state.judges, 0); assert.equal(subject.approvals.length, 1)
+  assert.deepEqual(subject.approvals.map(request => request.call.name), ['command_start'])
   assert(!subject.host.session.history.some(message => message.role === 'system'))
 })
 test('a finished run cannot reuse an execution ID in the next run', async t => {
@@ -69,41 +69,41 @@ test('a finished run cannot reuse an execution ID in the next run', async t => {
     assert(messages.at(-1).isError); return { content: 'Done', toolCalls: [] }
   } })
   await subject.host.enableCommands(); await subject.host.send('First fixture'); await subject.host.send('Second fixture')
-  assert.equal(subject.approvals.length, 2)
+  assert.equal(subject.approvals.length, 1)
 })
-test('new and resumed hosts never restore trust from a saved session or a reused workspace object', async t => {
+test('new and resumed hosts advertise proposals without restoring execution authority', async t => {
   const subject = await fixture(t); await subject.host.enableCommands()
   const next = new CliHost({ ...subject.options, session: newSession({ provider: 'openai', model: 'fixture' }),
     provider: { async generate() { return { content: 'Done', toolCalls: [] } } } })
   t.after(() => next.shutdown())
-  assert.equal(next.commandsEnabled, false)
+  assert.equal(next.commandsEnabled, true)
   await assert.rejects(subject.commandWorkspace.start({ id: 'wrong-owner', name: 'command_start', arguments: {
     executable: process.execPath, args: [] } }, { launchId: 'different-launch', sessionId: next.session.id, runId: 'fixture', accountRevision: 'fixture-account',
       isCurrent: () => true, canApprove: () => true, approve: async () => true }, new AbortController().signal), /interactive human approval/)
   const freshCapability = await TrustedCommandWorkspace.open(subject.root, process.env)
   const resumed = await CliHost.resume({ ...subject.options, commandWorkspace: freshCapability, id: subject.host.session.id,
     store: { async save() {}, async load() { return subject.host.session } } })
-  t.after(() => resumed.shutdown()); assert.equal(resumed.commandsEnabled, false)
+  t.after(() => resumed.shutdown()); assert.equal(resumed.commandsEnabled, true)
   const reused = await CliHost.resume({ ...subject.options, id: subject.host.session.id,
     store: { async save() {}, async load() { return subject.host.session } },
-    provider: { async generate({ tools }) { assert(!tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name))); return { content: 'Done', toolCalls: [] } } } })
-  t.after(() => reused.shutdown()); assert.equal(reused.commandsEnabled, false)
+    provider: { async generate({ tools }) { assert(tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name))); return { content: 'Done', toolCalls: [] } } } })
+  t.after(() => reused.shutdown()); assert.equal(reused.commandsEnabled, true)
   await reused.send('Fixture continuation')
-  assert.equal(subject.approvals.length, 1)
+  assert.equal(subject.approvals.length, 0)
 })
-test('command flags are launch-only enrollment requests and piped/headless allow callbacks cannot grant trust', async t => {
+test('command flags are launch-only proposal controls and piped/headless callbacks cannot grant execution authority', async t => {
   const subject = await fixture(t)
   const options = parseArguments(['--model', 'fixture', '--enable-commands'], {}, false, subject.root)
   assert.equal(options.enableCommands, true)
   const io = { output: '', write(value) { this.output += value }, canAutoReview: false, onCancel() { return () => {} } }
   assert.equal(await runCommandControl(subject.host, io, '/commands on'), true)
-  assert.equal(subject.approvals.length, 0); assert.equal(subject.host.commandsEnabled, false)
+  assert.equal(subject.approvals.length, 0); assert.equal(subject.commandWorkspace.isEnabled, false)
   const appIO = { ...io, async readLine() {}, event() {}, result() {}, async approve() { throw new Error('No headless approval') }, close() {} }
   const status = await main(['--model', 'fixture', '--tools', '--enable-commands', '--no-tui', '--session-dir', join(subject.root, 'state'), '--prompt', 'Fixture'], {},
     { io: appIO, launchDirectory: subject.root, providerFactory: () => ({ async generate({ tools }) {
       assert(!tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name))); return { content: 'Done', toolCalls: [] }
     } }) })
-  assert.equal(status, 0); assert.match(appIO.output, /interactive human approval/)
+  assert.equal(status, 0)
 })
 test('disabled commands cannot expand a chat-only host and shutdown disables existing trust', async t => {
   const subject = await fixture(t, { options: { enableTools: false } })
@@ -155,7 +155,7 @@ test('disable during lazy creation revokes the pending enrollment and permits a 
   await assert.rejects(pending, /no longer active/)
   assert.equal(host.commandsEnabled, false); assert.equal(subject.approvals.length, 0)
   assert.equal(await host.enableCommands(), true)
-  assert.equal(openings, 2); assert.equal(subject.approvals.length, 1)
+  assert.equal(openings, 2); assert.equal(subject.approvals.length, 0)
 })
 test('integrated Auto workspace creation keeps the following command on fresh human approval', async t => {
   const subject = await fixture(t, { generate({ messages, state }) {
@@ -176,5 +176,5 @@ test('integrated Auto workspace creation keeps the following command on fresh hu
   await subject.host.enableCommands(); subject.host.setApprovalMode('auto')
   assert.equal((await subject.host.send('Create created.txt with fixture text and run the controlled fixture')).status, 'completed')
   assert.equal(subject.state.judges, 1)
-  assert.deepEqual(subject.approvals.map(request => request.call.name), ['enable_trusted_commands', 'command_start'], subject.approvals[1]?.description)
+  assert.deepEqual(subject.approvals.map(request => request.call.name), ['command_start'], subject.approvals[0]?.description)
 })

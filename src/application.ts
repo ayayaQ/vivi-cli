@@ -18,7 +18,7 @@ import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, s
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
-import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } from './models.js'
+import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied, hydrateModelCapabilities, modelToolsEnabled } from './models.js'
 import type { Catalog, ModelEntry } from './models.js'
 import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
@@ -55,7 +55,7 @@ export interface ApplicationOptions {
   mcpManagerFactory?(options: McpManagerOptions): McpManager
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
-  reasoningCapabilities: [], stream: true, enableNotes: false, enableMemory: false, enableTools: false, maxRounds: 25 }
+  reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
 const envName = (provider: CliProviderName): string => provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
 
 export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPreferences {
@@ -63,7 +63,7 @@ export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPr
   const reasoning = same && (base.reasoning === 'default' || model.efforts.includes(base.reasoning as ReasoningEffort))
     ? base.reasoning : 'default'
   return { ...base, model: model.id, reasoning, reasoningCapabilities: [...model.efforts],
-    enableTools: model.tools === 'supported', enableNotes: model.tools === 'supported' && base.enableNotes }
+    enableTools: model.tools === 'supported' }
 }
 export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Promise<TuiPreferences | undefined> {
   if (!base.model) { io.write('Choose a model with /models first\n'); return }
@@ -82,7 +82,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
-/commands on requests launch/session-only workspace trust; every unsandboxed command needs fresh human approval, even in Auto. /commands off disables it.
+/commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
@@ -137,7 +137,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     ? options.enableMemory : settings.enableMemory
   if ((options.provider !== undefined && options.provider !== settings.provider) ||
     (options.model !== undefined && options.model !== settings.model)) {
-    settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false }
+    settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false }
   }
   if (args.includes('--provider')) settings.provider = options.provider!
   if (args.includes('--model')) settings.model = options.model!
@@ -148,8 +148,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   }
   if (args.includes('--no-stream')) settings.stream = false
   if (args.includes('--tools')) settings.enableTools = true
-  if (args.includes('--no-tools')) { settings.enableTools = false; settings.enableNotes = false }
-  if (args.includes('--enable-notes')) { settings.enableTools = true; settings.enableNotes = true }
+  if (args.includes('--no-tools')) settings.enableTools = false
+  if (args.includes('--enable-notes')) settings.enableNotes = true
+  if (args.includes('--disable-notes')) settings.enableNotes = false
   if (args.includes('--max-rounds')) settings.maxRounds = options.maxRounds
   if (settings.provider === 'openai' && settings.model) {
     const verified = documentedOpenAIModel(settings.model)
@@ -157,7 +158,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       const previousEffort = settings.reasoning
       settings = settingsForModel(settings, verified)
       if (previousEffort !== settings.reasoning) io.write('Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n')
-      if (args.includes('--no-tools')) { settings.enableTools = false; settings.enableNotes = false }
+      if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
+        savedSettings.model === settings.model && !savedSettings.enableTools && !args.includes('--tools')) settings.enableTools = false
     }
   }
   const declaredToolTarget = { provider: settings.provider, model: settings.model }
@@ -166,7 +168,6 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   let accountGeneration = randomUUID()
   let hostAccountGeneration: string | undefined
   let launchModePending = options.approvalMode === 'auto'
-  let launchCommandsPending = options.enableCommands
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
   let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
@@ -208,24 +209,26 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     const dispose = io.onCancel(() => controller.abort())
     try {
       io.write(`Loading ${settings.provider} model capabilities…\n`)
-      const result = await catalog.list(settings.provider, key, controller.signal)
+      const hydrated = await hydrateModelCapabilities(catalog, settings.provider, settings.model, key, controller.signal)
       if (io.isClosed || controller.signal.aborted) return false
+      const result = hydrated.catalog!
       let notice = ''
       for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
-      const model = result.models.find(model => model.id === settings.model)
-      if (model) {
+      const model = hydrated.model
+      knownModels.set(modelKey(settings.provider, model.id), model)
+      {
         const previous = settings
         settings = settingsForModel(settings, model)
         // A saved chat-only choice and an explicit launch opt-out remain off.
         // Unknown tool metadata cannot promote a saved claim into permission;
         // openSession still requires this launch's explicit --tools declaration.
         if (model.tools === 'unknown') {
-          settings.enableTools = previous.enableTools; settings.enableNotes = previous.enableNotes
+          settings.enableTools = previous.enableTools
         }
         if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
           savedSettings.model === settings.model && !savedSettings.enableTools &&
-          !args.includes('--tools') && !args.includes('--enable-notes')) {
-          settings.enableTools = false; settings.enableNotes = false
+          !args.includes('--tools')) {
+          settings.enableTools = false
         }
         if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
           settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
@@ -248,23 +251,25 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       { name: 'OpenAI', description: 'Responses API', value: 'openai' as const },
       { name: 'OpenRouter', description: 'Chat Completions gateway', value: 'openrouter' as const }
     ], base.provider === 'openrouter' ? 1 : 0)
-    if (!provider) return
+    if (!provider || io.isClosed) return
     const current = await loadKey(provider)
+    if (io.isClosed) return
     const action = current ? await io.choose(`${provider} API key`, [
       { name: 'Use current key', description: input.env[envName(provider)] ? 'From your environment; never copied to settings' : 'Already available for this launch', value: 'current' },
       { name: 'Enter a different key', description: 'Masked input; choose storage explicitly', value: 'enter' }
     ]) : 'enter'
-    if (!action) return
+    if (!action || io.isClosed) return
     if (action === 'enter') {
       if (!io.askSecret) { io.write(`Masked key input is unavailable. Set ${envName(provider)} in your environment\n`); return }
       const status = await credentials.status()
+      if (io.isClosed) return
       const mode = await io.choose('API key storage', [
         ...(status.available ? [{ name: `Save in ${status.label}`, description: 'Available on your next launch; never stored in settings or transcripts', value: 'save' }] : []),
         { name: 'Use for this launch only', description: status.available ? 'You’ll need to enter it again next time' : `${status.detail ?? status.label}. No plaintext fallback`, value: 'temporary' }
       ])
-      if (!mode) return
+      if (!mode || io.isClosed) return
       const entered = await io.askSecret(`${provider} API key · masked · Escape cancels`)
-      if (entered === undefined) return
+      if (entered === undefined || io.isClosed) return
       register(entered)
       const key = validateApiKey(entered)
       register(key)
@@ -283,11 +288,12 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         host?.setApprovalMode('manual')
         io.setApprovalMode?.('manual')
         accountGeneration = randomUUID()
+        for (const id of knownModels.keys()) if (id.startsWith(`${provider}:`)) knownModels.delete(id)
       }
       env[envName(provider)] = key
     }
     return provider === base.provider ? { ...base } : { ...base, provider, model: '', reasoning: 'default',
-      reasoningCapabilities: [], enableTools: false, enableNotes: false }
+      reasoningCapabilities: [], enableTools: false }
   }
   const chooseModel = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
     const key = await loadKey(base.provider)
@@ -354,6 +360,18 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     const defaults = { ...next, enableMemory: changeMemoryDefault ? next.enableMemory : settings.enableMemory }
     await preferences.save(defaults); settings = defaults
   }
+  const configureProviderModel = async (): Promise<void> => {
+    const configured = await setupProvider(activeSettings ?? settings)
+    if (!configured || io.isClosed) return
+    const model = await chooseModel(configured)
+    if (io.isClosed) return
+    if (model) { await save(model); selected = { fresh: true } }
+    else if (!host && configured.provider !== settings.provider) {
+      // Keep a completed provider choice after cancelling model selection, so
+      // /models can continue setup without a wizard loop or storing credentials.
+      await save(configured); io.setDraft?.(configured.provider)
+    }
+  }
   const configure = async (): Promise<boolean> => {
     const provider = await setupProvider(settings)
     if (!provider) return false
@@ -364,7 +382,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     const notes = effort.enableTools ? await io.choose('Session notes', [
       { name: 'Keep notes disabled', description: 'Calculator and current time only', value: false },
       { name: 'Enable session notes', description: 'Each write requires an allow/deny approval', value: true }
-    ], effort.enableNotes ? 1 : 0) : false
+    ], effort.enableNotes ? 1 : 0) : effort.enableNotes
     if (notes === undefined) return false
     const enableMemory = await io.choose('Persistent memory default · future launches', [
       { name: 'Keep memory disabled by default', description: 'No saved memory is read or sent unless you enable it', value: false },
@@ -505,13 +523,13 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         if (!declared) { await discardCandidate(); return false }
         capabilities = [session.reasoning as ReasoningEffort]
       }
-      const declaredTools = (args.includes('--tools') || args.includes('--enable-notes')) &&
+      const declaredTools = args.includes('--tools') &&
         (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model)
-      const enableTools = !args.includes('--no-tools') && metadata?.tools !== 'unsupported' &&
-        (metadata?.tools === 'supported' ? !sameModel || settings.enableTools : declaredTools)
+      const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
+        declared: declaredTools, enabled: !sameModel || settings.enableTools })
       const effective: CliOptions = { ...options, reasoningCapabilities: capabilities,
         stream: metadata?.streaming === 'unsupported' ? false : settings.stream,
-        enableTools, enableNotes: enableTools && (sameModel ? settings.enableNotes : explicitResume && args.includes('--enable-notes')),
+        enableTools, enableNotes: enableTools && settings.enableNotes,
         enableMemory: activeMemory, enableSkills: activeSkills,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
@@ -519,7 +537,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await discardCandidate(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        enableNotes: effective.enableNotes, enableCommands: options.enableCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
           isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),
@@ -537,7 +555,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       if (io.isClosed) { await discardCandidate(); return false }
       nextSettings = { ...settings, provider: session.provider, model: session.model,
         reasoning: session.reasoning ?? 'default', reasoningCapabilities: [...capabilities],
-        enableTools: effective.enableTools, enableNotes: effective.enableNotes }
+        enableTools: effective.enableTools, enableNotes: settings.enableNotes }
       try { await previousHost?.shutdown() }
       catch (error) { sessionCleanupFailed = true; throw error }
       if (io.isClosed) { await discardCandidate(); return false }
@@ -564,6 +582,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       else io.setSession(newSession({ provider: settings.provider, model: 'Choose a model with /models' }))
     }
     if (!settings.model) io.write('vivi · fresh conversation · use /provider to set up, then /models and /effort\n')
+    // Offer the existing minimal setup once per unconfigured interactive launch.
+    // Cancellation returns to a clean composer; explicit commands can retry.
+    if (!settings.model && !options.resume && options.prompt === undefined && !io.isClosed) {
+      try { await configureProviderModel() } catch (error) { report(error) }
+    }
     for (;;) {
       if (io.isClosed) { if (io.failed) await io.readLine(''); return 0 }
       if (selected) {
@@ -580,7 +603,6 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         launchModePending = false
         io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
       }
-      if (launchCommandsPending && host) { launchCommandsPending = false; await runCommandControl(host, io, '/commands on') }
       // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
@@ -637,12 +659,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           continue
         }
         if (command === '/provider') {
-          const configured = await setupProvider(activeSettings ?? settings)
-          if (configured) {
-            const model = await chooseModel(configured)
-            if (model) { await save(model); selected = { fresh: true } }
-            else if (!host) { await save(configured); io.setDraft?.(configured.provider) }
-          }
+          await configureProviderModel()
           continue
         }
         if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true } }; continue }

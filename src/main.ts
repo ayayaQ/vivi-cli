@@ -18,11 +18,11 @@ import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
-import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMode, runCommandControl } from './terminal.js'
+import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMode } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
-import type { Catalog } from './models.js'
-import { documentedOpenAIModel } from './models.js'
+import type { Catalog, ModelEntry } from './models.js'
+import { ModelCatalog, hydrateModelCapabilities, modelAccessDenied, modelToolsEnabled, unknownModel } from './models.js'
 import type { CredentialStore } from './credentials.js'
 import type { ApprovalMode } from './auto-review.js'
 import { assertReviewTransportCurrent } from './auto-review.js'
@@ -46,7 +46,7 @@ export interface CliOptions {
   tui: boolean
   enableNotes: boolean
   enableMemory: boolean
-  /** A request for fresh interactive enrollment, never command authority itself. */
+  /** Launch-only command proposal availability, never process execution authority. */
   enableCommands: boolean
   enableSkills: boolean
   skillsDirectories: string[]
@@ -77,10 +77,12 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --approval-mode MODE        manual (default) or auto; auto still needs fresh interactive enrollment
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
   --tools / --no-tools        Declare tool support / use chat only
-  --enable-notes              Enable session-only revisioned notes with allow/deny prompts
+  --enable-notes              Enable session-only reviewed notes (default)
+  --disable-notes             Disable session notes for this launch
   --enable-memory             Use reviewed app-wide saved context (plaintext local storage)
   --disable-memory            Override saved memory defaults for this launch
-  --enable-commands           Request fresh interactive workspace trust (off by default)
+  --enable-commands           Allow command proposals (default); every start needs human approval
+  --disable-commands          Disable command proposals for this launch
   --skills-dir PATH           Explicit read-only standard skills root (repeatable, max 8)
   --no-skills                 Disable skills for this launch
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
@@ -94,7 +96,7 @@ Saved memory is off by default. When enabled, it is sent to the selected provide
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
 Selected files may be sent to your provider and saved in session history.
 Workspace tools omit symlinks and private/ignored files; text writes require review; this is not an OS sandbox.
-/commands on enables separate trusted, unsandboxed commands for this launch/session. Every process requires human approval, even in Auto; piped approval is denied.
+/commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval, even in Auto; piped approval is denied.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual or optional Auto review for the current conversation and selected account.
 Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
@@ -111,7 +113,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    approvalMode: 'manual', stream: true, tui: true, enableNotes: false, enableMemory: false, enableCommands: false, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
+    approvalMode: 'manual', stream: true, tui: true, enableNotes: true, enableMemory: false, enableCommands: true, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
     ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
@@ -149,6 +151,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--workspace': explicitWorkspace = true; options.workspace = value(); break
       case '--no-workspace': noWorkspace = true; delete options.workspace; break
       case '--enable-commands': options.enableCommands = true; break
+      case '--disable-commands': options.enableCommands = false; break
       case '--prompt': options.prompt = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
@@ -161,6 +164,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--tui': options.tui = true; break
       case '--no-tui': options.tui = false; break
       case '--enable-notes': options.enableNotes = true; break
+      case '--disable-notes': options.enableNotes = false; break
       case '--enable-memory': options.enableMemory = true; break
       case '--disable-memory': options.enableMemory = false; break
       case '--no-skills': options.enableSkills = false; break
@@ -201,7 +205,6 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
     !options.reasoningCapabilities.includes(options.reasoning as ReasoningEffort)) {
     throw new Error('Selected reasoning requires explicit --reasoning-capabilities from your model’s supported efforts')
   }
-  if (options.enableNotes && !options.enableTools) throw new Error('Session notes require declared tool support; omit --enable-notes or --no-tools')
   // Never echo a rejected value. Credential-bearing flags are refused before provider construction.
   const secrets = environmentSecrets(env)
   for (const argument of args) {
@@ -341,15 +344,37 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     })
     release = await store.acquire(options.resume ?? fresh!.id)
     const session = options.resume ? await store.load(options.resume) : fresh!
-    const metadata = session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined
-    const enableTools = !args.includes('--no-tools') && (metadata?.tools === 'supported' ||
-      metadata?.tools !== 'unsupported' && (args.includes('--tools') || args.includes('--enable-notes')))
-    const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
+    let metadata: ModelEntry
+    const controller = new AbortController()
+    const dispose = io.onCancel(() => controller.abort())
+    try {
+      if (session.provider === 'openrouter') io.write('Loading openrouter model capabilities…\n')
+      const key = session.provider === 'openai' ? env.OPENAI_API_KEY : env.OPENROUTER_API_KEY
+      const hydrated = await hydrateModelCapabilities(dependencies.catalog ?? new ModelCatalog(),
+        session.provider, session.model, key, controller.signal)
+      if (io.isClosed || controller.signal.aborted) return 130
+      metadata = hydrated.model
+      if (hydrated.catalog?.warning) io.write(`${redactSecrets(hydrated.catalog.warning, secrets)}. Using a stale cached catalog\n`)
+      else if (hydrated.catalog?.state === 'cached') io.write('Using the cached model catalog (up to 15 minutes old)\n')
+    } catch (error) {
+      if (io.isClosed || controller.signal.aborted) return 130
+      // An unavailable catalog permits chat only or this launch's explicit
+      // declaration. Authentication denial must never fall back to a request.
+      if (modelAccessDenied(error)) throw error
+      metadata = unknownModel(session.model)
+      io.write(`${redactSecrets(error instanceof Error ? error.message : 'Model capabilities could not be loaded', secrets)}\n`)
+    } finally { dispose() }
+    if (metadata.conversation === 'unsupported') throw new Error('This model is incompatible with vivi’s text-conversation endpoint. Choose a supported model')
+    const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
+      declared: args.includes('--tools') })
+    const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools,
+      reasoningCapabilities: metadata.reasoning === 'supported' ? [...metadata.efforts] : options.reasoningCapabilities,
+      stream: metadata.streaming === 'unsupported' ? false : options.stream }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
     const commandEnv = captureCommandEnvironment(env)
     host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
-      enableTools, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
+      enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,
         isAvailable: () => io?.canAutoReview === true && !io.isClosed } } : {}),
@@ -367,7 +392,6 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
-    if (options.enableCommands) await runCommandControl(host, io, '/commands on')
     const result = await runChatLoop(host, io, options.prompt, {
       mcp: () => manageMcp(mcp!, io!, options.workspace)
     })

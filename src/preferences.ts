@@ -26,6 +26,7 @@ export interface TuiPreferences {
   reasoningCapabilities: ReasoningEffort[]
   stream: boolean
   enableTools: boolean
+  /** Session-note launch intent; availability is separately gated by model tool support. */
   enableNotes: boolean
   /** Future launch default; persistent context is independent of model tool support. */
   enableMemory: boolean
@@ -95,8 +96,9 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     'selected reasoning requires an explicit supported capability')
   check(typeof fields.stream === 'boolean' && typeof fields.enableTools === 'boolean' &&
     typeof fields.enableNotes === 'boolean' && typeof fields.enableMemory === 'boolean', 'invalid toggle')
-  check(!fields.enableNotes || fields.enableTools, 'notes require explicitly enabled tools')
-  check(fields.model !== '' || (fields.reasoning === 'default' && supported.length === 0 && !fields.enableTools && !fields.enableNotes),
+  // Preferences preserve note intent even before selecting a model or while using
+  // chat-only models. Runtime hosts still require enabled, supported tools.
+  check(fields.model !== '' || (fields.reasoning === 'default' && supported.length === 0 && !fields.enableTools),
     'unselected model cannot declare capabilities')
   check(Number.isSafeInteger(fields.maxRounds) && Number(fields.maxRounds) >= 1 && Number(fields.maxRounds) <= 100,
     'maxRounds must be an integer from 1 to 100')

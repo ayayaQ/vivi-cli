@@ -62,7 +62,7 @@ export interface TerminalOptions {
 export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
 export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
 
-/** Only this human command surface can enroll trust; model tools cannot enable it. */
+/** Human controls proposal availability; exact execution approval is always separate. */
 export async function runCommandControl(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
   const command = line.trim()
   if (!/^\/commands(?:\s|$)/.test(command)) return false
@@ -74,11 +74,11 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
     try {
       const enabled = await host.enableCommands(controller.signal)
       io.write(enabled ? `Trusted commands enabled for ${JSON.stringify(host.commandDirectory)} · every process still needs human approval\n`
-        : 'Trusted command enrollment denied; commands remain disabled\n')
+        : 'Command proposals are unavailable; every process requires interactive human approval\n')
     } finally { dispose() }
     return true
   }
-  io.write(`Trusted commands: ${host.commandsEnabled ? 'enabled' : 'disabled'}${host.commandDirectory ? ` · ${JSON.stringify(host.commandDirectory)}` : ' · no workspace selected'}\n${COMMAND_DISCLOSURE}\n/commands on · enable for this launch/session; /commands off · disable\n`)
+  io.write(`Command proposals: ${host.commandsEnabled ? 'available' : 'disabled'}${host.commandDirectory ? ` · ${JSON.stringify(host.commandDirectory)}` : ' · no workspace selected'}\n${COMMAND_DISCLOSURE}\n/commands on · restore proposals for this launch/session; /commands off · disable\n`)
   return true
 }
 
