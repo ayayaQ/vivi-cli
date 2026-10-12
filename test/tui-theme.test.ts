@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import { RGBA, TextareaRenderable, TextAttributes, TextBufferRenderable, TextTableRenderable } from '@opentui/core'
+import { MarkdownRenderable, RGBA, TextareaRenderable, TextAttributes, TextBufferRenderable, TextTableRenderable } from '@opentui/core'
 import type { CapturedSpan, Renderable } from '@opentui/core'
-import { createTestRenderer } from '@opentui/core/testing'
+import { createTestRenderer, setRendererCapabilities } from '@opentui/core/testing'
 import type { TestRendererSetup } from '@opentui/core/testing'
 import { OpenTuiIO, TUI_THEME } from '../src/tui.js'
 import { newSession } from '../src/session.js'
@@ -165,3 +165,76 @@ for (const palette of palettes) {
     setup.renderer.clearSelection(); await frame(); inheritedSurfaces(setup)
   })
 }
+
+
+const tableText = '| Header | Other |\n| --- | --- |\n| Copy table | Value |\n'
+function tableSpacing(setup: TestRendererSetup): void {
+  const nodes = descendants(setup.renderer.root)
+  const table = nodes.find(node => node instanceof TextTableRenderable)!
+  const following = nodes.find(node => node instanceof TextBufferRenderable && node.plainText.includes('Following paragraph'))!
+  expect(table).toBeDefined(); expect(following).toBeDefined()
+  expect(following.y - table.y - table.height).toBe(1)
+}
+async function selectText(setup: TestRendererSetup, frame: () => Promise<string>, text: string, endAdjustment = 0): Promise<void> {
+  const rows = setup.captureCharFrame().split('\n'), row = rows.findIndex(row => row.includes(text))
+  const col = rows[row]!.indexOf(text)
+  // These fixtures use single-width text; Unicode copies are checked separately.
+  await setup.mockMouse.drag(col, row, col + text.length + endAdjustment, row)
+  await frame(); expect(setup.renderer.getSelection()!.getSelectedText()).toBe(text)
+  contrastingSelection(setup, text)
+  setup.renderer.clearSelection(); await frame(); inheritedSurfaces(setup)
+}
+test('static Markdown tables preserve native spacing, transparent ordinary cells and header selection', async () => {
+  const { io, setup, frame } = await fixture(palettes[1])
+  io.event({ type: 'assistant', message: { kind: 'assistant', content: tableText + '\nFollowing paragraph\n', toolCalls: [] } })
+  await frame(); tableSpacing(setup); ordinary(setup, 'Copy table'); ordinary(setup, 'Value')
+  await selectText(setup, frame, 'Copy table'); await selectText(setup, frame, 'Header')
+})
+for (const initial of [tableText, tableText + '\n']) {
+  test(`streamed Markdown table retains native spacing after ${initial.endsWith('\n\n') ? 'existing' : 'new'} blank newline`, async () => {
+    const { io, setup, frame } = await fixture(palettes[0])
+    io.event({ type: 'text_delta', text: initial }); await frame()
+    const nodes = descendants(setup.renderer.root)
+    const markdown = nodes.find(node => node instanceof MarkdownRenderable)!
+    const table = nodes.find(node => node instanceof TextTableRenderable)!
+    expect(markdown.height).toBe(table.height)
+    io.event({ type: 'text_delta', text: (initial.endsWith('\n\n') ? '' : '\n') + 'Following paragraph\n' })
+    await frame(); tableSpacing(setup); await selectText(setup, frame, 'Copy table')
+  })
+}
+test('nested Markdown table selections preserve wide glyphs, native content and copied text', async () => {
+  const { io, setup, frame } = await fixture(palettes[2])
+  io.event({ type: 'assistant', message: { kind: 'assistant', content: '- Intro\n\n  | Header | Other |\n  | --- | --- |\n  | Nested 世界 | Value |\n\nOutside paragraph', toolCalls: [] } })
+  await frame(); ordinary(setup, 'Nested 世界')
+  const table = descendants(setup.renderer.root).find(node => node instanceof TextTableRenderable) as TextTableRenderable
+  const original = structuredClone(table.content)
+  const rows = setup.captureCharFrame().split('\n'), row = rows.findIndex(row => row.includes('Nested 世界'))
+  const col = rows[row]!.indexOf('Nested 世界')
+  await setup.mockMouse.drag(col, row, col + 11, row); await frame()
+  expect(setup.renderer.getSelection()!.getSelectedText()).toBe('Nested 世界')
+  contrastingSelection(setup, 'Nested 世界'); expect(table.content).toEqual(original)
+  setup.renderer.clearSelection(); await frame(); ordinary(setup, 'Nested 世界'); inheritedSurfaces(setup)
+})
+test('newly appended streamed list children get contrasting native selections', async () => {
+  const { io, setup, frame } = await fixture(palettes[0])
+  io.event({ type: 'text_delta', text: '- First item\n' }); await frame()
+  io.event({ type: 'text_delta', text: '- Second selection\n' }); await frame()
+  ordinary(setup, 'Second selection'); await selectText(setup, frame, 'Second selection')
+})
+test('late hyperlink capability changes keep native table identity, reflow and selection colors', async () => {
+  const { io, setup, frame } = await fixture(palettes[1])
+  io.event({ type: 'assistant', message: { kind: 'assistant', content: '| Header | Other |\n| --- | --- |\n| [OpenAI](https://openai.com) | Value |\n', toolCalls: [] } })
+  await frame()
+  const table = descendants(setup.renderer.root).find(node => node instanceof TextTableRenderable) as TextTableRenderable
+  const text = () => table.content.flat(2).map(chunk => chunk?.text ?? '').join('')
+  expect(text()).toContain('https://openai.com')
+  for (const hyperlinks of [true, false, true]) {
+    const capabilities = setRendererCapabilities(setup.renderer, { hyperlinks })
+    setup.renderer.emit('capabilities', capabilities); await frame()
+    expect(descendants(setup.renderer.root).find(node => node instanceof TextTableRenderable)).toBe(table)
+    expect(text().includes('https://openai.com')).toBe(!hyperlinks)
+    expect(table.content.flat(2).find(chunk => chunk?.text === 'OpenAI')!.link!.url).toBe('https://openai.com')
+    // Table selection endpoints include the next cell when fallback text follows.
+    await selectText(setup, frame, 'OpenAI', hyperlinks ? 0 : -1)
+  }
+})

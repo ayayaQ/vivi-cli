@@ -41,7 +41,34 @@ export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: 'tr
   foreground: RGBA.defaultForeground(), highlightForeground: '#e4e4e7',
   selectedBackground: '#3d2946', userBackground: '#24212d',
   muted: RGBA.defaultForeground(), attention: '#fbbf24' } as const
-const TEXT_SELECTION = { selectionBg: TUI_THEME.selectedBackground, selectionFg: TUI_THEME.highlightForeground } as const
+const TEXT_SELECTION = { selectionBg: RGBA.fromHex(TUI_THEME.selectedBackground),
+  selectionFg: RGBA.fromHex(TUI_THEME.highlightForeground) } as const
+const guardedTables = new WeakSet<TextTableRenderable>()
+function guardMarkdownSelection(node: Renderable): void {
+  if (node instanceof TextBufferRenderable) {
+    if (!node.selectionBg?.equals(TEXT_SELECTION.selectionBg)) node.selectionBg = TEXT_SELECTION.selectionBg
+    if (!node.selectionFg?.equals(TEXT_SELECTION.selectionFg)) node.selectionFg = TEXT_SELECTION.selectionFg
+  }
+  if (node instanceof TextTableRenderable && !guardedTables.has(node)) {
+    guardedTables.add(node)
+    const after = node.renderAfter
+    // OpenTUI 0.5 tables lack selection setters. Keep the native table and its
+    // layout/capability updates; only selections paint opaque cells in its
+    // otherwise-transparent buffer. Public post-render color views preserve
+    // glyphs, attributes, links and copied text, including nested tables.
+    node.renderAfter = function(buffer, deltaTime) {
+      after?.call(this, buffer, deltaTime)
+      if (!node.hasSelection()) return
+      const { fg, bg } = buffer.buffers
+      for (let offset = 0; offset < bg.length; offset += 4) {
+        if (RGBA.fromArray(bg.subarray(offset, offset + 4)).a === 0) continue
+        fg.set(TEXT_SELECTION.selectionFg.buffer, offset)
+        bg.set(TEXT_SELECTION.selectionBg.buffer, offset)
+      }
+    }
+  }
+  for (const child of node.getChildren()) guardMarkdownSelection(child)
+}
 export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a provider' },
   { command: '/models', description: 'Choose a model' },
@@ -1285,26 +1312,14 @@ export class OpenTuiIO implements ChatIO {
     }
     return new MarkdownRenderable(this.renderer, { content, syntaxStyle: this.style!, streaming,
       width: '100%', fg: TUI_THEME.foreground, treeSitterClient: this.parser,
+      // Native streaming can append list/table descendants after renderNode.
+      renderBefore() { guardMarkdownSelection(this) },
       // Plain fenced code is readable offline and does not fetch language grammars.
       renderNode: (token, context) => {
         if (token.type === 'code') return new TextRenderable(this.renderer, { ...TEXT_SELECTION,
           content: token.text, fg: TUI_THEME.pink, width: '100%', wrapMode: 'word', flexShrink: 0 })
         const rendered = context.defaultRender()
-        // OpenTUI 0.5 does not forward Markdown selection colors into tables.
-        // Retain its parsed cells/layout while supplying the same explicit pair.
-        if (rendered instanceof TextTableRenderable) return new TextTableRenderable(this.renderer, {
-          ...TEXT_SELECTION, id: rendered.id, content: rendered.content, width: '100%',
-          marginBottom: rendered.marginBottom ?? 0, fg: TUI_THEME.foreground,
-          columnWidthMode: rendered.columnWidthMode, columnFitter: rendered.columnFitter,
-          wrapMode: rendered.wrapMode, cellPaddingX: rendered.cellPaddingX, cellPaddingY: rendered.cellPaddingY,
-          columnGap: rendered.columnGap, border: rendered.border, outerBorder: rendered.outerBorder,
-          showBorders: rendered.showBorders, borderStyle: rendered.borderStyle, borderColor: rendered.borderColor
-        })
         const readable = (node: Renderable): void => {
-          if (node instanceof TextBufferRenderable) {
-            node.selectionBg = TEXT_SELECTION.selectionBg
-            node.selectionFg = TEXT_SELECTION.selectionFg
-          }
           if (node instanceof CodeRenderable) node.drawUnstyledText = true
           for (const child of node.getChildren()) readable(child)
         }
