@@ -243,3 +243,16 @@ test('account replacement revokes enrollment even when model selection cancels, 
   const store = new FileSessionStore(directory)
   assert.equal((await store.load(io.sessions[0].id)).provider, 'openai')
 })
+
+test('interactive /mode cycle bypasses the picker, requires enrollment and toggles back to Manual', async t => {
+  const directory = await fixture(t)
+  await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, model: 'gpt-5.1', enableTools: true })
+  const io = fakeIO({ interactive: true, lines: ['/mode cycle', '/mode cycle', '/exit'], approvals: [true] })
+  assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io,
+    providerFactory: () => ({ generate: async () => { throw new Error('Mode controls must not send a chat turn') } }) }), 0)
+  assert.equal(io.requests.length, 1)
+  assert.equal(io.requests[0].call.name, 'enroll_auto_review')
+  assert.equal(io.choices.length, 0)
+  assert.equal(io.modes.at(-1), 'manual')
+  assert.match(io.output, /enrolled for this conversation/)
+})

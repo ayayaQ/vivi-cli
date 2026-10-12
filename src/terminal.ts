@@ -126,6 +126,17 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
     }
   } finally { dispose() }
 }
+
+/** A human shortcut can revoke Auto immediately; entering Auto still needs fresh enrollment. */
+export async function cycleApprovalMode(host: CliHost, io: ChatIO): Promise<void> {
+  if (host.approvalMode === 'auto') {
+    host.setApprovalMode('manual')
+    io.setApprovalMode?.('manual')
+    io.write('Approval mode: Manual\n')
+    return
+  }
+  await selectApprovalMode(host, io)
+}
 export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Automatic skill saving is disabled on every platform; creator drafts are saved manually; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
@@ -488,8 +499,8 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       continue
     }
     if (/^\/mode(?:\s|$)/.test(line.trim())) {
-      if (line.trim() !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
-      try { await selectApprovalMode(host, io) }
+      if (line.trim() !== '/mode' && line.trim() !== '/mode cycle') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
+      try { await (line.trim() === '/mode cycle' ? cycleApprovalMode(host, io) : selectApprovalMode(host, io)) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
       continue
     }
