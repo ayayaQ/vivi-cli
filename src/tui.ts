@@ -316,9 +316,13 @@ export class OpenTuiIO implements ChatIO {
     this.updateChoiceLayout()
     this.updateComposerLayout()
   }
-  private readonly focusHandler = (): void => { this.mouseActivation.clear() }
+  private readonly focusHandler = (): void => {
+    this.mouseActivation.clear()
+    this.questionDialog?.resetGesture()
+  }
   private readonly blurHandler = (): void => {
     this.mouseActivation.clear()
+    this.questionDialog?.resetGesture()
     if (this.pending?.kind === 'approval') { this.approvalIndex = 0; this.renderDialogActions() }
   }
   private readonly resizeHandler = (): void => {

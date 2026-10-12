@@ -250,6 +250,8 @@ export class QuestionDialog {
       else this.activate(this.action)
     }
   }
+  /** Terminal focus transitions interrupt any incomplete mouse gesture. */
+  resetGesture(): void { this.mouse.clear() }
   redact(): void { if (!this.disposed) { this.renderProgress(); this.heading.content = this.options.safe(this.request.questions[this.page]!.question, 1200); this.renderChoices() } }
   close(): void {
     if (this.disposed) return

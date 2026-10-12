@@ -79,7 +79,7 @@ jobs:
       # Windows npm scripts do not expand the shell wildcard used by test:tui.
       - run: bun test ./test/tui.test.ts ./test/tui-theme.test.ts ./test/tui-diff.test.ts ./test/application-tui.test.ts ./test/tui-mouse.test.ts ./test/tui-composer-feedback.test.ts ./test/tui-input-diagnostic.test.ts ./test/session-status-tui.test.ts ./test/auto-review-controls-tui.test.ts ./test/auto-review-status-tui.test.ts ./test/skills-tui.test.ts ./test/tool-presentation-tui.test.ts
       - run: bun test ./test/mcp-controls-tui.test.ts
-      - run: bun test ./test/plan-mode-tui.test.ts ./test/mode-cycle-tui.test.ts ./test/input-queue.test.ts ./test/questions-tui.test.ts
+      - run: bun test ./test/plan-mode-tui.test.ts ./test/mode-cycle-tui.test.ts ./test/input-queue.test.ts ./test/questions-tui.test.ts ./test/questions-focus-tui.test.ts
       - run: npm run test:package
         env:
           VIVI_TEST_BUN: bun
