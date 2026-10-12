@@ -279,3 +279,42 @@ test('full-screen Plan selection and direct command require no enrollment; a new
   assert.equal(io.taskModes.at(-1), 'execute')
   assert.equal(io.sessions.length, 3) // Initial, post-turn refresh, new conversation.
 })
+
+test('application denied or cancelled Auto enrollment keeps Plan for the next ordinary turn without a decision provider', async t => {
+  for (const approval of [false, io => { io.cancel(); return true }]) {
+    const directory = await fixture(t)
+    await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, model: 'gpt-5.1', enableTools: true })
+    const io = fakeIO({ interactive: true, lines: ['/mode plan', '/mode', 'Continue planning', '/session', '/exit'],
+      choices: ['auto'], approvals: [approval] })
+    let generates = 0
+    assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io,
+      providerFactory: () => ({ async generate({ tools, messages }) {
+        generates++; assert(!tools.some(tool => ['note_set', 'create_memory', 'command_start', 'fetch_url'].includes(tool.name)))
+        assert(messages.some(message => message.content.startsWith('Plan mode is active'))); return answer()
+      } }), decisionProviderFactory: () => { throw new Error('Negative enrollment must not construct a decision provider') } }), 0)
+    assert.equal(generates, 1); assert.equal(io.requests.length, 1)
+    assert.equal(io.taskModes.at(-1), 'plan'); assert.match(io.output, /Mode: Plan/)
+  }
+})
+
+test('confirmed provider, model and effort replacements preserve Plan; explicit new conversations reset it', async t => {
+  const directory = await fixture(t)
+  await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, model: 'gpt-5.1', enableTools: true,
+    reasoningCapabilities: ['none', 'low', 'medium', 'high'] })
+  const io = fakeIO({ interactive: true,
+    lines: ['/mode plan', '/models', 'Plan after model', '/effort', 'Plan after effort', '/provider', 'Plan after provider', '/new', '/session', '/exit'],
+    choices: ['gpt-5.1', 'low', 'openai', 'current', 'gpt-5.1'] })
+  let generates = 0
+  const catalog = { async list() { return { state: 'fresh', models: [{ id: 'gpt-5.1', name: 'Offline model',
+    conversation: 'supported', tools: 'supported', reasoning: 'supported', efforts: ['none', 'low', 'medium', 'high'] }] } } }
+  assert.equal(await main(['--no-workspace', '--session-dir', directory], { OPENAI_API_KEY: 'offline-plan-key' }, { tuiIO: io, catalog,
+    providerFactory: () => ({ async generate({ tools, messages }) {
+      generates++; assert(!tools.some(tool => ['note_set', 'create_memory', 'command_start', 'fetch_url'].includes(tool.name)))
+      assert(messages.some(message => message.content.startsWith('Plan mode is active'))); return answer()
+    } }), decisionProviderFactory: () => { throw new Error('Plan replacements must not construct a decision provider') } }), 0)
+  assert.equal(generates, 3); assert.equal(io.requests.length, 0)
+  assert.deepEqual(io.taskModes, ['execute', 'plan', 'plan', 'plan', 'plan', 'execute'])
+  assert.equal(io.modes.at(-1), 'manual')
+  assert.equal(io.sessions.filter(session => session.reasoning === 'low').length > 0, true)
+  assert.match(io.output, /local-read task policy preserved/)
+})

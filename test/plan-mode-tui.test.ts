@@ -65,3 +65,30 @@ test('closing the native mode picker leaves the current Plan policy in force', a
   await f.frame(); f.io.close(); await choosing
   expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
 })
+
+test('denying, cancelling and closing Auto enrollment from Plan keep Plan and preserve the idle draft', async () => {
+  for (const outcome of ['deny', 'cancel', 'close'] as const) {
+    const f = await fixture()
+    f.host.setTaskMode('plan'); f.io.setTaskMode('plan')
+    const reading = f.io.readLine('Message'); await f.input.typeText('Keep this planning draft'); await f.frame()
+    f.input.pressTab({ shift: true }); expect(await reading).toBe('/mode cycle')
+    // Explicit picker choice, not Shift+Tab's Plan -> Manual transition.
+    const choosing = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
+    await f.frame(); f.input.pressArrow('up'); f.input.pressEnter()
+    await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
+    expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
+    // Complete the approval input-drain tick and a fresh frame before any
+    // gesture; the picker Return cannot count as enrollment confirmation.
+    await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
+    if (outcome === 'deny') f.input.pressEnter()
+    else if (outcome === 'cancel') f.input.pressEscape()
+    else f.io.close()
+    await choosing
+    expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
+    if (outcome !== 'close') {
+      const next = f.io.readLine('Message'); await f.frame()
+      expect((f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('Keep this planning draft')
+      f.input.pressEnter(); expect(await next).toBe('Keep this planning draft')
+    }
+  }
+})

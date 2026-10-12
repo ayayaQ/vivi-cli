@@ -186,6 +186,54 @@ test('mode setters reject active turns and cancelled old approvals cannot commit
   await subject.shutdown()
 })
 
+test('Auto enrollment from Plan is transactional on deny, cancel, close, unavailable surface and errors', async () => {
+  for (const outcome of ['deny', 'cancel', 'close', 'unavailable', 'error', 'allow']) {
+    const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
+      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('Enrollment cannot call the judge') } } } })
+    subject.setTaskMode('plan')
+    const f = controls(subject); let cancel
+    f.io.onCancel = callback => { cancel = callback; return () => {} }
+    f.io.canAutoReview = outcome !== 'unavailable'
+    f.io.approve = async () => {
+      assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
+      if (outcome === 'cancel') cancel()
+      if (outcome === 'close') f.io.isClosed = true
+      if (outcome === 'error') throw new Error('Offline approval failure')
+      return outcome !== 'deny'
+    }
+    const selection = selectApprovalMode(subject, f.io, async () => 'auto')
+    if (outcome === 'error') await assert.rejects(selection, /Offline approval failure/)
+    else await selection
+    assert.equal(subject.taskMode, outcome === 'allow' ? 'execute' : 'plan')
+    assert.equal(subject.approvalMode, outcome === 'allow' ? 'auto' : 'manual')
+    await subject.shutdown()
+  }
+})
+
+test('stale Auto confirmation from Plan preserves a newer explicit Plan or Manual choice', async () => {
+  for (const latest of ['plan', 'manual']) {
+    const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
+      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('No judge during enrollment') } } } })
+    subject.setTaskMode('plan'); const f = controls(subject)
+    f.io.approve = async () => { await runModeControl(subject, f.io, `/mode ${latest}`); return true }
+    await selectApprovalMode(subject, f.io, async () => 'auto')
+    assert.equal(subject.taskMode, latest === 'plan' ? 'plan' : 'execute')
+    assert.equal(subject.approvalMode, 'manual'); await subject.shutdown()
+  }
+})
+
+test('Auto enrollment failure after human allow restores Plan before exposing an unhealthy-ledger error', async () => {
+  const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: {
+    async upsert() {}, async drain() { throw new Error('Offline ledger failure') } },
+    provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('No judge during enrollment') } } } })
+  subject.setTaskMode('plan')
+  await subject.send('Ordinary read-only planning response')
+  const f = controls(subject, true)
+  await assert.rejects(selectApprovalMode(subject, f.io, async () => 'auto'), /healthy review ledger/)
+  assert.equal(f.requests.length, 1); assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
+  await subject.shutdown()
+})
+
 test('new and resumed hosts do not inherit Plan or approval authority from persisted conversation data', async () => {
   const store = persistence(), subject = host({ store })
   assert.equal(subject.taskMode, 'execute')

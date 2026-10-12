@@ -218,6 +218,33 @@ try {
   assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'compiled new')
   assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
 
+  let planRounds = 0
+  const planMethods = mcpMethods.length
+  const planHost = await CliHost.create({ workspace, commandWorkspace: commands, mcp, enableNotes: true,
+    store: new FileSessionStore(directory), settings: { provider: 'openai', model: 'fake' },
+    approve: async () => { assert.fail('Compiled Plan cannot request execution approval') },
+    provider: { async generate({ tools, messages }) {
+      assert(!tools.some(tool => ['note_set', 'workspace_edit_text', 'command_start', 'fetch_url', 'read_mcp_resource'].includes(tool.name)))
+      assert(messages.some(message => message.role === 'system' && message.content.startsWith('Plan mode is active')))
+      return ++planRounds === 1 ? { content: '', toolCalls: [
+        { id: 'compiled-plan-read', name: 'workspace_read', arguments: { path: 'created.txt' } },
+        { id: 'compiled-plan-note', name: 'note_set', arguments: { key: 'blocked', value: 'blocked', expectedRevision: 0 } },
+        { id: 'compiled-plan-command', name: 'command_start', arguments: {} },
+        { id: 'compiled-plan-url', name: 'fetch_url', arguments: { url: 'https://example.com/' } },
+        { id: 'compiled-plan-mcp', name: 'read_mcp_resource', arguments: {} }
+      ] } : { content: 'Compiled read-only plan', toolCalls: [] }
+    } } })
+  planHost.setTaskMode('plan')
+  const planResult = await planHost.send('Investigate and plan without changing anything')
+  assert.equal(planResult.status, 'completed'); assert.equal(planHost.taskMode, 'plan')
+  assert.equal(planHost.session.noteRevision, 0); assert.equal(mcpMethods.length, planMethods)
+  assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'compiled new')
+  const planResults = planResult.history.filter(message => message.kind === 'tool_result')
+  assert.equal(planResults.length, 5)
+  assert.equal(planResults[0]!.isError, undefined); assert(planResults.slice(1).every(message => message.isError))
+  planHost.setTaskMode('execute'); assert.equal(planHost.approvalMode, 'manual')
+  await planHost.shutdown()
+
 } finally { await mcp.close(); await rm(directory, { recursive: true, force: true }) }
 
 const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
@@ -279,5 +306,5 @@ try {
   assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0')!.getChildren().length, 0)
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only Plan policy, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

@@ -80,7 +80,7 @@ export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a provider' },
   { command: '/models', description: 'Choose a model' },
   { command: '/effort', description: 'Choose reasoning effort' },
-  { command: '/mode', description: 'Choose Manual or Auto review' },
+  { command: '/mode', description: 'Choose Manual / Auto review / Plan' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
   { command: '/rename', description: 'Rename the current session' },

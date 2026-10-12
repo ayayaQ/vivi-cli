@@ -120,12 +120,19 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   ], ['manual', 'auto', 'plan'].indexOf(current)) : 'auto'
   if (selected === undefined || (choose && io.isClosed)) return
   if (selected === 'plan') { selectPlan(host, io); return }
-  selectManual(host, io)
-  if (selected !== 'auto') { io.write('Approval mode: Manual\n'); return }
-  if (io.canAutoReview !== true || io.isClosed) { io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`); return }
+  if (selected !== 'auto') { selectManual(host, io); io.write('Approval mode: Manual\n'); return }
+  // Leaving Plan for Auto is contingent on successful fresh enrollment. While
+  // consent is pending, Plan remains the task policy even if its dialog closes.
+  const fromPlan = current === 'plan'
+  if (fromPlan) host.setApprovalMode('manual')
+  else selectManual(host, io)
+  if (io.canAutoReview !== true || io.isClosed) {
+    io.write(`${fromPlan ? AUTO_REVIEW_UNAVAILABLE.replace('Using Manual;', 'Plan remains active;') : AUTO_REVIEW_UNAVAILABLE}\n`)
+    return
+  }
   const disclosure = autoReviewDisclosure(host.session.provider)
   const binding = host.approvalEnrollmentBinding
-  io.write('Approval mode: Manual\n')
+  io.write(fromPlan ? 'Mode: Plan · Auto review requires fresh enrollment; cancel keeps Plan\n' : 'Approval mode: Manual\n')
   const controller = new AbortController()
   const dispose = io.onCancel(() => controller.abort())
   try {
@@ -135,15 +142,29 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
     } }, currentRevision: 'fresh Auto review enrollment',
     description: disclosure }, controller.signal)
     if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
-      host.setApprovalMode('auto')
+      try {
+        if (fromPlan) host.setTaskMode('execute')
+        host.setApprovalMode('auto')
+      } catch (error) {
+        // A suspended ledger or unavailable enrollment cannot relax Plan's
+        // task policy after the human confirmation. No await/effect lies between
+        // these setters; restore the policy before propagating the failure.
+        if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
+        io.setTaskMode?.(host.taskMode ?? 'execute')
+        io.setApprovalMode?.(host.approvalMode)
+        throw error
+      }
+      io.setTaskMode?.('execute')
       io.setApprovalMode?.('auto')
       io.write('Approval mode: Auto review · enrolled for this conversation and selected account\n')
     } else {
       const changed = binding !== host.approvalEnrollmentBinding
-      host.setApprovalMode('manual')
+      // A stale dialog cannot override a newer explicit mode choice.
+      if (!changed) host.setApprovalMode('manual')
       io.setTaskMode?.(host.taskMode ?? 'execute')
-      io.setApprovalMode?.('manual')
-      io.write(changed ? 'Approval mode: Manual. Enrollment changed; open /mode for a fresh confirmation\n' : 'Approval mode: Manual\n')
+      io.setApprovalMode?.(host.approvalMode)
+      const label = conversationModeLabel(host.taskMode, host.approvalMode)
+      io.write(changed ? `Mode: ${label}. Enrollment changed; open /mode for a fresh confirmation\n` : `Mode: ${label}\n`)
     }
   } finally { dispose() }
 }

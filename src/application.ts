@@ -190,7 +190,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       try { io.write('Candidate session cleanup failed; its session may remain locked\n'); report(error) } catch { /* Preserve the primary error. */ }
     }
   }
-  let selected: { resume?: string; fresh?: boolean } | undefined = options.resume ? { resume: options.resume }
+  let selected: { resume?: string; fresh?: boolean; preservePlan?: boolean } | undefined = options.resume ? { resume: options.resume }
     : settings.model ? { fresh: true } : undefined
   const loadKey = async (provider: CliProviderName): Promise<string | undefined> => {
     const name = envName(provider)
@@ -362,7 +362,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     if (!configured || io.isClosed) return
     const model = await chooseModel(configured)
     if (io.isClosed) return
-    if (model) { await save(model); selected = { fresh: true } }
+    if (model) { await save(model); selected = { fresh: true, preservePlan: true } }
     else if (!host && configured.provider !== settings.provider) {
       // Keep a completed provider choice after cancelling model selection, so
       // /models can continue setup without a wizard loop or storing credentials.
@@ -493,7 +493,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       }
     }
   }
-  const openSession = async (selection: { resume?: string; fresh?: boolean }): Promise<boolean> => {
+  const openSession = async (selection: { resume?: string; fresh?: boolean; preservePlan?: boolean }): Promise<boolean> => {
     if (!selection.resume && !settings.model) return false
     const capabilityNotice = selection.resume ? undefined : await hydrateModel()
     if (capabilityNotice === false) return false
@@ -547,6 +547,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       candidate.host = nextHost
+      if (selection.preservePlan && previousHost?.taskMode === 'plan') nextHost.setTaskMode('plan')
       await nextHost.initialize()
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
       if (io.isClosed) { await discardCandidate(); return false }
@@ -562,9 +563,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     await previousRelease?.().catch(report)
     io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setSession(host.session)
-    io.setTaskMode?.('execute')
+    io.setTaskMode?.(host.taskMode)
     io.setApprovalMode?.('manual')
-    io.write('Approval mode: Manual\n')
+    io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; Auto review enrollment revoked\n' : 'Approval mode: Manual\n')
     // Native transcript setup clears earlier loading output. Keep stale-cache
     // disclosure visible after that rebuild and before the first provider turn.
     if (capabilityNotice) io.write(capabilityNotice)
@@ -660,8 +661,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           await configureProviderModel()
           continue
         }
-        if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true } }; continue }
-        if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
+        if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
+        if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
         if (command === '/skills') { await manageSkills(); continue }
         if (isMcpCommand(command)) {

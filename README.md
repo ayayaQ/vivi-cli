@@ -73,10 +73,14 @@ still apply. Workspace/note/memory mutations, every unsandboxed command, public 
 GETs, MCP calls/resources and imported extensions are unavailable, even if described
 as read-only. The assistant describes its plan in a normal response and stays in
 Plan until you explicitly change mode. Switching does not execute old proposals.
+Choosing Auto from Plan leaves Plan only after successful fresh enrollment;
+cancelling, denying or closing that confirmation keeps Plan active.
 Plan does not mean zero filesystem writes: normal conversation checkpoints,
 transcripts, local store locks/recovery and shutdown bookkeeping still run. Explicit
 host controls such as session renaming and memory management keep their existing
-review rules. New and resumed hosts start in Manual execution mode.
+review rules. Explicit new/resumed conversations start in Manual execution mode.
+Model and reasoning-effort changes preserve Plan when it is selected, while
+revoking any Auto review enrollment.
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
