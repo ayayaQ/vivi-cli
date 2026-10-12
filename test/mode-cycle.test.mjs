@@ -5,8 +5,10 @@ import { cycleApprovalMode, runChatLoop } from '../dist/terminal.js'
 import { newSession } from '../dist/session.js'
 
 function fixture({ mode = 'manual', interactive = true, allow = false, lines = [] } = {}) {
+  let taskMode = 'execute'
   const host = { session: newSession({ provider: 'openai', model: 'offline' }),
-    get approvalMode() { return mode }, setApprovalMode(value) { mode = value } }
+    get approvalMode() { return mode }, setApprovalMode(value) { mode = value },
+    get taskMode() { return taskMode }, setTaskMode(value) { taskMode = value; if (value === 'plan') mode = 'manual' } }
   const requests = [], io = { canAutoReview: interactive, output: '', modes: [],
     async readLine() { return lines.shift() }, write(value) { this.output += value },
     event() {}, result() {}, close() {}, onCancel() { return () => {} },
@@ -15,13 +17,18 @@ function fixture({ mode = 'manual', interactive = true, allow = false, lines = [
   return { host, io, requests }
 }
 
-test('cycling into Auto requires fresh enrollment every time, while cycling out revokes immediately', async () => {
+test('Manual -> enrolled Auto -> Plan -> Manual revokes Auto and needs fresh enrollment next time', async () => {
   const f = fixture({ allow: true })
   await cycleApprovalMode(f.host, f.io)
   assert.equal(f.host.approvalMode, 'auto')
   assert.equal(f.requests[0].call.name, 'enroll_auto_review')
   assert.match(f.requests[0].description, /extra API charges/)
   await cycleApprovalMode(f.host, f.io)
+  assert.equal(f.host.approvalMode, 'manual')
+  assert.equal(f.host.taskMode, 'plan')
+  assert.equal(f.requests.length, 1)
+  await cycleApprovalMode(f.host, f.io)
+  assert.equal(f.host.taskMode, 'execute')
   assert.equal(f.host.approvalMode, 'manual')
   assert.equal(f.requests.length, 1)
   await cycleApprovalMode(f.host, f.io)

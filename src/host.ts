@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { runAgent } from '@ayayaq/vivi'
+import { PLAN_MODE_GUIDANCE, planModeRefusal } from './task-mode.js'
+import type { TaskMode } from './task-mode.js'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentAcceptedUpdate, AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
 import { createHash, randomUUID } from 'node:crypto'
@@ -288,6 +290,7 @@ export class CliHost {
   private persistence: Promise<void> = Promise.resolve()
   private enabledMemory: boolean
   private readonly reviews: AutoReviewController
+  private selectedTaskMode: TaskMode = 'execute'
   private readonly presentationDecisions: CliToolDecision[] = []
   private presentationTurnStart = 0
   private readonly memoryStoreRevision = randomUUID()
@@ -408,12 +411,22 @@ export class CliHost {
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
   get approvalMode(): ApprovalMode { return this.reviews.mode }
+  get taskMode(): TaskMode { return this.selectedTaskMode }
   get approvalEnrollmentBinding(): string {
-    return reviewDigest({ sessionId: this.current.id, provider: this.current.provider, enrollmentBinding: this.reviews.enrollmentBinding })
+    return reviewDigest({ sessionId: this.current.id, provider: this.current.provider, taskMode: this.taskMode, enrollmentBinding: this.reviews.enrollmentBinding })
   }
   setApprovalMode(mode: ApprovalMode): void {
     if (this.running) throw new Error('Wait for the current turn before changing approval mode')
+    if (mode === 'auto' && this.taskMode === 'plan') throw new Error('Leave Plan mode before enrolling Auto review')
     this.reviews.setMode(mode)
+  }
+  setTaskMode(mode: TaskMode): void {
+    if (this.running) throw new Error('Wait for the current turn before changing task mode')
+    if (mode !== 'execute' && mode !== 'plan') throw new Error('Unknown task mode')
+    // Entering Plan revokes enrollment. Leaving it cannot restore prior Auto
+    // authority or dispatch a queued proposal; only a new explicit turn can act.
+    if (mode === 'plan') this.reviews.setMode('manual')
+    this.selectedTaskMode = mode
   }
   /** Revision-checked atomic metadata change; a failed write leaves the current session intact. */
   async renameSession(input: string, expectedRevision: number): Promise<void> {
@@ -1134,6 +1147,7 @@ export class CliHost {
     }
     const enableNotes = this.options.enableNotes ?? false
     const enableTools = this.options.enableTools !== false
+    const taskMode = this.taskMode
     const controller = new AbortController(), owner = createExtensionScope()
     let finish!: () => void
     const settled = new Promise<void>(resolve => { finish = resolve })
@@ -1188,7 +1202,7 @@ export class CliHost {
       }) : undefined
       const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets,
         (call, signal) => this.executeWorkspaceMutation(call, signal, controller.signal)) : undefined
-      const commands = enableTools && this.commandsEnabled
+      const commands = taskMode !== 'plan' && enableTools && this.commandsEnabled
         ? createCommandExtension(() => this.openCommandWorkspace(controller.signal),
           () => this.commandContext(commandRunId, controller.signal), controller.signal) : undefined
       // A metadata commit already admitted while idle must settle before this
@@ -1198,7 +1212,7 @@ export class CliHost {
       await this.recoverMcpOutcomes()
       await this.recoverPublicUrlOutcomes()
       await this.initializeRecords()
-      const mcpManager = enableTools ? this.options.mcp : undefined
+      const mcpManager = taskMode !== 'plan' && enableTools ? this.options.mcp : undefined
       let mcp: ToolExtension | undefined
       if (mcpManager) {
         try {
@@ -1230,9 +1244,10 @@ export class CliHost {
           return this.enabledSkills && !memoryContextContainsSecret(catalog.document(request.name), this.options.secrets ?? [])
         }
       }) : undefined
-      const publicUrl = enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes
+      const publicUrl = taskMode !== 'plan' && enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes
         ? createPublicUrlExtension((call, signal) => this.executePublicUrl(call, signal, controller.signal)) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl)
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode)
+      const allowedTools = new Set(enableTools ? toolset.tools.map(tool => tool.name) : [])
       if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: PUBLIC_URL_GUIDANCE })
       owner.defer(() => toolset.dispose())
       const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name) ?? [])
@@ -1257,6 +1272,7 @@ export class CliHost {
       if (workspace) prefix.push({ kind: 'message', role: 'system', content: WORKSPACE_GUIDANCE })
       if (mcp) prefix.push({ kind: 'message', role: 'system', content: MCP_GUIDANCE })
       if (commands) prefix.push({ kind: 'message', role: 'system', content: COMMAND_GUIDANCE })
+      if (taskMode === 'plan') prefix.push({ kind: 'message', role: 'system', content: PLAN_MODE_GUIDANCE })
       // Accept the prompt and its title in one successful checkpoint. A failed
       // initial write must not leave an unsaved prompt/title in memory for a retry.
       const previous = structuredClone(this.current)
@@ -1326,6 +1342,8 @@ export class CliHost {
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: async (call, context) => {
+          context.signal.throwIfAborted()
+          if (taskMode === 'plan' && !allowedTools.has(call.name)) return planModeRefusal()
           if (ownedMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
           if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
             return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,

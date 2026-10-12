@@ -14,7 +14,8 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, cycleApprovalMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
@@ -81,8 +82,8 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
-/mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
-Shift+Tab cycles Manual / Auto review in the idle composer and preserves your draft; entering Auto still needs confirmation.
+/mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
+Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
@@ -561,6 +562,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     await previousRelease?.().catch(report)
     io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setSession(host.session)
+    io.setTaskMode?.('execute')
     io.setApprovalMode?.('manual')
     io.write('Approval mode: Manual\n')
     // Native transcript setup clears earlier loading output. Keep stale-cache
@@ -625,7 +627,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
-          { name: 'Approval mode', value: '/mode' },
+          { name: 'Mode', description: 'Manual / Auto review / Plan', value: '/mode' },
           { name: 'Trusted commands', value: '/commands' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
           { name: 'Skills', value: '/skills' },
@@ -680,21 +682,20 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           continue
         }
         if (/^\/mode(?:\s|$)/.test(command)) {
-          if (command !== '/mode' && command !== '/mode cycle') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
           if (!host) { io.write('Choose a provider and model before selecting approval mode\n'); continue }
-          if (hostAccountGeneration !== accountGeneration) {
+          if (hostAccountGeneration !== accountGeneration && command !== '/mode plan' && command !== '/mode manual' &&
+            !(command === '/mode cycle' && host.taskMode === 'plan')) {
             host.setApprovalMode('manual'); io.setApprovalMode?.('manual')
             io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling Auto review again\n')
             continue
           }
-          if (command === '/mode cycle') await cycleApprovalMode(host, io)
-          else await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
           continue
         }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nApproval mode: ${host!.approvalMode === 'auto' ? 'Auto review' : 'Manual'}\nSession tokens: ${formatUsage(session.usage)}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
           io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           continue
