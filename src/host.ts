@@ -6,6 +6,9 @@ import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentAcceptedUpdate, AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
 import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createQuestionExtension } from '@ayayaq/vivi/extensions/questions'
+import { askCurrentQuestion, QUESTION_GUIDANCE, QUESTION_TOOL_NAME } from './questions.js'
+import type { CliQuestionHost } from './questions.js'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
@@ -270,6 +273,8 @@ export interface CliHostOptions {
   secrets?: readonly string[]
   maxRounds?: number
   approve?(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
+  /** Genuine, interactive clarification; unrelated to execution review. */
+  questionHost?: CliQuestionHost
   decisionReview?: AutoReviewConfiguration
   onReviewNotice?(message: string, context?: ReviewNotice): void
   onMemoryNotice?(message: string): void
@@ -313,6 +318,7 @@ export class CliHost {
   private readonly mcpJobs = new Set<Promise<ToolResult>>()
   private readonly eventJobs = new Set<Promise<void>>()
   private readonly mcpIdentityReplacements: McpIdentityReplacements = { callIds: new Map(), toolNames: new Map() }
+  private readonly questionAccount: string | undefined
   private readonly commandAccount: string | undefined
   private readonly commandLaunchId = randomUUID()
   private activeTurn: { readonly scope: ExtensionScope; readonly settled: Promise<void> } | undefined
@@ -341,6 +347,7 @@ export class CliHost {
       (options.store instanceof FileSessionStore ? new FileCliConversationStore(options.store.directory) : undefined),
       () => this.options.secrets ?? [], options.onConversationNotice)
     this.mcpRecoveryCalls = this.current.history.flatMap(message => message.kind === 'assistant' ? structuredClone(message.toolCalls) : [])
+    this.questionAccount = options.questionHost?.accountRevision?.()
     this.commandAccount = options.commandApproval?.accountRevision()
     this.commandProposalsEnabled = options.enableCommands !== false
     if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
@@ -1246,7 +1253,20 @@ export class CliHost {
       }) : undefined
       const publicUrl = taskMode !== 'plan' && enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes
         ? createPublicUrlExtension((call, signal) => this.executePublicUrl(call, signal, controller.signal)) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode)
+      const questionHost = this.options.questionHost
+      const questionSession = this.current.id, questionModel = this.current.model, questionProvider = this.current.provider
+      const questionReasoning = this.current.reasoning, questionProviderAdapter = this.options.provider, questionAsk = questionHost?.ask
+      const questionRevision = this.toolsetRevision
+      const questionIsCurrent = (): boolean => !this.shutdownStarted && this.controller === controller && owner.state === 'open' &&
+        this.current.id === questionSession && this.current.model === questionModel && this.current.provider === questionProvider &&
+        this.current.reasoning === questionReasoning && this.options.provider === questionProviderAdapter && this.taskMode === taskMode &&
+        this.toolsetRevision === questionRevision && this.options.enableTools !== false && this.options.questionHost === questionHost &&
+        questionHost?.ask === questionAsk && questionHost?.isAvailable() === true && questionHost.accountRevision?.() === this.questionAccount
+      const questions = enableTools && questionHost && questionIsCurrent() ? createQuestionExtension({
+        ask: (request, { signal }) => askCurrentQuestion(questionHost, request, signal, questionIsCurrent, () => this.options.secrets ?? [])
+      }) : undefined
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode, questions)
+      if (questions) prefix.push({ kind: 'message', role: 'system', content: QUESTION_GUIDANCE })
       const allowedTools = new Set(enableTools ? toolset.tools.map(tool => tool.name) : [])
       if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: PUBLIC_URL_GUIDANCE })
       owner.defer(() => toolset.dispose())
@@ -1301,7 +1321,7 @@ export class CliHost {
               try { mcpToolContext.push(JSON.parse(message.content)) }
               catch { mcpToolContext.push(message.content) }
             }
-            if (message.kind === 'tool_result' && (memoryToolNames.has(message.name) || workspaceToolNames.has(message.name) || commandToolNames.has(message.name) || skillsToolNames.has(message.name))) {
+            if (message.kind === 'tool_result' && (memoryToolNames.has(message.name) || workspaceToolNames.has(message.name) || commandToolNames.has(message.name) || skillsToolNames.has(message.name) || message.name === QUESTION_TOOL_NAME)) {
               // Decode quoted/escaped content before checking, including resumed
               // canonical results that were serialized by an older host.
               try { memoryToolContext.push(JSON.parse(message.content)) }
@@ -1311,7 +1331,7 @@ export class CliHost {
               if (mcpSeen) mcpToolContext.push(message.content, message.providerState ?? null)
               for (const call of message.toolCalls) {
                 if (isMcpTool(call.name)) mcpToolContext.push(call, message.providerState ?? null)
-                if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name) || commandToolNames.has(call.name) || skillsToolNames.has(call.name)) memoryToolContext.push(call.arguments)
+                if (memoryToolNames.has(call.name) || workspaceToolNames.has(call.name) || commandToolNames.has(call.name) || skillsToolNames.has(call.name) || call.name === QUESTION_TOOL_NAME) memoryToolContext.push(call.arguments)
               }
             }
           }
@@ -1334,6 +1354,12 @@ export class CliHost {
             publicUrlContainsSecret([output.toolCalls.filter(call => isPublicUrlTool(call.name)), output.content, output.providerState ?? null], this.options.secrets ?? [])) {
             throw new Error('Public URL provider response contains a known credential; the assistant request was blocked before admission')
           }
+          if ((input.messages.some(message => message.kind === 'tool_result' && message.name === QUESTION_TOOL_NAME) ||
+            output.toolCalls.some(call => call.name === QUESTION_TOOL_NAME)) && mcpContainsSecret([
+              output.toolCalls.filter(call => call.name === QUESTION_TOOL_NAME), output.content, output.providerState ?? null
+            ], this.options.secrets ?? [])) {
+            throw new Error('Question provider response contains a known credential; the assistant request was blocked before admission')
+          }
           // Reject session-wide overflow before this response enters canonical history.
           aggregateUsage([...priorUsage, ...roundUsage, output.usage])
           this.records.assertOutput(output, input.messages.slice(prefix.length))
@@ -1348,6 +1374,10 @@ export class CliHost {
           if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
             return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
               error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true }
+          }
+          if (call.name === QUESTION_TOOL_NAME && mcpContainsSecret(call.arguments, this.options.secrets ?? [])) {
+            return { content: JSON.stringify({ success: false, error: { code: 'question_credentials_blocked',
+              message: 'Question contains a known credential; no prompt was displayed' } }), isError: true }
           }
           if (skillsToolNames.has(call.name)) {
             this.options.skills?.addSecrets(this.options.secrets ?? [])

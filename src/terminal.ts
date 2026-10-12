@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
+import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import type { CliHost } from './host.js'
 import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
@@ -26,6 +27,9 @@ export interface ChatIO {
   readonly isClosed?: boolean
   /** Enrollment requires a real interactive approval surface; omitted means unavailable. */
   readonly canAutoReview?: boolean
+  /** A genuine human question surface. Piped/headless and line-only flows are unavailable. */
+  readonly canAskQuestions?: boolean
+  askQuestions?(request: QuestionRequest, signal: AbortSignal): Promise<QuestionResponse>
   setApprovalMode?(mode: ApprovalMode): void
   setTaskMode?(mode: TaskMode): void
   /** Optional safe display sink that survives canonical transcript refresh. */
@@ -323,6 +327,11 @@ export class TerminalIO implements ChatIO {
   private readonly signalHandler: () => void
   get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
     !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
+  readonly canAskQuestions = false
+  async askQuestions(request: QuestionRequest, _signal: AbortSignal): Promise<QuestionResponse> {
+    this.write('Questions are unavailable in line mode; use the native interactive terminal UI\n')
+    return { requestId: request.requestId, status: 'cancelled' }
+  }
   get isClosed(): boolean { return this.disposed || this.ended }
   /** EOF can leave queued/prompt work to consume; disposal ends the launch. */
   get isDisposed(): boolean { return this.disposed }

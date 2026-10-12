@@ -36,6 +36,9 @@ import { mcpContainsSecret } from './mcp-content.js'
 import { WorkspaceDiffRenderable } from './tui-diff.js'
 import { createTerminalTitleSink, TerminalTitleController } from './terminal-title.js'
 import type { TerminalTitleSink } from './terminal-title.js'
+import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
+import { InputQueue } from './input-queue.js'
+import { QuestionDialog } from './question-dialog.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
@@ -149,7 +152,7 @@ function toolHeader(card: { readonly title: string; readonly status: string }, c
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
 const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /settings /menu /help /exit'
-type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search'
+type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question'
 interface PendingInput {
   kind: InputKind
   armed: boolean
@@ -276,6 +279,11 @@ export class OpenTuiIO implements ChatIO {
   private historyLength = 0
   private turnHistoryStart = 0
   private pending: PendingInput | undefined
+  private readonly inputQueue = new InputQueue()
+  private dialogOwner = new AbortController()
+  private activeDialog: object | undefined
+  private questionDialog: QuestionDialog | undefined
+  private suspendedChat: { pending: PendingInput; text: string; cursor: number; title: string } | undefined
   private closed = false
   private failure: Error | undefined
   private changingInput = false
@@ -324,6 +332,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.searchPicker) this.renderSearchPicker(false)
     if (this.completions.length) this.renderCompletions()
     this.updateComposerLayout()
+    this.questionDialog?.resize()
     this.rebuild()
   }
   private readonly pasteHandler = (event: PasteEvent): void => {
@@ -523,6 +532,7 @@ export class OpenTuiIO implements ChatIO {
   get canAutoReview(): boolean {
     return Boolean(process.stdin.isTTY && process.stdout.isTTY && !this.closed && !this.failed && !this.renderer.isDestroyed)
   }
+  get canAskQuestions(): boolean { return this.canAutoReview }
   setApprovalMode(mode: ApprovalMode): void { this.approvalMode = mode; this.updateHeader() }
   setTaskMode(mode: TaskMode): void { this.taskMode = mode; this.updateHeader() }
 
@@ -569,6 +579,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.picker) this.picker.options = this.picker.options.map((option) => ({ ...option,
       name: this.safe(option.name, 1024), description: this.safe(option.description, 2048) }))
     this.inputChanged()
+    this.questionDialog?.redact()
     this.rebuild()
     this.updateStatus()
   }
@@ -586,7 +597,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private ready(pending = this.pending): boolean {
     return !!pending?.armed && !this.closed &&
-      (pending.kind !== 'approval' || this.lastRenderedFrame > pending.openedFrame)
+      (!['approval', 'question'].includes(pending.kind) || this.lastRenderedFrame > pending.openedFrame)
   }
   private updateApprovalLayout(): void {
     if (this.closed) return
@@ -619,7 +630,8 @@ export class OpenTuiIO implements ChatIO {
     this.footerRows = stacked ? 2 : 1
     this.footer.height = this.footerRows
     this.footer.visible = this.workspaceStatus || this.actionBar.visible
-    this.hintLine.visible = !this.actionBar.visible && !(this.workspaceStatus && this.renderer.terminalHeight < 10)
+    this.hintLine.visible = !this.actionBar.visible && !(this.workspaceStatus && this.renderer.terminalHeight < 10) && !(this.pending?.kind === 'question' && this.renderer.terminalHeight <= 14)
+    if (this.pending?.kind === 'question' && this.renderer.terminalHeight <= 14) this.footer.visible = false
     this.actionBar.width = controls
     this.workspaceLine.visible = this.workspaceStatus
     const width = stacked ? columns : Math.max(1, columns - controls)
@@ -671,7 +683,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
     const pending = this.pending
-    if (!pending || pending.kind === 'chat') return
+    if (!pending || pending.kind === 'chat' || pending.kind === 'question') return
     // Preserve room for the query in very small terminals; keyboard paths remain.
     if (pending.kind !== 'approval' && this.renderer.terminalHeight < (pending.kind === 'search' ? 20 : 16)) return
     this.dialogActions = new BoxRenderable(this.renderer, { id: 'vivi-dialog-actions', height: 1,
@@ -757,7 +769,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private updateTerminalTitle(): void {
     if (this.closed) return
-    const input = this.pending !== undefined && ['text', 'secret', 'approval', 'choice', 'search'].includes(this.pending.kind)
+    const input = this.pending !== undefined && ['text', 'secret', 'approval', 'choice', 'search', 'question'].includes(this.pending.kind)
     this.terminalTitle.update(this.sessionTitle, input ? 'input'
       : this.runStatus.running || this.cancelCallbacks.size ? 'working' : 'idle', this.secrets)
   }
@@ -793,6 +805,7 @@ export class OpenTuiIO implements ChatIO {
     this.tokenLine.content = fitStatusColumns(fittedUsage, tokenWidth, true)
     const mode = conversationModeLabel(this.taskMode, this.approvalMode)
     const modelWidth = columns - statusTextColumns(` · ${mode}`)
+    this.modelLine.visible = this.pending?.kind !== 'question' || this.renderer.terminalHeight > 14
     this.modelLine.content = modelWidth > 0 ? `${fitStatusColumns(this.sessionModel, modelWidth, true)} · ${mode}` : fitStatusColumns(mode, columns, true)
     this.updateTerminalTitle()
   }
@@ -953,6 +966,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     this.consume(event)
     if (this.diagnosticKey) return
+    if (this.pending?.kind === 'question') { this.questionDialog?.handlePaste(event); return }
     if (!this.pending?.armed || this.closed || this.pending.kind === 'choice') return
     if (this.cancelCallbacks.size && this.pending.kind === 'chat') return
     if (this.pending.kind === 'approval') {
@@ -981,6 +995,13 @@ export class OpenTuiIO implements ChatIO {
         const latest = [...this.entries].reverse().find(entry => entry.tool)
         if (latest?.tool) this.toggleToolDetails(latest.tool.key)
       }
+      return
+    }
+    if (this.pending?.kind === 'question' && !(key.ctrl && key.name === 'c')) {
+      if (key.name === 'pageup' || key.name === 'pagedown') {
+        this.consume(key)
+        this.transcript.scrollTo(this.transcript.scrollTop + (key.name === 'pageup' ? -1 : 1) * Math.max(1, this.transcript.viewport.height - 1))
+      } else this.questionDialog?.handleKey(key)
       return
     }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
@@ -1066,7 +1087,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return
     // Launch-owned managers may keep cancellation armed while a modal is open.
     // Settle that modal too, so Ctrl-C cannot leave a cancelled picker hanging.
-    if (this.pending && this.pending.kind !== 'chat') this.pending.finish(undefined)
+    if (this.pending && (this.pending.kind !== 'chat' || this.cancelCallbacks.size)) this.pending.finish(undefined)
     this.clearInput()
     if (this.cancelCallbacks.size) {
       this.runStatus.setPhase('cancelling')
@@ -1094,7 +1115,7 @@ export class OpenTuiIO implements ChatIO {
       return
     }
     const text = this.composer.plainText
-    if (pending.kind === 'approval') return
+    if (pending.kind === 'approval' || pending.kind === 'question') return
     if (pending.kind === 'chat' && text.trim() && !text.trim().startsWith('/')) {
       this.appendEntry({ category: 'user', label: 'You', content: this.safe(text), markdown: false })
     }
@@ -1103,6 +1124,7 @@ export class OpenTuiIO implements ChatIO {
   private openInput(kind: InputKind, title: string, initial = '', signal?: AbortSignal,
     approvalLabels?: { deny: string; allow: string }): Promise<string | number | undefined> {
     if (this.failure) return Promise.reject(this.failure)
+    if (this.pending?.kind === 'question') return Promise.resolve(undefined)
     if (this.closed) return Promise.resolve(undefined)
     if (signal?.aborted) return kind === 'chat' ? Promise.reject(new Error('Input cancelled')) : Promise.resolve(undefined)
     if (kind !== 'chat' && !this.runStatus.running && this.runStatus.label !== undefined) {
@@ -1140,7 +1162,15 @@ export class OpenTuiIO implements ChatIO {
       const abort = (): void => pending.finish(undefined, true)
       const pending: PendingInput = { kind, armed: kind !== 'approval', openedFrame: this.renderer.frameId,
         ...(approvalLabels ? { approvalLabels } : {}), finish: (value, aborted = false): void => {
-        if (this.pending !== pending) return
+        if (this.pending !== pending) {
+          if (this.suspendedChat?.pending !== pending) return
+          this.suspendedChat = undefined
+          if (timer !== undefined) clearTimeout(timer)
+          signal?.removeEventListener('abort', abort)
+          if (aborted && kind === 'chat') reject(new Error('Input cancelled'))
+          else resolve(value)
+          return
+        }
         this.pending = undefined
         this.updateTerminalTitle()
         this.mouseActivation.clear()
@@ -1164,8 +1194,10 @@ export class OpenTuiIO implements ChatIO {
         if (this.failure) reject(this.failure)
         else if (aborted && kind === 'chat') reject(new Error('Input cancelled'))
         else resolve(value)
+        this.inputQueue.setBlocked(false)
       } }
       this.pending = pending
+      this.inputQueue.setBlocked(kind !== 'chat' && kind !== 'approval')
       this.updateTerminalTitle()
       this.approvalIndex = 0
       this.updateApprovalLayout()
@@ -1213,7 +1245,7 @@ export class OpenTuiIO implements ChatIO {
   }
   async choose<T>(title: string, choices: readonly Choice<T>[], initialIndex = 0): Promise<T | undefined> {
     if (this.failure) throw this.failure
-    if (this.closed || choices.length === 0) return undefined
+    if (this.closed || this.pending?.kind === 'question' || choices.length === 0) return undefined
     if (choices.length > MAX_ENTRIES) throw new Error('A picker supports at most 256 choices')
     const selection = this.openInput('choice', title)
     this.pickerChangedFrame = this.renderer.frameId
@@ -1248,7 +1280,7 @@ export class OpenTuiIO implements ChatIO {
   }
   async chooseSearchable<T>(title: string, choices: readonly Choice<T>[], options: SearchableOptions = {}): Promise<SearchableSelection<T> | undefined> {
     if (this.failure) throw this.failure
-    if (this.closed) return undefined
+    if (this.closed || this.pending?.kind === 'question') return undefined
     // Display is viewport-bounded, but every catalog entry remains reachable/searchable.
     const query = this.safe(options.query ?? '', MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
     const selection = this.openInput('search', 'Search models', query)
@@ -1285,7 +1317,12 @@ export class OpenTuiIO implements ChatIO {
     return typeof index !== 'number' ? undefined : index === -1 ? { kind: 'refresh', query: search.query }
       : choices[index] ? { kind: 'selected', value: choices[index]!.value, query: search.query } : undefined
   }
-  async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+  approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+    // Preserve the existing approval preemption path, but never reorder a queued dialog.
+    if (!this.inputQueue.pending && this.pending && !['chat', 'approval', 'question'].includes(this.pending.kind)) this.pending.finish(undefined)
+    return this.queueDialog(signal, () => false, activeSignal => this.showApproval(request, activeSignal))
+  }
+  private async showApproval(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
     const enrollment = request.call.name === 'enroll_auto_review'
     const publicUrl = request.call.name === 'fetch_url'
@@ -1317,8 +1354,100 @@ export class OpenTuiIO implements ChatIO {
       if (!this.closed && !this.runStatus.running) this.updateStatus('Ready')
     }
   }
+  private queueDialog<T>(signal: AbortSignal, cancelled: () => T, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.resolve(cancelled())
+    this.inputQueue.setBlocked(!!this.pending && !['chat', 'approval', 'question'].includes(this.pending.kind))
+    const bound = AbortSignal.any([signal, this.dialogOwner.signal])
+    return this.inputQueue.enqueue(bound, cancelled, async activeSignal => {
+      const token = {}; this.activeDialog = token
+      if (this.pending?.kind === 'chat') {
+        this.suspendedChat = { pending: this.pending, text: this.composer.plainText,
+          cursor: this.composer.cursorOffset, title: this.composerBox.title ?? 'Message' }
+        this.pending = undefined
+        this.hideCompletions(); this.disableComposer()
+      }
+      try { return await run(activeSignal) }
+      finally {
+        if (this.activeDialog === token) {
+          this.activeDialog = undefined
+          const chat = this.suspendedChat; this.suspendedChat = undefined
+          if (chat && !this.closed) {
+            this.pending = chat.pending
+            this.composerBox.visible = true; this.composer.visible = true; this.secretMask.visible = false
+            this.composerBox.title = chat.title
+            this.changingInput = true
+            try { this.composer.setText(chat.text); this.composer.cursorOffset = chat.cursor }
+            finally { this.changingInput = false }
+            if (!this.cancelCallbacks.size) { this.composer.traits = {}; this.composer.showCursor = true; this.composer.focus() }
+            this.hintLine.content = HINTS
+            this.updateCompletions(); this.updateActionBar(); this.updateComposerLayout()
+          }
+          this.updateTerminalTitle()
+        }
+      }
+    })
+  }
+  askQuestions(request: QuestionRequest, signal: AbortSignal): Promise<QuestionResponse> {
+    const requestId = request.requestId
+    const cancelled = (): QuestionResponse => ({ requestId, status: 'cancelled' })
+    if (request.questions.length < 1 || request.questions.length > 3 || !request.requestId || request.requestId.length > 128) return Promise.resolve(cancelled())
+    // Capture the exact request before it waits in the shared approval/question FIFO.
+    const captured = structuredClone(request)
+    return this.queueDialog(signal, cancelled, activeSignal => this.showQuestions(captured, activeSignal))
+  }
+  private showQuestions(request: QuestionRequest, signal: AbortSignal): Promise<QuestionResponse> {
+    return new Promise(resolve => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const cancelled = (): QuestionResponse => ({ requestId: request.requestId, status: 'cancelled' })
+      let finished = false
+      const finish = (response: QuestionResponse, mouse = false): void => {
+        if (finished || this.pending !== pending) return
+        finished = true
+        if (mouse) this.approvalMouseNotBefore = performance.now() + APPROVAL_REPEAT_WINDOW_MS
+        if (timer !== undefined) clearTimeout(timer)
+        signal.removeEventListener('abort', abort)
+        this.questionDialog?.close(); this.questionDialog = undefined
+        this.pending = undefined
+        this.composerBox.visible = true
+        this.hintLine.content = HINTS
+        if (!this.closed && response.status === 'cancelled') this.appendEntry({ category: 'activity', label: 'Questions cancelled', content: 'No answers submitted', markdown: false })
+        this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
+        if (!this.closed) this.updateStatus(this.runStatus.running ? 'Working' : 'Ready')
+        resolve(signal.aborted || this.closed ? cancelled() : response)
+      }
+      const abort = (): void => finish(cancelled())
+      const pending: PendingInput = { kind: 'question', armed: false, openedFrame: this.renderer.frameId,
+        finish: () => finish(cancelled()) }
+      this.pending = pending
+      this.composerBox.visible = false
+      this.hideCompletions(); this.disableComposer()
+      this.pickerBox.visible = false
+      if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
+      try {
+      this.appendEntry({ category: 'activity', label: 'Questions · answers do not authorize actions', markdown: false,
+        content: this.safe(request.questions.map((question, index) => `${index + 1}. ${question.header}: ${question.question}${question.options ? '\n' + question.options.map(option => `${option.label}${option.description ? ' · ' + option.description : ''}`).join('\n') : ''}`).join('\n\n')) })
+      this.questionDialog = new QuestionDialog(this.renderer, request, {
+        safe: (text, limit) => this.safe(text, limit), clean: stripControls, ready: () => this.pending === pending && this.ready(pending),
+        mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
+        status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
+        accent: TUI_THEME.lavender, background: TUI_THEME.background, selected: TUI_THEME.selectedBackground })
+      this.shell.insertBefore(this.questionDialog.box, this.modelLine)
+      this.hintLine.content = '↑/↓ choose · Enter saves · Tab actions · Ctrl+Enter Submit · Escape cancels questions'
+      this.runStatus.setPhase('waiting_question')
+      this.updateActionBar(); this.updateStatus('Questions need your answer · Submit when ready')
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted || this.closed) { abort(); return }
+      timer = setTimeout(() => { if (this.pending === pending && !this.closed) pending.armed = true }, 0)
+      } catch (error) {
+        finish(cancelled())
+        if (!this.closed) this.updateStatus(`Question dialog unavailable: ${error instanceof Error ? error.message : 'native setup failed'}`)
+      }
+    })
+  }
+  private invalidateDialogs(): void { this.dialogOwner.abort(); this.dialogOwner = new AbortController() }
   runStarted(): void {
     if (this.closed) return
+    this.invalidateDialogs()
     this.settleReviews('cancelled')
     this.turnHistoryStart = this.historyLength
     // The host accepts this turn's user message before its first assistant event.
@@ -1330,6 +1459,7 @@ export class OpenTuiIO implements ChatIO {
   }
   runFinished(outcome: RunOutcome): void {
     if (this.closed) return
+    this.invalidateDialogs()
     this.settleReviews(outcome)
     for (const [id, live] of this.liveToolCalls) {
       if (!['requested', 'approval_required', 'running'].includes(live.status ?? 'requested')) continue
@@ -1629,6 +1759,7 @@ export class OpenTuiIO implements ChatIO {
   }
   setDraft(provider: CliProviderName): void {
     if (this.closed) return
+    this.invalidateDialogs()
     this.runStatus.reset()
     this.sessionId = undefined
     this.sessionTitle = 'Untitled conversation'
@@ -1658,6 +1789,7 @@ export class OpenTuiIO implements ChatIO {
   }
   setSession(session: CliSession): void {
     if (this.closed) return
+    if (this.sessionId !== session.id) this.invalidateDialogs()
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
       this.runStatus.reset()
       this.resultNotices = []
@@ -1826,6 +1958,9 @@ export class OpenTuiIO implements ChatIO {
   private dispose(destroyRenderer: boolean): void {
     if (this.closed) return
     this.closed = true
+    this.inputQueue.close()
+    this.dialogOwner.abort()
+    this.suspendedChat?.pending.finish(undefined)
     this.runStatus.reset()
     // Pending input is settled before the native widgets disappear.
     this.pending?.finish(undefined)

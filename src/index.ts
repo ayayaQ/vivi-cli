@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 export { CliHost } from './host.js'
+export type { CliQuestionHost } from './questions.js'
 export type { CliHostOptions, MemoryChangeRequest } from './host.js'
 export { FileSkillStore } from './skills.js'
 export type { CliSkillStore, SkillStoreOptions } from './skills.js'

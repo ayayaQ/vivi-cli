@@ -110,10 +110,10 @@ export function cliToolPresentationView(encoded: string, collapsed = false, deta
       'External effects are unreported. Do not infer that no effects occurred.'], details: [] } }
 }
 
-/** Reserved host-owned reads have no external operation to verify. This is display
+/** Reserved host-owned reads and informational clarification have no external operation to verify. This is display
  * context supplied by the CLI, never inferred from a foreign presentation name. */
 export function isCliLocalReadTool(name: string): boolean {
-  return ['current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill',
+  return ['request_user_input', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill',
     'workspace_list', 'workspace_read', 'workspace_search', 'workspace_glob'].includes(name)
 }
 export interface CliToolCardView {

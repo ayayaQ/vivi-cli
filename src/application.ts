@@ -545,6 +545,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
           isAvailable: () => io.canAutoReview === true && !io.isClosed
         } } : {}),
+        ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
+          ask: (request, { signal }) => io.askQuestions!(request, signal),
+          isAvailable: () => io.canAskQuestions === true && !io.isClosed,
+          accountRevision: () => accountGeneration
+        } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       candidate.host = nextHost
       if (selection.preservePlan && previousHost?.taskMode === 'plan') nextHost.setTaskMode('plan')

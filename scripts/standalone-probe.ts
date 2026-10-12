@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Compiled headless probe: real native UI/assets, no terminal automation or provider request.
 import assert from 'node:assert/strict'
+import type { ProviderResult } from '@ayayaq/vivi'
 import { createTestRenderer } from '@opentui/core/testing'
 import { CodeRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
@@ -17,6 +18,10 @@ import { FileMemoryStore } from '../src/memory.js'
 import { FileSessionStore } from '../src/session.js'
 import { FileCliConversationStore, replayCliConversationDocument } from '../src/conversation-records.js'
 import { CliHost } from '../src/host.js'
+import type { CliHostOptions } from '../src/host.js'
+import type { CliQuestionHost } from '../src/questions.js'
+import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extensions/questions'
+import type { Question, QuestionOption, QuestionRequest, QuestionHost, QuestionResponse, QuestionAnswer, QuestionAnswerEntry } from '@ayayaq/vivi/extensions/questions'
 import { ReadOnlyWorkspace, createWorkspaceExtension } from '../src/workspace.js'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import type { Transport } from '@modelcontextprotocol/client'
@@ -62,6 +67,59 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
   return transport
 } })
 try {
+  {
+  // Real compiled consumer of the published renderer-neutral question API.
+  const option: QuestionOption = { id: 'short', label: 'Short', description: 'Concise' }
+  const question: Question = { id: 'style', header: 'Style', question: 'Which style?', options: [option, { id: 'long', label: 'Long' }] }
+  const questions: readonly Question[] = [question, { id: 'detail', header: 'Details', question: 'Anything else?' },
+    { id: 'skip', header: 'Optional', question: 'Any optional detail?' }]
+  const choice: QuestionAnswer = { kind: 'option', optionId: 'long' }
+  const entries: readonly QuestionAnswerEntry[] = [{ id: 'style', answer: choice },
+    { id: 'detail', answer: { kind: 'text', text: 'Compiled Unicode 你好 🌱\nSecond line' } }, { id: 'skip', answer: { kind: 'skipped' } }]
+  const sample: QuestionRequest = { requestId: 'compiled-types', callId: 'compiled-types', questions }
+  const cancelled: QuestionResponse = { requestId: sample.requestId, status: 'cancelled' }
+  void cancelled
+  assert.equal(QUESTION_LIMITS.questions, 3)
+  let compiledQuestionRequest: QuestionRequest | undefined, questionAsks = 0
+  const ask: QuestionHost = (request, { signal }): QuestionResponse => {
+    assert.equal(signal.aborted, false); questionAsks++; compiledQuestionRequest = request
+    return { requestId: request.requestId, status: 'answered', answers: entries }
+  }
+  const cliQuestionHost: CliQuestionHost = { ask, isAvailable: () => true, accountRevision: () => 'compiled-owned-account' }
+  const registry = createToolRegistry([createQuestionExtension({ ask })])
+  const direct = await registry.executeTool({ id: 'compiled-question-direct', name: 'request_user_input', arguments: { questions: JSON.parse(JSON.stringify(questions)) } },
+    { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(direct.content).answers, entries)
+  assert.equal(createQuestionExtension().tools.length, 0)
+  for (const mode of ['execute', 'plan'] as const) {
+    const snapshots: unknown[] = []
+    let rounds = 0, approvals = 0
+    const options: CliHostOptions = { session: newSession({ provider: 'openai', model: 'compiled-offline-questions' }),
+      store: { async save(session) { snapshots.push(structuredClone(session.history)) },
+        async load() { throw new Error('No compiled question session replay') } },
+      questionHost: cliQuestionHost, enableNotes: true, approve: async () => { approvals++; return false },
+      provider: { async generate({ messages, tools }) {
+        assert(tools.some(tool => tool.name === 'request_user_input'))
+        if (++rounds === 1) return { content: '', toolCalls: [{ id: 'compiled-question-host', name: 'request_user_input', arguments: { questions: JSON.parse(JSON.stringify(questions)) } }] }
+        const result = messages.at(-1)!
+        assert.equal(result.kind, 'tool_result')
+        if (result.kind !== 'tool_result') throw new Error('Compiled question result missing')
+        assert.equal(result.callId, 'compiled-question-host'); assert.equal(result.name, 'request_user_input')
+        assert.deepEqual(JSON.parse(result.content), { requestId: compiledQuestionRequest!.requestId, status: 'answered', answers: entries })
+        return { content: 'Compiled questions accepted', toolCalls: [] }
+      } } }
+    const host = new CliHost(options)
+    try {
+      host.setTaskMode(mode)
+      const result = await host.send('Clarify the offline compiled fixture')
+      assert.equal(result.status, 'completed'); assert.equal(approvals, 0)
+      assert.equal(host.approvalMode, 'manual'); assert.equal(host.session.noteRevision, 0)
+      assert.deepEqual(snapshots.at(-1), result.history)
+      assert.equal(result.history.filter(message => message.kind === 'tool_result').length, 1)
+    } finally { await host.shutdown() }
+  }
+  assert.equal(questionAsks, 3)
+  }
   await mcp.configure({ id: 'compiled', label: 'Owned compiled fixture', executable: process.execPath,
     args: [], cwd: directory, protocol: 'legacy', environment: [] })
   assert.equal(mcp.statuses()[0]!.state, 'disabled')
@@ -74,7 +132,7 @@ try {
   let mcpRounds = 0, mcpApprovals = 0
   const mcpHost = await CliHost.create({ mcp, store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, approve: async () => { mcpApprovals++; return true },
-    provider: { async generate({ tools }) {
+    provider: { async generate({ tools }): Promise<ProviderResult> {
       assert(tools.some(tool => tool.name === alias))
       if (++mcpRounds === 1) return { content: '', toolCalls: [{ id: 'compiled-mcp-call', name: alias, arguments: { query: 'compiled' } },
         { id: 'compiled-mcp-list', name: 'list_mcp_resources', arguments: { serverId: 'compiled' } }] }
@@ -223,9 +281,9 @@ try {
   const planHost = await CliHost.create({ workspace, commandWorkspace: commands, mcp, enableNotes: true,
     store: new FileSessionStore(directory), settings: { provider: 'openai', model: 'fake' },
     approve: async () => { assert.fail('Compiled Plan cannot request execution approval') },
-    provider: { async generate({ tools, messages }) {
+    provider: { async generate({ tools, messages }): Promise<ProviderResult> {
       assert(!tools.some(tool => ['note_set', 'workspace_edit_text', 'command_start', 'fetch_url', 'read_mcp_resource'].includes(tool.name)))
-      assert(messages.some(message => message.role === 'system' && message.content.startsWith('Plan mode is active')))
+      assert(messages.some(message => message.kind === 'message' && message.role === 'system' && message.content.startsWith('Plan mode is active')))
       return ++planRounds === 1 ? { content: '', toolCalls: [
         { id: 'compiled-plan-read', name: 'workspace_read', arguments: { path: 'created.txt' } },
         { id: 'compiled-plan-note', name: 'note_set', arguments: { key: 'blocked', value: 'blocked', expectedRevision: 0 } },
@@ -304,7 +362,35 @@ try {
   await setup.mockMouse.click(toolHeader.x + toolHeader.width - 1, toolHeader.y)
   await setup.renderOnce(); await setup.renderOnce()
   assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0')!.getChildren().length, 0)
+  // Native questions and action approvals share one focus/FIFO owner.
+  assert.equal(io.canAskQuestions, Boolean(process.stdin.isTTY && process.stdout.isTTY))
+  const nativeRequest: QuestionRequest = { requestId: 'compiled-native-question', callId: 'compiled-native-call', questions: [
+    { id: 'style', header: 'Style', question: 'Which native style?', options: [{ id: 'short', label: 'Short' }, { id: 'long', label: 'Long' }] }
+  ] }
+  let globalCancels = 0
+  const stopCancel = io.onCancel(() => { globalCancels++ })
+  const nativeAnswer = io.askQuestions(nativeRequest, new AbortController().signal)
+  const queuedApproval = io.approve({ call: { id: 'compiled-after-question', name: 'note_set', arguments: {} },
+    description: 'Owned compiled approval after question', currentRevision: 0 }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  assert(setup.renderer.root.findDescendantById('vivi-questions'))
+  assert.equal(setup.renderer.root.findDescendantById('vivi-approve'), undefined)
+  const long = setup.renderer.root.findDescendantById('vivi-question-option-1')!
+  await setup.mockMouse.click(long.x + 1, long.y)
+  await setup.renderOnce(); await setup.renderOnce()
+  const submit = setup.renderer.root.findDescendantById('vivi-question-submit')!
+  await setup.mockMouse.click(submit.x + 1, submit.y)
+  assert.deepEqual(await nativeAnswer, { requestId: nativeRequest.requestId, status: 'answered',
+    answers: [{ id: 'style', answer: { kind: 'option', optionId: 'long' } }] })
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  assert(setup.renderer.root.findDescendantById('vivi-approve'))
+  setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
+  const cancelling = io.askQuestions({ ...nativeRequest, requestId: 'compiled-native-cancel' }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  setup.mockInput.pressEscape()
+  assert.deepEqual(await cancelling, { requestId: 'compiled-native-cancel', status: 'cancelled' })
+  assert.equal(globalCancels, 0); stopCancel()
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only Plan policy, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only Plan policy, informational host/native questions and approval FIFO separation, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

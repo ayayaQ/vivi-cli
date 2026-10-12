@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 export type RunOutcome = 'completed' | 'cancelled' | 'error'
-export type RunPhase = 'working' | 'waiting_approval' | 'cancelling'
+export type RunPhase = 'working' | 'waiting_approval' | 'waiting_question' | 'cancelling'
 export interface RunClock {
   now(): number
   every(callback: () => void, milliseconds: number): unknown
@@ -37,6 +37,7 @@ export class RunStatus {
     const duration = formatRunElapsed(elapsed)
     if (this.outcome !== undefined) return `${this.outcome === 'completed' ? 'Completed' : this.outcome === 'cancelled' ? 'Cancelled' : 'Error'} · ${duration}`
     if (this.phase === 'waiting_approval') return `Waiting for approval · ${duration}`
+    if (this.phase === 'waiting_question') return `Waiting for answers · ${duration}`
     if (this.phase === 'cancelling') return `Cancelling · ${duration}`
     return `${frames[Math.floor(elapsed / 100) % frames.length]} Working · ${duration}`
   }

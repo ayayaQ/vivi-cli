@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.11.0'
-const coreIntegrity = 'sha512-n0YkJ1Ji7EPR2pKkJcdjKnj58MHsb0K2DALjX3rrJRVWg+Up7GR8q2KYzljIMq5Ije2ET35+XAERU+pEfjyu/Q=='
+const coreVersion = '0.12.0'
+const coreIntegrity = 'sha512-/xbgt9LA8ZaKkVl1h3x8W7ErP8fcMsSDS9bpKfjFdj6wp+DbTSrUMElDEgb9kOVLv9Gv7zE14MNkjcBuGlTjrw=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.11.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.12.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -103,7 +103,9 @@ try {
     'src/command-process.ts', 'dist/command-process.js', 'dist/command-process.d.ts',
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
-    'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
+    'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts',
+    'src/questions.ts', 'dist/questions.js', 'dist/questions.d.ts',
+    'src/input-queue.ts', 'dist/input-queue.js', 'dist/input-queue.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes']) {
     for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
       assert(paths.has(path), `Missing ${path}`)
@@ -121,6 +123,9 @@ try {
     'dist/cjs/extensions/skills.js', 'dist/cjs/extensions/skills.d.ts',
     'dist/providers/models.js', 'dist/providers/models.d.ts',
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
+    'docs/QUESTIONS.md', 'examples/questions.mjs', 'src/extensions/questions.ts',
+    'dist/extensions/questions.js', 'dist/extensions/questions.d.ts',
+    'dist/cjs/extensions/questions.js', 'dist/cjs/extensions/questions.d.ts',
     'docs/DECISIONS.md', 'src/decisions.ts', 'dist/decisions.js', 'dist/decisions.d.ts',
     'dist/cjs/decisions.js', 'dist/cjs/decisions.d.ts', 'examples/decisions.mjs',
     'docs/MCP.md', 'src/extensions/mcp.ts', 'dist/extensions/mcp.js', 'dist/extensions/mcp.d.ts',
@@ -214,6 +219,7 @@ import { fileURLToPath } from 'node:url'
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
+import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extensions/questions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
 import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContext } from '@ayayaq/vivi/extensions/memory'
 import { parseSkillDocument, skillCreatorSource } from '@ayayaq/vivi/extensions/skills'
@@ -292,6 +298,53 @@ for (const name of ['packed_fixture', 'current_time', 'note_read']) {
     new AbortController().signal, scopedHost), { name: 'AbortError' })
 }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
+// Installed ESM and CJS consumers must use the published question entrypoint.
+const cjsQuestions = createRequire(import.meta.url)('@ayayaq/vivi/extensions/questions')
+const questionArguments = { questions: [
+  { id: 'choice', header: 'Style', question: 'Which style?', options: [{ id: 'short', label: 'Short' }, { id: 'long', label: 'Long' }] },
+  { id: 'text', header: 'Details', question: 'Anything else?' },
+  { id: 'skip', header: 'Optional', question: 'Any optional detail?' }
+] }
+const humanAnswers = [{ id: 'choice', answer: { kind: 'option', optionId: 'long' } },
+  { id: 'text', answer: { kind: 'text', text: 'Packed Unicode 你好 🌱' + String.fromCharCode(10) + 'Second line' } },
+  { id: 'skip', answer: { kind: 'skipped' } }]
+for (const module of [{ createQuestionExtension, QUESTION_LIMITS }, cjsQuestions]) {
+  assert.equal(module.QUESTION_LIMITS.questions, 3)
+  assert.equal(module.createQuestionExtension().tools.length, 0)
+  const registry = createToolRegistry([module.createQuestionExtension({ ask: (request, { signal }) => {
+    assert.equal(signal.aborted, false); assert.equal(request.callId, 'packed-question-entrypoint')
+    return { requestId: request.requestId, status: 'answered', answers: humanAnswers }
+  } })])
+  const result = await registry.executeTool({ id: 'packed-question-entrypoint', name: 'request_user_input', arguments: questionArguments },
+    { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(result.content).answers, humanAnswers)
+}
+for (const mode of ['execute', 'plan']) {
+  const snapshots = [], approvals = []
+  let rounds = 0, asks = 0, activeRequest
+  const host = await CliHost.create({ settings: { provider: 'openai', model: 'packed-offline-questions' },
+    store: { async save(session) { snapshots.push(structuredClone(session)) } }, enableNotes: true,
+    approve: async request => { approvals.push(request); return false },
+    questionHost: { accountRevision: () => 'owned-packed-account', isAvailable: () => true, ask: (request, { signal }) => {
+      assert.equal(signal.aborted, false); asks++; activeRequest = request
+      return { requestId: request.requestId, status: 'answered', answers: humanAnswers }
+    } }, provider: { async generate({ messages, tools }) {
+      assert(tools.some(tool => tool.name === 'request_user_input'))
+      if (++rounds === 1) return { content: '', toolCalls: [{ id: 'packed-question-host', name: 'request_user_input', arguments: questionArguments }] }
+      const result = messages.at(-1)
+      assert.equal(result.callId, 'packed-question-host'); assert.equal(result.name, 'request_user_input')
+      assert.deepEqual(JSON.parse(result.content), { requestId: activeRequest.requestId, status: 'answered', answers: humanAnswers })
+      return { content: 'Packed questions accepted', toolCalls: [] }
+    } } })
+  try {
+    host.setTaskMode(mode)
+    const result = await host.send('Clarify the offline package fixture')
+    assert.equal(result.status, 'completed'); assert.equal(asks, 1); assert.deepEqual(approvals, [])
+    assert.equal(host.approvalMode, 'manual'); assert.equal(host.session.noteRevision, 0)
+    assert.deepEqual(snapshots.at(-1).history, result.history)
+    assert.equal(result.history.filter(message => message.kind === 'tool_result').length, 1)
+  } finally { await host.shutdown() }
+}
 const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
 const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
   ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
@@ -530,11 +583,12 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession, type CliQuestionHost,
   type SessionPersistence, type ApprovalRequest, type TaskMode, type ConversationMode, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
+import { createQuestionExtension, QUESTION_LIMITS, type Question, type QuestionOption, type QuestionRequest, type QuestionHost, type QuestionResponse, type QuestionAnswer, type QuestionAnswerEntry } from '@ayayaq/vivi/extensions/questions'
 import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabilities, type Capability } from '@ayayaq/vivi/providers/models'
 const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
@@ -569,7 +623,21 @@ void catalogs; void operation; void createMcpExtension
 const outcomes: McpOutcomeStore = new FileMcpOutcomeStore('/tmp/fake-types-only')
 let lifecycle: McpInvocationLifecycle | undefined
 void lifecycle
-const options: CliHostOptions = { provider, session, store, mcp, mcpOutcomes: outcomes, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
+const questionOption: QuestionOption = { id: 'short', label: 'Short', description: 'Concise' }
+const question: Question = { id: 'style', header: 'Style', question: 'Which style?', options: [questionOption, { id: 'long', label: 'Long' }] }
+const questionRequest: QuestionRequest = { requestId: 'typed-request', callId: 'typed-call', questions: [question] }
+const questionAnswer: QuestionAnswer = { kind: 'text', text: 'Typed Unicode 你好' }
+const questionEntry: QuestionAnswerEntry = { id: question.id, answer: questionAnswer }
+const questionResponse: QuestionResponse = { requestId: questionRequest.requestId, status: 'answered', answers: [questionEntry] }
+const questionHost: QuestionHost = async (request, { signal }): Promise<QuestionResponse> => signal.aborted
+  ? { requestId: request.requestId, status: 'cancelled' } : { ...questionResponse, requestId: request.requestId }
+const cliQuestionHost: CliQuestionHost = { ask: questionHost, isAvailable: () => true, accountRevision: () => 'typed-account' }
+const questionExtension: ToolExtension = createQuestionExtension({ ask: questionHost })
+const questionLimit: number = QUESTION_LIMITS.questions
+// @ts-expect-error A question response cannot grant action authority.
+const questionApproval: QuestionResponse = { requestId: 'typed', status: 'cancelled', approved: true }
+void questionApproval; void questionExtension; void questionLimit
+const options: CliHostOptions = { provider, session, store, questionHost: cliQuestionHost, mcp, mcpOutcomes: outcomes, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
 const taskMode: TaskMode = host.taskMode
@@ -578,6 +646,9 @@ host.setTaskMode(taskMode)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
 io.setTaskMode?.(taskMode)
+const canAskQuestions: boolean | undefined = io.canAskQuestions
+const askQuestions: Promise<QuestionResponse> | undefined = io.askQuestions?.(questionRequest, new AbortController().signal)
+void canAskQuestions; void askQuestions
 void conversationMode
 const toolEvidence: CliToolEvidence = host.toolPresentationEvidence
 let toolDecision: CliToolDecision | undefined
@@ -662,12 +733,39 @@ try {
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce()
   setup.mockInput.pressEnter()
   assert.equal(await deny, false)
+  assert.equal(io.canAskQuestions, Boolean(process.stdin.isTTY && process.stdout.isTTY))
+  const nativeRequest = { requestId: 'packed-native-question', callId: 'packed-native-call', questions: [
+    { id: 'style', header: 'Style', question: 'Which native style?', options: [{ id: 'short', label: 'Short' }, { id: 'long', label: 'Long' }] }
+  ] }
+  let globalCancels = 0
+  const stopCancel = io.onCancel(() => { globalCancels++ })
+  const nativeAnswer = io.askQuestions(nativeRequest, new AbortController().signal)
+  const queuedApproval = io.approve({ call: { id: 'packed-after-question', name: 'note_set', arguments: {} },
+    description: 'Owned packed approval after question', currentRevision: 0 }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  assert(setup.renderer.root.findDescendantById('vivi-questions'))
+  assert.equal(setup.renderer.root.findDescendantById('vivi-approve'), undefined)
+  const long = setup.renderer.root.findDescendantById('vivi-question-option-1')
+  await setup.mockMouse.click(long.x + 1, long.y)
+  await setup.renderOnce(); await setup.renderOnce()
+  const submit = setup.renderer.root.findDescendantById('vivi-question-submit')
+  await setup.mockMouse.click(submit.x + 1, submit.y)
+  assert.deepEqual(await nativeAnswer, { requestId: nativeRequest.requestId, status: 'answered',
+    answers: [{ id: 'style', answer: { kind: 'option', optionId: 'long' } }] })
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  assert(setup.renderer.root.findDescendantById('vivi-approve'))
+  setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
+  const cancelling = io.askQuestions({ ...nativeRequest, requestId: 'packed-native-cancel' }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  setup.mockInput.pressEscape()
+  assert.deepEqual(await cancelling, { requestId: 'packed-native-cancel', status: 'cancelled' })
+  assert.equal(globalCancels, 0); stopCancel()
   io.close()
 } finally { io.close(); setup.renderer.destroy() }
 `)
     run(process.env.VIVI_TEST_BUN, [join(installed, 'tui-consumer.ts')], temporary)
     assert.match(run(process.env.VIVI_TEST_BUN, [launcher, '--help'], temporary), /--provider/)
-    console.log('Packed native renderer, model search, mouse approvals and Bun CLI entrypoint passed')
+    console.log('Packed native renderer, model search, human questions/approval FIFO, mouse approvals and Bun CLI entrypoint passed')
   }
   const sha256 = candidate.artifact.sha256
   const bun = process.env.VIVI_TEST_BUN ? run(process.env.VIVI_TEST_BUN, ['--version']).trim() : undefined

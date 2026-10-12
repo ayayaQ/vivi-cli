@@ -386,6 +386,11 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
         accountRevision: () => accountRevision, isAvailable: () => io?.canAutoReview === true && !io.isClosed
       } } : {}),
+      ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
+        ask: (request, { signal }) => io!.askQuestions!(request, signal),
+        isAvailable: () => io?.canAskQuestions === true && !io.isClosed,
+        accountRevision: () => accountRevision
+      } } : {}),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
     await host.initialize()
