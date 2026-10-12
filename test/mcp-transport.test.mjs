@@ -14,22 +14,23 @@ import { McpStdioTransport } from '../dist/mcp-transport.js'
 
 // Replace only the owned-process startup boundary. Real start/send/receive/close/dispose run;
 // no process, Windows helper, network, model or provider is used by this fixture.
-function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart = () => {}) {
+function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart = () => {}, beforeReply) {
   const transport = new McpStdioTransport(launch), stdout = new PassThrough(), stderr = new PassThrough()
   const methods = []
-  let complete, starts = 0
+  let complete, starts = 0, ended = false
   const completed = new Promise(resolve => { complete = resolve })
   const owned = { stdout, stderr, ready, completed, stop: async () => {
-    await stop(); stdout.end(); stderr.end(); complete({ exitCode: 0 })
+    await stop(); ended = true; stdout.end(); stderr.end(); complete({ exitCode: 0 })
   }, write: async bytes => {
     const message = JSON.parse(bytes.toString('utf8'))
     methods.push(message.method)
-    if (message.id === undefined) return
-    const result = message.method === 'initialize' ? { resultType: 'complete', protocolVersion: '2025-11-25',
+    const reply = beforeReply ? await beforeReply(message.method) : undefined
+    if (message.id === undefined || ended) return
+    const result = reply ?? (message.method === 'initialize' ? { resultType: 'complete', protocolVersion: '2025-11-25',
       capabilities: { tools: {} }, serverInfo: { name: 'Owned inert peer', version: '1' } }
       : message.method === 'server/discover' ? { resultType: 'complete', supportedVersions: ['2026-07-28'],
         capabilities: { tools: {} }, ttlMs: 0, cacheScope: 'private' }
-      : { resultType: 'complete', tools: [{ name: 'never-show-revoked-metadata', inputSchema: { type: 'object' } }], ttlMs: 0, cacheScope: 'private' }
+      : { resultType: 'complete', tools: [{ name: 'never-show-revoked-metadata', inputSchema: { type: 'object' } }], ttlMs: 0, cacheScope: 'private' })
     queueMicrotask(() => stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\n'))
   } }
   transport.beginStart = async () => {
@@ -42,11 +43,11 @@ function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart
   return { transport, owned, methods, starts: () => starts }
 }
 
-async function managerFixture(t, { protocol = 'legacy', ready, onStart, onStop } = {}) {
+async function managerFixture(t, { protocol = 'legacy', ready, onStart, onStop, beforeReply } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-final-validation-')), store = new McpConfigStore(directory)
   const transports = []
   const manager = new McpManager({ store, env: {}, transportFactory: launch => {
-    const subject = injectedOwnedTransport(launch, async () => { onStop?.() }, ready, onStart)
+    const subject = injectedOwnedTransport(launch, async () => { onStop?.() }, ready, onStart, beforeReply)
     transports.push(subject); return subject.transport
   } })
   t.after(async () => {
@@ -68,8 +69,8 @@ for (const protocol of ['legacy', '2026-07-28']) test(`owned startup readiness p
   const outcome = pending.then(value => ({ value }), error => ({ error }))
   await started
   assert.deepEqual(subject.transports[0].methods, [])
-  // A cold native setup can exceed one RPC deadline without using the whole
-  // existing category deadline. Neither deadline is extended by transport.start.
+  // A cold native setup can exceed one RPC deadline within its independently
+  // bounded startup phase. Each protocol/page/category limit remains unchanged.
   await new Promise(resolve => setTimeout(resolve, MCP_LIMITS.pageMs + 100))
   assert.deepEqual(subject.transports[0].methods, [])
   release()
@@ -77,6 +78,131 @@ for (const protocol of ['legacy', '2026-07-28']) test(`owned startup readiness p
   assert.equal(result.error, undefined); assert.equal(result.value, true)
   assert.equal(subject.transports[0].methods[0], protocol === 'legacy' ? 'initialize' : 'server/discover')
   assert.equal(subject.transports[0].starts(), 1)
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`bounded startup does not consume the initial metadata page budget (${protocol})`, async t => {
+  let releaseReady, enteredStart, releaseReply, enteredPage
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  const reply = new Promise(resolve => { releaseReply = resolve })
+  const page = new Promise(resolve => { enteredPage = resolve })
+  t.after(() => { releaseReady(); releaseReply() })
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart,
+    beforeReply: async method => { if (method === 'tools/list') { enteredPage(); await reply } } })
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  await started
+  // Deliberate simulated work, not a readiness guess: release both owned gates.
+  await new Promise(resolve => setTimeout(resolve, 6000))
+  releaseReady()
+  await page
+  await new Promise(resolve => setTimeout(resolve, 4500))
+  releaseReply()
+  assert.equal(await pending, true)
+  const status = subject.manager.statuses()[0]
+  assert.equal(status.state, 'connected')
+  assert.equal(status.snapshot.categories.tools.state, 'ready')
+  assert.equal(subject.transports[0].starts(), 1)
+  assert.equal(MCP_LIMITS.categoryMs, 10_000); assert.equal(MCP_LIMITS.pageMs, 5000)
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`owned startup remains bounded and drains cancellation before returning (${protocol})`, async t => {
+  let releaseReady, enteredStart, stops = 0
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  t.after(releaseReady)
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart,
+    onStop: () => { stops++; releaseReady() } })
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  await started
+  assert.equal(await pending, false)
+  assert.equal(stops, 1)
+  assert.deepEqual(subject.transports[0].methods, [])
+  assert.equal(subject.manager.statuses()[0].state, 'error')
+  assert.match(subject.manager.statuses()[0].message, /server startup timed out/)
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`cancellation at owned readiness cannot send a handshake (${protocol})`, async t => {
+  let releaseReady, enteredStart, stops = 0
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  t.after(releaseReady)
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart,
+    onStop: () => { stops++; releaseReady() } })
+  const controller = new AbortController()
+  const pending = subject.manager.connect('docs', async () => true, controller.signal)
+  await started
+  releaseReady(); controller.abort()
+  assert.equal(await pending, false)
+  assert.equal(stops, 1); assert.deepEqual(subject.transports[0].methods, [])
+})
+
+for (const protocol of ['legacy', '2026-07-28']) for (const phase of ['handshake', 'metadata']) test(`cancellation during ${phase} drains ownership and never reports a connected success (${protocol})`, async t => {
+  let releaseReply, entered, stops = 0
+  const reply = new Promise(resolve => { releaseReply = resolve })
+  const held = new Promise(resolve => { entered = resolve })
+  const firstMethod = protocol === 'legacy' ? 'initialize' : 'server/discover'
+  const heldMethod = phase === 'handshake' ? firstMethod : 'tools/list'
+  t.after(releaseReply)
+  const subject = await managerFixture(t, { protocol,
+    beforeReply: async method => { if (method === heldMethod) { entered(); await reply } },
+    onStop: () => { stops++; releaseReply() } })
+  const controller = new AbortController()
+  const pending = subject.manager.connect('docs', async () => true, controller.signal)
+  await held; controller.abort()
+  assert.equal(await pending, false)
+  assert.equal(stops, 1); assert.equal(subject.manager.statuses()[0].state, 'error')
+  if (phase === 'handshake') assert.deepEqual(subject.transports[0].methods, [firstMethod])
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`handshake RPC retains its unchanged five-second page deadline (${protocol})`, async t => {
+  let releaseReply, entered, stops = 0
+  const reply = new Promise(resolve => { releaseReply = resolve })
+  const held = new Promise(resolve => { entered = resolve })
+  t.after(releaseReply)
+  const subject = await managerFixture(t, { protocol, beforeReply: async () => { entered(); await reply },
+    onStop: () => { stops++; releaseReply() } })
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  await held
+  assert.equal(await pending, false)
+  assert.equal(stops, 1); assert.equal(subject.manager.statuses()[0].state, 'error')
+  assert.equal(MCP_LIMITS.pageMs, 5000)
+})
+
+test('legacy handshake remains bounded while its final notification write is held', async t => {
+  let releaseReply, entered, stops = 0
+  const reply = new Promise(resolve => { releaseReply = resolve })
+  const held = new Promise(resolve => { entered = resolve })
+  t.after(releaseReply)
+  const subject = await managerFixture(t, { beforeReply: async method => {
+    if (method === 'notifications/initialized') { entered(); await reply }
+  }, onStop: () => { stops++; releaseReply() } })
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  await held
+  assert.equal(await pending, false)
+  assert.equal(stops, 1)
+  assert.deepEqual(subject.transports[0].methods, ['initialize', 'notifications/initialized'])
+  assert.match(subject.manager.statuses()[0].message, /protocol handshake timed out/)
+})
+
+test('initial metadata retains its own ten-second category deadline and quarantines incomplete pages', async t => {
+  let page = 0, releaseReply, replyTimer
+  const subject = await managerFixture(t, { beforeReply: async method => {
+    if (method !== 'tools/list') return
+    page++
+    await new Promise(resolve => { releaseReply = resolve; replyTimer = setTimeout(resolve, 4200) })
+    return { resultType: 'complete', tools: [], nextCursor: `page-${page}`, ttlMs: 0, cacheScope: 'private' }
+  }, onStop: () => { clearTimeout(replyTimer); releaseReply?.() } })
+  t.after(() => { clearTimeout(replyTimer); releaseReply?.() })
+  assert.equal(await subject.manager.connect('docs', async () => true, new AbortController().signal), true)
+  const status = subject.manager.statuses()[0]
+  assert.equal(status.state, 'connected')
+  assert.equal(status.snapshot.categories.tools.state, 'error')
+  assert.deepEqual(status.snapshot.categories.tools.entries, [])
+  assert.equal(page, 3)
+  // The final page uses the remaining category budget. Its timer can fire
+  // just before the category AbortSignal; both existing reasons quarantine it.
+  assert.ok(['Metadata discovery cancelled or timed out',
+    'Metadata discovery failed, changed or exceeded its bounds'].includes(status.snapshot.categories.tools.reason))
 })
 
 test('close stops an owned Windows helper while startup is awaiting acknowledgment', { timeout: 1000 }, async t => {

@@ -153,12 +153,31 @@ export class McpManager {
       inputRequired: { autoFulfill: false }, enforceStrictCapabilities: true,
       versionNegotiation: { mode: server.protocol === 'legacy' ? 'legacy' : { pin: server.protocol } } })
     const owned = (this.options.transportFactory ?? (value => new McpStdioTransport(value)))(launch)
+    // Owned startup and protocol negotiation have separate, equally bounded
+    // phases. Native readiness must not consume the protocol/category budget.
+    const deadline = new AbortController()
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+    let deadlinePhase: 'startup' | 'handshake' = 'startup'
+    const clearDeadline = (): void => {
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
+      deadlineTimer = undefined
+    }
+    const armDeadline = (phase: 'startup' | 'handshake'): void => {
+      clearDeadline()
+      deadlinePhase = phase
+      deadlineTimer = setTimeout(() => deadline.abort(), MCP_LIMITS.categoryMs)
+    }
     // Keep the guard at the actual transport boundary, including SDK async setup.
     // The SDK may attach only its fixed modern protocol envelope to our params.
     const closeOwned = async (): Promise<void> => { await owned.close() }
     // The pinned SDK starts detached cleanup after a failed legacy handshake.
     // Observe that rejection here; host ownership paths still await strict cleanup.
-    const transport: Transport = { start: () => owned.start(), close: () => closeOwned().catch(() => undefined), send: (message, options) => {
+    const transport: Transport = { start: async () => {
+      combined.throwIfAborted()
+      await owned.start()
+      combined.throwIfAborted()
+      armDeadline('handshake')
+    }, close: () => closeOwned().catch(() => undefined), send: (message, options) => {
       if (!('method' in message) || !['tools/call', 'resources/read'].includes(message.method)) return owned.send(message, options)
       const pending = connection.pending
       if (!pending || pending.boundaryStarted || !('id' in message)) return Promise.reject(new Error('MCP operation has no one-shot approval'))
@@ -214,11 +233,13 @@ export class McpManager {
     client.setNotificationHandler('notifications/resources/list_changed', () => invalidate(['resources', 'resourceTemplates']))
     client.onclose = () => { connection.state = 'error'; connection.message = 'MCP connection closed; reconnect requires fresh approval'; invalidate(kinds); connection.controller.abort() }
     client.onerror = () => { /* Untrusted server details are never logged, persisted or sent to a provider. */ }
-    const combined = AbortSignal.any([signal, connection.controller.signal, AbortSignal.timeout(MCP_LIMITS.categoryMs)])
+    const combined = AbortSignal.any([signal, connection.controller.signal, deadline.signal])
     const abort = (): void => { void closeOwned().catch(() => undefined) }
     combined.addEventListener('abort', abort, { once: true })
     try {
+      armDeadline('startup')
       await client.connect(transport, { signal: combined, timeout: MCP_LIMITS.pageMs, maxTotalTimeout: MCP_LIMITS.categoryMs })
+      clearDeadline()
       combined.throwIfAborted()
       if (this.connections.get(id) !== connection || this.configuration.revision !== revision) throw new Error('MCP connection changed during startup')
       connection.state = 'connected'
@@ -226,13 +247,17 @@ export class McpManager {
         protocolVersion: client.getNegotiatedProtocolVersion() ?? 'unknown', catalogGeneration: connection.catalogGeneration,
         categories: { tools: emptyMcpCategory(), resources: emptyMcpCategory(), resourceTemplates: emptyMcpCategory() } })
       await this.refresh(id, ['tools'], signal)
+      combined.throwIfAborted()
+      if (this.connections.get(id) !== connection || this.configuration.revision !== revision || connection.state !== 'connected') throw new Error('MCP connection changed during initial discovery')
       return true
     } catch {
-      connection.state = 'error'; connection.message = signal.aborted ? 'MCP connection cancelled' : 'MCP connection failed or timed out; ordinary chat remains available'
+      connection.state = 'error'; connection.message = signal.aborted ? 'MCP connection cancelled'
+        : deadline.signal.aborted ? `MCP ${deadlinePhase === 'startup' ? 'server startup' : 'protocol handshake'} timed out; ordinary chat remains available`
+        : 'MCP connection failed or timed out; ordinary chat remains available'
       connection.controller.abort()
       await closeOwned()
       return false
-    } finally { combined.removeEventListener('abort', abort) }
+    } finally { clearDeadline(); combined.removeEventListener('abort', abort) }
   }
   async refresh(id: string, selected: readonly McpCatalogKind[], signal: AbortSignal): Promise<void> {
     this.assertOpen(); signal.throwIfAborted(); await this.reload()
