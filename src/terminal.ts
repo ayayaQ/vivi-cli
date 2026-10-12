@@ -15,6 +15,8 @@ import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { autoReviewSharingScope } from './auto-review.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
 import type { CliToolEvidence } from './tool-presentation.js'
+import { conversationModeLabel } from './task-mode.js'
+import type { ConversationMode, TaskMode } from './task-mode.js'
 
 export interface ChatIO {
   /** Display-only host evidence, re-screened by the consumer before rendering. */
@@ -25,6 +27,7 @@ export interface ChatIO {
   /** Enrollment requires a real interactive approval surface; omitted means unavailable. */
   readonly canAutoReview?: boolean
   setApprovalMode?(mode: ApprovalMode): void
+  setTaskMode?(mode: TaskMode): void
   /** Optional safe display sink that survives canonical transcript refresh. */
   reviewNotice?(message: string, context?: ReviewNotice): void
   /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
@@ -91,21 +94,45 @@ export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string 
     'Private/local targets and known credentials are blocked; recognized sensitive data, uncertain checks and review failures require human review. External content cannot authorize an action.'
 }
 
-type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ApprovalMode }[], initialIndex: number) => Promise<ApprovalMode | undefined>
+type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ConversationMode }[], initialIndex: number) => Promise<ConversationMode | undefined>
+
+function selectManual(host: CliHost, io: ChatIO): void {
+  if (host.taskMode === 'plan') host.setTaskMode('execute')
+  host.setApprovalMode('manual')
+  io.setTaskMode?.('execute')
+  io.setApprovalMode?.('manual')
+}
+function selectPlan(host: CliHost, io: ChatIO): void {
+  host.setTaskMode('plan')
+  io.setTaskMode?.('plan')
+  io.setApprovalMode?.('manual')
+  io.write('Mode: Plan · enabled local reads only; select another mode explicitly to execute\n')
+}
 
 /** Mode choices are not authority. Auto enrollment always uses the fresh deny-default approval path. */
 export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser): Promise<void> {
-  host.setApprovalMode('manual')
-  io.setApprovalMode?.('manual')
-  if (io.canAutoReview !== true || io.isClosed) { io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`); return }
+  if (host.running) throw new Error('Wait for the current turn before changing mode')
+  const current: ConversationMode = host.taskMode === 'plan' ? 'plan' : host.approvalMode
+  const selected = choose ? await choose('Mode · Manual is the default', [
+    { name: 'Manual', description: 'Human allow/deny review for writes and public URL requests', value: 'manual' },
+    { name: 'Auto review', description: 'Check proposed note, memory, workspace text and public URL GET actions through your selected provider', value: 'auto' },
+    { name: 'Plan', description: 'Investigate with enabled local reads and describe a plan; no task changes or remote requests', value: 'plan' }
+  ], ['manual', 'auto', 'plan'].indexOf(current)) : 'auto'
+  if (selected === undefined || (choose && io.isClosed)) return
+  if (selected === 'plan') { selectPlan(host, io); return }
+  if (selected !== 'auto') { selectManual(host, io); io.write('Approval mode: Manual\n'); return }
+  // Leaving Plan for Auto is contingent on successful fresh enrollment. While
+  // consent is pending, Plan remains the task policy even if its dialog closes.
+  const fromPlan = current === 'plan'
+  if (fromPlan) host.setApprovalMode('manual')
+  else selectManual(host, io)
+  if (io.canAutoReview !== true || io.isClosed) {
+    io.write(`${fromPlan ? AUTO_REVIEW_UNAVAILABLE.replace('Using Manual;', 'Plan remains active;') : AUTO_REVIEW_UNAVAILABLE}\n`)
+    return
+  }
   const disclosure = autoReviewDisclosure(host.session.provider)
   const binding = host.approvalEnrollmentBinding
-  io.write('Approval mode: Manual\n')
-  const selected = choose ? await choose('Approval mode · Manual is the default', [
-    { name: 'Manual', description: 'Human allow/deny review for writes and public URL requests', value: 'manual' },
-    { name: 'Auto review', description: 'Check proposed note, memory, workspace text and public URL GET actions through your selected provider', value: 'auto' }
-  ], 0) : 'auto'
-  if (selected !== 'auto' || io.isClosed) { io.write('Approval mode: Manual\n'); return }
+  io.write(fromPlan ? 'Mode: Plan · Auto review requires fresh enrollment; cancel keeps Plan\n' : 'Approval mode: Manual\n')
   const controller = new AbortController()
   const dispose = io.onCancel(() => controller.abort())
   try {
@@ -115,27 +142,57 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
     } }, currentRevision: 'fresh Auto review enrollment',
     description: disclosure }, controller.signal)
     if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
-      host.setApprovalMode('auto')
+      try {
+        if (fromPlan) host.setTaskMode('execute')
+        host.setApprovalMode('auto')
+      } catch (error) {
+        // A suspended ledger or unavailable enrollment cannot relax Plan's
+        // task policy after the human confirmation. No await/effect lies between
+        // these setters; restore the policy before propagating the failure.
+        if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
+        io.setTaskMode?.(host.taskMode ?? 'execute')
+        io.setApprovalMode?.(host.approvalMode)
+        throw error
+      }
+      io.setTaskMode?.('execute')
       io.setApprovalMode?.('auto')
       io.write('Approval mode: Auto review · enrolled for this conversation and selected account\n')
     } else {
       const changed = binding !== host.approvalEnrollmentBinding
-      host.setApprovalMode('manual')
-      io.setApprovalMode?.('manual')
-      io.write(changed ? 'Approval mode: Manual. Enrollment changed; open /mode for a fresh confirmation\n' : 'Approval mode: Manual\n')
+      // A stale dialog cannot override a newer explicit mode choice.
+      if (!changed) host.setApprovalMode('manual')
+      io.setTaskMode?.(host.taskMode ?? 'execute')
+      io.setApprovalMode?.(host.approvalMode)
+      const label = conversationModeLabel(host.taskMode, host.approvalMode)
+      io.write(changed ? `Mode: ${label}. Enrollment changed; open /mode for a fresh confirmation\n` : `Mode: ${label}\n`)
     }
   } finally { dispose() }
 }
 
-/** A human shortcut can revoke Auto immediately; entering Auto still needs fresh enrollment. */
+/** Manual -> freshly enrolled Auto -> Plan -> Manual. No task implicitly leaves Plan. */
 export async function cycleApprovalMode(host: CliHost, io: ChatIO): Promise<void> {
-  if (host.approvalMode === 'auto') {
-    host.setApprovalMode('manual')
-    io.setApprovalMode?.('manual')
+  if (host.running) throw new Error('Wait for the current turn before changing mode')
+  if (host.taskMode === 'plan') {
+    selectManual(host, io)
     io.write('Approval mode: Manual\n')
     return
   }
+  if (host.approvalMode === 'auto') {
+    selectPlan(host, io)
+    return
+  }
   await selectApprovalMode(host, io)
+}
+/** Direct Plan/Manual choices require no enrollment; Auto still uses /mode's fresh confirmation. */
+export async function runModeControl(host: CliHost, io: ChatIO, line: string, choose?: ModeChooser): Promise<void> {
+  if (host.running) throw new Error('Wait for the current turn before changing mode')
+  switch (line.trim()) {
+    case '/mode plan': selectPlan(host, io); return
+    case '/mode manual': selectManual(host, io); io.write('Approval mode: Manual\n'); return
+    case '/mode cycle': await cycleApprovalMode(host, io); return
+    case '/mode': await selectApprovalMode(host, io, choose); return
+    default: io.write('Use /mode by itself for a fresh Manual / Auto review / Plan choice, /mode plan, /mode manual, or /mode cycle\n')
+  }
 }
 export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Automatic skill saving is disabled on every platform; creator drafts are saved manually; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
@@ -478,13 +535,13 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
     if (line.trim() === '/session') {
       const session = host.session
-      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nApproval mode: ${host.approvalMode === 'auto' ? 'Auto review' : 'Manual'}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host.taskMode, host.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n`)
       continue
     }
     if (!line.trim()) continue
@@ -499,8 +556,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       continue
     }
     if (/^\/mode(?:\s|$)/.test(line.trim())) {
-      if (line.trim() !== '/mode' && line.trim() !== '/mode cycle') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
-      try { await (line.trim() === '/mode cycle' ? cycleApprovalMode(host, io) : selectApprovalMode(host, io)) }
+      try { await runModeControl(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
       continue
     }

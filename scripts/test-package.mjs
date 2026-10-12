@@ -498,6 +498,26 @@ try {
   assert.equal(extensionResult.status, 'completed')
   assert.equal(extensionResult.history[2].content, 'packed extension works')
   assert.deepEqual((await new FileSessionStore(directory).load(extensionHost.session.id)).history, extensionResult.history)
+  let planRounds = 0
+  const planHost = await CliHost.create({ store: new FileSessionStore(directory), workspace, enableNotes: true,
+    settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
+    approve: async () => { assert.fail('Packed Plan cannot request execution approval') },
+    provider: { async generate({ tools }) {
+      assert(!tools.some(tool => ['note_set', 'workspace_edit_text', 'packed_fixture', 'command_start', 'fetch_url', 'read_mcp_resource'].includes(tool.name)))
+      return ++planRounds === 1 ? { content: '', toolCalls: [
+        { id: 'packed-plan-read', name: 'workspace_read', arguments: { path: 'created.txt' } },
+        ...['note_set', 'packed_fixture', 'command_start', 'fetch_url', 'read_mcp_resource'].map(name => ({ id: 'packed-plan-' + name, name, arguments: {} }))
+      ] } : { content: 'Packed read-only plan', toolCalls: [] }
+    } } })
+  planHost.setTaskMode('plan')
+  const planResult = await planHost.send('Investigate without changing anything')
+  assert.equal(planResult.status, 'completed'); assert.equal(planHost.taskMode, 'plan')
+  assert.equal(planHost.session.noteRevision, 0); assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed new')
+  const planResults = planResult.history.filter(message => message.kind === 'tool_result')
+  assert.equal(planResults.length, 6); assert.equal(planResults[0].isError, undefined)
+  assert(planResults.slice(1).every(message => message.isError))
+  planHost.setTaskMode('execute'); assert.equal(planHost.approvalMode, 'manual')
+  await planHost.shutdown()
   const openai = createOpenAIProvider({ model: 'fake', apiKey: 'fake', fetch: async () => new Response(JSON.stringify({
     status: 'completed', output: [{ type: 'message', id: 'fake-message', role: 'assistant', content: [{ type: 'output_text', text: 'OpenAI shared', annotations: [] }] }]
   })) })
@@ -511,7 +531,7 @@ try {
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
 import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
-  type SessionPersistence, type ApprovalRequest, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
+  type SessionPersistence, type ApprovalRequest, type TaskMode, type ConversationMode, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
@@ -552,8 +572,13 @@ void lifecycle
 const options: CliHostOptions = { provider, session, store, mcp, mcpOutcomes: outcomes, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
+const taskMode: TaskMode = host.taskMode
+const conversationMode: ConversationMode = 'plan'
+host.setTaskMode(taskMode)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
+io.setTaskMode?.(taskMode)
+void conversationMode
 const toolEvidence: CliToolEvidence = host.toolPresentationEvidence
 let toolDecision: CliToolDecision | undefined
 io.setToolEvidence?.(toolEvidence)

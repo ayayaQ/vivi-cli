@@ -98,7 +98,7 @@ Selected files may be sent to your provider and saved in session history.
 Workspace tools omit symlinks and private/ignored files; text writes require review; this is not an OS sandbox.
 /commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval, even in Auto; piped approval is denied.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
-/mode selects Manual or optional Auto review for the current conversation and selected account.
+/mode selects Manual / Auto review / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
 Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.

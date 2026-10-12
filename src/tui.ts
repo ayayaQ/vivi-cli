@@ -27,6 +27,8 @@ import { RunStatus } from './run-status.js'
 import type { RunClock, RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
+import { conversationModeLabel } from './task-mode.js'
+import type { TaskMode } from './task-mode.js'
 import { reviewNoticeSettled } from './auto-review.js'
 import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolCardView, cliToolSource, isCliLocalReadTool } from './tool-presentation.js'
 import type { CliToolEvidence } from './tool-presentation.js'
@@ -78,7 +80,7 @@ export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a provider' },
   { command: '/models', description: 'Choose a model' },
   { command: '/effort', description: 'Choose reasoning effort' },
-  { command: '/mode', description: 'Choose Manual or Auto review' },
+  { command: '/mode', description: 'Choose Manual / Auto review / Plan' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
   { command: '/rename', description: 'Rename the current session' },
@@ -287,6 +289,7 @@ export class OpenTuiIO implements ChatIO {
   private sessionModel = 'vivi · choose a model with /models'
   private sessionId: string | undefined
   private approvalMode: ApprovalMode = 'manual'
+  private taskMode: TaskMode = 'execute'
   private usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
   private usageScope: 'Session' | 'Round' | 'Turn' = 'Session'
   private streamed = ''
@@ -521,6 +524,7 @@ export class OpenTuiIO implements ChatIO {
     return Boolean(process.stdin.isTTY && process.stdout.isTTY && !this.closed && !this.failed && !this.renderer.isDestroyed)
   }
   setApprovalMode(mode: ApprovalMode): void { this.approvalMode = mode; this.updateHeader() }
+  setTaskMode(mode: TaskMode): void { this.taskMode = mode; this.updateHeader() }
 
   /** Explicit offline probe. No editable text, provider or session is opened. */
   async diagnoseInput(): Promise<InputDiagnosticReport> {
@@ -787,7 +791,7 @@ export class OpenTuiIO implements ChatIO {
     const priorityUsage = totalLabel.length <= tokenWidth ? totalLabel : total.length <= tokenWidth ? total : '…'
     const fittedUsage = usageColumns <= tokenWidth ? usage : statusTextColumns(compactUsage) <= tokenWidth ? compactUsage : priorityUsage
     this.tokenLine.content = fitStatusColumns(fittedUsage, tokenWidth, true)
-    const mode = this.approvalMode === 'auto' ? 'Auto review' : 'Manual'
+    const mode = conversationModeLabel(this.taskMode, this.approvalMode)
     const modelWidth = columns - statusTextColumns(` · ${mode}`)
     this.modelLine.content = modelWidth > 0 ? `${fitStatusColumns(this.sessionModel, modelWidth, true)} · ${mode}` : fitStatusColumns(mode, columns, true)
     this.updateTerminalTitle()

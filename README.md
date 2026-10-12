@@ -58,10 +58,29 @@ not change the terminal title.
 
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
 terminal reports those modifiers. Tab completes slash commands. Shift+Tab cycles
-Manual / Auto review while the composer is idle and preserves an unfinished draft.
-Entering Auto still needs the fresh enrollment confirmation; leaving it selects
-Manual immediately. During a turn and inside dialogs, the shortcut does not change
-approval mode. `/mode cycle` provides the same cycle through the command interface.
+Manual / Auto review / Plan while the composer is idle and preserves an unfinished
+draft. Entering Auto still needs the fresh enrollment confirmation. Entering Plan
+revokes Auto enrollment; leaving Plan returns to Manual. During a turn and inside
+dialogs, the shortcut does not change mode. `/mode cycle` provides the same cycle
+through the command interface. `/mode` opens all three choices in full-screen mode;
+`/mode plan` enters planning directly and `/mode manual` returns to reviewed execution.
+
+Plan is a read-only task policy, separate from Manual/Auto approval. It advertises
+and dispatches only enabled local reads: arithmetic, current time, session-note
+reads, memory listing, skill listing/reading, and bounded workspace reads/searches.
+Existing feature opt-ins, model tool support, secret screening and read permissions
+still apply. Workspace/note/memory mutations, every unsandboxed command, public URL
+GETs, MCP calls/resources and imported extensions are unavailable, even if described
+as read-only. The assistant describes its plan in a normal response and stays in
+Plan until you explicitly change mode. Switching does not execute old proposals.
+Choosing Auto from Plan leaves Plan only after successful fresh enrollment;
+cancelling, denying or closing that confirmation keeps Plan active.
+Plan does not mean zero filesystem writes: normal conversation checkpoints,
+transcripts, local store locks/recovery and shutdown bookkeeping still run. Explicit
+host controls such as session renaming and memory management keep their existing
+review rules. Explicit new/resumed conversations start in Manual execution mode.
+Model and reasoning-effort changes preserve Plan when it is selected, while
+revoking any Auto review enrollment.
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)

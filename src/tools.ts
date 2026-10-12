@@ -6,6 +6,8 @@ import { WORKSPACE_TOOL_NAMES } from './workspace.js'
 import { COMMAND_TOOL_NAMES } from './commands.js'
 import { PUBLIC_URL_TOOL_NAME } from './public-url-tools.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES } from './workspace-edit.js'
+import { isPlanTool, planModeRefusal } from './task-mode.js'
+import type { TaskMode } from './task-mode.js'
 export { calculate }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
@@ -44,13 +46,14 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 }
 
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
-export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension): {
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension, taskMode: TaskMode = 'execute'): {
   tools: ToolDefinition[]
   readonly signal: AbortSignal
   defer(cleanup: ExtensionCleanup): void
   dispose(): Promise<void>
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
 } {
+  if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
   const scope = createExtensionScope({
     reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
       PUBLIC_URL_TOOL_NAME, 'list_mcp_resources', 'read_mcp_resource', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
@@ -61,16 +64,25 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   scope.defer(() => builtins.dispose())
   try {
     scope.register(calculatorExtension)
-    for (const extension of extensions) scope.register(extension)
-    for (const extension of [memory, workspace, skills, commands, mcp, publicUrl]) if (extension) builtins.register(extension)
+    if (taskMode !== 'plan') for (const extension of extensions) scope.register(extension)
+    for (const extension of [memory, workspace, skills, ...(taskMode === 'plan' ? [] : [commands, mcp, publicUrl])]) if (extension) {
+      builtins.register(taskMode === 'plan' ? { ...extension, tools: extension.tools.filter(tool => isPlanTool(tool.definition.name)) } : extension)
+    }
     const registry = scope.snapshot(), builtinRegistry = builtins.snapshot()
+    const tools = [...registry.tools, ...hostTools(enableNotes), ...builtinRegistry.tools]
+      .filter(tool => taskMode !== 'plan' || isPlanTool(tool.name))
+    const allowed = new Set(tools.map(tool => tool.name))
     return {
-      tools: [...registry.tools, ...hostTools(enableNotes), ...builtinRegistry.tools],
+      tools,
       signal: scope.signal,
       defer: cleanup => scope.defer(cleanup),
       dispose: () => scope.dispose(),
       executeTool: async (call, signal, host) => {
         scope.signal.throwIfAborted()
+        signal.throwIfAborted()
+        // Advertisement is not the enforcement boundary: a direct or retained
+        // dispatcher cannot invoke an omitted tool or reuse another turn's approval.
+        if (taskMode === 'plan' && !allowed.has(call.name)) return planModeRefusal()
         // Host tools and built-in packs are restricted by this same turn owner.
         const ownedSignal = AbortSignal.any([signal, scope.signal])
         return builtinRegistry.has(call.name) ? builtinRegistry.executeTool(call, { signal: ownedSignal })
