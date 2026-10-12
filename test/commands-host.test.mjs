@@ -178,3 +178,60 @@ test('integrated Auto workspace creation keeps the following command on fresh hu
   assert.equal(subject.state.judges, 1)
   assert.deepEqual(subject.approvals.map(request => request.call.name), ['command_start'], subject.approvals[0]?.description)
 })
+
+test('first exact command approval is the only startup decision and denial cannot execute', async t => {
+  const marker = 'must-not-exist.txt'
+  let subject
+  subject = await fixture(t, { generate({ messages, state }) {
+    if (state.rounds === 1) return { content: '', toolCalls: [{ id: 'first-proposal', name: 'command_start', arguments: {
+      executable: process.execPath, args: ['-e', `require('node:fs').writeFileSync('${marker}', 'executed')`], yieldMs: 1000 } }] }
+    assert.equal(JSON.parse(messages.at(-1).content).error.code, 'approval_denied')
+    return { content: 'Denied', toolCalls: [] }
+  } })
+  subject.options.approve = async request => {
+    subject.approvals.push(request)
+    assert.equal(request.call.name, 'command_start')
+    assert.match(request.description, /unsandboxed/)
+    assert.match(request.description, /outside the selected working directory/)
+    assert.match(request.description, /Working directory:/)
+    assert.equal(subject.commandWorkspace.isEnabled, false)
+    await assert.rejects(import('node:fs/promises').then(fs => fs.readFile(join(subject.root, marker))), { code: 'ENOENT' })
+    return false
+  }
+  assert.equal(subject.host.commandsEnabled, true)
+  assert.equal((await subject.host.send('Propose a fixture command')).status, 'completed')
+  assert.equal(subject.approvals.length, 1)
+  assert.equal(subject.commandWorkspace.isEnabled, false)
+  await assert.rejects(import('node:fs/promises').then(fs => fs.readFile(join(subject.root, marker))), { code: 'ENOENT' })
+})
+for (const mode of ['manual', 'auto']) test(`startup ${mode} proposals require one fresh human decision per exact process`, async t => {
+  let propose = true, starts = 0
+  const subject = await fixture(t, { generate({ messages, state }) {
+    if (propose) {
+      propose = false
+      return { content: '', toolCalls: [{ id: `fresh-${++starts}`, name: 'command_start', arguments: {
+        executable: process.execPath, args: ['-e', 'console.log("approved")'], yieldMs: 1000 } }] }
+    }
+    const result = JSON.parse(messages.at(-1).content)
+    if (result.state === 'running') return { content: '', toolCalls: [{ id: `poll-${state.rounds}`, name: 'command_poll', arguments: { executionId: result.executionId, yieldMs: 2000 } }] }
+    return { content: 'Done', toolCalls: [] }
+  } })
+  subject.host.setApprovalMode(mode)
+  await subject.host.send('First exact process')
+  propose = true
+  await subject.host.send('Second exact process')
+  assert.deepEqual(subject.approvals.map(request => request.call.name), ['command_start', 'command_start'])
+  assert.equal(subject.state.judges, 0)
+})
+test('launch opt-out hides proposals until restored, without a preliminary execution approval', async t => {
+  const subject = await fixture(t, { options: { enableCommands: false }, generate({ tools }) {
+    assert(!tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name)))
+    return { content: 'Done', toolCalls: [] }
+  } })
+  assert.equal(subject.host.commandsEnabled, false)
+  await subject.host.send('Chat only')
+  assert.equal(await subject.host.enableCommands(), true)
+  assert.equal(subject.approvals.length, 0)
+  await subject.host.disableCommands()
+  assert.equal(subject.host.commandsEnabled, false)
+})

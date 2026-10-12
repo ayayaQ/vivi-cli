@@ -256,6 +256,8 @@ export class TerminalIO implements ChatIO {
   get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
     !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
   get isClosed(): boolean { return this.disposed || this.ended }
+  /** EOF can leave queued/prompt work to consume; disposal ends the launch. */
+  get isDisposed(): boolean { return this.disposed }
   constructor(options: TerminalOptions = {}) {
     this.input = options.input ?? process.stdin
     this.output = options.output ?? process.stdout
@@ -446,7 +448,7 @@ export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.te
 
 export async function runMcpCommand(io: ChatIO, line: string, controls: UserChatControls): Promise<boolean> {
   if (!isMcpCommand(line)) return false
-  if (line.trim() !== '/mcp') io.write('Use /mcp by itself to manage metadata-only connections\n')
+  if (line.trim() !== '/mcp') io.write('Use /mcp by itself to manage reviewed server connections\n')
   else if (controls.mcp) await controls.mcp()
   else io.write('MCP connection management is unavailable in this chat surface\n')
   return true
@@ -465,7 +467,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /skills manages skills, /mcp manages metadata-only connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return

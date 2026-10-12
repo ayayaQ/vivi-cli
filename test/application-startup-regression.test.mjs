@@ -116,7 +116,7 @@ test('startup tools can actually read a workspace file before any model picker o
 test('saved startup and verified /settings then /new use the same workspace tools without changing the active host', async t => {
   const context = await fixture(t), supplied = services()
   const io = fakeIO(['First', '/settings', 'Still first', '/new', 'Second', '/exit'],
-    ['openrouter', 'current', modelId, 'default', false, false])
+    ['openrouter', 'current', modelId, 'default', true, false])
   const launches = [], turns = []
   assert.equal(await run(context, io, supplied, [], inspectTurns(launches, turns)), 0)
   assert.equal(launches.length, 2)
@@ -257,7 +257,7 @@ test('cancelled startup metadata loading does not construct a provider or save a
 })
 
 test('normal first-time provider/model setup uses its verified catalog without a second startup discovery call', async t => {
-  const context = await fixture(t, null), supplied = services(), io = fakeIO(['/models', 'First', '/new', 'Second', '/exit'], [modelId])
+  const context = await fixture(t, null), supplied = services(), io = fakeIO(['/models', 'First', '/new', 'Second', '/exit'], [undefined, modelId])
   // Start in an unconfigured OpenRouter draft; no key is saved during model setup.
   await new PreferenceStore(context.state).save({ ...DEFAULT_PREFERENCES, provider: 'openrouter' })
   const launches = [], turns = []

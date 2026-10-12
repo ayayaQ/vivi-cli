@@ -149,8 +149,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   if (args.includes('--no-stream')) settings.stream = false
   if (args.includes('--tools')) settings.enableTools = true
   if (args.includes('--no-tools')) settings.enableTools = false
-  if (args.includes('--enable-notes')) settings.enableNotes = true
-  if (args.includes('--disable-notes')) settings.enableNotes = false
+  if (args.includes('--enable-notes') || args.includes('--disable-notes')) settings.enableNotes = options.enableNotes
   if (args.includes('--max-rounds')) settings.maxRounds = options.maxRounds
   if (settings.provider === 'openai' && settings.model) {
     const verified = documentedOpenAIModel(settings.model)
@@ -216,26 +215,21 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
       for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
       const model = hydrated.model
       knownModels.set(modelKey(settings.provider, model.id), model)
-      {
-        const previous = settings
-        settings = settingsForModel(settings, model)
-        // A saved chat-only choice and an explicit launch opt-out remain off.
-        // Unknown tool metadata cannot promote a saved claim into permission;
-        // openSession still requires this launch's explicit --tools declaration.
-        if (model.tools === 'unknown') {
-          settings.enableTools = previous.enableTools
-        }
-        if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
-          savedSettings.model === settings.model && !savedSettings.enableTools &&
-          !args.includes('--tools')) {
-          settings.enableTools = false
-        }
-        if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
-          settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
-        }
-        if (previous.reasoning !== settings.reasoning) notice += 'Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n'
+      const previous = settings
+      settings = settingsForModel(settings, model)
+      // A saved chat-only choice and an explicit launch opt-out remain off.
+      // Unknown tool metadata cannot promote a saved claim into permission;
+      // openSession still requires this launch's explicit --tools declaration.
+      if (model.tools === 'unknown') settings.enableTools = previous.enableTools
+      if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
+        savedSettings.model === settings.model && !savedSettings.enableTools && !args.includes('--tools')) {
+        settings.enableTools = false
       }
-      notice += result.warning ? `${result.warning}. Using a stale cached catalog\n`
+      if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
+        settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
+      }
+      if (previous.reasoning !== settings.reasoning) notice += 'Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n'
+      notice += result.warning ? `${redactSecrets(result.warning, secrets)}. Using a stale cached catalog\n`
         : result.state === 'cached' ? 'Using the cached model catalog (up to 15 minutes old)\n' : ''
       return notice || undefined
     } catch (error) {
@@ -380,7 +374,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
     const effort = await chooseEffort(io, model)
     if (!effort) return false
     const notes = effort.enableTools ? await io.choose('Session notes', [
-      { name: 'Keep notes disabled', description: 'Calculator and current time only', value: false },
+      { name: 'Keep notes disabled', description: 'Other supported tools remain available', value: false },
       { name: 'Enable session notes', description: 'Each write requires an allow/deny approval', value: true }
     ], effort.enableNotes ? 1 : 0) : effort.enableNotes
     if (notes === undefined) return false

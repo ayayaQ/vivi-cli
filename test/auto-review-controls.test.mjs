@@ -187,7 +187,7 @@ test('launch Auto still confirms, uses mocked review only after enrollment and n
   const directory = await fixture(t), captures = []
   const io = fakeIO({ interactive: true, approvals: [true] })
   let round = 0
-  assert.equal(await main(['--no-workspace', '--no-tui', '--model', 'offline-chat', '--enable-notes', '--session-dir', directory,
+  assert.equal(await main(['--no-workspace', '--no-tui', '--model', 'offline-chat', '--tools', '--enable-notes', '--session-dir', directory,
     '--approval-mode', 'auto', '--prompt', 'Set note tone to concise'], {}, { io,
     providerFactory: () => ({ generate: async () => ++round === 1 ? answer([call('save-tone')]) : answer() }),
     decisionProviderFactory: decisionFactory(captures) }), 0)
@@ -201,7 +201,7 @@ test('launch Auto still confirms, uses mocked review only after enrollment and n
   const resumed = fakeIO({ interactive: true, approvals: [false] })
   round = 0
   captures.length = 0
-  assert.equal(await main(['--no-workspace', '--no-tui', '--resume', session.id, '--enable-notes', '--session-dir', directory,
+  assert.equal(await main(['--no-workspace', '--no-tui', '--resume', session.id, '--tools', '--enable-notes', '--session-dir', directory,
     '--prompt', 'Set note tone to concise'], {}, { io: resumed,
     providerFactory: () => ({ generate: async () => ++round === 1 ? answer([call('save-again', 1)]) : answer() }),
     decisionProviderFactory: decisionFactory(captures) }), 0)

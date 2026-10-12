@@ -347,17 +347,18 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     let metadata: ModelEntry
     const controller = new AbortController()
     const dispose = io.onCancel(() => controller.abort())
+    const surfaceClosed = (): boolean => io instanceof TerminalIO ? io.isDisposed : io?.isClosed === true
     try {
       if (session.provider === 'openrouter') io.write('Loading openrouter model capabilities…\n')
       const key = session.provider === 'openai' ? env.OPENAI_API_KEY : env.OPENROUTER_API_KEY
       const hydrated = await hydrateModelCapabilities(dependencies.catalog ?? new ModelCatalog(),
         session.provider, session.model, key, controller.signal)
-      if (io.isClosed || controller.signal.aborted) return 130
+      if (surfaceClosed() || controller.signal.aborted) return 130
       metadata = hydrated.model
       if (hydrated.catalog?.warning) io.write(`${redactSecrets(hydrated.catalog.warning, secrets)}. Using a stale cached catalog\n`)
       else if (hydrated.catalog?.state === 'cached') io.write('Using the cached model catalog (up to 15 minutes old)\n')
     } catch (error) {
-      if (io.isClosed || controller.signal.aborted) return 130
+      if (surfaceClosed() || controller.signal.aborted) return 130
       // An unavailable catalog permits chat only or this launch's explicit
       // declaration. Authentication denial must never fall back to a request.
       if (modelAccessDenied(error)) throw error

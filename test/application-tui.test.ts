@@ -187,15 +187,13 @@ test('fatal native failure exits nonzero and prints a redacted error after termi
   const directory = await mkdtemp(join(tmpdir(), 'vivi-native-failure-'))
   const setup = await createTestRenderer({ width: 80, height: 24, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer, { secrets: ['known-secret'] })
-  const ready = observeUI(io)
   const originalWrite = process.stderr.write
   let errors = ''
   process.stderr.write = ((chunk: string | Uint8Array) => { errors += chunk.toString(); return true }) as typeof process.stderr.write
   try {
     const running = main([], { VIVI_SESSION_DIR: directory, OPENAI_API_KEY: 'known-secret' }, { tuiIO: io,
-      credentials: { status: async () => ({ available: false, label: 'Fake vault' }), load: async () => undefined, save: async () => { throw new Error('Fake storage unavailable') } }, providerFactory: () => { throw new Error('A failed welcome screen must never construct a provider') } })
-    await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes('fresh conversation'))
+      credentials: { status: async () => ({ available: false, label: 'Fake vault' }), load: async () => undefined, save: async () => { throw new Error('Fake storage unavailable') } }, providerFactory: () => { throw new Error('A failed automatic setup must never construct a provider') } })
+    await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
     setup.renderer.emit(CliRenderEvents.RENDER_ERROR, { error: new Error('\x1b[31mSynthetic known-secret failure\x1b[0m') })
     expect(await running).toBe(1)
     expect(setup.renderer.isDestroyed).toBe(true)
@@ -232,6 +230,8 @@ for (const oneShot of [false, true]) {
           providerFactory: () => ({ generate: async () => { calls++; return { content: 'Fake completed response', toolCalls: [] } } })
         })
       if (!oneShot) {
+        await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+        setup.mockInput.pressEscape()
         await ready(state => state.kind === 'composer')
         await setup.mockInput.typeText('/exit')
         setup.mockInput.pressEnter()
@@ -330,7 +330,55 @@ test('one-shot native user cancellation remains status 130 without a fatal diagn
   } finally { process.stderr.write = originalWrite; io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
 })
 
-test('native slash setup saves a masked fake key and model/effort pickers work after repeated cancellation', async () => {
+test('native fresh startup selects provider/model directly and skips broader settings dialogs', async () => {
+  const { parseModelCatalog } = await import('../src/models.js')
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-automatic-setup-'))
+  const setup = await createTestRenderer({ width: 100, height: 30, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  let running: Promise<number> | undefined
+  let catalogs = 0, turns = 0
+  try {
+    running = main(['--no-workspace'], { VIVI_SESSION_DIR: directory, OPENAI_API_KEY: 'offline-native-key' }, {
+      tuiIO: io,
+      credentials: { status: async () => ({ available: false, label: 'Offline vault' }),
+        load: async () => { throw new Error('Environment key must take precedence') },
+        save: async () => { throw new Error('Automatic setup must not save an environment key') } },
+      catalog: { list: async provider => {
+        catalogs++
+        return { state: 'fresh', models: parseModelCatalog(provider, { data: [{ id: 'gpt-5.1' }] }) }
+      } },
+      providerFactory: (_session, options) => {
+        expect(options.enableNotes).toBe(true); expect(options.enableMemory).toBe(false)
+        return { generate: async input => {
+          turns++; expect(input.tools.some(tool => tool.name === 'note_set')).toBe(true)
+          return { content: 'Automatic setup ready', toolCalls: [] }
+        } }
+      }
+    })
+    await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame(frame => frame.includes('Use current key'))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame(frame => frame.includes('Models · openai') && frame.includes('gpt-5.1'))
+    setup.mockInput.pressEnter()
+    await ready(state => state.kind === 'composer')
+    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('Menu  Models'))
+    expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
+    const afterSend = ready.nextComposer()
+    await setup.mockInput.typeText('Hello'); setup.mockInput.pressEnter(); await afterSend
+    await setup.waitForFrame(frame => frame.includes('Automatic setup ready'))
+    expect(catalogs).toBe(1); expect(turns).toBe(1)
+    expect(setup.captureCharFrame()).not.toContain('offline-native-key')
+    await setup.mockInput.typeText('/exit'); setup.mockInput.pressEnter()
+    expect(await running).toBe(0)
+    const defaults = await new PreferenceStore(directory).load()
+    expect(defaults?.model).toBe('gpt-5.1'); expect(defaults?.enableMemory).toBe(false)
+    expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false)
+  } finally { io.close(); await running; setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+}, 10000)
+
+test('native automatic setup cancels cleanly and slash setup saves a masked key through repeated picker flows', async () => {
   const { parseModelCatalog } = await import('../src/models.js')
   const directory = await mkdtemp(join(tmpdir(), 'vivi-native-provider-'))
   const setup = await createTestRenderer({ width: 100, height: 32, kittyKeyboard: true,
@@ -349,7 +397,7 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
         expect(env.OPENAI_API_KEY).toBe(key)
         expect(options.enableTools).toBe(true)
         return { generate: async input => {
-          expect(input.tools).toHaveLength(11)
+          expect(input.tools.some(tool => tool.name === 'note_set')).toBe(true)
           expect(input.tools.some(tool => tool.name === 'fetch_url')).toBe(true)
           expect(input.tools.some(tool => tool.name === 'read_skill')).toBe(true)
           expect(input.tools.some(tool => tool.name === 'save_skill')).toBe(false)
@@ -358,8 +406,11 @@ test('native slash setup saves a masked fake key and model/effort pickers work a
         } }
       }
     })
+    await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+    setup.mockInput.pressEscape()
     await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes('fresh conversation'))
+    await setup.waitForFrame(frame => frame.includes('fresh conversation') && !frame.includes('Responses API'))
+    expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
     await setup.mockInput.typeText('/pro')
     await setup.waitForFrame(frame => frame.includes('Commands') && frame.includes('/provider'))
     setup.mockInput.pressTab()
