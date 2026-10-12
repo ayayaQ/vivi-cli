@@ -31,6 +31,7 @@ import { reviewNoticeSettled } from './auto-review.js'
 import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolCardView, cliToolSource, isCliLocalReadTool } from './tool-presentation.js'
 import type { CliToolEvidence } from './tool-presentation.js'
 import { mcpContainsSecret } from './mcp-content.js'
+import { WorkspaceDiffRenderable } from './tui-diff.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
@@ -162,6 +163,7 @@ interface DisplayEntry {
   review?: ReviewNotice
   historyStart?: number
   approval?: object
+  workspaceDiff?: string
   tool?: { encoded: string; key: string; detailBytes?: number; retained?: boolean; localRead?: boolean; resultError?: boolean }
 }
 interface SearchPicker {
@@ -1246,7 +1248,9 @@ export class OpenTuiIO implements ChatIO {
     this.activeApproval = approval
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     this.appendEntry({ category: 'activity', attention: true, label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
-      content: this.safe(request.description), markdown: false, approval: approval.token })
+      content: this.safe(request.description), markdown: false, approval: approval.token,
+      ...(['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
+        ? { workspaceDiff: request.workspaceDiff } : {}) })
     const title = enrollment ? 'Enable Auto review? (default: cancel)' : publicUrl
       ? 'Review this public URL request (default: deny)' : 'Review this change (default: deny)'
     this.updateStatus(enrollment ? 'Enable Auto review? · Cancel is the default' : `Approval required · ${scope} · denial is the default`)
@@ -1369,8 +1373,12 @@ export class OpenTuiIO implements ChatIO {
       if (!collapsed && view.notice) details.add(new TextRenderable(this.renderer,
         { ...TEXT_SELECTION, content: view.notice, fg: TUI_THEME.muted, attributes: TextAttributes.DIM, width: '100%', wrapMode: 'word', flexShrink: 0 }))
     }
-    if (entry.content && !entry.tool) box.add(entry.markdown ? this.markdown(entry.content) : new TextRenderable(this.renderer,
-      { ...TEXT_SELECTION, content: entry.content, fg: bodyColor, attributes: bodyAttributes, width: '100%', wrapMode: 'word', flexShrink: 0 }))
+    if (entry.content && !entry.tool) {
+      const options = { ...TEXT_SELECTION, content: entry.content, fg: bodyColor, attributes: bodyAttributes,
+        width: '100%' as const, wrapMode: 'word' as const, flexShrink: 0 }
+      box.add(entry.markdown ? this.markdown(entry.content) : entry.workspaceDiff
+        ? new WorkspaceDiffRenderable(this.renderer, options, entry.workspaceDiff, this.transcript.viewport) : new TextRenderable(this.renderer, options))
+    }
     this.transcript.add(box)
     return box
   }

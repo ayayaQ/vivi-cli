@@ -589,7 +589,7 @@ export class CliHost {
         toolsEnabled: this.options.enableTools !== false, toolsetRevision: this.toolsetRevision,
         rawCallDigest: reviewDigest(call), capturedCallDigest: reviewDigest(capturedCall),
         proposalDigest: reviewDigest(prepared), resultRevision: prepared.revision })
-      const result = await this.reviews.execute({ approval: { call, currentRevision: prepared.expectedRevision,
+      const result = await this.reviews.execute({ approval: { call, currentRevision: prepared.expectedRevision, workspaceDiff: prepared.diff,
         description: `${prepared.kind === 'create' ? 'Create' : 'Precisely edit'} workspace text file ${JSON.stringify(prepared.path)}.\n` +
           'The complete diff below uses JSON-quoted lines, including exact newline/control escapes. A temporary sibling .vivi-stage-*.tmp file is used and removed; no backup copy is retained.\n' +
           `Before SHA-256: ${prepared.expectedRevision}\nAfter SHA-256: ${prepared.revision}\n${prepared.diff}` },

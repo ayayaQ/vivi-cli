@@ -13,6 +13,8 @@ export interface ApprovalRequest {
   call: ToolCall
   description: string
   currentRevision: number | string
+  /** Presentation only: the host-prepared workspace diff already included in description. */
+  workspaceDiff?: string
 }
 export interface ToolHost {
   enableNotes: boolean
