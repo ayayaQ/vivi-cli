@@ -50,6 +50,11 @@ The full-screen status shows an animated Working indicator and total elapsed
 turn time, including time spent waiting for approval. Waiting for approval and
 Cancelling have separate labels. The timer stops when the turn settles or the UI
 closes, including non-streaming requests and failed turns.
+The full-screen terminal tab shows `vivi · session name`, with `[~]` at the
+start while working and `[!]` when a dialog needs input. The title is bounded and
+updates only when its state or session name changes. The prior title is restored
+on exit where the terminal supports xterm title stacks. Line and JSON output do
+not change the terminal title.
 
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
 terminal reports those modifiers. Tab completes slash commands. Shift+Tab cycles
