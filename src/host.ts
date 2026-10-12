@@ -318,6 +318,7 @@ export class CliHost {
   private commandOpening: Promise<TrustedCommandWorkspace> | undefined
   private commandSetupEpoch = 0
   private commandProposalsEnabled: boolean
+  private commandRestorePending = false
   private enabledSkills: boolean
   private lastSkillsDiagnostics = ''
   constructor(private readonly options: CliHostOptions) {
@@ -459,19 +460,32 @@ export class CliHost {
     if (this.options.commandApproval?.isAvailable() !== true) return false
     if (this.options.commandApproval.accountRevision() !== this.commandAccount) return false
     if (this.options.enableTools === false) return false
-    this.commandProposalsEnabled = true
-    const workspace = await this.openCommandWorkspace(signal)
-    await workspace.allowProposals(signal)
-    return this.commandsEnabled
-  }
-  private async openCommandWorkspace(signal: AbortSignal): Promise<TrustedCommandWorkspace> {
+    signal.throwIfAborted()
+    if (this.commandRestorePending) throw new Error('Command setup is already in progress; wait before trying again')
     const epoch = this.commandSetupEpoch
-    if (!this.commandsEnabled) throw new Error('Command proposals are unavailable for this launch/session')
+    this.commandRestorePending = true
+    try {
+      const workspace = await this.openCommandWorkspace(signal, true)
+      await workspace.allowProposals(signal)
+      signal.throwIfAborted()
+      if (this.shutdownStarted || this.running || this.commandSetupEpoch !== epoch ||
+        this.options.commandApproval.isAvailable() !== true || this.options.commandApproval.accountRevision() !== this.commandAccount) {
+        throw new Error('Command setup is no longer active; try again while idle')
+      }
+      this.commandProposalsEnabled = true
+      return this.commandsEnabled
+    } finally { this.commandRestorePending = false }
+  }
+  private async openCommandWorkspace(signal: AbortSignal, restoring = false): Promise<TrustedCommandWorkspace> {
+    const epoch = this.commandSetupEpoch
+    const available = (): boolean => restoring ? !this.shutdownStarted && !this.running && this.options.enableTools !== false &&
+      this.options.commandApproval?.isAvailable() === true && this.options.commandApproval.accountRevision() === this.commandAccount : this.commandsEnabled
+    if (!available()) throw new Error('Command proposals are unavailable for this launch/session')
     if (!this.options.commandWorkspace && this.options.commandWorkspaceFactory) {
       const opening = this.commandOpening ??= this.options.commandWorkspaceFactory()
       let workspace: TrustedCommandWorkspace
       try { workspace = await opening } finally { if (this.commandOpening === opening) this.commandOpening = undefined }
-      if (!this.commandsEnabled || this.commandSetupEpoch !== epoch || signal.aborted) {
+      if (!available() || this.commandSetupEpoch !== epoch || signal.aborted) {
         await workspace.shutdown()
         throw new Error('Command setup is no longer active; start a fresh host or try again while idle')
       }

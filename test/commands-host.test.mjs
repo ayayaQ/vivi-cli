@@ -251,3 +251,33 @@ test('a stale account cannot advertise or restore proposals or open a command wo
   assert.equal((await subject.host.send('Continue existing conversation')).status, 'completed')
   assert.equal(openings, 0); assert.equal(subject.approvals.length, 0)
 })
+
+test('cancelled lazy restoration preserves prior command off and permits a fresh retry', async t => {
+  const subject = await fixture(t)
+  let resolveOpening, began, openings = 0
+  const opened = new Promise(resolve => { began = resolve })
+  const host = new CliHost({ ...subject.options, enableCommands: false, commandWorkspace: undefined,
+    commandWorkspaceFactory: async () => {
+      if (++openings === 1) { began(); return new Promise(resolve => { resolveOpening = resolve }) }
+      return TrustedCommandWorkspace.open(subject.root, process.env)
+    } })
+  t.after(() => host.shutdown())
+  const controller = new AbortController(), pending = host.enableCommands(controller.signal)
+  await opened
+  assert.equal(host.commandsEnabled, false)
+  controller.abort(); resolveOpening(subject.commandWorkspace)
+  await assert.rejects(pending, /no longer active/)
+  assert.equal(host.commandsEnabled, false); assert.equal(subject.approvals.length, 0)
+  assert.equal(await host.enableCommands(), true)
+  assert.equal(openings, 2); assert.equal(subject.approvals.length, 0)
+})
+test('an aborted existing-workspace restoration preserves off and allows a subsequent retry', async t => {
+  const subject = await fixture(t)
+  await subject.host.disableCommands()
+  const controller = new AbortController(); controller.abort()
+  await assert.rejects(subject.host.enableCommands(controller.signal), { name: 'AbortError' })
+  assert.equal(subject.host.commandsEnabled, false); assert.equal(subject.commandWorkspace.canPropose, false)
+  assert.equal(subject.approvals.length, 0)
+  assert.equal(await subject.host.enableCommands(), true)
+  assert.equal(subject.commandWorkspace.canPropose, true)
+})

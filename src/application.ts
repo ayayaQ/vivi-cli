@@ -667,6 +667,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         }
         if (command === '/memories') { await manageMemories(); continue }
         if (/^\/commands(?:\s|$)/.test(command)) {
+          if (!host && /^\/commands\s+off$/.test(command)) {
+            activeCommands = false
+            io.write('Command proposals disabled for this launch\n')
+            continue
+          }
           if (!host) { io.write('Choose a provider and model before enabling trusted commands\n'); continue }
           await runCommandControl(host, io, command)
           if (/^\/commands\s+off$/.test(command)) activeCommands = false

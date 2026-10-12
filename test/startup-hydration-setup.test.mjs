@@ -300,3 +300,24 @@ test('replacement key and cancelled model selection withhold stale-host commands
   assert.match(io.output, /Command proposals are unavailable/)
   assert(!io.output.includes(key)); assert(!io.output.includes(replacement))
 })
+
+test('commands can be disabled after cancelling onboarding before any host or command workspace exists', async t => {
+  const root = await fixture(t), directory = join(root, 'state'), workspace = join(root, 'project')
+  await mkdir(workspace)
+  const supplied = services(), io = fakeIO([undefined, 'openrouter', 'current', id],
+    ['/commands off', '/provider', 'Hello', '/new', 'Still off', '/exit'])
+  io.canAutoReview = true
+  const advertised = [], guidance = []
+  assert.equal(await main(['--workspace', workspace], { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
+    tuiIO: io, catalog: supplied.catalog, credentials: supplied.credentials,
+    providerFactory: () => ({ async generate(input) {
+      advertised.push(input.tools.some(tool => tool.name === 'command_start'))
+      guidance.push(input.messages.some(message => message.role === 'system' && message.content.includes('Trusted command tools')))
+      return { content: 'Done', toolCalls: [] }
+    } })
+  }), 0)
+  assert.deepEqual(advertised, [false, false]); assert.deepEqual(guidance, advertised)
+  assert.match(io.output, /Command proposals disabled for this launch/)
+  assert(!io.output.includes('before enabling trusted commands'))
+  assert.equal(supplied.saves.length, 0)
+})
