@@ -241,7 +241,9 @@ export interface CliHostOptions {
   onSkillsNotice?(message: string): void
   /** Explicit launch-only scope; never recovered from a session or preferences. */
   workspace?: ReadOnlyWorkspace
-  /** Separate launch/session-only trust. Merely supplying it never enables commands. */
+  /** Launch-only proposal opt-out. Every command still requires human approval. */
+  enableCommands?: boolean
+  /** Host-owned workspace; supplying it never authorizes process execution. */
   commandWorkspace?: TrustedCommandWorkspace
   /** Dormant app factory keeps command-only environment errors out of read/chat startup. */
   commandWorkspaceFactory?(): Promise<TrustedCommandWorkspace>
@@ -315,6 +317,8 @@ export class CliHost {
   private shutdownStarted = false
   private commandOpening: Promise<TrustedCommandWorkspace> | undefined
   private commandSetupEpoch = 0
+  private commandProposalsEnabled: boolean
+  private commandRestorePending = false
   private enabledSkills: boolean
   private lastSkillsDiagnostics = ''
   constructor(private readonly options: CliHostOptions) {
@@ -335,6 +339,7 @@ export class CliHost {
       () => this.options.secrets ?? [], options.onConversationNotice)
     this.mcpRecoveryCalls = this.current.history.flatMap(message => message.kind === 'assistant' ? structuredClone(message.toolCalls) : [])
     this.commandAccount = options.commandApproval?.accountRevision()
+    this.commandProposalsEnabled = options.enableCommands !== false
     if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
       throw new Error('Decision review must use this session’s selected provider; cross-provider review is unavailable')
     }
@@ -435,15 +440,16 @@ export class CliHost {
     await operation
   }
   get memoryEnabled(): boolean { return this.enabledMemory }
-  get commandsEnabled(): boolean { return this.options.commandWorkspace?.isEnabledFor(this.commandLaunchId, this.current.id,
-    this.options.commandApproval?.accountRevision() ?? 'unavailable') ?? false }
+  get commandsEnabled(): boolean { return !this.shutdownStarted && this.commandProposalsEnabled && this.options.enableTools !== false &&
+    this.options.commandApproval?.isAvailable() === true && this.options.commandApproval.accountRevision() === this.commandAccount &&
+    Boolean(this.options.commandWorkspace ?? this.options.commandWorkspaceFactory) }
   get commandDirectory(): string | undefined { return this.options.commandWorkspace?.directory ?? this.options.workspace?.directory }
   private commandContext(runId: string, signal?: AbortSignal): CommandApprovalContext {
     const workspace = this.options.commandWorkspace, sessionId = this.current.id, toolset = this.toolsetRevision, epoch = this.commandSetupEpoch
     const options = this.options, account = this.commandAccount
-    return { launchId: this.commandLaunchId, sessionId, runId, get accountRevision() { return options.commandApproval?.accountRevision() ?? 'unavailable' },
+    return { launchId: this.commandLaunchId, sessionId, runId, allowFirstApproval: true, get accountRevision() { return options.commandApproval?.accountRevision() ?? 'unavailable' },
       canApprove: () => options.commandApproval?.isAvailable() === true,
-      isCurrent: () => !this.shutdownStarted && this.commandSetupEpoch === epoch && this.current.id === sessionId && options.commandWorkspace === workspace && options.enableTools !== false &&
+      isCurrent: () => this.commandsEnabled && this.commandSetupEpoch === epoch && this.current.id === sessionId && options.commandWorkspace === workspace && options.enableTools !== false &&
         options.commandApproval?.accountRevision() === account && (signal === undefined ? !this.running :
           this.controller?.signal === signal && this.toolsetRevision === toolset),
       approve: options.approve ?? (async () => false) }
@@ -451,13 +457,35 @@ export class CliHost {
   async enableCommands(signal = new AbortController().signal): Promise<boolean> {
     if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host before enabling commands')
     if (this.running) throw new Error('Wait for the current turn before enabling trusted commands')
-    const epoch = this.commandSetupEpoch
     if (this.options.commandApproval?.isAvailable() !== true) return false
+    if (this.options.commandApproval.accountRevision() !== this.commandAccount) return false
+    if (this.options.enableTools === false) return false
+    signal.throwIfAborted()
+    if (this.commandRestorePending) throw new Error('Command setup is already in progress; wait before trying again')
+    const epoch = this.commandSetupEpoch
+    this.commandRestorePending = true
+    try {
+      const workspace = await this.openCommandWorkspace(signal, true)
+      await workspace.allowProposals(signal)
+      signal.throwIfAborted()
+      if (this.shutdownStarted || this.running || this.commandSetupEpoch !== epoch ||
+        this.options.commandApproval.isAvailable() !== true || this.options.commandApproval.accountRevision() !== this.commandAccount) {
+        throw new Error('Command setup is no longer active; try again while idle')
+      }
+      this.commandProposalsEnabled = true
+      return this.commandsEnabled
+    } finally { this.commandRestorePending = false }
+  }
+  private async openCommandWorkspace(signal: AbortSignal, restoring = false): Promise<TrustedCommandWorkspace> {
+    const epoch = this.commandSetupEpoch
+    const available = (): boolean => restoring ? !this.shutdownStarted && !this.running && this.options.enableTools !== false &&
+      this.options.commandApproval?.isAvailable() === true && this.options.commandApproval.accountRevision() === this.commandAccount : this.commandsEnabled
+    if (!available()) throw new Error('Command proposals are unavailable for this launch/session')
     if (!this.options.commandWorkspace && this.options.commandWorkspaceFactory) {
       const opening = this.commandOpening ??= this.options.commandWorkspaceFactory()
       let workspace: TrustedCommandWorkspace
       try { workspace = await opening } finally { if (this.commandOpening === opening) this.commandOpening = undefined }
-      if (this.shutdownStarted || this.commandSetupEpoch !== epoch || signal.aborted || this.running) {
+      if (!available() || this.commandSetupEpoch !== epoch || signal.aborted) {
         await workspace.shutdown()
         throw new Error('Command setup is no longer active; start a fresh host or try again while idle')
       }
@@ -467,12 +495,13 @@ export class CliHost {
       this.options.commandWorkspace = workspace
     }
     if (!this.options.commandWorkspace) throw new Error('Trusted commands require a selected workspace')
-    if (this.commandsEnabled) return true
-    return this.options.commandWorkspace.enable(this.commandContext('enrollment'), signal)
+    signal.throwIfAborted()
+    return this.options.commandWorkspace
   }
   async disableCommands(): Promise<void> {
     if (this.running) throw new Error('Cancel the current turn before disabling trusted commands')
     this.commandSetupEpoch++; this.commandOpening = undefined
+    this.commandProposalsEnabled = false
     await this.options.commandWorkspace?.disable()
   }
   /** Cancels children before releasing a session or closing its approval surface. */
@@ -1159,8 +1188,9 @@ export class CliHost {
       }) : undefined
       const workspace = enableTools && this.options.workspace ? createWorkspaceExtension(this.options.workspace, secrets,
         (call, signal) => this.executeWorkspaceMutation(call, signal, controller.signal)) : undefined
-      const commands = enableTools && this.commandsEnabled && this.options.commandApproval?.isAvailable() === true && this.options.commandWorkspace
-        ? createCommandExtension(this.options.commandWorkspace, this.commandContext(commandRunId, controller.signal), controller.signal) : undefined
+      const commands = enableTools && this.commandsEnabled
+        ? createCommandExtension(() => this.openCommandWorkspace(controller.signal),
+          () => this.commandContext(commandRunId, controller.signal), controller.signal) : undefined
       // A metadata commit already admitted while idle must settle before this
       // turn mutates current history. Otherwise its pre-turn snapshot could
       // replace a newly accepted prompt while the initial checkpoint waits.

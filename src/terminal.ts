@@ -62,7 +62,7 @@ export interface TerminalOptions {
 export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
 export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
 
-/** Only this human command surface can enroll trust; model tools cannot enable it. */
+/** Human controls proposal availability; exact execution approval is always separate. */
 export async function runCommandControl(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
   const command = line.trim()
   if (!/^\/commands(?:\s|$)/.test(command)) return false
@@ -74,11 +74,11 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
     try {
       const enabled = await host.enableCommands(controller.signal)
       io.write(enabled ? `Trusted commands enabled for ${JSON.stringify(host.commandDirectory)} · every process still needs human approval\n`
-        : 'Trusted command enrollment denied; commands remain disabled\n')
+        : 'Command proposals are unavailable; every process requires interactive human approval\n')
     } finally { dispose() }
     return true
   }
-  io.write(`Trusted commands: ${host.commandsEnabled ? 'enabled' : 'disabled'}${host.commandDirectory ? ` · ${JSON.stringify(host.commandDirectory)}` : ' · no workspace selected'}\n${COMMAND_DISCLOSURE}\n/commands on · enable for this launch/session; /commands off · disable\n`)
+  io.write(`Command proposals: ${host.commandsEnabled ? 'available' : 'disabled'}${host.commandDirectory ? ` · ${JSON.stringify(host.commandDirectory)}` : ' · no workspace selected'}\n${COMMAND_DISCLOSURE}\n/commands on · restore proposals for this launch/session; /commands off · disable\n`)
   return true
 }
 
@@ -256,6 +256,8 @@ export class TerminalIO implements ChatIO {
   get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
     !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
   get isClosed(): boolean { return this.disposed || this.ended }
+  /** EOF can leave queued/prompt work to consume; disposal ends the launch. */
+  get isDisposed(): boolean { return this.disposed }
   constructor(options: TerminalOptions = {}) {
     this.input = options.input ?? process.stdin
     this.output = options.output ?? process.stdout
@@ -446,7 +448,7 @@ export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.te
 
 export async function runMcpCommand(io: ChatIO, line: string, controls: UserChatControls): Promise<boolean> {
   if (!isMcpCommand(line)) return false
-  if (line.trim() !== '/mcp') io.write('Use /mcp by itself to manage metadata-only connections\n')
+  if (line.trim() !== '/mcp') io.write('Use /mcp by itself to manage reviewed server connections\n')
   else if (controls.mcp) await controls.mcp()
   else io.write('MCP connection management is unavailable in this chat surface\n')
   return true
@@ -465,7 +467,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /skills manages skills, /mcp manages metadata-only connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual or Auto review, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return

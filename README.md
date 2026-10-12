@@ -17,8 +17,9 @@ bun dist/launcher.js
 
 ## Usage
 
-Each launch starts a fresh conversation. Use `/provider` to set up your API key,
-then choose a model.
+Each launch starts a fresh conversation. An unconfigured interactive launch opens
+the existing provider/key and model pickers automatically. Escape cancels; use
+`/provider` to retry. Configured launches use saved defaults without repeating setup.
 
 - `/provider` — choose OpenAI or OpenRouter and enter a key
 - `/models` — search and select a model
@@ -29,6 +30,8 @@ then choose a model.
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
 - `/settings` — change defaults for future conversations
 - `/memories` — manage this launch’s app-wide saved context
+- `/commands` — inspect or disable reviewed unsandboxed command proposals
+- `/skills` — inspect instruction-only skills and prepare creator drafts
 - `/mcp` — configure and explicitly connect trusted installed stdio servers for reviewed tools and resource reads
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
@@ -106,7 +109,7 @@ will succeed. Provider default sends no reasoning override. The explicit disable
 is offered only when supported, including optional OpenRouter token-budget models that
 have no named effort choices. A documented non-streaming model uses complete responses;
 unknown streaming keeps your selected stream setting.
-Saved OpenRouter selections are checked against the provider catalog before the
+OpenRouter selections in both full-screen and line mode are checked against the provider catalog before the
 first session opens, so supported workspace tools are available on the first
 turn. Explicit tools-off choices stay off; unavailable or unknown metadata stays
 chat-only unless tool support was explicitly declared for this launch.
@@ -291,13 +294,15 @@ changes. This is not an OS sandbox against hostile programs changing the tree;
 use a project folder you control. Exact policy and verification limits are in
 [RELEASING.md](RELEASING.md#read-only-workspace-policy).
 
-## Trusted commands (optional)
+## Reviewed commands
 
-Use `/commands on`, or `--enable-commands`, to request a fresh interactive
-confirmation for the selected workspace and current launch/session. Commands are
-off by default; trust is never saved or restored from history. `/commands off`
-disables the capability. Every `command_start` needs a separate human approval,
-even in Auto. Piped/headless input cannot approve it.
+Command proposals are available from startup with a selected workspace, supported
+tools and an interactive approval surface. The first exact `command_start` approval
+includes the unsandboxed-execution disclosure; there is no separate enablement
+approval. Every new process still needs fresh human approval, even in Auto.
+`/commands off` or `--disable-commands` disables proposals; `/commands on` restores
+them for this launch/session. Execution permission is never saved or restored
+from history. Piped/headless input cannot approve a process.
 
 The approval shows the resolved executable, exact argv array, resolved working
 directory, environment variable names, and hard timeout. Execution uses
@@ -318,6 +323,13 @@ and `.bat`/`.cmd` files are unsupported; explicit PowerShell is supported.
 Windows PowerShell 5.1 may take tens of seconds preparing built-in modules on first
 use and emit progress on stderr. That output is preserved; request an explicit
 `timeoutMs` when needed (30 seconds by default, maximum 5 minutes).
+
+## Session notes
+
+Session-only notes are enabled by default for tool-capable models. Every note
+write still requires review; `--disable-notes`, saved notes-off defaults or
+`--no-tools` suppress them. Notes do not enable tools for unverified models and
+do not opt you into app-wide persistent-memory sharing.
 
 ## Persistent memory
 

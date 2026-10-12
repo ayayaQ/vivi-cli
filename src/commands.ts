@@ -104,6 +104,8 @@ export interface CommandApprovalContext {
   readonly sessionId: string
   readonly runId: string
   readonly accountRevision: string
+  /** Host-owned proposal availability; never authority to execute without exact approval. */
+  readonly allowFirstApproval?: boolean
   canApprove(): boolean
   isCurrent(): boolean
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
@@ -113,6 +115,7 @@ export interface CommandApprovalContext {
 export class TrustedCommandWorkspace {
   private readonly revision = randomUUID()
   private enabled = false
+  private proposalsDisabled = false
   private generation = 0
   private trustOwner: string | undefined
   private readonly executions = new Map<string, Execution>()
@@ -129,6 +132,7 @@ export class TrustedCommandWorkspace {
     return new TrustedCommandWorkspace(root, info, commandEnvironment(source, secrets), secrets)
   }
   get isEnabled(): boolean { return this.enabled && !this.shutdownStarted }
+  get canPropose(): boolean { return !this.proposalsDisabled && !this.shutdownStarted }
   isEnabledFor(launchId: string, sessionId: string, accountRevision: string): boolean {
     return this.isEnabled && this.trustOwner === `${launchId}:${sessionId}:${accountRevision}`
   }
@@ -155,11 +159,16 @@ export class TrustedCommandWorkspace {
     check(context.canApprove() && context.isCurrent() && context.launchId === launchId && context.sessionId === sessionId && context.accountRevision === account &&
       this.trustBinding === binding && reviewDigest(request) === digest, 'Command enrollment changed; request fresh approval')
     this.enabled = true
+    this.proposalsDisabled = false
     this.generation++
     this.trustOwner = `${launchId}:${sessionId}:${account}`
     return true
   }
-  async disable(): Promise<void> { this.enabled = false; this.generation++; this.trustOwner = undefined; await this.stopAll() }
+  async allowProposals(signal: AbortSignal): Promise<void> {
+    await this.verifyRoot(); signal.throwIfAborted()
+    this.proposalsDisabled = false
+  }
+  async disable(): Promise<void> { this.enabled = false; this.proposalsDisabled = true; this.generation++; this.trustOwner = undefined; await this.stopAll() }
   private async resolveExecutable(name: string, cwd: string): Promise<string> {
     const candidates = isAbsolute(name) || /[\\/]/.test(name) ? [resolve(cwd, name)] :
       (this.environment.PATH ?? '').split(delimiter).filter(part => part && isAbsolute(part)).flatMap(part =>
@@ -216,7 +225,9 @@ export class TrustedCommandWorkspace {
     check(!reviewContainsSecret([command.executable, command.args, this.environment], this.secrets), 'A known credential invalidated this command')
   }
   async start(call: ToolCall, context: CommandApprovalContext, signal: AbortSignal, lifetimeSignal = signal): Promise<ToolResult> {
-    check(this.isEnabledFor(context.launchId, context.sessionId, context.accountRevision) && context.canApprove() && context.isCurrent(), 'Trusted commands require enabled workspace trust and an interactive human approval surface')
+    const available = (): boolean => this.isEnabledFor(context.launchId, context.sessionId, context.accountRevision) ||
+      context.allowFirstApproval === true && this.canPropose
+    check(available() && context.canApprove() && context.isCurrent(), 'Trusted commands require an interactive human approval surface and an available command workspace')
     check(this.secrets.every(secret => secret.length <= COMMAND_LIMITS.maximumPendingBytes), 'A known credential exceeds the bounded streaming redaction limit')
     const executionOwner = owner(context), callDigest = reviewDigest(call)
     check(!this.starts.has(`${executionOwner}:${call.id}`), 'This command proposal has already been used')
@@ -229,13 +240,17 @@ export class TrustedCommandWorkspace {
     const approvalDigest = reviewDigest(approval), preparedDigest = reviewDigest(command)
     const assertCurrent = (): void => {
       signal.throwIfAborted(); lifetimeSignal.throwIfAborted()
-      check(this.isEnabledFor(context.launchId, context.sessionId, context.accountRevision) && context.canApprove() && context.isCurrent() && context.accountRevision === account &&
+      check(available() && context.canApprove() && context.isCurrent() && context.accountRevision === account &&
         owner(context) === executionOwner && this.trustBinding === binding && reviewDigest(call) === callDigest &&
         reviewDigest(approval) === approvalDigest && reviewDigest(command) === preparedDigest, 'Command approval changed; request fresh human approval')
     }
     assertCurrent()
     if (!await context.approve(approval, signal)) return { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'Human denied this command' } }), isError: true }
     assertCurrent(); await this.verifyPrepared(command); assertCurrent()
+    // First-use disclosure and this exact command share one human decision.
+    // This ephemeral binding never substitutes for the next command's approval.
+    this.enabled = true
+    this.trustOwner = `${context.launchId}:${context.sessionId}:${account}`
     const process_ = await launchCommandProcess({ executable: command.executable, args: command.args, cwd: command.cwd, env: this.environment })
     // Platform setup is asynchronous on Windows. A revocation during setup must
     // stop the process rather than returning a live session to a stale run.
@@ -336,22 +351,25 @@ export class TrustedCommandWorkspace {
   async shutdown(): Promise<void> { this.enabled = false; this.generation++; this.shutdownStarted = true; await this.stopAll() }
 }
 
-export function createCommandExtension(workspace: TrustedCommandWorkspace, context: CommandApprovalContext, lifetimeSignal?: AbortSignal): ToolExtension {
+export function createCommandExtension(workspace: TrustedCommandWorkspace | (() => Promise<TrustedCommandWorkspace>),
+  context: CommandApprovalContext | (() => CommandApprovalContext), lifetimeSignal?: AbortSignal): ToolExtension {
+  const resolveWorkspace = (): Promise<TrustedCommandWorkspace> => typeof workspace === 'function' ? workspace() : Promise.resolve(workspace)
+  const currentContext = (): CommandApprovalContext => typeof context === 'function' ? context() : context
   return { id: 'vivi-cli-trusted-commands', apiVersion: 1, tools: [
     { definition: { name: 'command_start', description: 'Propose a trusted unsandboxed process. Fresh human approval is always required; shell:false uses executable plus argv. cwd is workspace-relative; output waits are separate from the hard timeout.',
       parameters: schema({ executable: { type: 'string', maxLength: 4096 }, args: { type: 'array', maxItems: COMMAND_LIMITS.maximumArguments, items: { type: 'string', maxLength: COMMAND_LIMITS.maximumArgumentBytes } },
         cwd: { type: 'string', maxLength: 4096 }, yieldMs: { type: 'integer', minimum: 0, maximum: COMMAND_LIMITS.maximumYieldMs },
         timeoutMs: { type: 'integer', minimum: 1, maximum: COMMAND_LIMITS.maximumTimeoutMs } }, ['executable', 'args']) },
       validateArguments(args) { exact(args, ['executable', 'args', 'cwd', 'yieldMs', 'timeoutMs']) },
-      execute: (call, { signal }) => workspace.start(call, context, signal, lifetimeSignal) },
+      execute: async (call, { signal }) => (await resolveWorkspace()).start(call, currentContext(), signal, lifetimeSignal) },
     { definition: { name: 'command_poll', description: 'Read bounded untrusted output/status from an existing execution ID in this session/run. Does not launch a process.',
       parameters: schema({ executionId: { type: 'string' }, yieldMs: { type: 'integer', minimum: 0, maximum: COMMAND_LIMITS.maximumYieldMs } }, ['executionId']) },
       validateArguments(args) { exact(args, ['executionId', 'yieldMs']) },
-      execute: (call, { signal }) => workspace.poll(call.arguments.executionId, owner(context),
+      execute: async (call, { signal }) => (await resolveWorkspace()).poll(call.arguments.executionId, owner(currentContext()),
         milliseconds(call.arguments.yieldMs, 250, COMMAND_LIMITS.maximumYieldMs), signal) },
     { definition: { name: 'command_stop', description: 'Stop this session/run’s existing process tree and return its final bounded output/status. Stopping never requires new approval.',
       parameters: schema({ executionId: { type: 'string' } }, ['executionId']) },
       validateArguments(args) { exact(args, ['executionId']) },
-      execute: call => workspace.stop(call.arguments.executionId, owner(context)) }
+      execute: async call => (await resolveWorkspace()).stop(call.arguments.executionId, owner(currentContext())) }
   ] }
 }

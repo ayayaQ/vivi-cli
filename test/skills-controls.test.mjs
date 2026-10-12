@@ -37,7 +37,7 @@ test('line commands list, inspect, create through agent, toggle and refuse malfo
 test('interactive skills manager works before model setup and never sends inspection as a prompt', async t => {
   const dir = await fixture(t), lines = ['/skills', '/skills', '/exit'], choices = ['inspect', 'skill-creator', 'close', 'back', 'toggle', 'back']
   const output = io(); let providers = 0
-  const interactive = { ...output, async readLine() { return lines.shift() }, async choose(_title, values) { const value = choices.shift(); assert(values.some(item => item.value === value)); return value },
+  const interactive = { ...output, async readLine() { return lines.shift() }, async choose(title, values) { if (title === 'Provider') return undefined; const value = choices.shift(); assert(values.some(item => item.value === value)); return value },
     async chooseSearchable() {}, async askText() {}, setSession() {}, setDraft() {}, event() {}, async approve() { return false }, close() {} }
   assert.equal(await main(['--no-workspace'], { VIVI_SESSION_DIR: dir }, { tuiIO: interactive, providerFactory() { providers++; return { generate: async () => answer() } } }), 0)
   assert.equal(providers, 0); assert.match(interactive.output, /exact-source portion/); assert.equal(choices.length, 0)
