@@ -239,7 +239,7 @@ nativeTest('closed target stdin reports failure and cleans up without a manual s
   const pids = await subject.pids()
   assert.equal(pids.length, 1)
   assert.ok(pids.every(pid => !dead(pid)), 'closed-input fixture must remain alive before the failed write')
-  assert.equal((await subject.messages()).find(message => message.event === 'stdin-handle-closed')?.originalHandleInvalid, true)
+  assert.equal((await subject.messages()).find(message => message.event === 'stdin-handle-closed')?.stdinReadInvalid, true)
   // The helper may accept this frame before its native pump sees the broken
   // target pipe. The authoritative lifecycle must still fail and close the job.
   await bounded(owned.write(Buffer.alloc(65_536, 97)), 'closed stdin write').catch(error => {

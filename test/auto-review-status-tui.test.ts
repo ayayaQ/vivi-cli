@@ -3,7 +3,7 @@ import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { TextRenderable, BoxRenderable } from '@opentui/core'
+import { TextRenderable, BoxRenderable, CliRenderEvents } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import type { HistoryMessage } from '@ayayaq/vivi'
@@ -17,7 +17,6 @@ import type { ReviewNotice } from '../src/auto-review.js'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
-const tick = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 3))
 function contents(node: Renderable): string {
   return [node instanceof TextRenderable ? node.plainText : '',
     node instanceof BoxRenderable ? `${node.title ?? ''}` : '', ...node.getChildren().map(contents)].join('\n')
@@ -27,7 +26,13 @@ async function fixture() {
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
   cleanups.push(async () => { io.close(); await Promise.resolve() })
-  const frame = async (): Promise<string> => { await tick(); await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
+  const frame = async (): Promise<string> => {
+    // renderOnce may return while another frame is in flight. Drain that frame
+    // and the approval's input-batch arming before rendering a fresh frame.
+    await setup.flush()
+    await setup.renderOnce()
+    return setup.captureCharFrame()
+  }
   const transcript = (): string => contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
   const toolHeader = (name: string): TextRenderable => {
     const headers = setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren()
@@ -41,6 +46,54 @@ async function fixture() {
   }
   return { io, setup, frame, transcript, toolHeader, input: setup.mockInput }
 }
+
+test('status fixture waits for a completed new frame before a fresh deny gesture', async () => {
+  const f = await fixture()
+  let resume!: () => void, entered!: () => void, paused = false
+  const pause = new Promise<void>(resolve => { resume = resolve })
+  const drawingStarted = new Promise<void>(resolve => { entered = resolve })
+  const holdFrame = async (): Promise<void> => {
+    if (paused) return
+    paused = true; entered(); await pause
+  }
+  let completedFrame = 0
+  const rendered = (event: { frameId: number }): void => { completedFrame = event.frameId }
+  f.setup.renderer.on(CliRenderEvents.FRAME, rendered)
+  f.setup.renderer.setFrameCallback(holdFrame)
+  try {
+    const drawing = f.setup.renderOnce()
+    await drawingStarted
+    const answer = f.io.approve({ call: { id: 'owned-frame-fixture', name: 'create_memory',
+      arguments: { content: 'Owned inert fixture' } }, currentRevision: 'new memory',
+      description: 'Owned inert fixture' }, new AbortController().signal)
+    let answered = false, frameReady = false
+    void answer.then(() => { answered = true })
+    const openedFrame = f.setup.renderer.frameId
+    const ready = f.frame().then(text => { frameReady = true; return text })
+    // Observe the stalled renderer longer than the old 3ms guess, without
+    // releasing its controlled frame. This is a negative readiness assertion,
+    // not a delay used to make the dialog accept a gesture.
+    let probeTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      expect(await Promise.race([ready.then(() => 'returned-before-render'),
+        new Promise<string>(resolve => { probeTimer = setTimeout(() => resolve('waiting-for-render'), 20) })]))
+        .toBe('waiting-for-render')
+    } finally { clearTimeout(probeTimer) }
+    expect(frameReady).toBe(false)
+    f.input.pressEnter()
+    await Promise.resolve()
+    expect(answered).toBe(false)
+    resume(); await drawing
+    expect(await ready).toContain('Review this change')
+    expect(completedFrame).toBeGreaterThan(openedFrame)
+    f.input.pressEnter()
+    expect(await answer).toBe(false)
+  } finally {
+    resume()
+    f.setup.renderer.removeFrameCallback(holdFrame)
+    f.setup.renderer.off(CliRenderEvents.FRAME, rendered)
+  }
+})
 
 type Phase = { kind: 'choice'; names: string[] } | { kind: 'approval'; request: ApprovalRequest }
   | { kind: 'composer' } | { kind: 'fetch'; finish(response: Response): void; body: Record<string, unknown> }
