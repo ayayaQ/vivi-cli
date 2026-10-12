@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   BoxRenderable, CliRenderEvents, CodeRenderable, createCliRenderer, decodePasteBytes, MarkdownRenderable,
-  RGBA, SelectRenderable, SelectRenderableEvents, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable,
+  RGBA, SelectRenderable, SelectRenderableEvents, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable, TextTableRenderable,
   ScrollBoxRenderable, TreeSitterClient
 } from '@opentui/core'
 import { mkdtempSync } from 'node:fs'
@@ -1290,6 +1290,16 @@ export class OpenTuiIO implements ChatIO {
         if (token.type === 'code') return new TextRenderable(this.renderer, { ...TEXT_SELECTION,
           content: token.text, fg: TUI_THEME.pink, width: '100%', wrapMode: 'word', flexShrink: 0 })
         const rendered = context.defaultRender()
+        // OpenTUI 0.5 does not forward Markdown selection colors into tables.
+        // Retain its parsed cells/layout while supplying the same explicit pair.
+        if (rendered instanceof TextTableRenderable) return new TextTableRenderable(this.renderer, {
+          ...TEXT_SELECTION, id: rendered.id, content: rendered.content, width: '100%',
+          marginBottom: rendered.marginBottom ?? 0, fg: TUI_THEME.foreground,
+          columnWidthMode: rendered.columnWidthMode, columnFitter: rendered.columnFitter,
+          wrapMode: rendered.wrapMode, cellPaddingX: rendered.cellPaddingX, cellPaddingY: rendered.cellPaddingY,
+          columnGap: rendered.columnGap, border: rendered.border, outerBorder: rendered.outerBorder,
+          showBorders: rendered.showBorders, borderStyle: rendered.borderStyle, borderColor: rendered.borderColor
+        })
         const readable = (node: Renderable): void => {
           if (node instanceof TextBufferRenderable) {
             node.selectionBg = TEXT_SELECTION.selectionBg
