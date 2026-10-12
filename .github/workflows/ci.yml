@@ -12,6 +12,8 @@ env:
 
 jobs:
   check:
+    # This temporary evidence branch runs only the focused Windows job.
+    if: github.ref != 'refs/heads/test/windows-mcp-startup-evidence' && github.head_ref != 'test/windows-mcp-startup-evidence'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -26,6 +28,7 @@ jobs:
       - run: npm run check
 
   tui:
+    if: github.ref != 'refs/heads/test/windows-mcp-startup-evidence' && github.head_ref != 'test/windows-mcp-startup-evidence'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

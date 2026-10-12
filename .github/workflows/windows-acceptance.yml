@@ -12,6 +12,7 @@ env:
 
 jobs:
   candidate:
+    if: github.ref != 'refs/heads/test/windows-mcp-startup-evidence' && github.head_ref != 'test/windows-mcp-startup-evidence'
     # Produce one private npm archive. Both Windows runtimes consume these exact bytes.
     runs-on: ubuntu-latest
     steps:
@@ -41,6 +42,7 @@ jobs:
           if-no-files-found: error
 
   headless:
+    if: github.ref != 'refs/heads/test/windows-mcp-startup-evidence' && github.head_ref != 'test/windows-mcp-startup-evidence'
     # Windows x64 headless evidence. Real native vault/TTY acceptance remains pending.
     needs: candidate
     runs-on: windows-latest
@@ -92,3 +94,30 @@ jobs:
           name: windows-node-${{ matrix.node }}-headless-evidence
           path: ${{ runner.temp }}/windows-package-evidence.json
           if-no-files-found: error
+
+  startup-evidence:
+    # Temporary evidence only. Never warm up the helper before cold discovery.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/test/windows-mcp-startup-evidence'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['26.4.0', '26']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - id: build
+        run: npm run build
+      # Exact existing assertion and production startup/category/cleanup limits.
+      - name: Cold legacy discovery first
+        run: |
+          node --test --test-concurrency=1 --test-name-pattern="^real harmless stdio discovery: legacy," test/mcp-discovery.test.mjs
+      # A later helper is explicitly a warm observation, even if discovery failed.
+      - name: Supported helper boundary diagnostics after discovery
+        if: always() && steps.build.conclusion == 'success'
+        run: node --test --test-concurrency=1 test/mcp-windows-startup-diagnostic.test.mjs

@@ -41,18 +41,36 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
     if (process.platform === 'win32') {
       // Fixture-only diagnostics: production transport still drains server stderr privately.
       const startedAt = Date.now(), start = transport.start.bind(transport), close = transport.close.bind(transport)
-      let nativeResult, completedAfterMs
+      const send = transport.send.bind(transport), outboundKinds = [], observedKinds = new Set()
+      const allowedKinds = new Set(['initialize', 'server/discover', 'notifications/initialized',
+        'tools/list', 'resources/list', 'resources/templates/list'])
+      let nativeResult, completedAfterMs, startRequestedAfterMs, readyAfterMs, startRejectedAfterMs, closeRequestedAfterMs
+      transport.send = (message, ...options) => {
+        if (allowedKinds.has(message.method) && !observedKinds.has(message.method)) {
+          observedKinds.add(message.method)
+          outboundKinds.push({ kind: message.method, afterMs: Date.now() - startedAt })
+        }
+        return send(message, ...options)
+      }
       transport.start = async () => {
-        try { await start() }
+        startRequestedAfterMs = Date.now() - startedAt
+        try { await start(); readyAfterMs = Date.now() - startedAt }
+        catch (error) { startRejectedAfterMs = Date.now() - startedAt; throw error }
         finally {
           void transport.windows?.completed.then(result => { nativeResult = result; completedAfterMs = Date.now() - startedAt })
+          t.diagnostic(JSON.stringify({ event: 'owned-windows-discovery-startup', observation: 'discovery-first',
+            mode, protocol, startRequestedAfterMs, readyAfterMs, startRejectedAfterMs, closeRequestedAfterMs }))
         }
       }
-      transport.close = withFailureDiagnostic(close, async () => {
+      transport.close = withFailureDiagnostic(() => {
+        closeRequestedAfterMs ??= Date.now() - startedAt
+        return close()
+      }, async () => {
         const pidText = await readFile(join(directory, 'pid'), 'utf8').catch(() => '')
         const logText = await readFile(join(directory, 'log'), 'utf8').catch(() => '')
         t.diagnostic(JSON.stringify({ event: 'owned-windows-discovery-cleanup-failure', mode, protocol,
           elapsedMs: Date.now() - startedAt, completedAfterMs,
+          startRequestedAfterMs, readyAfterMs, startRejectedAfterMs, closeRequestedAfterMs, outboundKinds,
           nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
           fixturePidRecorded: /^\d+(?:\n\d+)*\s*$/.test(pidText),
           fixtureStartRecorded: logText.split('\n').some(line => line.includes('"event":"start"')) }))
