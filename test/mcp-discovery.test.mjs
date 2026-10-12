@@ -17,6 +17,19 @@ const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun
 const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
   ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
 const signal = () => new AbortController().signal
+function withFailureDiagnostic(close, report) {
+  let reporting
+  return async () => {
+    try { await close() }
+    catch (error) {
+      // SDK, manager and completion callbacks can close concurrently. Every
+      // failing caller must drain the same report before its test can finish.
+      reporting ??= Promise.resolve().then(report)
+      await reporting
+      throw error
+    }
+  }
+}
 async function fixture(t, mode = 'normal', protocol = 'legacy') {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-discovery-'))
   const store = new McpConfigStore(directory, ['fixture-secret'])
@@ -28,29 +41,22 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
     if (process.platform === 'win32') {
       // Fixture-only diagnostics: production transport still drains server stderr privately.
       const startedAt = Date.now(), start = transport.start.bind(transport), close = transport.close.bind(transport)
-      let nativeResult, completedAfterMs, reported = false
+      let nativeResult, completedAfterMs
       transport.start = async () => {
         try { await start() }
         finally {
           void transport.windows?.completed.then(result => { nativeResult = result; completedAfterMs = Date.now() - startedAt })
         }
       }
-      transport.close = async () => {
-        try { await close() }
-        catch (error) {
-          if (!reported) {
-            reported = true
-            const pidText = await readFile(join(directory, 'pid'), 'utf8').catch(() => '')
-            const logText = await readFile(join(directory, 'log'), 'utf8').catch(() => '')
-            t.diagnostic(JSON.stringify({ event: 'owned-windows-discovery-cleanup-failure', mode, protocol,
-              elapsedMs: Date.now() - startedAt, completedAfterMs,
-              nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
-              fixturePidRecorded: /^\d+(?:\n\d+)*\s*$/.test(pidText),
-              fixtureStartRecorded: logText.split('\n').some(line => line.includes('"event":"start"')) }))
-          }
-          throw error
-        }
-      }
+      transport.close = withFailureDiagnostic(close, async () => {
+        const pidText = await readFile(join(directory, 'pid'), 'utf8').catch(() => '')
+        const logText = await readFile(join(directory, 'log'), 'utf8').catch(() => '')
+        t.diagnostic(JSON.stringify({ event: 'owned-windows-discovery-cleanup-failure', mode, protocol,
+          elapsedMs: Date.now() - startedAt, completedAfterMs,
+          nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
+          fixturePidRecorded: /^\d+(?:\n\d+)*\s*$/.test(pidText),
+          fixtureStartRecorded: logText.split('\n').some(line => line.includes('"event":"start"')) }))
+      })
     }
     return transport
   } })
@@ -61,6 +67,26 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
 }
 const tool = (name, schema = { type: 'object', properties: {} }) => ({ name, inputSchema: schema })
 const collect = (items, kind = 'tools', aliasFor) => collectMcpCategory('docs', kind, async () => ({ [kind]: items }), signal(), aliasFor)
+
+test('failed fixture close drains one shared diagnostic before concurrent callers reject', async () => {
+  const failure = new Error('Owned inert cleanup failure')
+  let release, entered, reports = 0, rejections = 0
+  const held = new Promise(resolve => { release = resolve })
+  const reporting = new Promise(resolve => { entered = resolve })
+  const close = withFailureDiagnostic(() => Promise.reject(failure), async () => {
+    reports++; entered(); await held
+  })
+  const rejected = () => close().catch(error => { assert.equal(error, failure); rejections++ })
+  const first = rejected(), second = rejected()
+  await reporting
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(reports, 1); assert.equal(rejections, 0)
+  release()
+  await Promise.all([first, second])
+  assert.equal(rejections, 2)
+  await assert.rejects(close(), error => error === failure)
+  assert.equal(reports, 1)
+})
 
 test('configuration is app-private, bounded and loads disabled without startup', async t => {
   const subject = await fixture(t)

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, spyOn, test } from 'bun:test'
-import { BoxRenderable, CliRenderEvents, CodeRenderable, RGBA, SelectRenderable,
+import { BoxRenderable, CliRenderEvents, CodeRenderable, parseColor, RGBA, SelectRenderable,
   TextareaRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
@@ -1601,11 +1601,11 @@ test('native transcript differentiates user, assistant and activity without chan
   expect(entries[0]!.borderColor.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
   expect(entries[0]!.backgroundColor.equals(RGBA.fromHex(TUI_THEME.userBackground))).toBe(true)
   expect(label(0).fg.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
-  expect(body(0).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
+  expect(body(0).fg.equals(RGBA.fromHex(TUI_THEME.highlightForeground))).toBe(true)
   expect(label(1).fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
   expect(entries[1]!.border).toBe(false)
-  expect(label(3).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
-  expect(body(3).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+  expect(label(3).fg.equals(parseColor(TUI_THEME.muted))).toBe(true)
+  expect(body(3).fg.equals(parseColor(TUI_THEME.muted))).toBe(true)
   expect(entries[3]!.border).toBe(false)
   const ordinaryHeader = label(2), errorHeader = label(4)
   expect(ordinaryHeader.id).toStartWith('vivi-tool-details-')
@@ -1629,15 +1629,15 @@ test('native transcript differentiates user, assistant and activity without chan
     .find(node => node instanceof TextRenderable && node.plainText.startsWith('Result:\n')) as TextRenderable
   expect(resultBody(2)).toBeInstanceOf(TextRenderable)
   expect(resultBody(2).plainText).toBe('Result:\nSelectable tool text')
-  expect(resultBody(2).fg.equals(RGBA.fromHex(TUI_THEME.muted))).toBe(true)
+  expect(resultBody(2).fg.equals(parseColor(TUI_THEME.muted))).toBe(true)
   expect(resultBody(4)).toBeInstanceOf(TextRenderable)
   expect(resultBody(4).plainText).toBe('Result:\nAction failed')
-  expect(resultBody(4).fg.equals(RGBA.fromHex(TUI_THEME.foreground))).toBe(true)
+  expect(resultBody(4).fg.equals(parseColor(TUI_THEME.foreground))).toBe(true)
   for (const text of ['Selectable user text', 'Assistant content', 'Selectable tool text', 'System context', 'Action failed']) expect(display).toContain(text)
   const spans = setup.captureSpans().lines.flatMap(line => line.spans)
   expect(spans.some(span => span.text.includes('You') && span.fg.equals(RGBA.fromHex(TUI_THEME.lavender)) &&
     span.bg.equals(RGBA.fromHex(TUI_THEME.userBackground)))).toBe(true)
-  expect(spans.some(span => span.text.includes('Selectable tool text') && span.fg.equals(RGBA.fromHex(TUI_THEME.muted)))).toBe(true)
+  expect(spans.some(span => span.text.includes('Selectable tool text') && span.fg.equals(parseColor(TUI_THEME.muted)))).toBe(true)
   for (const [node, text, rowOffset] of [[body(0), 'Selectable user text', 0], [resultBody(2), 'Selectable tool text', 1]] as const) {
     expect(node.selectable).toBe(true)
     await setup.mockMouse.drag(node.x, node.y + rowOffset, node.x + text.length, node.y + rowOffset)
@@ -1655,8 +1655,8 @@ test('review state, pending approvals and result errors remain prominent while s
     .find(node => (node.getChildren()[0] as TextRenderable).plainText === label) as BoxRenderable
   const colors = (label: string, attention: boolean) => {
     const nodes = entry(label).getChildren() as TextRenderable[]
-    expect(nodes[0]!.fg.equals(RGBA.fromHex(attention ? TUI_THEME.attention : TUI_THEME.muted))).toBe(true)
-    expect(nodes[1]!.fg.equals(RGBA.fromHex(attention ? TUI_THEME.foreground : TUI_THEME.muted))).toBe(true)
+    expect(nodes[0]!.fg.equals(parseColor(attention ? TUI_THEME.attention : TUI_THEME.muted))).toBe(true)
+    expect(nodes[1]!.fg.equals(parseColor(attention ? TUI_THEME.foreground : TUI_THEME.muted))).toBe(true)
   }
   const context = { sessionId: session.id, runId: 'fixture', callId: 'save', toolName: 'note_set' }
   io.reviewNotice('Reviewing note_set', { ...context, state: 'reviewing' }); await frame()
