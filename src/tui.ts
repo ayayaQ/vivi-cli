@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   BoxRenderable, CliRenderEvents, CodeRenderable, createCliRenderer, decodePasteBytes, MarkdownRenderable,
-  SelectRenderable, SelectRenderableEvents, SyntaxStyle, TextareaRenderable, TextRenderable,
+  RGBA, SelectRenderable, SelectRenderableEvents, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable,
   ScrollBoxRenderable, TreeSitterClient
 } from '@opentui/core'
 import { mkdtempSync } from 'node:fs'
@@ -35,9 +35,13 @@ import { mcpContainsSecret } from './mcp-content.js'
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock }
 
-export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: '#18181b',
-  foreground: '#e4e4e7', selectedBackground: '#3d2946', userBackground: '#24212d',
-  muted: '#a1a1aa', attention: '#fbbf24' } as const
+// Ordinary surfaces and text inherit the terminal palette. Dark localized
+// highlights need their own foreground, including native text selections.
+export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: 'transparent',
+  foreground: RGBA.defaultForeground(), highlightForeground: '#e4e4e7',
+  selectedBackground: '#3d2946', userBackground: '#24212d',
+  muted: RGBA.defaultForeground(), attention: '#fbbf24' } as const
+const TEXT_SELECTION = { selectionBg: TUI_THEME.selectedBackground, selectionFg: TUI_THEME.highlightForeground } as const
 export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a provider' },
   { command: '/models', description: 'Choose a model' },
@@ -330,11 +334,11 @@ export class OpenTuiIO implements ChatIO {
         default: { fg: TUI_THEME.foreground }, 'markup.heading': { fg: TUI_THEME.lavender, bold: true },
         'markup.strong': { bold: true }, 'markup.italic': { italic: true },
         'markup.raw': { fg: TUI_THEME.pink }, 'markup.link': { fg: TUI_THEME.lavender, underline: true },
-        'markup.list': { fg: TUI_THEME.lavender }, 'markup.quote': { fg: '#a1a1aa', italic: true },
-        conceal: { fg: '#71717a' }
+        'markup.list': { fg: TUI_THEME.lavender }, 'markup.quote': { fg: TUI_THEME.muted, dim: true, italic: true },
+        conceal: { fg: TUI_THEME.muted, dim: true }
       })
       this.shell = new BoxRenderable(renderer, { id: 'vivi-root', width: '100%', height: '100%',
-        flexDirection: 'column', backgroundColor: '#18181b', onMouse: (event) => {
+        flexDirection: 'column', backgroundColor: TUI_THEME.background, onMouse: (event) => {
           if (event.type !== 'over') this.mouseActivation.clear()
           // Transcript scrolling must not steal the next keystroke from an input.
           if (event.type === 'down' && this.pending) event.preventDefault()
@@ -342,17 +346,17 @@ export class OpenTuiIO implements ChatIO {
       renderer.root.add(this.shell)
       this.headerBox = new BoxRenderable(renderer, { id: 'vivi-header-box', height: 2, flexShrink: 0,
         width: '100%', flexDirection: 'column' })
-      this.header = new TextRenderable(renderer, { id: 'vivi-header', height: 1, flexShrink: 0,
+      this.header = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-header', height: 1, flexShrink: 0,
         content: this.sessionTitle, fg: TUI_THEME.pink, wrapMode: 'none' })
-      this.tokenLine = new TextRenderable(renderer, { id: 'vivi-tokens', height: 1, flexShrink: 0,
-        fg: TUI_THEME.muted, textAlign: 'right', wrapMode: 'none' })
+      this.tokenLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-tokens', height: 1, flexShrink: 0,
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, textAlign: 'right', wrapMode: 'none' })
       this.headerBox.add(this.header); this.headerBox.add(this.tokenLine)
-      this.modelLine = new TextRenderable(renderer, { id: 'vivi-model', height: 1, flexShrink: 0,
+      this.modelLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-model', height: 1, flexShrink: 0,
         width: '100%', fg: TUI_THEME.pink, wrapMode: 'none' })
       this.footer = new BoxRenderable(renderer, { id: 'vivi-footer', height: 1, flexShrink: 0,
         width: '100%', flexDirection: 'row' })
-      this.workspaceLine = new TextRenderable(renderer, { id: 'vivi-workspace', height: 1, flexShrink: 0,
-        fg: TUI_THEME.muted, textAlign: 'right', wrapMode: 'none', visible: false })
+      this.workspaceLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-workspace', height: 1, flexShrink: 0,
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, textAlign: 'right', wrapMode: 'none', visible: false })
       this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
         flexDirection: 'row', visible: false })
       for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
@@ -367,14 +371,16 @@ export class OpenTuiIO implements ChatIO {
         minHeight: 1, width: '100%', scrollX: false, scrollY: true, stickyScroll: true,
         stickyStart: 'bottom', contentOptions: { flexDirection: 'column', paddingX: 1 },
         viewportCulling: true })
-      this.statusLine = new TextRenderable(renderer, { id: 'vivi-status', width: '100%', height: 1, flexShrink: 0,
-        fg: '#a1a1aa', wrapMode: 'word', content: this.status })
+      this.statusLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-status', width: '100%', height: 1, flexShrink: 0,
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'word', content: this.status })
       this.composerBox = new BoxRenderable(renderer, { id: 'vivi-composer-box', height: 4,
         flexShrink: 0, border: true, borderColor: TUI_THEME.pink, titleColor: TUI_THEME.pink,
         title: 'Message', paddingX: 1 })
       this.composer = new TextareaRenderable(renderer, { id: 'vivi-composer', width: '100%', height: 2,
-        wrapMode: 'word', placeholder: 'Enter a message or /menu', backgroundColor: '#18181b',
-        textColor: '#e4e4e7', focusedBackgroundColor: '#27272a', cursorColor: TUI_THEME.lavender,
+        wrapMode: 'word', placeholder: 'Enter a message or /menu', backgroundColor: TUI_THEME.background,
+        textColor: TUI_THEME.foreground, focusedBackgroundColor: TUI_THEME.background,
+        focusedTextColor: TUI_THEME.foreground, placeholderColor: TUI_THEME.muted,
+        ...TEXT_SELECTION, cursorColor: TUI_THEME.lavender,
         keyBindings: ['return', 'kpenter', 'linefeed'].flatMap((name) => [
           { name, action: 'submit' as const }, { name, shift: true, action: 'newline' as const },
           { name, meta: true, action: 'newline' as const }
@@ -384,19 +390,19 @@ export class OpenTuiIO implements ChatIO {
           ['chat', 'text', 'search'].includes(this.pending!.kind)) this.composer.focus()
       }
       this.composerBox.add(this.composer)
-      this.secretMask = new TextRenderable(renderer, { id: 'vivi-secret-mask', width: '100%', height: 2,
+      this.secretMask = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-secret-mask', width: '100%', height: 2,
         visible: false, content: '', fg: TUI_THEME.lavender, wrapMode: 'none' })
       this.composerBox.add(this.secretMask)
       this.completionBox = new BoxRenderable(renderer, { id: 'vivi-completions', visible: false,
         flexDirection: 'column', height: 6, flexShrink: 0, border: true, borderColor: TUI_THEME.lavender,
         titleColor: TUI_THEME.lavender, title: 'Commands · ↑/↓ choose · Tab complete', paddingX: 1 })
-      this.completionList = new TextRenderable(renderer, { id: 'vivi-completion-list', width: '100%',
+      this.completionList = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-completion-list', width: '100%',
         height: '100%', fg: TUI_THEME.lavender, wrapMode: 'none' })
       this.completionList.selectable = false
       this.completionList.onMouse = (event) => this.handleCompletionMouse(event)
       this.completionBox.add(this.completionList)
-      this.hintLine = new TextRenderable(renderer, { id: 'vivi-hints', height: 1, flexShrink: 0,
-        fg: '#71717a', content: HINTS, wrapMode: 'none' })
+      this.hintLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-hints', height: 1, flexShrink: 0,
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, content: HINTS, wrapMode: 'none' })
       this.pickerBox = new BoxRenderable(renderer, { id: 'vivi-picker-box', visible: false,
         height: 8, flexShrink: 0, flexDirection: 'column', border: true, borderColor: TUI_THEME.lavender,
         titleColor: TUI_THEME.lavender, paddingX: 1 })
@@ -445,7 +451,7 @@ export class OpenTuiIO implements ChatIO {
         ...(windowsInput ? { stdin: windowsInput.stdin } : {}),
         screenMode: 'alternate-screen', consoleMode: 'disabled', openConsoleOnError: false,
         externalOutputMode: 'passthrough', useKittyKeyboard: { disambiguate: true, alternateKeys: true },
-        useMouse: true, backgroundColor: '#18181b' })
+        useMouse: true, backgroundColor: TUI_THEME.background })
       if (windowsInput?.failure) throw windowsInput.failure
       const io = new OpenTuiIO(renderer, options)
       io.windowsInput = windowsInput
@@ -594,7 +600,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.composerBox.height !== height + 2) this.composerBox.height = height + 2
   }
   private mouseButton(id: string, label: string, activate: () => void): TextRenderable {
-    const button = new TextRenderable(this.renderer, { id, content: ` ${label} `, width: label.length + 2,
+    const button = new TextRenderable(this.renderer, { ...TEXT_SELECTION, id, content: ` ${label} `, width: label.length + 2,
       height: 1, flexShrink: 0, fg: TUI_THEME.lavender, bg: TUI_THEME.selectedBackground, wrapMode: 'none' })
     button.selectable = false
     button.onMouse = (event) => {
@@ -1145,9 +1151,10 @@ export class OpenTuiIO implements ChatIO {
           description: this.safe(choice.description ?? '', 2048), value: index })),
         selectedIndex: Math.max(0, Math.min(choices.length - 1, Number.isFinite(initialIndex) ? Math.trunc(initialIndex) : 0)),
         showDescription: true, showScrollIndicator: true, wrapSelection: true,
-        backgroundColor: TUI_THEME.background, textColor: TUI_THEME.foreground,
+        backgroundColor: TUI_THEME.background, focusedBackgroundColor: TUI_THEME.background,
+        textColor: TUI_THEME.foreground, focusedTextColor: TUI_THEME.foreground,
         selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
-        descriptionColor: '#a1a1aa', selectedDescriptionColor: TUI_THEME.lavender })
+        descriptionColor: TUI_THEME.muted, selectedDescriptionColor: TUI_THEME.lavender })
       this.picker.on(SelectRenderableEvents.ITEM_SELECTED, (index: number) => this.pending?.finish(index))
       this.picker.on(SelectRenderableEvents.SELECTION_CHANGED, () => {
         this.mouseActivation.clear(); this.pickerChangedFrame = this.renderer.frameId
@@ -1178,9 +1185,10 @@ export class OpenTuiIO implements ChatIO {
       this.picker = new SelectRenderable(this.renderer, { id: 'vivi-picker', width: '100%', height: '100%',
         minHeight: 1, flexShrink: 1, onMouse: (event) => this.handlePickerMouse(event),
         options: [], showDescription: true, showScrollIndicator: true, wrapSelection: false,
-        backgroundColor: TUI_THEME.background, textColor: TUI_THEME.foreground,
+        backgroundColor: TUI_THEME.background, focusedBackgroundColor: TUI_THEME.background,
+        textColor: TUI_THEME.foreground, focusedTextColor: TUI_THEME.foreground,
         selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
-        descriptionColor: '#a1a1aa', selectedDescriptionColor: TUI_THEME.lavender })
+        descriptionColor: TUI_THEME.muted, selectedDescriptionColor: TUI_THEME.lavender })
       // This is a result view, not a second input target. Mouse autofocus must not
       // redirect later query typing into SelectRenderable's own key handler.
       this.picker.focusable = false
@@ -1276,13 +1284,17 @@ export class OpenTuiIO implements ChatIO {
       this.parser = new TreeSitterClient({ dataPath: this.parserDirectory })
     }
     return new MarkdownRenderable(this.renderer, { content, syntaxStyle: this.style!, streaming,
-      width: '100%', fg: '#e4e4e7', treeSitterClient: this.parser,
+      width: '100%', fg: TUI_THEME.foreground, treeSitterClient: this.parser,
       // Plain fenced code is readable offline and does not fetch language grammars.
       renderNode: (token, context) => {
-        if (token.type === 'code') return new TextRenderable(this.renderer, {
+        if (token.type === 'code') return new TextRenderable(this.renderer, { ...TEXT_SELECTION,
           content: token.text, fg: TUI_THEME.pink, width: '100%', wrapMode: 'word', flexShrink: 0 })
         const rendered = context.defaultRender()
         const readable = (node: Renderable): void => {
+          if (node instanceof TextBufferRenderable) {
+            node.selectionBg = TEXT_SELECTION.selectionBg
+            node.selectionFg = TEXT_SELECTION.selectionFg
+          }
           if (node instanceof CodeRenderable) node.drawUnstyledText = true
           for (const child of node.getChildren()) readable(child)
         }
@@ -1294,15 +1306,16 @@ export class OpenTuiIO implements ChatIO {
     const user = entry.category === 'user'
     const activity = entry.category === 'activity'
     const headerColor = user ? TUI_THEME.lavender : entry.attention ? TUI_THEME.attention : activity ? TUI_THEME.muted : TUI_THEME.pink
-    const bodyColor = activity && !entry.attention ? TUI_THEME.muted : TUI_THEME.foreground
+    const bodyColor = user ? TUI_THEME.highlightForeground : TUI_THEME.foreground
+    const bodyAttributes = activity && !entry.attention ? TextAttributes.DIM : 0
     const box = new BoxRenderable(this.renderer, { flexDirection: 'column', flexShrink: 0, width: '100%', marginBottom: entry.tool ? 0 : 1,
       ...(user ? { backgroundColor: TUI_THEME.userBackground, border: ['left'], borderColor: TUI_THEME.lavender, paddingLeft: 1 } : {}) })
-    if (!entry.tool) box.add(new TextRenderable(this.renderer, { content: entry.label, fg: headerColor, flexShrink: 0, wrapMode: 'word' }))
+    if (!entry.tool) box.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, content: entry.label, fg: headerColor, attributes: activity && !entry.attention ? TextAttributes.DIM : 0, flexShrink: 0, wrapMode: 'word' }))
     if (entry.tool) {
       const key = entry.tool.key, collapsed = !this.expandedTools.has(key)
       const card = cliToolCardView(entry.tool.encoded, collapsed, entry.tool.detailBytes ?? 8192, this.secrets, entry.tool)
       const view = card.expanded
-      const button = new TextRenderable(this.renderer, { id: `vivi-tool-details-${key}`,
+      const button = new TextRenderable(this.renderer, { ...TEXT_SELECTION, id: `vivi-tool-details-${key}`,
         content: toolHeader(card, collapsed, Math.max(1, this.renderer.width - 3)),
         fg: card.attention ? TUI_THEME.attention : TUI_THEME.lavender,
         flexShrink: 0, width: '100%', height: 1, wrapMode: 'none' })
@@ -1316,23 +1329,23 @@ export class OpenTuiIO implements ChatIO {
       box.add(button)
       // Actionable custom warnings stay outside the detail budget, even when collapsed.
       for (const warning of collapsed ? card.warnings : []) box.add(new TextRenderable(this.renderer,
-        { content: this.safe(warning), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+        { ...TEXT_SELECTION, content: this.safe(warning), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
       const details = new BoxRenderable(this.renderer, { id: `vivi-tool-body-${key}`, flexDirection: 'column',
         flexShrink: 0, width: '100%' })
       if (!collapsed) {
         for (const line of view.header) details.add(new TextRenderable(this.renderer,
-          { content: this.safe(line), fg: bodyColor, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+          { ...TEXT_SELECTION, content: this.safe(line), fg: bodyColor, attributes: bodyAttributes, flexShrink: 0, width: '100%', wrapMode: 'word' }))
         for (const warning of view.warnings) details.add(new TextRenderable(this.renderer,
-          { content: this.safe(`Warning: ${warning}`), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
+          { ...TEXT_SELECTION, content: this.safe(`Warning: ${warning}`), fg: TUI_THEME.attention, flexShrink: 0, width: '100%', wrapMode: 'word' }))
       }
       for (const section of view.details) details.add(new TextRenderable(this.renderer,
-        { content: this.safe(`${section.label}:\n${section.text}`), fg: bodyColor, width: '100%', wrapMode: 'word', flexShrink: 0 }))
+        { ...TEXT_SELECTION, content: this.safe(`${section.label}:\n${section.text}`), fg: bodyColor, attributes: bodyAttributes, width: '100%', wrapMode: 'word', flexShrink: 0 }))
       box.add(details)
       if (!collapsed && view.notice) details.add(new TextRenderable(this.renderer,
-        { content: view.notice, fg: TUI_THEME.muted, width: '100%', wrapMode: 'word', flexShrink: 0 }))
+        { ...TEXT_SELECTION, content: view.notice, fg: TUI_THEME.muted, attributes: TextAttributes.DIM, width: '100%', wrapMode: 'word', flexShrink: 0 }))
     }
     if (entry.content && !entry.tool) box.add(entry.markdown ? this.markdown(entry.content) : new TextRenderable(this.renderer,
-      { content: entry.content, fg: bodyColor, width: '100%', wrapMode: 'word', flexShrink: 0 }))
+      { ...TEXT_SELECTION, content: entry.content, fg: bodyColor, attributes: bodyAttributes, width: '100%', wrapMode: 'word', flexShrink: 0 }))
     this.transcript.add(box)
     return box
   }
@@ -1643,7 +1656,7 @@ export class OpenTuiIO implements ChatIO {
     if (!this.partialBox) {
       this.partialBox = new BoxRenderable(this.renderer, { id: 'vivi-partial', flexDirection: 'column',
         flexShrink: 0, width: '100%', marginBottom: 1 })
-      this.partialBox.add(new TextRenderable(this.renderer, { content: 'Assistant · streaming preview (not accepted)', fg: TUI_THEME.pink }))
+      this.partialBox.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, content: 'Assistant · streaming preview (not accepted)', fg: TUI_THEME.pink }))
       this.partial = this.markdown('', true)
       this.partialBox.add(this.partial)
       this.transcript.add(this.partialBox)
