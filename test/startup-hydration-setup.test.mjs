@@ -274,3 +274,29 @@ test('commands off remains a launch-local opt-out across new conversations until
   assert.equal(new Set(io.sessions.map(session => session.id)).size, 2)
   assert.equal(io.choices.length, 0)
 })
+
+test('replacement key and cancelled model selection withhold stale-host commands until a new host opens', async t => {
+  const root = await fixture(t), directory = join(root, 'state'), workspace = join(root, 'project')
+  await mkdir(workspace)
+  const replacement = 'offline-new-account-key', supplied = services()
+  const io = fakeIO(['openrouter', 'enter', 'temporary', undefined],
+    ['Before', '/provider', 'After cancel', '/commands on', 'Still stale', '/new', 'New account', '/exit'], [replacement])
+  io.canAutoReview = true
+  const advertised = [], guidance = [], accounts = []
+  assert.equal(await main(['--workspace', workspace, ...selections], { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
+    tuiIO: io, catalog: supplied.catalog, credentials: supplied.credentials,
+    providerFactory: (_session, _options, env) => {
+      accounts.push(env.OPENROUTER_API_KEY)
+      return { async generate(input) {
+        advertised.push(input.tools.some(tool => tool.name === 'command_start'))
+        guidance.push(input.messages.some(message => message.role === 'system' && message.content.includes('Trusted command tools')))
+        return { content: 'Done', toolCalls: [] }
+      } }
+    }
+  }), 0)
+  assert.deepEqual(accounts, [key, replacement])
+  assert.deepEqual(advertised, [true, false, false, true])
+  assert.deepEqual(guidance, advertised)
+  assert.match(io.output, /Command proposals are unavailable/)
+  assert(!io.output.includes(key)); assert(!io.output.includes(replacement))
+})

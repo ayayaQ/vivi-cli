@@ -440,7 +440,8 @@ export class CliHost {
   }
   get memoryEnabled(): boolean { return this.enabledMemory }
   get commandsEnabled(): boolean { return !this.shutdownStarted && this.commandProposalsEnabled && this.options.enableTools !== false &&
-    this.options.commandApproval?.isAvailable() === true && Boolean(this.options.commandWorkspace ?? this.options.commandWorkspaceFactory) }
+    this.options.commandApproval?.isAvailable() === true && this.options.commandApproval.accountRevision() === this.commandAccount &&
+    Boolean(this.options.commandWorkspace ?? this.options.commandWorkspaceFactory) }
   get commandDirectory(): string | undefined { return this.options.commandWorkspace?.directory ?? this.options.workspace?.directory }
   private commandContext(runId: string, signal?: AbortSignal): CommandApprovalContext {
     const workspace = this.options.commandWorkspace, sessionId = this.current.id, toolset = this.toolsetRevision, epoch = this.commandSetupEpoch
@@ -456,6 +457,7 @@ export class CliHost {
     if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host before enabling commands')
     if (this.running) throw new Error('Wait for the current turn before enabling trusted commands')
     if (this.options.commandApproval?.isAvailable() !== true) return false
+    if (this.options.commandApproval.accountRevision() !== this.commandAccount) return false
     if (this.options.enableTools === false) return false
     this.commandProposalsEnabled = true
     const workspace = await this.openCommandWorkspace(signal)

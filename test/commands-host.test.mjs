@@ -235,3 +235,19 @@ test('launch opt-out hides proposals until restored, without a preliminary execu
   await subject.host.disableCommands()
   assert.equal(subject.host.commandsEnabled, false)
 })
+
+test('a stale account cannot advertise or restore proposals or open a command workspace', async t => {
+  const subject = await fixture(t, { generate({ tools, messages }) {
+    assert(!tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name)))
+    assert(!messages.some(message => message.role === 'system' && message.content.includes('Trusted command tools')))
+    return { content: 'Stale commands withheld', toolCalls: [] }
+  } })
+  let openings = 0
+  subject.options.commandWorkspace = undefined
+  subject.options.commandWorkspaceFactory = async () => { openings++; return subject.commandWorkspace }
+  subject.state.account = 'replacement-account'
+  assert.equal(subject.host.commandsEnabled, false)
+  assert.equal(await subject.host.enableCommands(), false)
+  assert.equal((await subject.host.send('Continue existing conversation')).status, 'completed')
+  assert.equal(openings, 0); assert.equal(subject.approvals.length, 0)
+})
