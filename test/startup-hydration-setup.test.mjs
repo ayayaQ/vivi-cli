@@ -9,6 +9,7 @@ import { DEFAULT_PREFERENCES, settingsForModel } from '../dist/application.js'
 import { PreferenceStore } from '../dist/preferences.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 import { ModelCatalog, hydrateModelCapabilities, modelToolsEnabled, unknownModel } from '../dist/models.js'
+import { captureCommandEnvironment } from '../dist/commands.js'
 
 const id = 'vendor/startup-defaults'
 const key = 'offline-fixture-key-no-network'
@@ -261,7 +262,7 @@ test('commands off remains a launch-local opt-out across new conversations until
   const supplied = services(), io = fakeIO([], ['First', '/commands off', 'Disabled', '/new', 'Still disabled', '/commands on', 'Restored', '/exit'])
   io.canAutoReview = true
   const advertised = [], guidance = []
-  assert.equal(await main(['--workspace', workspace, ...selections], { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
+  assert.equal(await main(['--workspace', workspace, ...selections], { ...captureCommandEnvironment(process.env), VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
     tuiIO: io, catalog: supplied.catalog, credentials: supplied.credentials,
     providerFactory: () => ({ async generate(input) {
       advertised.push(input.tools.some(tool => tool.name === 'command_start'))
@@ -283,7 +284,7 @@ test('replacement key and cancelled model selection withhold stale-host commands
     ['Before', '/provider', 'After cancel', '/commands on', 'Still stale', '/new', 'New account', '/exit'], [replacement])
   io.canAutoReview = true
   const advertised = [], guidance = [], accounts = []
-  assert.equal(await main(['--workspace', workspace, ...selections], { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
+  assert.equal(await main(['--workspace', workspace, ...selections], { ...captureCommandEnvironment(process.env), VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
     tuiIO: io, catalog: supplied.catalog, credentials: supplied.credentials,
     providerFactory: (_session, _options, env) => {
       accounts.push(env.OPENROUTER_API_KEY)
@@ -308,7 +309,7 @@ test('commands can be disabled after cancelling onboarding before any host or co
     ['/commands off', '/provider', 'Hello', '/new', 'Still off', '/exit'])
   io.canAutoReview = true
   const advertised = [], guidance = []
-  assert.equal(await main(['--workspace', workspace], { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
+  assert.equal(await main(['--workspace', workspace], { ...captureCommandEnvironment(process.env), VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: key }, {
     tuiIO: io, catalog: supplied.catalog, credentials: supplied.credentials,
     providerFactory: () => ({ async generate(input) {
       advertised.push(input.tools.some(tool => tool.name === 'command_start'))
