@@ -66,7 +66,7 @@ through the command interface. `/mode` opens all three choices in full-screen mo
 `/mode plan` enters planning directly and `/mode manual` returns to reviewed execution.
 
 Plan is a read-only task policy, separate from Manual/Auto approval. It advertises
-and dispatches only enabled local reads: arithmetic, current time, session-note
+and dispatches only enabled local reads: informational clarification, arithmetic, current time, session-note
 reads, memory listing, skill listing/reading, and bounded workspace reads/searches.
 Existing feature opt-ins, model tool support, secret screening and read permissions
 still apply. Workspace/note/memory mutations, every unsandboxed command, public URL
@@ -81,6 +81,12 @@ host controls such as session renaming and memory management keep their existing
 review rules. Explicit new/resumed conversations start in Manual execution mode.
 Model and reasoning-effort changes preserve Plan when it is selected, while
 revoking any Auto review enrollment.
+The assistant can ask 1–3 clarification questions in the native full-screen UI.
+Choose an option, write an answer, skip, or cancel; review the answers and select
+Submit to send them. Questions work in Manual, Auto review and Plan, and never
+approve an action or enroll Auto review. Questions and action approvals share one
+input queue. Line mode, pipes and headless hosts omit this capability.
+
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
