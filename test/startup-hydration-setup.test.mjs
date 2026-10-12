@@ -271,6 +271,6 @@ test('commands off remains a launch-local opt-out across new conversations until
   }), 0)
   assert.deepEqual(advertised, [true, false, false, true])
   assert.deepEqual(guidance, advertised)
-  assert.equal(io.sessions.length, 2)
+  assert.equal(new Set(io.sessions.map(session => session.id)).size, 2)
   assert.equal(io.choices.length, 0)
 })
