@@ -52,7 +52,11 @@ Cancelling have separate labels. The timer stops when the turn settles or the UI
 closes, including non-streaming requests and failed turns.
 
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
-terminal reports those modifiers. Tab completes slash commands.
+terminal reports those modifiers. Tab completes slash commands. Shift+Tab cycles
+Manual / Auto review while the composer is idle and preserves an unfinished draft.
+Entering Auto still needs the fresh enrollment confirmation; leaving it selects
+Manual immediately. During a turn and inside dialogs, the shortcut does not change
+approval mode. `/mode cycle` provides the same cycle through the command interface.
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)

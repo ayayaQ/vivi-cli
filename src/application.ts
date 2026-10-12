@@ -14,7 +14,7 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, cycleApprovalMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
@@ -82,6 +82,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual or optional Auto review for this conversation and selected account; Manual is always the default.
+Shift+Tab cycles Manual / Auto review in the idle composer and preserves your draft; entering Auto still needs confirmation.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
@@ -679,14 +680,15 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
           continue
         }
         if (/^\/mode(?:\s|$)/.test(command)) {
-          if (command !== '/mode') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
+          if (command !== '/mode' && command !== '/mode cycle') { io.write('Use /mode by itself for a fresh Manual / Auto review choice\n'); continue }
           if (!host) { io.write('Choose a provider and model before selecting approval mode\n'); continue }
           if (hostAccountGeneration !== accountGeneration) {
             host.setApprovalMode('manual'); io.setApprovalMode?.('manual')
             io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling Auto review again\n')
             continue
           }
-          await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+          if (command === '/mode cycle') await cycleApprovalMode(host, io)
+          else await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
           continue
         }
         if (command === '/help') { io.write(COMMAND_HELP); continue }

@@ -987,6 +987,16 @@ export class OpenTuiIO implements ChatIO {
     if (!pending?.armed) { this.consume(key); return }
     if (this.cancelCallbacks.size && pending.kind === 'chat') { this.consume(key); return }
     if (pending.kind === 'secret') { this.handleSecretKey(key); return }
+    // Modes change only between turns. Dialogs keep their own Tab navigation,
+    // and the draft never becomes input to the enrollment approval.
+    if (pending.kind === 'chat' && key.name === 'tab' && key.shift &&
+      !key.ctrl && !key.meta && !key.super && !key.hyper) {
+      this.consume(key)
+      if (key.repeated || key.eventType === 'repeat' || this.runStatus.running) return
+      this.nextComposerDraft = this.safe(this.composer.plainText, MAX_INPUT)
+      pending.finish('/mode cycle')
+      return
+    }
     // Legacy terminals encode Ctrl+J as LF and may encode Shift+Enter exactly
     // like Enter (CR). Only chat/text editors use LF as a newline fallback;
     // search, secret, choice and approval prompts keep their confirmation keys.
@@ -1004,7 +1014,7 @@ export class OpenTuiIO implements ChatIO {
         this.renderCompletions()
         return
       }
-      if (key.name === 'tab') {
+      if (key.name === 'tab' && !key.shift) {
         this.consume(key)
         this.acceptCompletion()
         return
