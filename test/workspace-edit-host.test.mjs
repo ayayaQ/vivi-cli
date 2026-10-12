@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream'
 import { CliHost } from '../dist/host.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 import { ReadOnlyWorkspace } from '../dist/workspace.js'
-import { workspaceRevision, WORKSPACE_MUTATION_TOOL_NAMES } from '../dist/workspace-edit.js'
+import { workspaceDiff, workspaceRevision, WORKSPACE_MUTATION_TOOL_NAMES } from '../dist/workspace-edit.js'
 import { FileDecisionLedger } from '../dist/decision-ledger.js'
 import { autoReviewSharingScope, AUTO_REVIEW_POLICY_REVISION, AUTO_REVIEW_SHARING_REVISION } from '../dist/auto-review.js'
 import { TerminalIO, autoReviewDisclosure, selectApprovalMode } from '../dist/terminal.js'
@@ -52,12 +52,25 @@ test('Manual shows the exact full diff and requires one approval for every actua
     const result = mutationResult(await subject.host.send('Create new.txt with ordinary project text'))
     assert.equal(result.success, allow); assert.equal(subject.approvals.length, 1); assert.equal(subject.requests.length, 0)
     const review = subject.approvals[0].description
+    assert.equal(subject.approvals[0].workspaceDiff, workspaceDiff('new.txt', null, 'ordinary project text\n'))
+    assert(review.endsWith(`\n${subject.approvals[0].workspaceDiff}`))
     assert.match(review, /Create workspace text file "new.txt"/); assert.match(review, /Before SHA-256: absent/)
     assert.match(review, /\+"ordinary project text\\n"/); assert.match(review, /temporary sibling/)
     if (allow) assert.equal(await fs.readFile(join(subject.root, 'new.txt'), 'utf8'), 'ordinary project text\n')
     else await assert.rejects(fs.readFile(join(subject.root, 'new.txt')), { code: 'ENOENT' })
     await noStages(subject.root)
   }
+})
+test('Manual edit display metadata is the exact host-prepared diff, including unchanged context and revisions', async t => {
+  const before = 'header\nold\nfooter\n', after = 'header\nnew\nfooter\n'
+  const subject = await fixture(t, { name: 'workspace_edit_text', initial: before })
+  assert.equal(mutationResult(await subject.host.send('Replace old with new in new.txt')).success, false)
+  const approval = subject.approvals[0]
+  assert.equal(approval.workspaceDiff, workspaceDiff('new.txt', before, after))
+  assert(approval.description.endsWith(`\n${approval.workspaceDiff}`))
+  assert.equal(approval.currentRevision, workspaceRevision(Buffer.from(before)))
+  assert(approval.description.includes(`After SHA-256: ${workspaceRevision(Buffer.from(after))}`))
+  assert.equal(await fs.readFile(join(subject.root, 'new.txt'), 'utf8'), before)
 })
 for (const providerId of ['openai', 'openrouter']) for (const name of WORKSPACE_MUTATION_TOOL_NAMES) {
   test(`${providerId} Auto prepares exact trusted ${name} effects, hashes and changed text`, async t => {
@@ -94,6 +107,7 @@ test('oversized exact decision evidence uses full Manual diff without any judge 
   assert.equal(mutationResult(await subject.host.send('Create new.txt with the supplied text')).success, true)
   assert.equal(subject.requests.length, 0); assert.equal(subject.approvals.length, 1)
   assert(subject.approvals[0].description.includes(content)); assert(!subject.approvals[0].description.includes('truncated'))
+  assert.equal(subject.approvals[0].workspaceDiff, workspaceDiff('new.txt', null, content))
   assert.equal(await fs.readFile(join(subject.root, 'new.txt'), 'utf8'), content)
 })
 test('sensitive changed text stays Manual and known credentials are withheld before human/model review', async t => {
@@ -112,6 +126,8 @@ test('Auto rejection can be manually approved once for the exact diff', async t 
   assert.equal(mutationResult(await subject.host.send('Create new.txt with ordinary project text')).success, true)
   assert.equal(subject.requests.length, 1); assert.equal(subject.approvals.length, 1)
   assert.match(subject.approvals[0].description, /AI recommends rejecting/)
+  assert.equal(subject.approvals[0].workspaceDiff, workspaceDiff('new.txt', null, 'ordinary project text\n'))
+  assert(subject.approvals[0].description.endsWith(`\n${subject.approvals[0].workspaceDiff}`))
   assert.equal(subject.records.at(-1).source, 'human-once'); await noStages(subject.root)
 })
 for (const cause of ['workspace', 'tools', 'account', 'provider', 'evaluator', 'ledger', 'surface']) {

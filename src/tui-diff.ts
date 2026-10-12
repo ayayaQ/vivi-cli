@@ -36,14 +36,22 @@ export class WorkspaceDiffRenderable extends TextRenderable {
     this.kinds = kinds
   }
   protected override renderSelf(buffer: OptimizedBuffer): void {
+    super.renderSelf(buffer)
     // Native visual-line sources follow word wrapping and Unicode column widths.
-    // Paint only visible rows; native text draws selections over these bands.
+    // Recolor only visible cells, retaining native glyphs, attributes and selections.
     const first = Math.max(0, -this.y), count = Math.max(0, Math.min(this.height, buffer.height - this.y) - first)
     const sources = this.getLineSources(this.scrollY + first, count)
+    const { fg, bg } = buffer.buffers
+    const selected = this.hasSelection() ? this.selectionBg : undefined
     for (const [offset, source] of sources.entries()) {
       const colors = rowColors(this.kinds[source])
-      if (colors) buffer.fillRect(this.x, this.y + first + offset, this.width, 1, colors.bg)
+      if (!colors) continue
+      const y = this.y + first + offset
+      for (let x = Math.max(0, this.x); x < Math.min(buffer.width, this.x + this.width); x++) {
+        const cell = (y * buffer.width + x) * 4
+        if (selected?.equals(RGBA.fromArray(bg.subarray(cell, cell + 4)))) continue
+        fg.set(colors.fg.buffer, cell); bg.set(colors.bg.buffer, cell)
+      }
     }
-    super.renderSelf(buffer)
   }
 }
