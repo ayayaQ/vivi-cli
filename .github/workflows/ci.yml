@@ -2,10 +2,17 @@ name: CLI checks
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  # Unique main/manual runs; only superseded heads of the same PR are cancelled.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   npm_config_engine_strict: 'true'
@@ -14,6 +21,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         node: ['26.4.0', '26']
     steps:
@@ -23,24 +31,5 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run check
-
-  tui:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '26'
-          cache: npm
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.2
-      - run: npm ci --ignore-scripts
-      - run: npm run test:tui
-      - run: npm run test:package
-        env:
-          VIVI_TEST_BUN: bun
-      - run: npm run test:standalone
-      - run: npm run build:standalone
-      - run: ./build/vivi --help
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs linux-node
