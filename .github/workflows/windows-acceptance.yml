@@ -2,17 +2,23 @@ name: Windows acceptance preparation
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   npm_config_engine_strict: 'true'
 
 jobs:
   candidate:
-    # Produce one private npm archive. Both Windows runtimes consume these exact bytes.
+    # One Linux TUI/package/standalone gate exports validated immutable Windows inputs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,13 +30,16 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: npm ci --ignore-scripts
-      - run: npm test
-      - run: npm run test:tui
-      - run: npm run test:package
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs bun-tui
+      - run: npm run test:package:built
         env:
           VIVI_TEST_BUN: bun
           VIVI_TEST_CANDIDATE_DIR: ${{ runner.temp }}/canonical-npm-candidate
-      # Explicit allowlist: private test archive and nonsecret metadata/evidence only.
+      - run: bun scripts/test-standalone.ts
+      - run: bun scripts/build-standalone.ts
+      - run: ./build/vivi --help
+      # Exact private archive plus nonsecret metadata/evidence only.
       - uses: actions/upload-artifact@v4
         with:
           name: canonical-private-npm-candidate
@@ -40,20 +49,103 @@ jobs:
             ${{ runner.temp }}/canonical-npm-candidate/package-evidence.json
           if-no-files-found: error
 
-  headless:
-    # Windows x64 headless evidence plus a private native ConPTY transport gate.
-    # Physical Windows Terminal and native vault acceptance remain separate.
-    needs: candidate
+  mcp:
+    # All minimum-Node Windows MCP cases premerge; full current-Node on main/manual.
+    # Native helpers stay serial inside their isolated runner, without longer deadlines.
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ['26.4.0', '26']
+        node: ${{ fromJSON(github.event_name == 'pull_request' && '["26.4.0"]' || '["26.4.0", "26"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs windows-mcp
+
+  headless:
+    # All remaining minimum-Node Windows headless cases; full current on main/manual.
+    # Packed minimum-Node behavior belongs to bun below, using the same archive.
+    needs: candidate
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(github.event_name == 'pull_request' && '["26.4.0"]' || '["26.4.0", "26"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs windows-headless
+      - uses: actions/download-artifact@v4
+        if: matrix.node == '26'
+        with:
+          name: canonical-private-npm-candidate
+          path: ${{ runner.temp }}/canonical-npm-candidate
+      - run: npm run test:package:built
+        if: matrix.node == '26'
+        env:
+          VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+          VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-current-package-evidence.json
+      - uses: actions/upload-artifact@v4
+        if: matrix.node == '26'
+        with:
+          name: windows-current-node-headless-evidence
+          path: ${{ runner.temp }}/windows-current-package-evidence.json
+          if-no-files-found: error
+
+  current-compatibility:
+    # Actual current Node startup, argv/env, binary I/O, cancellation and descendant cleanup.
+    # OAuth callback/lifecycle files are included automatically when present in the checkout.
+    if: github.event_name == 'pull_request'
+    needs: candidate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          architecture: x64
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          name: canonical-private-npm-candidate
+          path: ${{ runner.temp }}/canonical-npm-candidate
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs windows-current
+      - run: npm run test:package:built
+        env:
+          VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+          VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-current-package-evidence.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-current-node-headless-evidence
+          path: ${{ runner.temp }}/windows-current-package-evidence.json
+          if-no-files-found: error
+
+  bun:
+    # One pinned Windows Bun runtime, stock OS transport and packed minimum-Node gate.
+    # No physical Windows Terminal, live keys, providers or native credential store.
+    needs: candidate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
           architecture: x64
           cache: npm
       - uses: oven-sh/setup-bun@v2
@@ -65,47 +157,30 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       - run: npm ci --ignore-scripts
       - run: npm run build
-      # Owned local MCP fixtures only. Serial files avoid unrelated native-startup contention;
-      # every existing per-operation deadline remains unchanged.
-      - run: node --test --test-concurrency=1 test/mcp-config.test.mjs test/mcp-templates.test.mjs test/mcp-http.test.mjs test/mcp-transport.test.mjs test/mcp-controls.test.mjs test/mcp-discovery.test.mjs test/mcp-lifecycle.test.mjs test/mcp-integration.test.mjs test/mcp-invocation.test.mjs test/mcp-host.test.mjs test/mcp-send-boundary.test.mjs test/mcp-outcomes.test.mjs test/mcp-outcome-host.test.mjs test/mcp-windows.test.mjs test/mcp-windows-real.test.mjs test/mcp-windows-node-env.test.mjs
-      - run: bun test ./test/mcp-http.test.mjs
-      # Harmless owned process fixtures plus mocks. No native UI, live keys or providers.
-      - run: node --test test/commands.test.mjs test/commands-host.test.mjs test/command-process.test.mjs test/command-windows.test.mjs test/command-windows-real.test.mjs
-      # Fake runners only: no native credential store, live keys, model calls or TTY automation.
-      - run: node --test test/credentials.test.mjs test/models.test.mjs test/picker.test.mjs test/application.test.mjs test/application-startup-regression.test.mjs test/startup-hydration-setup.test.mjs test/session-note-defaults.test.mjs test/application-session-lifecycle.test.mjs test/input-diagnostic.test.mjs test/platform-acceptance.test.mjs test/package-candidate.test.mjs test/extensions.test.mjs test/extension-scope-host.test.mjs test/conversation-record-host.test.mjs test/conversation-record-recovery.test.mjs test/tool-presentation.test.mjs test/compact-tool-card.test.mjs test/usage-pure.test.mjs test/usage-host.test.mjs test/memory-store.test.mjs test/memory-host.test.mjs test/memory-controls.test.mjs test/workspace.test.mjs test/workspace-host.test.mjs test/workspace-cli.test.mjs test/workspace-edit.test.mjs test/workspace-edit-host.test.mjs test/windows-input.test.mjs test/windows-conpty.test.mjs test/session-status.test.mjs test/auto-review.test.mjs test/auto-review-controls.test.mjs test/auto-review-routing.test.mjs test/decision-ledger.test.mjs test/prepared-action-routing.test.mjs test/skills-store.test.mjs test/skills-host.test.mjs test/skills-controls.test.mjs
-      # Plan and mode controls use offline fixtures only; no approvals, providers or remote requests in Plan.
-      - run: node --test test/plan-mode.test.mjs test/mode-cycle.test.mjs test/questions-host.test.mjs
-      # Real URL engine, host admission, DNS/TLS/HTTP adapters and owned response fixtures only; no external requests.
-      - run: node --test --test-concurrency=1 test/public-url-contract.test.mjs test/public-url.test.mjs test/public-url-html.test.mjs test/public-url-transport.test.mjs test/public-url-host.test.mjs test/public-url-outcomes.test.mjs
-      - run: bun test ./test/public-url-contract.test.mjs ./test/public-url.test.mjs ./test/public-url-html.test.mjs ./test/public-url-transport.test.mjs ./test/public-url-host.test.mjs ./test/public-url-outcomes.test.mjs
+      - run: node scripts/ci-tests.mjs bun-boundaries
       - name: Verify real stock Windows fallback transport
         run: |
           $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
           $env:VIVI_TEST_POWERSHELL = (Get-Command pwsh -CommandType Application).Source
-          node --test test/windows-conpty-fallback-native.test.mjs
-      # Windows npm scripts do not expand the shell wildcard used by test:tui.
-      - run: bun test ./test/tui.test.ts ./test/tui-theme.test.ts ./test/tui-diff.test.ts ./test/application-tui.test.ts ./test/tui-mouse.test.ts ./test/tui-composer-feedback.test.ts ./test/tui-input-diagnostic.test.ts ./test/tui-conpty.test.ts ./test/windows-conpty-fixture.test.ts ./test/session-status-tui.test.ts ./test/auto-review-controls-tui.test.ts ./test/auto-review-status-tui.test.ts ./test/skills-tui.test.ts ./test/tool-presentation-tui.test.ts
-      - run: bun test ./test/mcp-controls-tui.test.ts
-      - run: bun test ./test/plan-mode-tui.test.ts ./test/mode-cycle-tui.test.ts ./test/input-queue.test.ts ./test/questions-tui.test.ts ./test/questions-focus-tui.test.ts
-      - run: npm run test:package
+          node scripts/ci-tests.mjs windows-stock
+      - run: node scripts/ci-tests.mjs bun-tui
+      - run: npm run test:package:built
         env:
           VIVI_TEST_BUN: bun
           VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
           VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
-          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-package-evidence.json
-      - run: npm run test:standalone
-      - run: npm run build:standalone
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-minimum-package-evidence.json
+      - run: bun scripts/test-standalone.ts
+      - run: bun scripts/build-standalone.ts
       - run: .\build\vivi.exe --help
-      # Separate observed Windows reports only. No credentials, sessions or executables.
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-node-${{ matrix.node }}-headless-evidence
-          path: ${{ runner.temp }}/windows-package-evidence.json
+          name: windows-minimum-node-bun-headless-evidence
+          path: ${{ runner.temp }}/windows-minimum-package-evidence.json
           if-no-files-found: error
 
   packaged-conpty:
-    # Additional mode1 transport lane. Stock OS jobs and their paste gate stay independent.
-    needs: candidate
+    # Independent hash-pinned mode1 gate. It consumes no canonical npm artifact.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +201,7 @@ jobs:
           $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
           $env:VIVI_TEST_POWERSHELL = (Get-Command pwsh -CommandType Application).Source
           $env:VIVI_TEST_CONPTY_PINNED_DIRECTORY = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
-          node --test test/windows-conpty-packaged-native.test.mjs
+          node scripts/ci-tests.mjs windows-modern
       - name: Remove the private Microsoft backend
         if: always()
         run: |
