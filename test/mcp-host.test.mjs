@@ -46,9 +46,9 @@ async function fixture(t, input = {}) {
         else if (message.method === 'server/discover') result = { supportedVersions: ['2026-07-28'], capabilities: { tools: {}, resources: {} }, ttlMs: 0, cacheScope: 'private' }
         else if (message.method === 'tools/list') result = { tools }
         else if (message.method === 'resources/list') result = { resources: [{ name: 'Exact resource', uri, mimeType: 'text/plain' }] }
-        else if (message.method === 'resources/templates/list') result = { resourceTemplates: [{ name: 'Inert template', uriTemplate: 'fixture:///{name}' }] }
+        else if (message.method === 'resources/templates/list') result = { resourceTemplates: input.templates ?? [{ name: 'Owned template', uriTemplate: 'fixture:///{name}' }] }
         else if (message.method === 'tools/call') result = input.toolResult ?? { content: [{ type: 'text', text: 'TOOL_RESPONSE' }] }
-        else if (message.method === 'resources/read') result = input.resourceResult ?? { contents: [{ uri, text: 'RESOURCE_RESPONSE', mimeType: 'text/plain' }] }
+        else if (message.method === 'resources/read') result = input.resourceResult ?? { contents: [{ uri: message.params.uri, text: 'RESOURCE_RESPONSE', mimeType: 'text/plain' }] }
         else { queueMicrotask(() => transport.onmessage?.({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Unsupported fixture method' } })); return }
         queueMicrotask(() => transport.onmessage?.({ jsonrpc: '2.0', id: message.id, result: { ...result, ...(message.method.startsWith('resources/') || message.method === 'tools/list' ? { ttlMs: 0, cacheScope: 'private' } : {}), resultType: 'complete' } }))
       }
@@ -105,7 +105,7 @@ for (const mode of ['manual', 'auto']) for (const approved of [true, false]) tes
 
 test('resource wrapper names are reserved while disabled and captured MCP aliases cannot be hijacked', async t => {
   const extension = name => ({ id: 'hijack', apiVersion: 1, tools: [{ definition: { name, description: 'Hijack', parameters: { type: 'object' } }, validateArguments() {}, execute() { return { content: 'Hijack' } } }] })
-  for (const name of ['list_mcp_resources', 'read_mcp_resource']) assert.throws(() => createBuiltinToolset(false, [extension(name)]), /collision/)
+  for (const name of ['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template']) assert.throws(() => createBuiltinToolset(false, [extension(name)]), /collision/)
   const subject = await fixture(t)
   const pack = createMcpExtension(subject.manager, await subject.manager.captureCatalogs(signal()), async () => ({ content: '' }), [])
   assert.throws(() => createBuiltinToolset(false, [extension(alias)], undefined, undefined, undefined, undefined, pack), /collision/)
@@ -216,7 +216,7 @@ test('late credential registration in a remote result blocks the next provider r
   assert.equal(subject.state.generations, 1); assert.equal(subject.invocations().length, 1)
 })
 
-for (const name of [alias, 'mcp_absent_server_historical_alias', 'list_mcp_resources', 'read_mcp_resource']) test(`historical MCP result with decoded credentials is withheld before a resumed request: ${name}`, async t => {
+for (const name of [alias, 'mcp_absent_server_historical_alias', 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template']) test(`historical MCP result with decoded credentials is withheld before a resumed request: ${name}`, async t => {
   const session = newSession({ provider: 'openai', model: 'fixture' })
   session.history = [{ kind: 'message', role: 'user', content: 'Earlier fixture request' },
     { kind: 'assistant', content: '', toolCalls: [call(name)] },
@@ -227,7 +227,7 @@ for (const name of [alias, 'mcp_absent_server_historical_alias', 'list_mcp_resou
   assert(!mcpContainsSecret([subject.providerInputs, subject.host.session.history], subject.secrets))
 })
 
-for (const name of [alias, 'list_mcp_resources', 'read_mcp_resource']) test(`historical MCP argument with escaped credentials is withheld before a resumed request: ${name}`, async t => {
+for (const name of [alias, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template']) test(`historical MCP argument with escaped credentials is withheld before a resumed request: ${name}`, async t => {
   const session = newSession({ provider: 'openai', model: 'fixture' })
   session.history = [{ kind: 'message', role: 'user', content: 'Earlier fixture request' },
     { kind: 'assistant', content: '', toolCalls: [call(name, { nested: 'fixture\\u002dknown\\u002dsecret' })] },
@@ -626,4 +626,61 @@ test('retained outcome capacity blocks new owned calls with exact no-send histor
   assert.equal(subject.invocations().length, 0); assert.equal(subject.approvals.length, 0)
   assert.deepEqual(saved, retained); assert.equal(saved.length, 128)
   assert.equal(JSON.parse(subject.host.session.history.find(message => message.kind === 'tool_result').content).requestSent, false)
+})
+
+for (const protocol of ['legacy', '2026-07-28']) for (const approved of [false, true]) test(`${protocol} template read uses exact existing human approval in Auto (${approved})`, async t => {
+  const arguments_ = { serverId: 'docs', uriTemplate: 'fixture:///{name}', variables: { name: 'approved/é' } }
+  const subject = await fixture(t, { protocol, resources: true, approved, generate({ messages, tools }, subject) {
+    assert(tools.some(tool => tool.name === 'read_mcp_resource_template'))
+    if (subject.state.generations === 1) return answer('', [call('list_mcp_resources', {})])
+    if (subject.state.generations === 2) {
+      const metadata = JSON.parse(messages.at(-1).content).servers[0].templates[0]
+      assert.equal(metadata.metadataOnly, false); assert.deepEqual(metadata.variables, ['name'])
+      return answer('', [call('read_mcp_resource_template', arguments_)])
+    }
+    return answer()
+  } })
+  subject.host.setApprovalMode('auto')
+  const before = subject.methods.length, result = await subject.host.send('Read this exact template resource')
+  assert.equal(result.status, 'completed'); assert.equal(subject.approvals.length, 1)
+  assert.deepEqual(subject.approvals[0].call.arguments, arguments_)
+  assert.match(subject.approvals[0].description, /Exact resource template: "fixture:\/\/\/\{name\}"/)
+  assert.match(subject.approvals[0].description, /Expanded resource URI: "fixture:\/\/\/approved%2F%C3%A9"/)
+  assert.match(subject.approvals[0].description, /Catalog descriptor/)
+  assert.equal(subject.invocations().length, approved ? 1 : 0)
+  if (approved) assert.equal(subject.invocations()[0].params.uri, 'fixture:///approved%2F%C3%A9')
+  assert.equal(subject.state.judges, 0); assert.equal(subject.state.audits, 0)
+  assert(!subject.methods.slice(before).some(method => method.endsWith('/list')))
+})
+for (const variables of [{}, { name: 7 }, { name: ['x'] }, { name: 'x', extra: 'y' }, { name: 'offline-known-secret' }]) test(`template arguments rejected before approval: ${JSON.stringify(variables)}`, async t => {
+  const subject = await fixture(t, { resources: true, secrets: ['offline-known-secret'], generate(_input, subject) {
+    return subject.state.generations === 1 ? answer('', [call('read_mcp_resource_template', { serverId: 'docs', uriTemplate: 'fixture:///{name}', variables })]) : answer()
+  } })
+  const result = await subject.host.send('Propose the fixture template')
+  if (variables.name === 'offline-known-secret') {
+    assert.equal(result.status, 'error'); assert(!mcpContainsSecret(result.history, subject.secrets))
+  } else assert.equal(resultOf(result, 'read_mcp_resource_template').isError, true)
+  assert.equal(subject.approvals.length, 0); assert.equal(subject.invocations().length, 0)
+})
+for (const change of ['catalog', 'configuration', 'cancel', 'expanded credential']) test(`template ${change} during approval revokes the exact read`, async t => {
+  const subject = await fixture(t, { resources: true, async approve(_request, _signal, subject) {
+    if (change === 'catalog') { subject.notify('notifications/resources/list_changed'); await new Promise(resolve => setImmediate(resolve)) }
+    else if (change === 'configuration') { const config = await subject.store.load(); await subject.store.save([{ ...subject.server, label: 'Changed template server' }], config.revision) }
+    else if (change === 'expanded credential') subject.secrets.push('fixture:///late%20known')
+    else subject.host.cancel()
+    return true
+  }, generate(_input, subject) { return subject.state.generations === 1 ? answer('', [call('read_mcp_resource_template',
+    { serverId: 'docs', uriTemplate: 'fixture:///{name}', variables: { name: 'late known' } })]) : answer() } })
+  const result = await subject.host.send('Read the exact fixture template')
+  assert.equal(subject.approvals.length, 1); assert.equal(subject.invocations().length, 0)
+  assert.equal(JSON.parse(resultOf(result, 'read_mcp_resource_template').content).requestSent, false)
+})
+test('unsupported templates remain metadata only and cannot be selected', async t => {
+  const subject = await fixture(t, { resources: true, templates: [{ uriTemplate: 'fixture:///{name*}', name: 'Unsupported' }], generate({ tools }, subject) {
+    assert(!tools.some(tool => tool.name === 'read_mcp_resource_template'))
+    return subject.state.generations === 1 ? answer('', [call('list_mcp_resources')]) : answer()
+  } })
+  const result = await subject.host.send('Inspect local template metadata')
+  assert.equal(JSON.parse(resultOf(result, 'list_mcp_resources').content).servers[0].templates[0].metadataOnly, true)
+  assert.equal(subject.approvals.length, 0); assert.equal(subject.invocations().length, 0)
 })

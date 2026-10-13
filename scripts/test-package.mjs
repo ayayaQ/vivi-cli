@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.12.0'
-const coreIntegrity = 'sha512-/xbgt9LA8ZaKkVl1h3x8W7ErP8fcMsSDS9bpKfjFdj6wp+DbTSrUMElDEgb9kOVLv9Gv7zE14MNkjcBuGlTjrw=='
+const coreVersion = '0.13.0'
+const coreIntegrity = 'sha512-OsOmJP+cJTAVJadkzRMmmCmmWaWLEVNEK5+QLbSnbP7PhZ6Ltb388/+UISLO/SgWl4RhXtxFnqKg8yscMU+WWA=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.12.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.13.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -106,7 +106,7 @@ try {
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts',
     'src/questions.ts', 'dist/questions.js', 'dist/questions.d.ts',
     'src/input-queue.ts', 'dist/input-queue.js', 'dist/input-queue.d.ts']) assert(paths.has(path), `Missing ${path}`)
-  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes']) {
+  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes', 'templates']) {
     for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
       assert(paths.has(path), `Missing ${path}`)
     }
@@ -130,7 +130,7 @@ try {
     'dist/cjs/decisions.js', 'dist/cjs/decisions.d.ts', 'examples/decisions.mjs',
     'docs/MCP.md', 'src/extensions/mcp.ts', 'dist/extensions/mcp.js', 'dist/extensions/mcp.d.ts',
     'dist/cjs/extensions/mcp.js', 'dist/cjs/extensions/mcp.d.ts',
-    'src/extensions/mcp/catalog.ts', 'src/extensions/mcp/operations.ts', 'src/extensions/mcp/content.ts',
+    'src/extensions/mcp/catalog.ts', 'src/extensions/mcp/operations.ts', 'src/extensions/mcp/content.ts', 'src/extensions/mcp/templates.ts',
     'src/presentation.ts', 'dist/presentation.js', 'dist/presentation.d.ts', 'dist/cjs/presentation.js',
     'dist/cjs/presentation.d.ts', 'docs/TOOL_PRESENTATION.md', 'examples/tool-presentation.mjs',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
@@ -148,7 +148,7 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch', '@modelcontextprotocol/client', '@modelcontextprotocol/core']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch', '@modelcontextprotocol/client', '@modelcontextprotocol/core', 'url-template']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
@@ -182,6 +182,13 @@ try {
   assert.equal(globManifest.version, '4.0.7'); assert.equal(globManifest.license, 'MIT')
   assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/picomatch/LICENSE'))),
     normalizeLicense(await readFile(join(root, 'node_modules/picomatch/LICENSE'))), 'Picomatch MIT legal text mismatch')
+  assert.equal(installedManifest.dependencies['url-template'], '3.1.1')
+  assert.equal(lock.packages['node_modules/url-template'].integrity, 'sha512-4oszoaEKE/mQOtAmdMWqIRHmkxWkUZMnXFnjQ5i01CuRSK3uluxcH1MRVVVWmhlnzT1SCDfKxxficm2G37qzCA==')
+  const templateManifest = JSON.parse(await readFile(join(temporary, 'node_modules/url-template/package.json'), 'utf8'))
+  assert.equal(templateManifest.version, '3.1.1'); assert.equal(templateManifest.license, 'BSD-3-Clause')
+  assert.deepEqual(templateManifest.dependencies ?? {}, {})
+  assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/url-template/LICENSE'))),
+    normalizeLicense(await readFile(join(root, 'node_modules/url-template/LICENSE'))), 'Template BSD legal text mismatch')
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
     normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
@@ -368,13 +375,15 @@ try {
     settings: { provider: 'openai', model: 'fake' }, approve: async () => { mcpApprovals++; return true },
     provider: { async generate(input) {
       assert(input.tools.some(tool => tool.name === alias))
+      assert(input.tools.some(tool => tool.name === 'read_mcp_resource_template'))
       if (++mcpRounds === 1) return { content: '', toolCalls: [{ id: 'packed-mcp-call', name: alias, arguments: { query: 'packed' } },
         { id: 'packed-mcp-list', name: 'list_mcp_resources', arguments: { serverId: 'packed' } }] }
-      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'packed-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'packed', uri: 'fixture:///document' } }] }
+      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'packed-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'packed', uri: 'fixture:///document' } },
+        { id: 'packed-mcp-template', name: 'read_mcp_resource_template', arguments: { serverId: 'packed', uriTemplate: 'fixture:///{name}', variables: { name: 'from template/é' } } }] }
       return { content: 'Packed MCP invocation accepted', toolCalls: [] }
     } } })
   const mcpResult = await mcpHost.send('Use the owned packed MCP fixture')
-  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 2)
+  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 3)
   assert.match(JSON.stringify(mcpResult.history), /Echo: packed/)
   assert.match(JSON.stringify(mcpResult.history), /Owned resource 1/)
   assert.equal(mcpHost.conversationRecords.state, 'shadow')
@@ -393,7 +402,8 @@ try {
   assert(deniedMcpHost.conversationRecords.projection.outcomes.some(item => item.effect === 'not_attempted'))
   const protocolLog = (await readFile(join(directory, 'mcp-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
   assert.equal(protocolLog.filter(message => message.method === 'tools/call').length, 1)
-  assert.equal(protocolLog.filter(message => message.method === 'resources/read').length, 1)
+  assert.equal(protocolLog.filter(message => message.method === 'resources/read').length, 2)
+  assert.equal(protocolLog.filter(message => message.method === 'resources/read')[1].params.uri, 'fixture:///from%20template%2F%C3%A9')
   await mcp.disconnect('packed')
   assert.equal(mcp.statuses()[0].state, 'disabled')
   await mcp.remove('packed')

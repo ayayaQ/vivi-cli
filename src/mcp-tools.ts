@@ -6,6 +6,7 @@ import type { McpCatalogSnapshot } from './mcp-catalog.js'
 import { assertMcpAllowed } from './mcp-content.js'
 import type { McpManager, McpPreparedOperation } from './mcp-manager.js'
 import { createMcpSchemaValidator } from './mcp-schema.js'
+import { expandMcpTemplate } from './mcp-templates.js'
 
 export { MCP_RESOURCE_TOOL_NAMES } from '@ayayaq/vivi/extensions/mcp'
 export const MCP_GUIDANCE = `${SHARED_MCP_GUIDANCE} Human approval also applies in Auto mode.`
@@ -15,6 +16,6 @@ type ReviewMcpOperation = (operation: McpPreparedOperation, signal: AbortSignal)
 export function createMcpExtension(manager: McpManager, catalogs: readonly McpCatalogSnapshot[],
   review: ReviewMcpOperation, secrets: readonly string[] = []): ToolExtension {
   return { ...createSharedMcpExtension(manager, catalogs, review, {
-    validateSchema: createMcpSchemaValidator(), assertAllowed: value => assertMcpAllowed(value, secrets)
+    validateSchema: createMcpSchemaValidator(), expandTemplate: expandMcpTemplate, assertAllowed: value => assertMcpAllowed(value, secrets)
   }), id: 'vivi-cli-mcp' }
 }

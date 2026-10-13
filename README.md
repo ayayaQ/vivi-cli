@@ -189,7 +189,11 @@ Starting a trusted server runs its code with your OS permissions before any
 tool-call approval. It can access files and network; this is not a sandbox.
 Connected, ready catalogs expose bounded tool aliases and schemas to the agent.
 Every remote tool call and resource read requires human approval, including in Auto
-review. Reads use exact discovered resource URIs; templates are metadata only.
+review. Reads use exact discovered resource URIs. Admitted scalar RFC 6570 templates can
+propose one expanded absolute URI with every variable supplied as a string; the
+existing human approval shows the template, exact values and expanded URI.
+Unsupported templates remain metadata only. Expansion performs no I/O, URI
+normalization, completion or linked reads.
 Unsupported schemas are quarantined; stale catalogs and changed connections block
 calls. Results are bounded, untrusted data; uncertain outcomes disable the connection
 without retry. Send intent and outcomes are persisted separately from transcript

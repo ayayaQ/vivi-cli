@@ -59,7 +59,7 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
 function operation(manager, snapshot, kind = 'tools', key = 'echo/name', arguments_ = { query: 'hello' }) {
   const entry = snapshot.categories[kind].entries.find(item => item.remoteKey === key)
   assert(entry, `Missing fixture entry ${key}`)
-  const call = { id: `invoke-${kind}`, name: kind === 'tools' ? entry.alias : 'read_mcp_resource', arguments: arguments_ }
+  const call = { id: `invoke-${kind}`, name: kind === 'tools' ? entry.alias : kind === 'resourceTemplates' ? 'read_mcp_resource_template' : 'read_mcp_resource', arguments: arguments_ }
   return manager.prepareOperation(snapshot, entry, kind, call, kind === 'resources' ? key : undefined)
 }
 const invoke = (manager, prepared, abortSignal = signal(), assertCurrent = () => {}) => manager.invoke(prepared, abortSignal, assertCurrent)
@@ -253,4 +253,33 @@ test('a post-send deadline is unknown and is never automatically retried', { tim
   assert.equal(content(result).doNotRetry, true)
   assert.equal(subject.manager.statuses()[0].state, 'error')
   assert.equal((await requests(subject, 'tools/call')).length, 1)
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`owned stdio ${protocol} sends the exact approved expanded URI with no catalog refresh`, async t => {
+  const subject = await fixture(t, 'normal', protocol)
+  await subject.manager.refresh('fixture', ['resourceTemplates'], signal())
+  const [snapshot] = await subject.manager.captureCatalogs(signal())
+  const prepared = operation(subject.manager, snapshot, 'resourceTemplates', 'fixture:///{name}',
+    { serverId: 'fixture', uriTemplate: 'fixture:///{name}', variables: { name: 'document/é %2f' } })
+  assert.equal(prepared.remoteKey, 'fixture:///{name}')
+  assert.equal(prepared.resourceUri, 'fixture:///document%2F%C3%A9%20%252f')
+  for (let sequence = 1; sequence <= 2; sequence++) {
+    const result = await invoke(subject.manager, prepared)
+    assert.equal(result.isError, undefined); assert.match(result.content, new RegExp(`Owned resource ${sequence}`))
+    assert.equal(content(result).requestSent, true); assert.equal(content(result).confirmedOutcome, true)
+  }
+  assert.equal((await requests(subject, 'resources/read')).length, 2)
+  assert((await requests(subject, 'resources/read')).every(request => request.params.uri === prepared.resourceUri))
+  assert.equal((await requests(subject, 'resources/templates/list')).length, 1)
+  assert.equal((await requests(subject, 'resources/list')).length, 0)
+})
+for (const protocol of ['legacy', '2026-07-28']) test(`owned stdio ${protocol} mismatched template response URI stays unknown and withheld`, async t => {
+  const subject = await fixture(t, 'wrong-uri', protocol)
+  await subject.manager.refresh('fixture', ['resourceTemplates'], signal())
+  const [snapshot] = await subject.manager.captureCatalogs(signal())
+  const result = await invoke(subject.manager, operation(subject.manager, snapshot, 'resourceTemplates', 'fixture:///{name}',
+    { serverId: 'fixture', uriTemplate: 'fixture:///{name}', variables: { name: 'document' } }))
+  assert.equal(content(result).unknownOutcome, true); assert.equal(content(result).requestSent, true)
+  assert(!result.content.includes('Owned resource')); assert(!result.content.includes('fixture:///other'))
+  assert.equal((await requests(subject, 'resources/read')).length, 1)
 })

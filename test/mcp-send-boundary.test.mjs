@@ -20,7 +20,7 @@ const body = result => JSON.parse(result.content)
 const success = kind => kind === 'tools' ? { content: [{ type: 'text', text: 'CONFIRMED_TOOL_RESPONSE' }], structuredContent: { echo: 'ordinary' } }
   : { contents: [{ uri, text: 'CONFIRMED_RESOURCE_RESPONSE' }] }
 const wire = (kind, value = success(kind)) => ({ ...value, resultType: value.resultType ?? 'complete',
-  ...(kind === 'resources' ? { ttlMs: 0, cacheScope: 'private' } : {}) })
+  ...(kind !== 'tools' ? { ttlMs: 0, cacheScope: 'private' } : {}) })
 function deferred() {
   let resolve
   const promise = new Promise(done => { resolve = done })
@@ -56,6 +56,7 @@ async function fixture(t, protocol, options = {}) {
           capabilities: { tools: { listChanged: true }, resources: { listChanged: true } }, ttlMs: 0, cacheScope: 'private' })
         else if (message.method === 'tools/list') reply({ tools: [{ name: remoteName, inputSchema, outputSchema }] })
         else if (message.method === 'resources/list') reply({ resources: [{ uri, name: 'Exact owned resource' }] })
+        else if (message.method === 'resources/templates/list') reply({ resourceTemplates: [{ uriTemplate: 'fixture:///{name}', name: 'Exact owned template' }] })
         else assert.fail(`Unexpected owned request: ${message.method}`)
       }
     }
@@ -66,13 +67,15 @@ async function fixture(t, protocol, options = {}) {
     args: process.versions.bun ? ['--no-install', fileURLToPath(import.meta.url)] : [], cwd: directory, protocol, environment: [] }
   await manager.configure(server)
   assert.equal(await manager.connect(server.id, async () => true, signal()), true)
-  await manager.refresh(server.id, ['resources'], signal())
+  await manager.refresh(server.id, ['resources', 'resourceTemplates'], signal())
   const [snapshot] = await manager.captureCatalogs(signal())
   return { manager, store, server, snapshot, protocol, requests, effects, events, closes: () => closes,
     prepare(kind = 'tools') {
       const entry = snapshot.categories[kind].entries[0]
       return manager.prepareOperation(snapshot, entry, kind, { id: `boundary-${kind}`,
-        name: kind === 'tools' ? entry.alias : 'read_mcp_resource', arguments: kind === 'tools' ? { query: 'ordinary' } : { serverId: server.id, uri } })
+        name: kind === 'tools' ? entry.alias : kind === 'resourceTemplates' ? 'read_mcp_resource_template' : 'read_mcp_resource',
+        arguments: kind === 'tools' ? { query: 'ordinary' } : kind === 'resourceTemplates'
+          ? { serverId: server.id, uriTemplate: 'fixture:///{name}', variables: { name: 'exact' } } : { serverId: server.id, uri } })
     },
     notify() { transport.onmessage?.({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) },
     changeConfig() { writeFileSync(join(directory, 'mcp-servers.json'),
@@ -113,7 +116,7 @@ function exactFrame(subject, kind = 'tools') {
 function settledOnce(persistence, result) { assert.deepEqual(persistence.settled, [result]) }
 
 for (const protocol of ['legacy', '2026-07-28']) {
-  for (const kind of ['tools', 'resources']) {
+  for (const kind of ['tools', 'resources', 'resourceTemplates']) {
     for (const change of ['configuration', 'run', 'catalog', 'arguments credential', 'binding credential', 'snapshot credential', 'cancel']) {
       test(`${protocol} ${kind} rechecks ${change} after paused durable intent`, timeout, async t => {
         const subject = await fixture(t, protocol), entered = deferred(), release = deferred(), controller = new AbortController()
@@ -297,7 +300,7 @@ for (const protocol of ['legacy', '2026-07-28']) {
       })
     }
     const metadata = { 'object progress token': { progressToken: {} }, 'numeric task ID': { [RELATED_TASK_META_KEY]: { taskId: 42 } } }
-    for (const kind of ['tools', 'resources']) for (const [name, _meta] of Object.entries(metadata)) for (const cancel of [false, true]) {
+    for (const kind of ['tools', 'resources', 'resourceTemplates']) for (const [name, _meta] of Object.entries(metadata)) for (const cancel of [false, true]) {
       test(`legacy ${kind} invalid metadata ${name} stays unknown${cancel ? ' on abort' : ''}`, timeout, async t => {
         assert.equal(isSpecType.RequestMeta(_meta), false)
         const controller = new AbortController(), subject = await fixture(t, protocol, { onEffect({ raw }) { raw({ ...success(kind), _meta }); if (cancel) controller.abort() } })
@@ -305,7 +308,7 @@ for (const protocol of ['legacy', '2026-07-28']) {
         unknown(result); exactFrame(subject, kind); settledOnce(persistence, result)
       })
     }
-    for (const kind of ['tools', 'resources']) test(`legacy ${kind} valid metadata is admitted and omitted from projection`, timeout, async t => {
+    for (const kind of ['tools', 'resources', 'resourceTemplates']) test(`legacy ${kind} valid metadata is admitted and omitted from projection`, timeout, async t => {
       const controller = new AbortController(), _meta = { progressToken: 'owned-progress', [RELATED_TASK_META_KEY]: { taskId: 'owned-task' } }
       assert.equal(isSpecType.RequestMeta(_meta), true)
       const subject = await fixture(t, protocol, { onEffect({ raw }) { raw({ ...success(kind), _meta }); controller.abort() } })
