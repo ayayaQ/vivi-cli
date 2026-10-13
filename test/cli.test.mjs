@@ -10,6 +10,7 @@ import { CliHost } from '../dist/host.js';
 import { FileSessionStore, newSession, validateSession, environmentSecrets, redactSecrets, MAX_SESSION_BYTES, MAX_HISTORY_MESSAGES } from '../dist/session.js';
 import { TerminalIO, runChatLoop } from '../dist/terminal.js';
 import { calculate, builtinTools } from '../dist/tools.js';
+import { PUBLIC_URL_GUIDANCE } from '../dist/public-url-tools.js';
 import { main, parseArguments, providerForSession } from '../dist/main.js';
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi';
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai';
@@ -57,7 +58,9 @@ test('headless CLI new session uses shared core, persists native state and usage
     received = messages; return answer('Second', [], { usage });
   } } });
   assert.equal((await resumed.send('Continue')).status, 'completed');
-  assert.deepEqual(received.slice(0, -1), first.history);
+  assert.equal(received[0].content, PUBLIC_URL_GUIDANCE);
+  assert(!first.history.some(message => message.content === PUBLIC_URL_GUIDANCE));
+  assert.deepEqual(received.slice(1, -1), first.history);
   assert.equal(received.at(-1).content, 'Continue');
   assert.deepEqual(resumed.session.usage, { inputTokens: 6, outputTokens: 4, totalTokens: 14 });
 });
@@ -272,7 +275,7 @@ test('crash recovery closes persisted pending tools without approving or executi
   await resumed.send('Continue');
   assert.equal(approvals, 0);
   assert.deepEqual(resumed.session.notes, {});
-  assert.equal(received[1].providerState.items[0].opaque, 'retained');
+  assert.equal(received.find(message => message.kind === 'assistant' && message.toolCalls.some(tool => tool.id === 'crashed')).providerState.items[0].opaque, 'retained');
   validateHistory(received);
 });
 

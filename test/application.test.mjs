@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { main, parseArguments } from '../dist/main.js'
 import { chooseEffort, settingsForModel, DEFAULT_PREFERENCES } from '../dist/application.js'
+import { FileSkillStore } from '../dist/skills.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 import { PreferenceStore } from '../dist/preferences.js'
 import { parseModelCatalog, unknownModel } from '../dist/models.js'
@@ -60,29 +61,36 @@ const base = { ...DEFAULT_PREFERENCES, model: 'saved-model' }
 async function run(directory, io, services, providerFactory = defaultFactory, args = [], env = {}) {
   return main(['--no-workspace', ...args], { VIVI_SESSION_DIR: directory, ...env }, { tuiIO: io, providerFactory, ...services })
 }
-test('first launch opens a fresh composer without welcome, provider call, credential read or saved session', async t => {
+test('first launch offers minimal provider setup and cancellation retains a fresh composer without provider calls or saved state', async t => {
   const directory = await fixture(t), io = fakeIO([], [], ['Hello', '/exit']), services = fakeServices()
   let calls = 0
   assert.equal(await run(directory, io, services, () => { calls++; return defaultFactory() }), 0)
-  assert.equal(calls, 0); assert.equal(io.choices.length, 0); assert.equal(services.loads.length, 0)
+  assert.equal(calls, 0); assert.deepEqual(io.choices.map(choice => choice.title), ['Provider']); assert.equal(services.loads.length, 0)
   assert.match(io.output, /\/provider/); assert(!io.output.includes('Welcome'))
   assert.equal(io.sessions[0].history.length, 0); assert.deepEqual(await readdir(directory), [])
 })
 test('slash provider setup masks and securely saves keys, model picker selects without manual names', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5.1' }], { available: true })
   const key = 'fake-key-only-no-network'
-  const io = fakeIO(['openai', 'save', 'gpt-5.1'], [], ['/provider', 'Hello', '/exit'], [key])
+  const io = fakeIO([undefined, 'openai', 'save', 'gpt-5.1'], [], ['/provider', 'Hello', '/exit'], [key])
   let turns = 0
   assert.equal(await run(directory, io, services, (session, options, env) => {
     assert.equal(session.model, 'gpt-5.1'); assert.equal(env.OPENAI_API_KEY, key); assert.equal(options.enableTools, true)
-    return { generate: async input => { turns++; assert.equal(input.tools.length, 2); return answer('Hello back') } }
+    return { generate: async input => { turns++; const names = input.tools.map(tool => tool.name); for (const name of ['calculate', 'current_time', 'list_skills', 'read_skill']) assert(names.includes(name)); assert.equal(names.includes('save_skill'), new FileSkillStore(join(directory, 'agent-skills')).writable); return answer('Hello back') } }
   }), 0)
   assert.equal(turns, 1); assert.deepEqual(services.saves, [{ provider: 'openai', key }])
   assert.equal(io.secretTitles.length, 1); assert(io.protected.includes(key)); assert(!io.output.includes(key))
   const prefs = await readFile(join(directory, 'preferences.json'), 'utf8')
   assert.equal(JSON.parse(prefs).model, 'gpt-5.1'); assert(!prefs.includes(key))
   const session = io.sessions.at(-1); assert.equal(session.history[1].content, 'Hello back')
-  for (const file of await readdir(directory)) assert(!(await readFile(join(directory, file), 'utf8')).includes(key))
+  const inspectFiles = async path => {
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const file = join(path, entry.name)
+      if (entry.isDirectory()) await inspectFiles(file)
+      else assert(!(await readFile(file, 'utf8')).includes(key))
+    }
+  }
+  await inspectFiles(directory)
   const next = fakeIO([], [], ['Again', '/exit'])
   assert.equal(await run(directory, next, services, (_session, _options, env) => { assert.equal(env.OPENAI_API_KEY, key); return defaultFactory() }), 0)
   assert.equal(next.choices.length, 0); assert.notEqual(next.sessions.at(-1).id, session.id)
@@ -90,7 +98,7 @@ test('slash provider setup masks and securely saves keys, model picker selects w
 })
 test('unavailable storage explicitly offers this-launch only and never writes plaintext credentials', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'vendor/chat', supported_parameters: [] }])
-  const io = fakeIO(['openrouter', 'temporary', 'vendor/chat'], [], ['/provider', '/exit'], ['fake-router-key'])
+  const io = fakeIO([undefined, 'openrouter', 'temporary', 'vendor/chat'], [], ['/provider', '/exit'], ['fake-router-key'])
   assert.equal(await run(directory, io, services), 0)
   assert.equal(services.saves.length, 0); assert.match(io.output, /this launch only/)
   assert.match(io.choices.find(c => c.title === 'API key storage').values[0].description, /No plaintext fallback/)
@@ -98,14 +106,14 @@ test('unavailable storage explicitly offers this-launch only and never writes pl
 })
 test('failed secure save requires an explicit temporary fallback and cancel retains no provider settings', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'fake-model' }], { available: true, failSave: true })
-  const io = fakeIO(['openai', 'save', false], [], ['/provider', '/exit'], ['fake-key'])
+  const io = fakeIO([undefined, 'openai', 'save', false], [], ['/provider', '/exit'], ['fake-key'])
   assert.equal(await run(directory, io, services), 0)
   assert.equal(services.catalogCalls.length, 0); assert.equal(services.saves.length, 1)
   assert.deepEqual(await readdir(directory), []); assert(!io.output.includes('fake-key'))
 })
 test('cancelled provider/key/model/effort flows retain clean input and no unintended provider calls', async t => {
   for (const choices of [[undefined], ['openai', undefined], ['openai', 'temporary', undefined]]) {
-    const directory = await fixture(t), services = fakeServices(), io = fakeIO(choices, [], ['/provider', '/exit'], choices.length === 3 ? ['fake-key'] : [])
+    const directory = await fixture(t), services = fakeServices(), io = fakeIO([undefined, ...choices], [], ['/provider', '/exit'], choices.length === 3 ? ['fake-key'] : [])
     let calls = 0
     assert.equal(await run(directory, io, services, () => { calls++; return defaultFactory() }), 0)
     assert.equal(calls, 0); assert.equal(services.saves.length, 0)
@@ -115,7 +123,7 @@ test('cancelled provider/key/model/effort flows retain clean input and no uninte
 test('environment key precedes saved key and is never copied to credential storage', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5.1' }], { available: true })
   services.vault.set('openai', 'fake-vault-key')
-  const io = fakeIO(['openai', 'current', 'gpt-5.1'], [], ['/provider', '/exit'])
+  const io = fakeIO([undefined, 'openai', 'current', 'gpt-5.1'], [], ['/provider', '/exit'])
   assert.equal(await run(directory, io, services, (_s, _o, env) => { assert.equal(env.OPENAI_API_KEY, 'fake-environment-key'); return defaultFactory() }, [], { OPENAI_API_KEY: 'fake-environment-key' }), 0)
   assert.equal(services.loads.length, 0); assert.equal(services.saves.length, 0)
 })
@@ -146,7 +154,7 @@ test('catalog failure keeps saved selection explicit and downgrades unknown capa
 })
 test('live model picker gets the full catalog and retains the query across explicit refresh', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'alpha' }, { id: 'beta' }])
-  const io = fakeIO([{ kind: 'refresh', query: 'OPENAI bet' }, 'beta'], [], ['/models', '/exit'])
+  const io = fakeIO([undefined, { kind: 'refresh', query: 'OPENAI bet' }, 'beta'], [], ['/models', '/exit'])
   assert.equal(await run(directory, io, services, defaultFactory, [], { OPENAI_API_KEY: 'fake' }), 0)
   assert.equal(services.catalogCalls.length, 2); assert.equal(services.catalogCalls[1].refresh, true)
   assert.equal(JSON.parse(await readFile(join(directory, 'preferences.json'))).model, 'beta')
@@ -191,7 +199,7 @@ test('resume preserves original model, acquires lease before capability confirma
 })
 test('newly entered keys redact provider errors and are refused in prompts or settings', async t => {
   const directory = await fixture(t), services = fakeServices(), key = 'fake-new-protected-key'
-  const io = fakeIO(['openai', 'temporary', 'fake-model'], [], ['/provider', '/exit'], [key])
+  const io = fakeIO([undefined, 'openai', 'temporary', 'fake-model'], [], ['/provider', '/exit'], [key])
   assert.equal(await run(directory, io, services, () => { throw new Error(`Failure ${key}`) }), 0)
   assert.match(io.output, /Failure \[REDACTED\]/); assert(!io.output.includes(key))
   assert(!(await readdir(directory)).some(file => file.endsWith('.lock')))
@@ -214,7 +222,7 @@ test('unknown slash commands never become provider prompts and line parsing rema
   assert.equal(calls, 0); assert.match(io.output, /Unknown slash command/)
   assert.throws(() => parseArguments([]), /requires --model/)
   assert.equal(parseArguments([], {}, true).model, undefined)
-  assert.throws(() => parseArguments(['--no-tools', '--enable-notes', '--model', 'fake']), /notes require/)
+  assert.equal(parseArguments(['--no-tools', '--enable-notes', '--model', 'fake']).enableTools, false)
 })
 test('TUI runtime guard rejects absent or old Bun without loading native modules', async () => {
   const { supportsBunTui } = await import('../dist/main.js')
@@ -280,7 +288,7 @@ test('effort/model/provider pickers scope to the resumed current model while set
 test('unknown conversation eligibility requires a separate explicit choice and picker cancellation is safe', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'future-text-model' }])
   services.catalog.list = async provider => ({ state: 'fresh', models: parseModelCatalog(provider, { data: [{ id: 'future-text-model' }] }) })
-  const io = fakeIO(['future-text-model', undefined, 'future-text-model', true], [], ['/models', '/exit'])
+  const io = fakeIO([undefined, 'future-text-model', undefined, 'future-text-model', true], [], ['/models', '/exit'])
   let calls = 0
   assert.equal(await run(directory, io, services, (session, options) => { calls++; assert.equal(session.model, 'future-text-model'); assert.equal(options.enableTools, false); return defaultFactory() }), 0)
   assert.equal(calls, 1)
@@ -298,7 +306,7 @@ test('known nonconversation saved or explicit interactive models never construct
 test('a post-write verification failure is disclosed as uncertain storage, never proof the vault is empty', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5.1' }], { available: true })
   services.credentials.save = async (provider, key) => { services.vault.set(provider, key); throw new Error('Read-back could not be verified') }
-  const io = fakeIO(['openai', 'save', false], [], ['/provider', '/exit'], ['fake-key-written-before-verification'])
+  const io = fakeIO([undefined, 'openai', 'save', false], [], ['/provider', '/exit'], ['fake-key-written-before-verification'])
   assert.equal(await run(directory, io, services), 0)
   assert.equal(services.vault.get('openai'), 'fake-key-written-before-verification')
   const uncertain = io.choices.find(c => c.title === 'Key storage could not be verified')
@@ -314,16 +322,16 @@ test('nonstreaming model capability stays effective-only when effort and model c
   assert.deepEqual(seen, [['gpt-5.5-pro', false], ['gpt-5.5-pro', false], ['gpt-5.1', true]])
   assert.equal((await new PreferenceStore(directory).load()).stream, true)
 })
-test('resuming another model does not borrow notes opt-in from future defaults', async t => {
+test('resuming another supported model keeps launch notes intent and supports an explicit opt-out', async t => {
   const directory = await fixture(t), services = fakeServices(), store = new FileSessionStore(directory)
   await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1', enableTools: true, enableNotes: true })
   const original = newSession({ provider: 'openai', model: 'gpt-5', reasoning: 'default' }); await store.save(original)
   assert.equal(await run(directory, fakeIO([], [], ['/exit']), services, (_session, options) => {
-    assert.equal(options.enableTools, true); assert.equal(options.enableNotes, false); return defaultFactory()
+    assert.equal(options.enableTools, true); assert.equal(options.enableNotes, true); return defaultFactory()
   }, ['--resume', original.id]), 0)
   assert.equal(await run(directory, fakeIO([], [], ['/exit']), services, (_session, options) => {
-    assert.equal(options.enableNotes, true); return defaultFactory()
-  }, ['--resume', original.id, '--enable-notes']), 0)
+    assert.equal(options.enableNotes, false); return defaultFactory()
+  }, ['--resume', original.id, '--disable-notes']), 0)
 })
 
 test('optional OpenRouter token-budget reasoning offers explicit disable and preserves its saved none sentinel', async t => {
@@ -331,7 +339,7 @@ test('optional OpenRouter token-budget reasoning offers explicit disable and pre
   const services = fakeServices([{ id: 'vendor/budget-only', supported_parameters: ['reasoning'],
     architecture: { input_modalities: ['text'], output_modalities: ['text'] },
     reasoning: { mandatory: false, supports_max_tokens: true } }])
-  const io = fakeIO(['openrouter', 'temporary', 'vendor/budget-only', 'none'], [],
+  const io = fakeIO([undefined, 'openrouter', 'temporary', 'vendor/budget-only', 'none'], [],
     ['/provider', '/effort', 'Hello', '/exit'], ['fake-budget-key'])
   const seen = []
   assert.equal(await run(directory, io, services, (session, options) => {
@@ -489,7 +497,7 @@ test('TUI manager repeats reviewed actions, refreshes stale revisions, and Back/
 })
 
 test('memory can be enabled or disabled before model setup without reading or creating its store', async t => {
-  const directory = await fixture(t), io = fakeIO(['on', 'off', 'back'], [], ['/memories', '/exit'])
+  const directory = await fixture(t), io = fakeIO([undefined, 'on', 'off', 'back'], [], ['/memories', '/exit'])
   let calls = 0
   assert.equal(await run(directory, io, fakeServices(), () => { calls++; return defaultFactory() }), 0)
   assert.equal(calls, 0); assert.deepEqual(await readdir(directory), [])

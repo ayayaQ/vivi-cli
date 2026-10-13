@@ -5,10 +5,12 @@ Set-StrictMode -Version Latest
 $config = Get-Content -LiteralPath $Configuration -Raw -Encoding UTF8 | ConvertFrom-Json
 # This compiles repository-owned test code, with only official Kernel32 and pinned Microsoft ConPTY APIs.
 $phase = 'Compile'
+Set-Content -LiteralPath ($config.prefix + '.host-phase') -Value $phase -Encoding UTF8
 try {
   # Independently bind the DLL/server bytes to entries inside the hash-pinned
   # official archive. The mutable provenance file is not authority to load code.
   $phase = 'VerifyPinnedArchive'
+  Set-Content -LiteralPath ($config.prefix + '.host-phase') -Value $phase -Encoding UTF8
   $archive = Join-Path $config.backendDirectory 'archive.nupkg'
   $expected = 'eceaafe3bdcc85e95d18666eb647e0b8e7e00af45dbcad7034cdc61c4a29fe74'
   if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
@@ -38,8 +40,10 @@ try {
     }
   } finally { $zip.Dispose() }
   $phase = 'Compile'
+  Set-Content -LiteralPath ($config.prefix + '.host-phase') -Value $phase -Encoding UTF8
   Add-Type -Path (Join-Path $PSScriptRoot 'host.cs')
   $phase = 'Run'
+  Set-Content -LiteralPath ($config.prefix + '.host-phase') -Value $phase -Encoding UTF8
   $result = [ConPtyProbeHost]::Run($config.bun, $config.child, $config.repository, $config.prefix,
     $config.basic, $config.repeats, $config.paste, $config.finish, $config.restore, $config.expectReset,
     $config.backendDirectory, $verifiedHashes['conpty.dll'], $verifiedHashes['OpenConsole.exe'])

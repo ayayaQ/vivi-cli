@@ -1,23 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ModelProvider } from '@ayayaq/vivi'
+import { randomUUID } from 'node:crypto'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import type { CliOptions } from './main.js'
+import { decisionProviderForSession, deferredDecisionProvider } from './main.js'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
+import { FileSkillStore } from './skills.js'
+import { join } from 'node:path'
 import { ReadOnlyWorkspace } from './workspace.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn } from './terminal.js'
+import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
-import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied } from './models.js'
+import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied, hydrateModelCapabilities, modelToolsEnabled } from './models.js'
 import type { Catalog, ModelEntry } from './models.js'
 import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
+import { FileDecisionLedger } from './decision-ledger.js'
+import { McpConfigStore } from './mcp-config.js'
+import { McpManager } from './mcp-manager.js'
+import type { McpManagerOptions } from './mcp-manager.js'
+import { manageMcp } from './mcp-controls.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -26,6 +37,7 @@ export interface InteractiveIO extends ChatIO {
   askSecret?(title: string): Promise<string | undefined>
   addSecrets?(secrets: readonly string[]): void
   setDraft?(provider: CliProviderName): void
+  setComposerDraft?(content: string): void
   setSession(session: CliSession): void
   setWorkspace?(directory?: string): void
 }
@@ -39,9 +51,12 @@ export interface ApplicationOptions {
   catalog?: Catalog
   registerSecret?(secret: string): void
   providerFactory(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider
+  decisionProviderFactory?: typeof decisionProviderForSession
+  /** Trusted launch wiring only; never configured by the model. */
+  mcpManagerFactory?(options: McpManagerOptions): McpManager
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
-  reasoningCapabilities: [], stream: true, enableNotes: false, enableMemory: false, enableTools: false, maxRounds: 25 }
+  reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
 const envName = (provider: CliProviderName): string => provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
 
 export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPreferences {
@@ -49,7 +64,7 @@ export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPr
   const reasoning = same && (base.reasoning === 'default' || model.efforts.includes(base.reasoning as ReasoningEffort))
     ? base.reasoning : 'default'
   return { ...base, model: model.id, reasoning, reasoningCapabilities: [...model.efforts],
-    enableTools: model.tools === 'supported', enableNotes: model.tools === 'supported' && base.enableNotes }
+    enableTools: model.tools === 'supported' }
 }
 export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Promise<TuiPreferences | undefined> {
   if (!base.model) { io.write('Choose a model with /models first\n'); return }
@@ -67,8 +82,13 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
 /memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
+/mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
+Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
+/commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
+/skills lists and inspects standard skills and prepares creator drafts for manual saving.
+/mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
-Mouse: click action buttons, picker rows and dialog choices; wheel scrolls. Approvals select Deny by default.
+Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
 Keys are masked and saved only in an available OS credential store, or used for this launch after your choice.
@@ -76,14 +96,32 @@ Keys are masked and saved only in an available OS credential store, or used for 
 
 /** Navigation and host policy; the shared core owns conversation/tool execution. */
 export async function runApplication(input: ApplicationOptions): Promise<number> {
+  const manager = (input.mcpManagerFactory ?? (options => new McpManager(options)))({
+    store: new McpConfigStore(input.options.sessionDirectory, input.secrets), env: input.env, secrets: input.secrets
+  })
+  try {
+    if (input.options.prompt !== undefined && await runMcpCommand(input.io, input.options.prompt, {
+      mcp: () => manageMcp(manager, input.io, input.options.workspace)
+    })) return 0
+    return await runManagedApplication(input, manager)
+  }
+  finally { await manager.close() }
+}
+
+async function runManagedApplication(input: ApplicationOptions, mcp: McpManager): Promise<number> {
   const { io, options, args, providerFactory } = input
   const env = { ...input.env }
+  const commandEnv = captureCommandEnvironment(input.env)
   const secrets = [...input.secrets]
   const credentials = input.credentials ?? createCredentialStore()
   const catalog = input.catalog ?? new ModelCatalog()
   const store = new FileSessionStore(options.sessionDirectory, secrets)
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
+  const decisions = new FileDecisionLedger(options.sessionDirectory, secrets)
+  const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io.write(`${message}\n`) })
+  let activeSkills = options.enableSkills
+  let activeCommands = options.enableCommands
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
   io.setWorkspace?.(workspace?.directory)
   const knownModels = new Map<string, ModelEntry>()
@@ -91,7 +129,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
   const register = (key: string): void => {
     if (!key || secrets.includes(key)) return
-    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
+    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); decisions.addSecrets([key]); skills.addSecrets([key]); mcp.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
   }
   let settings = structuredClone(DEFAULT_PREFERENCES)
   let savedSettings: TuiPreferences | undefined
@@ -102,7 +140,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     ? options.enableMemory : settings.enableMemory
   if ((options.provider !== undefined && options.provider !== settings.provider) ||
     (options.model !== undefined && options.model !== settings.model)) {
-    settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false }
+    settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false }
   }
   if (args.includes('--provider')) settings.provider = options.provider!
   if (args.includes('--model')) settings.model = options.model!
@@ -113,8 +151,8 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   }
   if (args.includes('--no-stream')) settings.stream = false
   if (args.includes('--tools')) settings.enableTools = true
-  if (args.includes('--no-tools')) { settings.enableTools = false; settings.enableNotes = false }
-  if (args.includes('--enable-notes')) { settings.enableTools = true; settings.enableNotes = true }
+  if (args.includes('--no-tools')) settings.enableTools = false
+  if (args.includes('--enable-notes') || args.includes('--disable-notes')) settings.enableNotes = options.enableNotes
   if (args.includes('--max-rounds')) settings.maxRounds = options.maxRounds
   if (settings.provider === 'openai' && settings.model) {
     const verified = documentedOpenAIModel(settings.model)
@@ -122,14 +160,37 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       const previousEffort = settings.reasoning
       settings = settingsForModel(settings, verified)
       if (previousEffort !== settings.reasoning) io.write('Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n')
-      if (args.includes('--no-tools')) { settings.enableTools = false; settings.enableNotes = false }
+      if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
+        savedSettings.model === settings.model && !savedSettings.enableTools && !args.includes('--tools')) settings.enableTools = false
     }
   }
   const declaredToolTarget = { provider: settings.provider, model: settings.model }
   let host: CliHost | undefined
+  // Opaque launch-owned revisions never expose, derive from or persist credentials.
+  let accountGeneration = randomUUID()
+  let hostAccountGeneration: string | undefined
+  let launchModePending = options.approvalMode === 'auto'
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
-  let selected: { resume?: string; fresh?: boolean } | undefined = options.resume ? { resume: options.resume }
+  let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
+  let sessionCleanupFailed = false
+  const discardCandidate = async (): Promise<void> => {
+    if (!candidate) return
+    try {
+      // Keep the lease while shutdown is unconfirmed: this host may still write.
+      if (!candidate.shutdownConfirmed) { await candidate.host?.shutdown(); candidate.shutdownConfirmed = true }
+      // FileSessionStore's release is one-shot, including failed unlink attempts.
+      if (candidate.releaseFailed) return
+      try { await candidate.release() }
+      catch (error) { candidate.releaseFailed = true; throw error }
+      candidate = undefined
+    } catch (error) {
+      sessionCleanupFailed = true
+      // A secondary cleanup/display failure must not replace the setup error.
+      try { io.write('Candidate session cleanup failed; its session may remain locked\n'); report(error) } catch { /* Preserve the primary error. */ }
+    }
+  }
+  let selected: { resume?: string; fresh?: boolean; preservePlan?: boolean } | undefined = options.resume ? { resume: options.resume }
     : settings.model ? { fresh: true } : undefined
   const loadKey = async (provider: CliProviderName): Promise<string | undefined> => {
     const name = envName(provider)
@@ -150,31 +211,28 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     const dispose = io.onCancel(() => controller.abort())
     try {
       io.write(`Loading ${settings.provider} model capabilities…\n`)
-      const result = await catalog.list(settings.provider, key, controller.signal)
+      const hydrated = await hydrateModelCapabilities(catalog, settings.provider, settings.model, key, controller.signal)
       if (io.isClosed || controller.signal.aborted) return false
+      const result = hydrated.catalog!
       let notice = ''
       for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
-      const model = result.models.find(model => model.id === settings.model)
-      if (model) {
-        const previous = settings
-        settings = settingsForModel(settings, model)
-        // A saved chat-only choice and an explicit launch opt-out remain off.
-        // Unknown tool metadata cannot promote a saved claim into permission;
-        // openSession still requires this launch's explicit --tools declaration.
-        if (model.tools === 'unknown') {
-          settings.enableTools = previous.enableTools; settings.enableNotes = previous.enableNotes
-        }
-        if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
-          savedSettings.model === settings.model && !savedSettings.enableTools &&
-          !args.includes('--tools') && !args.includes('--enable-notes')) {
-          settings.enableTools = false; settings.enableNotes = false
-        }
-        if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
-          settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
-        }
-        if (previous.reasoning !== settings.reasoning) notice += 'Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n'
+      const model = hydrated.model
+      knownModels.set(modelKey(settings.provider, model.id), model)
+      const previous = settings
+      settings = settingsForModel(settings, model)
+      // A saved chat-only choice and an explicit launch opt-out remain off.
+      // Unknown tool metadata cannot promote a saved claim into permission;
+      // openSession still requires this launch's explicit --tools declaration.
+      if (model.tools === 'unknown') settings.enableTools = previous.enableTools
+      if (args.includes('--no-tools') || savedSettings?.provider === settings.provider &&
+        savedSettings.model === settings.model && !savedSettings.enableTools && !args.includes('--tools')) {
+        settings.enableTools = false
       }
-      notice += result.warning ? `${result.warning}. Using a stale cached catalog\n`
+      if (model.reasoning === 'unknown' && args.includes('--reasoning-capabilities')) {
+        settings.reasoning = previous.reasoning; settings.reasoningCapabilities = previous.reasoningCapabilities
+      }
+      if (previous.reasoning !== settings.reasoning) notice += 'Saved reasoning is no longer verified for this model; using provider default. Use /effort to select a supported level\n'
+      notice += result.warning ? `${redactSecrets(result.warning, secrets)}. Using a stale cached catalog\n`
         : result.state === 'cached' ? 'Using the cached model catalog (up to 15 minutes old)\n' : ''
       return notice || undefined
     } catch (error) {
@@ -190,23 +248,25 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       { name: 'OpenAI', description: 'Responses API', value: 'openai' as const },
       { name: 'OpenRouter', description: 'Chat Completions gateway', value: 'openrouter' as const }
     ], base.provider === 'openrouter' ? 1 : 0)
-    if (!provider) return
+    if (!provider || io.isClosed) return
     const current = await loadKey(provider)
+    if (io.isClosed) return
     const action = current ? await io.choose(`${provider} API key`, [
       { name: 'Use current key', description: input.env[envName(provider)] ? 'From your environment; never copied to settings' : 'Already available for this launch', value: 'current' },
       { name: 'Enter a different key', description: 'Masked input; choose storage explicitly', value: 'enter' }
     ]) : 'enter'
-    if (!action) return
+    if (!action || io.isClosed) return
     if (action === 'enter') {
       if (!io.askSecret) { io.write(`Masked key input is unavailable. Set ${envName(provider)} in your environment\n`); return }
       const status = await credentials.status()
+      if (io.isClosed) return
       const mode = await io.choose('API key storage', [
         ...(status.available ? [{ name: `Save in ${status.label}`, description: 'Available on your next launch; never stored in settings or transcripts', value: 'save' }] : []),
         { name: 'Use for this launch only', description: status.available ? 'You’ll need to enter it again next time' : `${status.detail ?? status.label}. No plaintext fallback`, value: 'temporary' }
       ])
-      if (!mode) return
+      if (!mode || io.isClosed) return
       const entered = await io.askSecret(`${provider} API key · masked · Escape cancels`)
-      if (entered === undefined) return
+      if (entered === undefined || io.isClosed) return
       register(entered)
       const key = validateApiKey(entered)
       register(key)
@@ -219,10 +279,18 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           if (!fallback) return
         }
       } else io.write('API key is available for this launch only\n')
+      // A cancelled model picker can follow a real key replacement. Revoke
+      // enrollment immediately and prevent the old host from re-enrolling.
+      if (env[envName(provider)] !== key) {
+        host?.setApprovalMode('manual')
+        io.setApprovalMode?.('manual')
+        accountGeneration = randomUUID()
+        for (const id of knownModels.keys()) if (id.startsWith(`${provider}:`)) knownModels.delete(id)
+      }
       env[envName(provider)] = key
     }
     return provider === base.provider ? { ...base } : { ...base, provider, model: '', reasoning: 'default',
-      reasoningCapabilities: [], enableTools: false, enableNotes: false }
+      reasoningCapabilities: [], enableTools: false }
   }
   const chooseModel = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
     const key = await loadKey(base.provider)
@@ -289,6 +357,18 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     const defaults = { ...next, enableMemory: changeMemoryDefault ? next.enableMemory : settings.enableMemory }
     await preferences.save(defaults); settings = defaults
   }
+  const configureProviderModel = async (): Promise<void> => {
+    const configured = await setupProvider(activeSettings ?? settings)
+    if (!configured || io.isClosed) return
+    const model = await chooseModel(configured)
+    if (io.isClosed) return
+    if (model) { await save(model); selected = { fresh: true, preservePlan: true } }
+    else if (!host && configured.provider !== settings.provider) {
+      // Keep a completed provider choice after cancelling model selection, so
+      // /models can continue setup without a wizard loop or storing credentials.
+      await save(configured); io.setDraft?.(configured.provider)
+    }
+  }
   const configure = async (): Promise<boolean> => {
     const provider = await setupProvider(settings)
     if (!provider) return false
@@ -297,9 +377,9 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     const effort = await chooseEffort(io, model)
     if (!effort) return false
     const notes = effort.enableTools ? await io.choose('Session notes', [
-      { name: 'Keep notes disabled', description: 'Calculator and current time only', value: false },
+      { name: 'Keep notes disabled', description: 'Other supported tools remain available', value: false },
       { name: 'Enable session notes', description: 'Each write requires an allow/deny approval', value: true }
-    ], effort.enableNotes ? 1 : 0) : false
+    ], effort.enableNotes ? 1 : 0) : effort.enableNotes
     if (notes === undefined) return false
     const enableMemory = await io.choose('Persistent memory default · future launches', [
       { name: 'Keep memory disabled by default', description: 'No saved memory is read or sent unless you enable it', value: false },
@@ -367,14 +447,63 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       // Reload after approval, cancellation or conflicts; never reuse a stale edit revision.
     }
   }
-  const openSession = async (selection: { resume?: string; fresh?: boolean }): Promise<boolean> => {
+  const manageSkills = async (): Promise<void> => {
+    io.write(`${SKILLS_DISCLOSURE}\n`)
+    for (;;) {
+      if (io.isClosed) return
+      let snapshot: Awaited<ReturnType<CliHost['listSkills']>> | undefined
+      if (activeSkills) {
+        try { snapshot = await skills.snapshot(); displaySkills(io, snapshot, skills.diagnostics) }
+        catch (error) { report(error) }
+      }
+      const action = await io.choose(`Skills · ${activeSkills ? 'enabled' : 'disabled'} for this launch`, [
+        { name: 'Back', description: 'Return to the conversation', value: 'back' },
+        { name: activeSkills ? 'Disable for this launch' : 'Enable for this launch', description: SKILLS_DISCLOSURE, value: 'toggle' },
+        ...(activeSkills ? [{ name: 'Refresh skills', description: 'Reload metadata and diagnostics', value: 'refresh' },
+          ...(snapshot?.skills.length ? [{ name: 'Inspect SKILL.md', description: 'View exact source as inert text', value: 'inspect' }] : []),
+          { name: 'Create with agent', description: 'Put a manual-save draft request in the composer', value: 'create' }] : [])
+      ])
+      if (action === undefined || action === 'back') return
+      if (action === 'toggle') { activeSkills = !activeSkills; host?.setSkillsEnabled(activeSkills); continue }
+      if (action === 'inspect' && snapshot) {
+        const name = await io.choose('Inspect a skill', [{ name: 'Back', value: '' },
+          ...snapshot.skills.map(skill => ({ name: skill.name, description: `${skill.readOnly ? 'read only · ' : ''}${skill.description}`, value: skill.name }))])
+        if (name) {
+          const content = snapshot.document(name)!.content
+          const pages = Math.max(1, Math.ceil(content.length / 8192))
+          let page = 0
+          for (;;) {
+            io.write(`SKILL.md ${JSON.stringify(name)} · page ${page + 1}/${pages} (inert exact-source portion):\n${JSON.stringify(content.slice(page * 8192, (page + 1) * 8192))}\n`)
+            const navigation = await io.choose('Inspect SKILL.md', [{ name: 'Close', value: 'close' },
+              ...(page > 0 ? [{ name: 'Previous page', value: 'previous' }] : []),
+              ...(page + 1 < pages ? [{ name: 'Next page', value: 'next' }] : [])])
+            if (navigation === undefined || navigation === 'close') break
+            page += navigation === 'next' ? 1 : -1
+          }
+        }
+      } else if (action === 'create') {
+        if (!host) { io.write('Choose a provider and model before drafting a skill\n'); continue }
+        const description = await io.askText('What should the new skill do? · Escape cancels')
+        if (description?.trim()) {
+          const prompt = skillCreationPrompt(description)
+          if (io.setComposerDraft) io.setComposerDraft(prompt)
+          else io.write(`Send this request to draft the skill:\n${prompt}\n`)
+          return
+        }
+      }
+    }
+  }
+  const openSession = async (selection: { resume?: string; fresh?: boolean; preservePlan?: boolean }): Promise<boolean> => {
     if (!selection.resume && !settings.model) return false
     const capabilityNotice = selection.resume ? undefined : await hydrateModel()
     if (capabilityNotice === false) return false
     await host?.drainMemory()
+    await host?.drainSkills()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
     const nextRelease = await store.acquire(selection.resume ?? fresh!.id)
-    let nextHost: CliHost
+    candidate = { release: nextRelease }
+    let nextHost: CliHost, nextSettings: TuiPreferences
+    const previousRelease = release, previousHost = host
     try {
       const session = selection.resume ? await store.load(selection.resume) : fresh!
       const sameModel = session.provider === settings.provider && session.model === settings.model
@@ -388,37 +517,60 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         const declared = await io.choose(`Resume requires verified support for reasoning '${session.reasoning}'`, [
           { name: 'Cancel resume', value: false }, { name: 'I verified this model supports that effort', value: true }
         ])
-        if (!declared) { await nextRelease(); return false }
+        if (!declared) { await discardCandidate(); return false }
         capabilities = [session.reasoning as ReasoningEffort]
       }
-      const declaredTools = (args.includes('--tools') || args.includes('--enable-notes')) &&
+      const declaredTools = args.includes('--tools') &&
         (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model)
-      const enableTools = !args.includes('--no-tools') && metadata?.tools !== 'unsupported' &&
-        (metadata?.tools === 'supported' ? !sameModel || settings.enableTools : declaredTools)
+      const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
+        declared: declaredTools, enabled: !sameModel || settings.enableTools })
       const effective: CliOptions = { ...options, reasoningCapabilities: capabilities,
         stream: metadata?.streaming === 'unsupported' ? false : settings.stream,
-        enableTools, enableNotes: enableTools && (sameModel ? settings.enableNotes : explicitResume && args.includes('--enable-notes')),
-        enableMemory: activeMemory,
+        enableTools, enableNotes: enableTools && settings.enableNotes,
+        enableMemory: activeMemory, enableSkills: activeSkills,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
-      if (io.isClosed) { await nextRelease(); return false }
+      if (io.isClosed) { await discardCandidate(); return false }
       const provider = providerFactory(session, effective, env)
-      if (io.isClosed) { await nextRelease(); return false }
-      nextHost = new CliHost({ provider, store, session, secrets, enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableMemory: activeMemory, memory, ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
+      if (io.isClosed) { await discardCandidate(); return false }
+      nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
+        enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
+        ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
+          isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),
         onMemoryNotice: message => io.write(`${message}\n`),
+        onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
+        ...(io.canAutoReview === true ? { decisionReview: {
+          provider: deferredDecisionProvider(session, env, input.decisionProviderFactory ?? decisionProviderForSession),
+          ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
+          isAvailable: () => io.canAutoReview === true && !io.isClosed
+        } } : {}),
+        ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
+          ask: (request, { signal }) => io.askQuestions!(request, signal),
+          isAvailable: () => io.canAskQuestions === true && !io.isClosed,
+          accountRevision: () => accountGeneration
+        } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
-      await store.save(nextHost.session)
+      candidate.host = nextHost
+      if (selection.preservePlan && previousHost?.taskMode === 'plan') nextHost.setTaskMode('plan')
+      await nextHost.initialize()
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
-      if (io.isClosed) { await nextRelease(); return false }
-      activeSettings = { ...settings, provider: session.provider, model: session.model,
+      if (io.isClosed) { await discardCandidate(); return false }
+      nextSettings = { ...settings, provider: session.provider, model: session.model,
         reasoning: session.reasoning ?? 'default', reasoningCapabilities: [...capabilities],
-        enableTools: effective.enableTools, enableNotes: effective.enableNotes }
-    } catch (error) { await nextRelease().catch(report); throw error }
-    const previousRelease = release
-    release = nextRelease; host = nextHost
+        enableTools: effective.enableTools, enableNotes: settings.enableNotes }
+      try { await previousHost?.shutdown() }
+      catch (error) { sessionCleanupFailed = true; throw error }
+      if (io.isClosed) { await discardCandidate(); return false }
+    } catch (error) { await discardCandidate(); throw error }
+    release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
+    activeSettings = nextSettings; candidate = undefined
     await previousRelease?.().catch(report)
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setSession(host.session)
+    io.setTaskMode?.(host.taskMode)
+    io.setApprovalMode?.('manual')
+    io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; Auto review enrollment revoked\n' : 'Approval mode: Manual\n')
     // Native transcript setup clears earlier loading output. Keep stale-cache
     // disclosure visible after that rebuild and before the first provider turn.
     if (capabilityNotice) io.write(capabilityNotice)
@@ -426,6 +578,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
   }
   let workspaceNoticePending = true
   try {
+    if (activeSkills) io.write(`${SKILLS_DISCLOSURE}\n`)
     if (activeMemory) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {
@@ -433,17 +586,31 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       else io.setSession(newSession({ provider: settings.provider, model: 'Choose a model with /models' }))
     }
     if (!settings.model) io.write('vivi · fresh conversation · use /provider to set up, then /models and /effort\n')
+    // Offer the existing minimal setup once per unconfigured interactive launch.
+    // Cancellation returns to a clean composer; explicit commands can retry.
+    if (!settings.model && !options.resume && options.prompt === undefined && !io.isClosed) {
+      try { await configureProviderModel() } catch (error) { report(error) }
+    }
     for (;;) {
       if (io.isClosed) { if (io.failed) await io.readLine(''); return 0 }
       if (selected) {
         try { await openSession(selected) } catch (error) { report(error); if (options.prompt !== undefined) return 1 }
+        // A failed shutdown may have partially revoked its owner. Do not run again.
+        if (sessionCleanupFailed) return 1
         selected = undefined
       }
       if (io.isClosed) continue
+      if (launchModePending && host) {
+        launchModePending = false
+        await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+      } else if (launchModePending && io.canAutoReview !== true) {
+        launchModePending = false
+        io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
+      }
       // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
-        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
       }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
@@ -466,7 +633,11 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
+          { name: 'Mode', description: 'Manual / Auto review / Plan', value: '/mode' },
+          { name: 'Trusted commands', value: '/commands' },
           { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
+          { name: 'Skills', value: '/skills' },
+          { name: 'MCP connections', description: 'Trusted installed servers; human-reviewed tools and resource reads', value: '/mcp' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
         if (!action || action === 'continue') continue
@@ -492,24 +663,47 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
           continue
         }
         if (command === '/provider') {
-          const configured = await setupProvider(activeSettings ?? settings)
-          if (configured) {
-            const model = await chooseModel(configured)
-            if (model) { await save(model); selected = { fresh: true } }
-            else if (!host) { await save(configured); io.setDraft?.(configured.provider) }
-          }
+          await configureProviderModel()
           continue
         }
-        if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true } }; continue }
-        if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true } }; continue }
+        if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
+        if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
+        if (command === '/skills') { await manageSkills(); continue }
+        if (isMcpCommand(command)) {
+          await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace) })
+          continue
+        }
         if (command === '/memories') { await manageMemories(); continue }
+        if (/^\/commands(?:\s|$)/.test(command)) {
+          if (!host && /^\/commands\s+off$/.test(command)) {
+            activeCommands = false
+            io.write('Command proposals disabled for this launch\n')
+            continue
+          }
+          if (!host) { io.write('Choose a provider and model before enabling trusted commands\n'); continue }
+          await runCommandControl(host, io, command)
+          if (/^\/commands\s+off$/.test(command)) activeCommands = false
+          else if (/^\/commands\s+on$/.test(command) && host.commandsEnabled) activeCommands = true
+          continue
+        }
+        if (/^\/mode(?:\s|$)/.test(command)) {
+          if (!host) { io.write('Choose a provider and model before selecting approval mode\n'); continue }
+          if (hostAccountGeneration !== accountGeneration && command !== '/mode plan' && command !== '/mode manual' &&
+            !(command === '/mode cycle' && host.taskMode === 'plan')) {
+            host.setApprovalMode('manual'); io.setApprovalMode?.('manual')
+            io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling Auto review again\n')
+            continue
+          }
+          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+          continue
+        }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
-          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch\n` : 'Workspace: disabled\n')
+          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           continue
         }
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }
@@ -521,5 +715,18 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
         finally { dispose() }
       } catch (error) { report(error) }
     }
-  } finally { try { await host?.drainMemory() } finally { await release?.() } }
+  } finally {
+    await discardCandidate()
+    if (sessionCleanupFailed) {
+      // Preserve the original failure and keep any incompletely shut-down owner locked.
+      const reportCleanup = (error: unknown): void => { try { report(error) } catch { /* Preserve the primary error. */ } }
+      let shutdownConfirmed = false
+      try { await host?.shutdown(); shutdownConfirmed = true }
+      catch (error) { reportCleanup(error) }
+      await skills.drain({ close: true }).catch(reportCleanup)
+      if (shutdownConfirmed) await release?.().catch(reportCleanup)
+    } else {
+      try { await host?.shutdown(); await skills.drain({ close: true }) } finally { await release?.() }
+    }
+  }
 }

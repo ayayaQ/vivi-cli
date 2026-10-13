@@ -93,6 +93,25 @@ const label = (value: unknown, fallback: string): string => typeof value === 'st
 export function unknownModel(id: string): ModelEntry {
   return { id, name: id, tools: 'unknown', conversation: 'unknown', streaming: 'unknown', efforts: [], reasoning: 'unknown', reasoningMandatory: false, source: 'Capability metadata unavailable' }
 }
+export interface HydratedModel { model: ModelEntry; catalog?: CatalogResult }
+/** Resolve exact startup metadata through the same bounded catalog used by /models.
+ * Missing entries remain unknown; a launch declaration is never catalog evidence. */
+export async function hydrateModelCapabilities(catalog: Catalog, provider: CliProviderName, id: string,
+  apiKey?: string, signal?: AbortSignal): Promise<HydratedModel> {
+  if (signal?.aborted) throw new ModelCatalogError('Model loading cancelled')
+  if (provider === 'openai') return { model: documentedOpenAIModel(id) }
+  const result = await catalog.list(provider, apiKey, signal)
+  if (signal?.aborted) throw new ModelCatalogError('Model loading cancelled')
+  return { model: result.models.find(model => model.id === id) ?? unknownModel(id), catalog: result }
+}
+/** Verified support can enable tools by default; unknown support requires a fresh
+ * host declaration. An explicit opt-out or verified incompatibility always wins. */
+export function modelToolsEnabled(model: ModelEntry | undefined, policy: {
+  disabled?: boolean; declared?: boolean; enabled?: boolean
+} = {}): boolean {
+  if (policy.disabled || model?.tools === 'unsupported') return false
+  return model?.tools === 'supported' ? policy.enabled !== false : policy.declared === true
+}
 function applyCapabilities(model: ModelEntry, shared: ModelCapabilities): void {
   if (shared.tools !== 'unknown') model.tools = shared.tools
   if (shared.chat !== 'unknown') model.conversation = shared.chat

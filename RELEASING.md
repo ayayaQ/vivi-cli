@@ -4,18 +4,54 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.5.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.9.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
-dependency, including its source, LICENSE, NOTICE and attribution records, so the shared core needs no separate registry request. OpenTUI and its native platform
+dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
 dependencies remain registry dependencies; offline installs need a populated npm cache.
 
 ## Shared registry dependency
 
-The published shared vivi `0.5.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.9.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
+The verified registry tarball is 233,863 bytes (262 files), SHA-256
+`50ce7d16682214ce2053f79dbb3d6a01f0a8ea6cb495b263009463121e4fe88e`.
+The shared MCP catalog, preparation and result projection helpers are consumed
+from the registry. Its exact `yaml@2.9.1` dependency and unchanged
+reviewed integrity are bundled transitively and checked alongside the core.
+
+MCP startup, exact human approval, transport writes and recovery remain host-owned.
+`FileSessionStore` uses bounded, private per-session outcome evidence to preserve
+cancellation and uncertain sends across failed transcript checkpoints. A custom
+session store must supply `mcpOutcomes: McpOutcomeStore` before external MCP sends;
+otherwise the host fails closed. Embedders constructing `CliHost` directly should
+await `initialize()` before displaying recovered history; `create()` and `resume()`
+do this themselves.
+
+Public URL GET tools similarly require durable `publicUrlOutcomes` evidence; file
+sessions supply a private sidecar automatically. Recovery never restores approval
+or replays a send. URL fixtures exercise the real host, bounded extractor and
+controlled DNS/TLS/HTTP dependencies on Node and Bun, including Windows CI;
+external-site routing, real model judgments and native terminal acceptance remain
+separate evidence.
+
+Auto review is a separate host opt-in with Manual as the launch/session default.
+Its fixed-provider numeric gates are initial host heuristics, not calibrated model
+accuracy or equivalent cross-provider probabilities. Offline adversarial fixtures
+verify binding, cancellation, privacy vetoes, manual fallbacks and persistence;
+they do not establish real-model accuracy. Provider-specific labeled evaluation
+is needed before any broader rollout or scope expansion. There are no live API
+calls or credentials in the automated tests. See README for enrollment and limits.
+The fresh Auto confirmation names OpenAI, or OpenRouter plus TypeSafe, and asks
+for bounded sharing consent for the exact request/proposal text, including eligible
+agent proposals the user did not request, to assess whether they authorized the exact
+change. This text can contain
+personal or sensitive details. Known credentials are excluded and recognized
+sensitive content stays Manual. Lexical detection is incomplete; the disclosure
+does not claim a privacy guarantee. Consent is versioned and bound to the current
+conversation/account; a changed or cancelled enrollment cannot authorize a save.
 
 The optional shared `providers/models` module normalizes capability facts for OpenAI
 Responses and OpenRouter Chat Completions. The CLI retains its 52 documented OpenAI
@@ -61,7 +97,7 @@ provider construction; there is no fallback to the install or profile directory.
 Library `CliHost` construction remains explicit-only and gets no ambient cwd access.
 The shared core
 does not load extensions or own filesystem policy. The CLI reserves `workspace_list`,
-`workspace_read` and `workspace_search` even when disabled, and advertises/executed
+`workspace_read`, `workspace_search` and `workspace_glob` even when disabled, and advertises/executed
 tools share a fixed registry. Tool support gating remains unchanged: selecting a
 folder alone does not declare unknown model support. Chat-only turns neither expose
 workspace tools nor add their guidance. Folder roots are not in preferences or
@@ -99,9 +135,24 @@ results, and host checks reject known credentials before each provider request,
 including decoded workspace results from resumed history. This does not detect all
 unknown credentials or other sensitive data.
 
+`workspace_glob` uses exact MIT registry dependency `picomatch@4.0.7` only for
+matching names after the existing read-policy checks. It matches files, not
+directories or contents, so binary and oversized file names can match without
+granting text-read access. Patterns are relative to the optional `path`; results
+are workspace-relative. Matching is case-sensitive and forward-slash-only on
+every OS, including dotfiles permitted by the read policy. Patterns are bounded
+to 200 characters; `*` stays inside one component, `?` matches one UTF-16 code unit,
+and standalone `**` spans zero or more components. Escapes, double quotes, negation,
+brackets, braces, extglobs and regex are refused. Glob defaults are depth 8 and 50 results.
+One worker per operation runs fixed matcher code with the compiled expression
+and one permitted name at a time. The operation deadline or cancellation terminates
+the worker and discards partial results; every completion/failure closes it. This
+is a responsiveness bound, not a filesystem sandbox. The dependency's MIT license
+remains in its registry installation and local standalone notices.
+
 Hard limits: 8 traversal levels per operation, 1,000 examined directory entries,
-200 search files, 256 KiB per file, 2 MiB searched bytes, 8 KiB read output, 56 KiB
-serialized result output, 100 list entries, 50 matched search lines, 200 requested
+200 search/glob files, 256 KiB per text file, 2 MiB searched bytes, 8 KiB read output, 56 KiB
+serialized result output, 100 list/glob entries, 50 matched search lines, 200 requested
 read lines and 10 seconds. Budgets are checked between bounded filesystem calls;
 cancellation cannot interrupt an OS filesystem call already in progress, but its
 late result is discarded and handles are closed. There are no writes or replays.
@@ -126,9 +177,11 @@ canonical session history, so edits/deletes do not leave obsolete saved snapshot
 The shared `extensions/memory` API supplies v1 codecs, limits, revisions, prepared
 mutations and static tools. The CLI owns fresh disk loads, an app-wide commit lease,
 backup/evidence recovery, atomic durability, explicit review and shutdown draining.
-Every create/edit/delete requires a fresh human approval (select Approve in the
-full-screen UI, or type allow in line mode); pipe, EOF and cancellation
-default to denial. Memory context remains available in chat-only mode, but memory
+Every create/edit/delete requires host review. Manual is the default; explicitly
+enrolled eligible agent create/edit may use Auto review. Manager changes and
+deletion always require fresh human approval (select Approve in the full-screen
+UI, or type allow in line mode); pipe, EOF and cancellation default to denial.
+Memory context remains available in chat-only mode, but memory
 tools are omitted when tools are disabled or their support is unverified. Records
 are retained when the feature is disabled. No notes migration, embeddings or
 automatic summarization is added.
@@ -199,3 +252,32 @@ notice collection is an aid, not a substitute for that release review. No binari
 or native archives are vendored into Git, and no executable publishing workflow is
 enabled. npm publication, GitHub publication and binary release remain separately
 authorized operations.
+
+## Agent Skills adoption checks
+
+Skills use the pinned vivi 0.9.0 extension without changes to its shared agent loop.
+Run ordinary skills store, host, manager, native headless UI, package, and standalone checks
+with the current main checks. Automatic saving is disabled on every platform. Confirm
+only list/read tools are exposed, creator drafts describe manual saving, and all sources
+remain read-only. Prior restricted assessments stay unconditionally skipped; passing
+ordinary checks does not complete that stopped review or accept automatic skill saves.
+Actual Windows and macOS behavior is verified only when the relevant platform ran.
+
+## Trusted command checks
+
+Commands require launch/session workspace trust and fresh human approval for every
+start, including Auto. Check exact argv, immutable minimal environment, current-run
+IDs, bounded output, timeout/cancel and inherited process-tree cleanup. Windows uses
+the built-in PowerShell helper with its own fixed OS module path and exact Utility
+manifest import; the approved target environment is unchanged. No precompiled helper
+or additional persistent access is used.
+
+Run command mock/host/process tests plus actual Windows lifecycle fixtures on both
+Node 26.4 and current Node 26. The ordinary unchanged Windows PowerShell 5.1 cmdlet
+fixture uses a 50-second explicitly approved request within the existing 5-minute
+maximum because the controlled direct-host baseline also spent about 27 seconds on
+first-use module preparation. It requires exit 0, exact stdout and only completed
+first-use progress CLIXML; the 30-second default and shorter timeout/cleanup gates
+stay unchanged. Installed Node/Bun and compiled consumer tests use the same private
+canonical npm archive. These checks do not claim real-user terminal/vault behavior,
+hostile-code isolation, macOS cleanup or live-provider accuracy.

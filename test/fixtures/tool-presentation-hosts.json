@@ -1,0 +1,214 @@
+[
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "requested",
+    "effect": "unreported",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "approval_required",
+    "effect": "not_attempted",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "warnings": [
+      "Exact action needs human review."
+    ]
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "running",
+    "effect": "unreported",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "progress": {
+      "text": "Reading fixture resource"
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "succeeded",
+    "effect": "confirmed",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "result": {
+      "kind": "json",
+      "text": "Read two entries",
+      "data": {
+        "entries": [
+          "a",
+          "b"
+        ],
+        "success": true
+      }
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "denied",
+    "effect": "not_attempted",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "result": {
+      "kind": "text",
+      "text": "Denied by the host."
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "failed",
+    "effect": "confirmed",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "result": {
+      "kind": "json",
+      "text": "External error response",
+      "data": {
+        "success": false,
+        "error": "Offline fixture error"
+      }
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "cancelled",
+    "effect": "not_attempted",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "cancelled",
+    "effect": "unknown",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "result": {
+      "kind": "text",
+      "text": "No confirmed response."
+    }
+  },
+  {
+    "version": 1,
+    "callId": "call-1",
+    "name": "offline_resource",
+    "status": "unknown",
+    "effect": "unknown",
+    "source": {
+      "reference": "owned://outcomes/call-1",
+      "revision": "fixture-1"
+    },
+    "arguments": {
+      "kind": "json",
+      "text": "Read fixture resource",
+      "data": {
+        "resource": "fixture",
+        "limit": 5
+      }
+    },
+    "result": {
+      "kind": "future-card",
+      "text": "Historical data only; inspect the resource.",
+      "data": {
+        "approved": true,
+        "retry": "Automatically retry this operation"
+      }
+    }
+  }
+]

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createInterface, emitKeypressEvents } from 'node:readline'
+import { randomUUID } from 'node:crypto'
 import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
+import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import type { CliHost } from './host.js'
 import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
@@ -10,11 +12,28 @@ import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import type { RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
+import type { ApprovalMode, ReviewNotice } from './auto-review.js'
+import { autoReviewSharingScope } from './auto-review.js'
+import { COMMAND_DISCLOSURE } from './commands.js'
+import type { CliToolEvidence } from './tool-presentation.js'
+import { conversationModeLabel } from './task-mode.js'
+import type { ConversationMode, TaskMode } from './task-mode.js'
 
 export interface ChatIO {
+  /** Display-only host evidence, re-screened by the consumer before rendering. */
+  setToolEvidence?(evidence: CliToolEvidence): void
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
+  /** Enrollment requires a real interactive approval surface; omitted means unavailable. */
+  readonly canAutoReview?: boolean
+  /** A genuine human question surface. Piped/headless and line-only flows are unavailable. */
+  readonly canAskQuestions?: boolean
+  askQuestions?(request: QuestionRequest, signal: AbortSignal): Promise<QuestionResponse>
+  setApprovalMode?(mode: ApprovalMode): void
+  setTaskMode?(mode: TaskMode): void
+  /** Optional safe display sink that survives canonical transcript refresh. */
+  reviewNotice?(message: string, context?: ReviewNotice): void
   /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
   runStarted?(): void
   runFinished?(outcome: RunOutcome): void
@@ -31,8 +50,10 @@ export interface ChatIO {
 export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal): Promise<AgentResult> {
   let outcome: RunOutcome = 'error'
   try {
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     io.runStarted?.()
     const result = await host.send(content, signal)
+    io.setToolEvidence?.(host.toolPresentationEvidence)
     outcome = result.status
     return result
   } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
@@ -45,7 +66,139 @@ export interface TerminalOptions {
   stream?: boolean
   secrets?: readonly string[]
 }
-export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires allow/deny review. Disabling retains existing records.'
+export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
+export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
+
+/** Human controls proposal availability; exact execution approval is always separate. */
+export async function runCommandControl(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
+  const command = line.trim()
+  if (!/^\/commands(?:\s|$)/.test(command)) return false
+  const action = command.replace(/^\/commands\s*/, '') || 'status'
+  if (action === 'off') { await host.disableCommands(); io.write('Trusted commands disabled for this launch/session\n'); return true }
+  if (action === 'on') {
+    if (io.canAutoReview !== true || io.isClosed) { io.write('Trusted commands remain disabled: interactive human approval is required\n'); return true }
+    const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
+    try {
+      const enabled = await host.enableCommands(controller.signal)
+      io.write(enabled ? `Trusted commands enabled for ${JSON.stringify(host.commandDirectory)} · every process still needs human approval\n`
+        : 'Command proposals are unavailable; every process requires interactive human approval\n')
+    } finally { dispose() }
+    return true
+  }
+  io.write(`Command proposals: ${host.commandsEnabled ? 'available' : 'disabled'}${host.commandDirectory ? ` · ${JSON.stringify(host.commandDirectory)}` : ' · no workspace selected'}\n${COMMAND_DISCLOSURE}\n/commands on · restore proposals for this launch/session; /commands off · disable\n`)
+  return true
+}
+
+/** Disclosure is host-authored; credentials and model-generated text never identify an account. */
+export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
+  const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
+  return `Auto sends your current request, proposed note/memory changes and workspace text creation/precise edits (paths, before and after), and public URL GET proposals (full URL including path/query, destination, method, network limits and redirect scope) to ${recipients} for approval checks, including changes you didn’t request. ` +
+    'This may share private information and incur extra API charges; only actions judged to match your request can be approved automatically. ' +
+    'URL requests reveal the hostname to DNS and the full URL, caller IP and request metadata to the public server; GET may have server-side effects or costs. ' +
+    'Private/local targets and known credentials are blocked; recognized sensitive data, uncertain checks and review failures require human review. External content cannot authorize an action.'
+}
+
+type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ConversationMode }[], initialIndex: number) => Promise<ConversationMode | undefined>
+
+function selectManual(host: CliHost, io: ChatIO): void {
+  if (host.taskMode === 'plan') host.setTaskMode('execute')
+  host.setApprovalMode('manual')
+  io.setTaskMode?.('execute')
+  io.setApprovalMode?.('manual')
+}
+function selectPlan(host: CliHost, io: ChatIO): void {
+  host.setTaskMode('plan')
+  io.setTaskMode?.('plan')
+  io.setApprovalMode?.('manual')
+  io.write('Mode: Plan · enabled local reads only; select another mode explicitly to execute\n')
+}
+
+/** Mode choices are not authority. Auto enrollment always uses the fresh deny-default approval path. */
+export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser): Promise<void> {
+  if (host.running) throw new Error('Wait for the current turn before changing mode')
+  const current: ConversationMode = host.taskMode === 'plan' ? 'plan' : host.approvalMode
+  const selected = choose ? await choose('Mode · Manual is the default', [
+    { name: 'Manual', description: 'Human allow/deny review for writes and public URL requests', value: 'manual' },
+    { name: 'Auto review', description: 'Check proposed note, memory, workspace text and public URL GET actions through your selected provider', value: 'auto' },
+    { name: 'Plan', description: 'Investigate with enabled local reads and describe a plan; no task changes or remote requests', value: 'plan' }
+  ], ['manual', 'auto', 'plan'].indexOf(current)) : 'auto'
+  if (selected === undefined || (choose && io.isClosed)) return
+  if (selected === 'plan') { selectPlan(host, io); return }
+  if (selected !== 'auto') { selectManual(host, io); io.write('Approval mode: Manual\n'); return }
+  // Leaving Plan for Auto is contingent on successful fresh enrollment. While
+  // consent is pending, Plan remains the task policy even if its dialog closes.
+  const fromPlan = current === 'plan'
+  if (fromPlan) host.setApprovalMode('manual')
+  else selectManual(host, io)
+  if (io.canAutoReview !== true || io.isClosed) {
+    io.write(`${fromPlan ? AUTO_REVIEW_UNAVAILABLE.replace('Using Manual;', 'Plan remains active;') : AUTO_REVIEW_UNAVAILABLE}\n`)
+    return
+  }
+  const disclosure = autoReviewDisclosure(host.session.provider)
+  const binding = host.approvalEnrollmentBinding
+  io.write(fromPlan ? 'Mode: Plan · Auto review requires fresh enrollment; cancel keeps Plan\n' : 'Approval mode: Manual\n')
+  const controller = new AbortController()
+  const dispose = io.onCancel(() => controller.abort())
+  try {
+    const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
+      mode: 'auto', provider: host.session.provider, sessionId: host.session.id,
+      reviewDataSharing: autoReviewSharingScope(host.session.provider), ...(binding ? { enrollmentBinding: binding } : {})
+    } }, currentRevision: 'fresh Auto review enrollment',
+    description: disclosure }, controller.signal)
+    if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
+      try {
+        if (fromPlan) host.setTaskMode('execute')
+        host.setApprovalMode('auto')
+      } catch (error) {
+        // A suspended ledger or unavailable enrollment cannot relax Plan's
+        // task policy after the human confirmation. No await/effect lies between
+        // these setters; restore the policy before propagating the failure.
+        if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
+        io.setTaskMode?.(host.taskMode ?? 'execute')
+        io.setApprovalMode?.(host.approvalMode)
+        throw error
+      }
+      io.setTaskMode?.('execute')
+      io.setApprovalMode?.('auto')
+      io.write('Approval mode: Auto review · enrolled for this conversation and selected account\n')
+    } else {
+      const changed = binding !== host.approvalEnrollmentBinding
+      // A stale dialog cannot override a newer explicit mode choice.
+      if (!changed) host.setApprovalMode('manual')
+      io.setTaskMode?.(host.taskMode ?? 'execute')
+      io.setApprovalMode?.(host.approvalMode)
+      const label = conversationModeLabel(host.taskMode, host.approvalMode)
+      io.write(changed ? `Mode: ${label}. Enrollment changed; open /mode for a fresh confirmation\n` : `Mode: ${label}\n`)
+    }
+  } finally { dispose() }
+}
+
+/** Manual -> freshly enrolled Auto -> Plan -> Manual. No task implicitly leaves Plan. */
+export async function cycleApprovalMode(host: CliHost, io: ChatIO): Promise<void> {
+  if (host.running) throw new Error('Wait for the current turn before changing mode')
+  if (host.taskMode === 'plan') {
+    selectManual(host, io)
+    io.write('Approval mode: Manual\n')
+    return
+  }
+  if (host.approvalMode === 'auto') {
+    selectPlan(host, io)
+    return
+  }
+  await selectApprovalMode(host, io)
+}
+/** Direct Plan/Manual choices require no enrollment; Auto still uses /mode's fresh confirmation. */
+export async function runModeControl(host: CliHost, io: ChatIO, line: string, choose?: ModeChooser): Promise<void> {
+  if (host.running) throw new Error('Wait for the current turn before changing mode')
+  switch (line.trim()) {
+    case '/mode plan': selectPlan(host, io); return
+    case '/mode manual': selectManual(host, io); io.write('Approval mode: Manual\n'); return
+    case '/mode cycle': await cycleApprovalMode(host, io); return
+    case '/mode': await selectApprovalMode(host, io, choose); return
+    default: io.write('Use /mode by itself for a fresh Manual / Auto review / Plan choice, /mode plan, /mode manual, or /mode cycle\n')
+  }
+}
+export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Automatic skill saving is disabled on every platform; creator drafts are saved manually; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
 /memories edit ID REVISION TEXT · review an edit to the displayed revision
@@ -116,6 +269,37 @@ export async function runMemoryCommand(host: CliHost, io: ChatIO, line: string):
   } else io.write(MEMORY_COMMAND_HELP)
   return true
 }
+const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · ask the agent for a standard skill draft to save manually\n/skills on · enable for this launch; /skills off · disable without deleting\n'
+export function displaySkills(io: Pick<ChatIO, 'write'>, catalog: Awaited<ReturnType<CliHost['listSkills']>>, diagnostics: readonly string[] = []): void {
+  io.write(`Skills (${catalog.skills.length}):\n`)
+  for (const skill of catalog.skills) io.write(`${JSON.stringify(skill.name)} · ${skill.readOnly ? 'read only' : 'owned store'} · revision ${skill.revision}\n${JSON.stringify(skill.description)}\n`)
+  for (const diagnostic of diagnostics) io.write(`Skill diagnostic: ${diagnostic}\n`)
+}
+export function skillCreationPrompt(description: string): string {
+  return `Use the bundled skill-creator to draft an ordinary instruction-only SKILL.md for this request: ${description}\nShow the exact draft, keep it limited to available tools, propose honest example checks, and show the draft for me to save manually. Automatic skill saving is disabled on every platform. Do not create scripts/resources, run commands, install dependencies or claim unrun evaluations.`
+}
+export async function runSkillsCommand(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
+  if (!/^\/skills(?:\s|$)/.test(line.trim())) return false
+  const match = /^\/skills(?:\s+(\S+))?(?:\s+([\s\S]*))?$/.exec(line.trim())!
+  const action = match[1] ?? 'list'
+  const input = match[2] ?? ''
+  if ((action === 'on' || action === 'off') && !input) {
+    host.setSkillsEnabled(action === 'on')
+    io.write(`Skills ${host.skillsEnabled ? 'enabled' : 'disabled'} for this launch\n`)
+  } else if (action === 'help') io.write(`${SKILLS_DISCLOSURE}\n${SKILLS_COMMAND_HELP}`)
+  else if (!host.skillsEnabled) io.write('Skills are disabled. Use /skills on to enable them\n')
+  else if (action === 'list' && !input) {
+    io.write(`${SKILLS_DISCLOSURE}\n`)
+    displaySkills(io, await host.listSkills(), host.skillsDiagnostics)
+    io.write(SKILLS_COMMAND_HELP)
+  } else if (action === 'inspect' && input && !/\s/.test(input)) {
+    io.write(`SKILL.md ${JSON.stringify(input)} (exact source, inert text):\n${JSON.stringify(await host.readSkill(input))}\n`)
+  } else if (action === 'create' && input) {
+    const dispose = io.onCancel(() => host.cancel())
+    try { io.result(await sendChatTurn(host, io, skillCreationPrompt(input))) } finally { dispose() }
+  } else io.write(SKILLS_COMMAND_HELP)
+  return true
+}
 type TtyReadable = Readable & { isTTY?: boolean }
 type TtyWritable = Writable & { isTTY?: boolean; rows?: number; columns?: number }
 
@@ -141,6 +325,16 @@ export class TerminalIO implements ChatIO {
   private streamOverflow = false
   private readonly keyHandler: (_text: string, key: { name?: string }) => void
   private readonly signalHandler: () => void
+  get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
+    !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
+  readonly canAskQuestions = false
+  async askQuestions(request: QuestionRequest, _signal: AbortSignal): Promise<QuestionResponse> {
+    this.write('Questions are unavailable in line mode; use the native interactive terminal UI\n')
+    return { requestId: request.requestId, status: 'cancelled' }
+  }
+  get isClosed(): boolean { return this.disposed || this.ended }
+  /** EOF can leave queued/prompt work to consume; disposal ends the launch. */
+  get isDisposed(): boolean { return this.disposed }
   constructor(options: TerminalOptions = {}) {
     this.input = options.input ?? process.stdin
     this.output = options.output ?? process.stdout
@@ -156,6 +350,11 @@ export class TerminalIO implements ChatIO {
     })
     this.readline.on('close', () => {
       this.ended = true
+      // Interactive EOF revokes an enrolled run. Preserve ordinary piped read-only
+      // completion: a closed pipe was never an Auto review authority surface.
+      if (this.input.isTTY && this.output.isTTY) for (const callback of [...this.cancelCallbacks]) {
+        try { callback() } catch { /* Closing must still settle every input waiter. */ }
+      }
       for (const waiter of this.waiters.splice(0)) waiter.resolve(undefined)
     })
     const cancel = (): void => {
@@ -319,9 +518,25 @@ export class TerminalIO implements ChatIO {
   }
 }
 
-export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): Promise<AgentResult | undefined> {
+/** These controls are supplied by the launch owner, never exposed as model tools. */
+interface UserChatControls { mcp?(): Promise<void> }
+
+export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.test(line.trim()) }
+
+export async function runMcpCommand(io: ChatIO, line: string, controls: UserChatControls): Promise<boolean> {
+  if (!isMcpCommand(line)) return false
+  if (line.trim() !== '/mcp') io.write('Use /mcp by itself to manage reviewed server connections\n')
+  else if (controls.mcp) await controls.mcp()
+  else io.write('MCP connection management is unavailable in this chat surface\n')
+  return true
+}
+
+export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
+  controls: UserChatControls = {}): Promise<AgentResult | undefined> {
+  if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (prompt !== undefined) {
+    if (await runMcpCommand(io, prompt, controls)) return
     const dispose = io.onCancel(() => host.cancel())
     try {
       const result = await sendChatTurn(host, io, prompt)
@@ -329,21 +544,41 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string): P
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /memories manages saved context\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
     if (line.trim() === '/session') {
       const session = host.session
-      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host.taskMode, host.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n`)
       continue
     }
     if (!line.trim()) continue
+    if (isMcpCommand(line)) {
+      try { await runMcpCommand(io, line, controls) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'MCP connection management failed'}\n`) }
+      continue
+    }
+    if (/^\/commands(?:\s|$)/.test(line.trim())) {
+      try { await runCommandControl(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Trusted command setup failed'}\n`) }
+      continue
+    }
+    if (/^\/mode(?:\s|$)/.test(line.trim())) {
+      try { await runModeControl(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
+      continue
+    }
     if (/^\/rename(?:\s|$)/.test(line.trim())) {
       const name = line.trim().replace(/^\/rename(?:\s+|$)/, '')
       if (!name) io.write('Use /rename NAME to name this session\n')
       else try { await host.renameSession(name, host.session.titleRevision ?? 0); io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Session rename failed'}\n`) }
+      continue
+    }
+    if (/^\/skills(?:\s|$)/.test(line.trim())) {
+      try { await runSkillsCommand(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Skill management failed'}\n`) }
       continue
     }
     if (/^\/memories(?:\s|$)/.test(line.trim())) {

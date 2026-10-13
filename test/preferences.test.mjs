@@ -70,6 +70,35 @@ test('old exact schema-1 preferences load memory disabled and save a complete cu
     { ...preferences(), enableMemory: undefined }]) assert.throws(() => validatePreferences(invalid));
 });
 
+test('session-note intent round-trips independently of model tool availability and memory consent', async (t) => {
+  const { store } = await fixture(t);
+  for (const model of ['', 'unverified-model', 'chat-only-model']) {
+    const expected = { ...preferences(), model, enableTools: false, enableNotes: true };
+    assert.deepEqual(validatePreferences(expected), expected);
+    await store.save(expected);
+    assert.deepEqual(await store.load(), expected);
+    assert.equal((await store.load()).enableTools, false);
+    assert.equal((await store.load()).enableMemory, false);
+  }
+  const optedOut = { ...preferences(), enableTools: true, enableNotes: false };
+  await store.save(optedOut);
+  assert.deepEqual(await store.load(), optedOut);
+});
+
+test('legacy note intent stays independent from tools and never opts into persistent memory', async (t) => {
+  const { directory, store } = await fixture(t);
+  for (const enableNotes of [true, false]) {
+    const old = { ...preferences(), model: '', enableTools: false, enableNotes };
+    delete old.enableMemory;
+    const expected = { ...old, enableMemory: false };
+    await writeFile(join(directory, 'preferences.json'), JSON.stringify(old), { mode: 0o600 });
+    assert.deepEqual(validatePreferences(old), expected);
+    assert.deepEqual(await store.load(), expected);
+    await store.save(expected);
+    assert.deepEqual(await store.load(), expected);
+  }
+});
+
 test('preferences reject unsupported, credential, extra and out-of-bounds settings without altering saved data', async (t) => {
   const { store } = await fixture(t);
   await store.save(preferences());
@@ -83,7 +112,7 @@ test('preferences reject unsupported, credential, extra and out-of-bounds settin
     { ...preferences(), reasoningCapabilities: ['high', 'high'] },
     { ...preferences(), reasoningCapabilities: Array(8).fill('low') },
     { ...preferences(), stream: 1 }, { ...preferences(), enableTools: 'true' },
-    { ...preferences(), enableNotes: 'true' }, { ...preferences(), enableNotes: true }, { ...preferences(), enableMemory: 1 },
+    { ...preferences(), enableNotes: 'true' }, { ...preferences(), enableMemory: 1 },
     ...[0, 101, 1.5, NaN, Infinity, '25'].map((maxRounds) => ({ ...preferences(), maxRounds }))];
   for (const input of invalid) {
     assert.throws(() => validatePreferences(input));
@@ -340,5 +369,10 @@ test('session picker tolerates absent directories and refuses public directories
 
 test('provider setup can be saved before selecting a model, without any capability claims', () => {
   assert.equal(validatePreferences({ ...preferences(), model: '' }).model, '');
+  const noteDefault = validatePreferences({ ...preferences(), model: '', enableNotes: true });
+  assert.equal(noteDefault.enableNotes, true);
+  assert.equal(noteDefault.enableTools, false);
+  assert.equal(noteDefault.enableMemory, false);
+  assert.throws(() => validatePreferences({ ...preferences(), model: '', enableTools: true, enableNotes: true }));
   assert.throws(() => validatePreferences({ ...preferences(), model: '', reasoning: 'high', reasoningCapabilities: ['high'] }));
 });

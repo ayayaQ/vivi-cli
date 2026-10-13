@@ -143,7 +143,9 @@ test('line main omits tools for unknown/no-tools models while memory context rem
   assert.equal(await main(['--model', 'future-model', '--session-dir', directory, '--prompt', 'Hello'], {}, {
     io: off, providerFactory: () => ({ generate: async input => {
       assert.deepEqual(input.tools, [])
-      assert.deepEqual(input.messages.map(message => message.content), ['Hello'])
+      assert.equal(input.messages.at(-1).content, 'Hello')
+      assert(!input.messages.some(message => message.content.includes('I prefer concise replies')))
+      assert(input.messages.some(message => message.role === 'user' && message.content.includes('skill-creator')))
       return answer()
     } })
   }), 0)

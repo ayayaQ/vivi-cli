@@ -112,7 +112,7 @@ test('pinned Microsoft WT1.24 ConPTY preserves the exact mode1 Bun transport', {
     try { child = JSON.parse(await readFile(`${prefix}.json`, 'utf8')) } catch { }
     try {
       const phase = (await readFile(`${prefix}.host-phase`, 'utf8')).trim()
-      if (['Setup', 'LoadPinnedConpty', 'CreatePseudoConsole', 'AttachBun', 'Negotiate', 'Probe', 'Restore', 'Exit', 'Teardown'].includes(phase)) hostPhase = phase
+      if (['VerifyPinnedArchive', 'Compile', 'Run', 'Setup', 'LoadPinnedConpty', 'CreatePseudoConsole', 'AttachBun', 'Negotiate', 'Probe', 'Restore', 'Exit', 'Teardown'].includes(phase)) hostPhase = phase
     } catch { }
     assert.equal(Boolean(hostProcess.error), false, `Private ConPTY supervisor exceeded its deadline: ${JSON.stringify({
       hostPhase, child: progress, report: child

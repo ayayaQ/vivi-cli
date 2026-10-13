@@ -25,7 +25,8 @@ export interface CliMemoryStore {
   prepareCreate(content: string, actor: MemoryActor, signal?: AbortSignal): Promise<MemoryMutation>
   prepareUpdate(id: string, revision: string, content: string, actor: MemoryActor, signal?: AbortSignal): Promise<MemoryMutation>
   prepareDelete(id: string, revision: string, signal?: AbortSignal): Promise<MemoryMutation>
-  commit(mutation: MemoryMutation, options?: { readonly signal?: AbortSignal }): Promise<MemoryCommitResult>
+  /** Enforce a supplied guard inside queue/lease admission and immediately before resource replacement. */
+  commit(mutation: MemoryMutation, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<MemoryCommitResult>
   addSecrets(secrets: readonly string[]): void
   drain(options?: { readonly close?: boolean }): Promise<void>
 }
@@ -338,7 +339,8 @@ export class FileMemoryStore implements CliMemoryStore {
     return { data, primary: recovered }
   }
 
-  private async save(directory: Directory, data: MemoriesData, loaded: Loaded, signal?: AbortSignal): Promise<void> {
+  private async save(directory: Directory, data: MemoriesData, loaded: Loaded, signal?: AbortSignal, assertCurrent?: () => void): Promise<void> {
+    assertCurrent?.()
     plainJson(data)
     this.assertNoSecrets(data)
     const bytes = Buffer.from(`${encodeMemories(data)}\n`, 'utf8')
@@ -358,11 +360,11 @@ export class FileMemoryStore implements CliMemoryStore {
     this.assertNoSecrets(backupData)
     const backupBytes = loaded.primary?.bytes ?? Buffer.from(`${encodeMemories(backupData)}\n`, 'utf8')
     await this.replace(directory, BACKUP, backupBytes, backup, () => {
-      signal?.throwIfAborted(); this.assertNoSecrets(backupData)
+      signal?.throwIfAborted(); assertCurrent?.(); this.assertNoSecrets(backupData)
     })
     signal?.throwIfAborted()
     await this.replace(directory, PRIMARY, bytes, loaded.primary, () => {
-      signal?.throwIfAborted(); this.assertNoSecrets(data)
+      signal?.throwIfAborted(); assertCurrent?.(); this.assertNoSecrets(data)
     })
   }
 
@@ -444,16 +446,17 @@ export class FileMemoryStore implements CliMemoryStore {
   }
 
   private operation<T>(signal: AbortSignal | undefined, action: (service: MemoryService) => Promise<T>,
-    committedProjection?: (result: T) => T): Promise<T> {
+    committedProjection?: (result: T) => T, assertCurrent?: () => void): Promise<T> {
     return this.admit(signal, async directory => {
+      assertCurrent?.()
       let loaded: Loaded | undefined
       let committed = false
       const persistence: MemoryPersistence = {
         load: async () => { loaded = await this.load(directory, signal); return loaded.data },
-        assertWritable: () => { signal?.throwIfAborted() },
+        assertWritable: () => { signal?.throwIfAborted(); assertCurrent?.() },
         save: async data => {
           if (!loaded) throw new Error('Memory store must be loaded before saving')
-          await this.save(directory, data, loaded, signal)
+          await this.save(directory, data, loaded, signal, assertCurrent)
           committed = true
         }
       }
@@ -498,14 +501,15 @@ export class FileMemoryStore implements CliMemoryStore {
     })
   }
 
-  commit(mutation: MemoryMutation, options: { readonly signal?: AbortSignal } = {}): Promise<MemoryCommitResult> {
+  commit(mutation: MemoryMutation, options: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void } = {}): Promise<MemoryCommitResult> {
     let captured: MemoryMutation
     try { plainJson(mutation); this.assertNoSecrets(mutation); captured = structuredClone(mutation) }
     catch (error) { return Promise.reject(this.safeError(error)) }
     return this.operation<MemoryCommitResult>(options.signal, service => {
+      options.assertCurrent?.()
       this.assertNoSecrets(captured)
-      return service.commit(captured, options)
-    }, result => ({ memories: [], limits: result.limits, contentWithheld: true }))
+      return service.commit(captured, { ...(options.signal ? { signal: options.signal } : {}) })
+    }, result => ({ memories: [], limits: result.limits, contentWithheld: true }), options.assertCurrent)
   }
 
   /** Drain admission, not merely a runner's abortable filesystem promise. Reusable between turns. */

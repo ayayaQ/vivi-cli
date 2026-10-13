@@ -18,8 +18,10 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.5.0'
-const coreIntegrity = 'sha512-9Y8PJF4EGKEJRfNoP1adJ3zhCe3mGebSl9bX3u6RmBPC6IOzflAo6wJyFeZV4JLsgFrfMzi0WrGMCYRbNeXPmA=='
+const coreVersion = '0.12.0'
+const coreIntegrity = 'sha512-/xbgt9LA8ZaKkVl1h3x8W7ErP8fcMsSDS9bpKfjFdj6wp+DbTSrUMElDEgb9kOVLv9Gv7zE14MNkjcBuGlTjrw=='
+const yamlVersion = '2.9.1'
+const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
 
 function run(command, args, cwd = root) {
@@ -54,7 +56,9 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.5.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.12.0 release bytes')
+  assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
+  assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
     assert.equal(installedLock.packages[corePath][field], coreLock[field], `Installed shared core ${field} mismatch; run npm ci`)
   }
@@ -88,8 +92,25 @@ try {
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
+    'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
+    'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
+    'src/skills.ts', 'dist/skills.js', 'dist/skills.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
-    'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts']) assert(paths.has(path), `Missing ${path}`)
+    'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
+    'src/conversation-records.ts', 'dist/conversation-records.js', 'dist/conversation-records.d.ts',
+    'src/tool-presentation.ts', 'dist/tool-presentation.js', 'dist/tool-presentation.d.ts',
+    'src/commands.ts', 'dist/commands.js', 'dist/commands.d.ts',
+    'src/command-process.ts', 'dist/command-process.js', 'dist/command-process.d.ts',
+    'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
+    'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
+    'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts',
+    'src/questions.ts', 'dist/questions.js', 'dist/questions.d.ts',
+    'src/input-queue.ts', 'dist/input-queue.js', 'dist/input-queue.d.ts']) assert(paths.has(path), `Missing ${path}`)
+  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes']) {
+    for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
+      assert(paths.has(path), `Missing ${path}`)
+    }
+  }
   for (const path of ['package.json', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md',
     'docs/API.md', 'examples/headless.mjs', 'src/extensions.ts', 'src/extensions/calculator.ts',
     'dist/extensions.js', 'dist/extensions.d.ts', 'dist/extensions/calculator.js',
@@ -97,13 +118,29 @@ try {
     'CAPABILITIES.md', 'examples/model-capabilities.mjs', 'src/providers/models.ts',
     'examples/memory.mjs', 'src/extensions/memory.ts', 'dist/extensions/memory.js', 'dist/extensions/memory.d.ts',
     'dist/cjs/extensions/memory.js', 'dist/cjs/extensions/memory.d.ts',
+    'docs/SKILLS.md', 'examples/skills.mjs', 'skills/skill-creator/SKILL.md',
+    'src/extensions/skills.ts', 'dist/extensions/skills.js', 'dist/extensions/skills.d.ts',
+    'dist/cjs/extensions/skills.js', 'dist/cjs/extensions/skills.d.ts',
     'dist/providers/models.js', 'dist/providers/models.d.ts',
     'dist/cjs/providers/models.js', 'dist/cjs/providers/models.d.ts',
+    'docs/QUESTIONS.md', 'examples/questions.mjs', 'src/extensions/questions.ts',
+    'dist/extensions/questions.js', 'dist/extensions/questions.d.ts',
+    'dist/cjs/extensions/questions.js', 'dist/cjs/extensions/questions.d.ts',
+    'docs/DECISIONS.md', 'src/decisions.ts', 'dist/decisions.js', 'dist/decisions.d.ts',
+    'dist/cjs/decisions.js', 'dist/cjs/decisions.d.ts', 'examples/decisions.mjs',
+    'docs/MCP.md', 'src/extensions/mcp.ts', 'dist/extensions/mcp.js', 'dist/extensions/mcp.d.ts',
+    'dist/cjs/extensions/mcp.js', 'dist/cjs/extensions/mcp.d.ts',
+    'src/extensions/mcp/catalog.ts', 'src/extensions/mcp/operations.ts', 'src/extensions/mcp/content.ts',
+    'src/presentation.ts', 'dist/presentation.js', 'dist/presentation.d.ts', 'dist/cjs/presentation.js',
+    'dist/cjs/presentation.d.ts', 'docs/TOOL_PRESENTATION.md', 'examples/tool-presentation.mjs',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
     'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
   }
-  assert.deepEqual(packed.bundled, [coreName], 'Shared core must remain bundled')
+  assert.deepEqual(packed.bundled.sort(), [coreName, 'yaml'].sort(), 'Shared core and its exact transitive YAML dependency must remain bundled')
+  for (const path of ['package.json', 'LICENSE', 'dist/index.js', 'browser/dist/index.js']) {
+    assert(paths.has(`node_modules/yaml/${path}`), `Missing bundled YAML ${path}`)
+  }
   assert([...paths].every((path) => !path.startsWith('vendor/')), 'Obsolete vendor snapshots must not be packed')
   assert(!paths.has('src/run-agent.ts') && !paths.has('src/providers/openai.ts'), 'CLI must not copy core or provider implementations')
   assert([...paths].every((path) => !path.startsWith('test/') && !path.startsWith('dist/cjs/')))
@@ -111,7 +148,7 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch', '@modelcontextprotocol/client', '@modelcontextprotocol/core']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)
@@ -127,54 +164,100 @@ try {
   assert.equal(installedManifest.engines.node, manifest.engines.node)
   assert.equal(installedManifest.license, 'Apache-2.0')
   assert.equal(installedManifest.dependencies[coreName], coreVersion)
+  assert.equal(installedManifest.dependencies['@modelcontextprotocol/client'], '2.3.1')
+  for (const name of ['@modelcontextprotocol/client', '@modelcontextprotocol/core']) {
+    const sdk = JSON.parse(await readFile(join(temporary, 'node_modules', name, 'package.json'), 'utf8'))
+    assert.equal(sdk.version, '2.3.1'); assert.equal(sdk.license, 'Apache-2.0')
+    assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules', name, 'LICENSE'))),
+      normalizeLicense(await readFile(join(root, 'node_modules', name, 'LICENSE'))), 'MCP SDK legal text mismatch')
+  }
   assert.equal(installedManifest.dependencies.ignore, '7.0.12')
   const ignoreManifest = JSON.parse(await readFile(join(temporary, 'node_modules/ignore/package.json'), 'utf8'))
   assert.equal(ignoreManifest.version, '7.0.12')
   assert.equal(ignoreManifest.license, 'MIT')
   assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/ignore/LICENSE-MIT'))),
     normalizeLicense(await readFile(join(root, 'node_modules/ignore/LICENSE-MIT'))), 'Ignore MIT legal text mismatch')
+  assert.equal(installedManifest.dependencies.picomatch, '4.0.7')
+  const globManifest = JSON.parse(await readFile(join(temporary, 'node_modules/picomatch/package.json'), 'utf8'))
+  assert.equal(globManifest.version, '4.0.7'); assert.equal(globManifest.license, 'MIT')
+  assert.deepEqual(normalizeLicense(await readFile(join(temporary, 'node_modules/picomatch/LICENSE'))),
+    normalizeLicense(await readFile(join(root, 'node_modules/picomatch/LICENSE'))), 'Picomatch MIT legal text mismatch')
   assert.equal(packed.filename, `ayayaq-vivi-cli-${manifest.version}.tgz`)
   assert.deepEqual(normalizeLicense(await readFile(join(installed, 'LICENSE'))),
     normalizeLicense(await readFile(join(root, 'LICENSE'))), 'CLI LICENSE legal text mismatch')
-  const bundledCore = join(installed, corePath)
-  async function compareDirectory(relative = '') {
-    const entries = await readdir(join(root, corePath, relative), { withFileTypes: true })
-    assert.deepEqual((await readdir(join(bundledCore, relative))).sort(), entries.map(entry => entry.name).sort(),
-      `Bundled shared core directory mismatch: ${relative}`)
+  async function compareDirectory(relative = '', dependency = corePath) {
+    const entries = await readdir(join(root, dependency, relative), { withFileTypes: true })
+    assert.deepEqual((await readdir(join(installed, dependency, relative))).sort(), entries.map(entry => entry.name).sort(),
+      `Bundled dependency directory mismatch: ${dependency}/${relative}`)
     for (const entry of entries) {
       const path = join(relative, entry.name)
-      if (entry.isDirectory()) await compareDirectory(path)
+      if (entry.isDirectory()) await compareDirectory(path, dependency)
       else {
         assert(entry.isFile(), `Unexpected shared core file type: ${path}`)
-        assert.deepEqual(await readFile(join(bundledCore, path)), await readFile(join(root, corePath, path)),
-          `Bundled shared core bytes mismatch: ${path}`)
+        assert.deepEqual(await readFile(join(installed, dependency, path)), await readFile(join(root, dependency, path)),
+          `Bundled dependency bytes mismatch: ${dependency}/${path}`)
       }
     }
   }
   await compareDirectory()
+  await compareDirectory('', 'node_modules/yaml')
   // npm exec resolves the platform's installed bin shim, including vivi.cmd on Windows.
   assert.match(runNpm(['exec', '--offline', '--', 'vivi', '--help'], temporary), /--provider/)
   const launcher = join(installed, installedManifest.bin.vivi)
   assert.match(run(process.execPath, [...nodeGuard, launcher, '--no-tui', '--help'], temporary), /--provider/)
   // Anchor runtime/type consumers beside the installed package: its bundled core is an
   // implementation dependency, not a promise that npm hoists that package for other consumers.
+  // The installed invocation consumer executes only this package-authored local fixture.
+  await writeFile(join(installed, 'mcp-fixture.mjs'), await readFile(join(root, 'test/fixtures/mcp-invocation-server.mjs')))
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage } from '@ayayaq/vivi-cli'
+import { fileURLToPath } from 'node:url'
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
+import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extensions/questions'
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
 import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContext } from '@ayayaq/vivi/extensions/memory'
+import { parseSkillDocument, skillCreatorSource } from '@ayayaq/vivi/extensions/skills'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
+import { createDecisionRequest, evaluateDecision, isDecisionCurrent, createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
 import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
+import { McpConfigStore } from './dist/mcp-config.js'
+import { McpManager } from './dist/mcp-manager.js'
+import { decodeToolPresentation, toolPresentationView } from '@ayayaq/vivi/presentation'
+import { createCliToolPresentation, cliToolPresentationView } from './dist/tool-presentation.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
+const presentation = createCliToolPresentation({ call: { id: 'packed-presentation', name: 'offline_tool', arguments: {} },
+  source: { reference: 'owned://packed/presentation', revision: 'packed-1' }, status: 'approval_required', effect: 'unknown' })
+const cjsPresentation = createRequire(import.meta.url)('@ayayaq/vivi/presentation')
+for (const module of [{ decodeToolPresentation, toolPresentationView }, cjsPresentation]) {
+  const view = module.toolPresentationView(module.decodeToolPresentation(JSON.stringify(presentation)), { collapsed: true, detailBytes: 0 })
+  assert(view.header.some(line => line.includes('owned://packed/presentation')))
+  assert(view.warnings.some(line => line.includes('Approval required')))
+  assert(view.warnings.some(line => line.includes('External effects are unknown')))
+  assert.equal(view.details.length, 0)
+}
+assert(cliToolPresentationView('{').warnings.some(line => line.includes('Invalid or oversized')))
 const cjsModels = createRequire(import.meta.url)('@ayayaq/vivi/providers/models')
+const cjsDecisions = createRequire(import.meta.url)('@ayayaq/vivi/decisions')
+assert.equal(createOpenAIDecisionProvider({ apiKey: 'fake' }).model, 'gpt-6-luna')
+assert.equal(createOpenRouterDecisionProvider({ apiKey: 'fake' }).model, 'typesafe/jev-1.13')
+for (const module of [{ createDecisionRequest, evaluateDecision, isDecisionCurrent }, cjsDecisions]) {
+  const snapshot = { sessionId: 'packed', runId: 'packed-run', toolCall: { id: 'packed-review', name: 'note_set', arguments: { key: 'color', value: 'blue' } },
+    userRequest: { id: 'packed-request', text: 'Set a note color to blue', approvedScope: { tool: 'note_set' } },
+    policyRevision: 'packed-v1', resourceRevisions: { noteRevision: 0 }, inputData: { before: null, after: 'blue' } }
+  const request = module.createDecisionRequest(snapshot, { provider: 'openai', checks: [{ name: 'requested', instructions: 'The exact save was requested',
+    trueDescription: 'Requested', falseDescription: 'Not requested', allowAt: 0.995, denyAt: 0.05 }] })
+  const result = await module.evaluateDecision(request, { id: 'openai', model: 'gpt-6-luna', evaluate: async () => ({ model: 'gpt-6-luna',
+    answers: [{ name: 'requested', type: 'predicate', probability: 1 }], usage: { inputTokens: 1, outputTokens: 1 } }) })
+  assert.equal(result.outcome, 'allow'); assert(module.isDecisionCurrent(result, snapshot))
+}
 const budgetModel = { id: 'vendor/budget-only', supported_parameters: ['reasoning'],
   reasoning: { mandatory: false, supports_max_tokens: true } }
 const budget = normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: budgetModel })
@@ -198,8 +281,135 @@ const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
   definition: { name: 'packed_fixture', description: 'Packed extension', parameters: { type: 'object' } },
   validateArguments() {}, execute() { return { content: 'packed extension works' } }
 }] }
+const scopedTools = createBuiltinToolset(true, [fixture]), scopedCleanup = []
+scopedTools.defer(() => { scopedCleanup.push('first') })
+scopedTools.defer(async () => { await Promise.resolve(); scopedCleanup.push('last') })
+const scopedHost = { enableNotes: true, readNotes() { assert.fail('Closed note dispatch') },
+  async commitNote() { assert.fail('Closed note commit') }, async approve() { assert.fail('Closed approval') } }
+assert.equal((await scopedTools.executeTool({ id: 'packed-scoped', name: 'packed_fixture', arguments: {} },
+  new AbortController().signal, scopedHost)).content, 'packed extension works')
+const scopedDisposal = scopedTools.dispose()
+assert.equal(scopedTools.signal.aborted, true)
+assert.equal(scopedTools.dispose(), scopedDisposal)
+await scopedDisposal
+assert.deepEqual(scopedCleanup, ['last', 'first'])
+for (const name of ['packed_fixture', 'current_time', 'note_read']) {
+  await assert.rejects(scopedTools.executeTool({ id: 'packed-closed', name, arguments: {} },
+    new AbortController().signal, scopedHost), { name: 'AbortError' })
+}
 const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
+// Installed ESM and CJS consumers must use the published question entrypoint.
+const cjsQuestions = createRequire(import.meta.url)('@ayayaq/vivi/extensions/questions')
+const questionArguments = { questions: [
+  { id: 'choice', header: 'Style', question: 'Which style?', options: [{ id: 'short', label: 'Short' }, { id: 'long', label: 'Long' }] },
+  { id: 'text', header: 'Details', question: 'Anything else?' },
+  { id: 'skip', header: 'Optional', question: 'Any optional detail?' }
+] }
+const humanAnswers = [{ id: 'choice', answer: { kind: 'option', optionId: 'long' } },
+  { id: 'text', answer: { kind: 'text', text: 'Packed Unicode 你好 🌱' + String.fromCharCode(10) + 'Second line' } },
+  { id: 'skip', answer: { kind: 'skipped' } }]
+for (const module of [{ createQuestionExtension, QUESTION_LIMITS }, cjsQuestions]) {
+  assert.equal(module.QUESTION_LIMITS.questions, 3)
+  assert.equal(module.createQuestionExtension().tools.length, 0)
+  const registry = createToolRegistry([module.createQuestionExtension({ ask: (request, { signal }) => {
+    assert.equal(signal.aborted, false); assert.equal(request.callId, 'packed-question-entrypoint')
+    return { requestId: request.requestId, status: 'answered', answers: humanAnswers }
+  } })])
+  const result = await registry.executeTool({ id: 'packed-question-entrypoint', name: 'request_user_input', arguments: questionArguments },
+    { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(result.content).answers, humanAnswers)
+}
+for (const mode of ['execute', 'plan']) {
+  const snapshots = [], approvals = []
+  let rounds = 0, asks = 0, activeRequest
+  const host = await CliHost.create({ settings: { provider: 'openai', model: 'packed-offline-questions' },
+    store: { async save(session) { snapshots.push(structuredClone(session)) } }, enableNotes: true,
+    approve: async request => { approvals.push(request); return false },
+    questionHost: { accountRevision: () => 'owned-packed-account', isAvailable: () => true, ask: (request, { signal }) => {
+      assert.equal(signal.aborted, false); asks++; activeRequest = request
+      return { requestId: request.requestId, status: 'answered', answers: humanAnswers }
+    } }, provider: { async generate({ messages, tools }) {
+      assert(tools.some(tool => tool.name === 'request_user_input'))
+      if (++rounds === 1) return { content: '', toolCalls: [{ id: 'packed-question-host', name: 'request_user_input', arguments: questionArguments }] }
+      const result = messages.at(-1)
+      assert.equal(result.callId, 'packed-question-host'); assert.equal(result.name, 'request_user_input')
+      assert.deepEqual(JSON.parse(result.content), { requestId: activeRequest.requestId, status: 'answered', answers: humanAnswers })
+      return { content: 'Packed questions accepted', toolCalls: [] }
+    } } })
+  try {
+    host.setTaskMode(mode)
+    const result = await host.send('Clarify the offline package fixture')
+    assert.equal(result.status, 'completed'); assert.equal(asks, 1); assert.deepEqual(approvals, [])
+    assert.equal(host.approvalMode, 'manual'); assert.equal(host.session.noteRevision, 0)
+    assert.deepEqual(snapshots.at(-1).history, result.history)
+    assert.equal(result.history.filter(message => message.kind === 'tool_result').length, 1)
+  } finally { await host.shutdown() }
+}
+const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun ? ['SYSTEMROOT'] : []
+const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
+  ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
+const mcp = new McpManager({ store: new McpConfigStore(directory), env: { ...fixtureEnv, OPENAI_API_KEY: 'fake-provider-key' } })
 try {
+  await mcp.configure({ id: 'packed', label: 'Owned package fixture', executable: process.execPath,
+    args: [...(process.versions.bun ? ['--no-install'] : []), fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'normal', join(directory, 'mcp-log'), join(directory, 'mcp-pid')],
+    cwd: directory, protocol: 'legacy', environment: fixtureEnvironment })
+  assert.equal(mcp.statuses()[0].state, 'disabled')
+  assert.equal(await mcp.connect('packed', async () => false, new AbortController().signal), false)
+  assert.equal(await mcp.connect('packed', async launch => { assert.deepEqual(launch.environment, fixtureEnv); return true }, new AbortController().signal), true)
+  const packedMcp = mcp.statuses()[0].snapshot
+  assert.equal(packedMcp.categories.tools.state, 'ready')
+  assert.equal(packedMcp.categories.tools.entries[0].remoteKey, 'echo/name')
+  assert(Object.isFrozen(packedMcp.categories.tools.entries[0].descriptor))
+  await mcp.refresh('packed', ['resources', 'resourceTemplates'], new AbortController().signal)
+  assert.equal(mcp.statuses()[0].snapshot.categories.resources.state, 'ready')
+  const alias = packedMcp.categories.tools.entries[0].alias
+  let mcpRounds = 0, mcpApprovals = 0
+  const mcpHost = await CliHost.create({ store: new FileSessionStore(directory), mcp,
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => { mcpApprovals++; return true },
+    provider: { async generate(input) {
+      assert(input.tools.some(tool => tool.name === alias))
+      if (++mcpRounds === 1) return { content: '', toolCalls: [{ id: 'packed-mcp-call', name: alias, arguments: { query: 'packed' } },
+        { id: 'packed-mcp-list', name: 'list_mcp_resources', arguments: { serverId: 'packed' } }] }
+      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'packed-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'packed', uri: 'fixture:///document' } }] }
+      return { content: 'Packed MCP invocation accepted', toolCalls: [] }
+    } } })
+  const mcpResult = await mcpHost.send('Use the owned packed MCP fixture')
+  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 2)
+  assert.match(JSON.stringify(mcpResult.history), /Echo: packed/)
+  assert.match(JSON.stringify(mcpResult.history), /Owned resource 1/)
+  assert.equal(mcpHost.conversationRecords.state, 'shadow')
+  assert.deepEqual(mcpHost.conversationRecords.projection.history.map(entry => entry.message), mcpResult.history)
+  assert(mcpHost.conversationRecords.projection.outcomes.some(item => item.effect === 'confirmed' && item.status === 'succeeded'))
+  const packedRecords = await new FileCliConversationStore(directory).read(mcpHost.session.id)
+  assert.deepEqual(replayCliConversationDocument(packedRecords.value).projection, mcpHost.conversationRecords.projection)
+  let denyRounds = 0
+  const deniedMcpHost = await CliHost.create({ store: new FileSessionStore(directory), mcp,
+    settings: { provider: 'openai', model: 'fake' }, approve: async () => false,
+    provider: { async generate() { return ++denyRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-mcp-denied', name: alias, arguments: { query: 'denied' } }] }
+      : { content: 'Packed MCP denied', toolCalls: [] } } } })
+  assert.equal((await deniedMcpHost.send('Review the owned echo')).status, 'completed')
+  assert.equal(deniedMcpHost.conversationRecords.state, 'shadow')
+  assert(deniedMcpHost.conversationRecords.projection.outcomes.some(item => item.effect === 'not_attempted'))
+  const protocolLog = (await readFile(join(directory, 'mcp-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
+  assert.equal(protocolLog.filter(message => message.method === 'tools/call').length, 1)
+  assert.equal(protocolLog.filter(message => message.method === 'resources/read').length, 1)
+  await mcp.disconnect('packed')
+  assert.equal(mcp.statuses()[0].state, 'disabled')
+  await mcp.remove('packed')
+  await mcp.configure({ id: 'unknown', label: 'Owned unknown-outcome fixture', executable: process.execPath,
+    args: [...(process.versions.bun ? ['--no-install'] : []), fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), 'bad-output', join(directory, 'unknown-log'), join(directory, 'unknown-pid')],
+    cwd: directory, protocol: 'legacy', environment: fixtureEnvironment })
+  assert.equal(await mcp.connect('unknown', async () => true, new AbortController().signal), true)
+  const [unknownCatalog] = await mcp.captureCatalogs(new AbortController().signal)
+  const unknownEntry = unknownCatalog.categories.tools.entries.find(entry => entry.remoteKey === 'echo/name')
+  const unknownOperation = mcp.prepareOperation(unknownCatalog, unknownEntry, 'tools', { id: 'packed-unknown', name: unknownEntry.alias, arguments: { query: 'uncertain' } })
+  const uncertain = await mcp.invoke(unknownOperation, new AbortController().signal, () => {})
+  assert.equal(uncertain.isError, true); assert.equal(JSON.parse(uncertain.content).unknownOutcome, true)
+  assert.equal(mcp.statuses()[0].state, 'error')
+  const unknownLog = (await readFile(join(directory, 'unknown-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
+  assert.equal(unknownLog.filter(message => message.method === 'tools/call').length, 1)
+  await mcp.disconnect('unknown')
   const host = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' },
     provider: { generate: async () => ({ content: 'Packed host works', toolCalls: [],
@@ -228,11 +438,41 @@ try {
   const memoryResult = await memoryHost.send('Use opted-in context')
   assert.deepEqual(memoryResult.history.map(message => message.content), ['Use opted-in context', 'Packed context works'])
   assert.deepEqual((await new FileSessionStore(directory).load(memoryHost.session.id)).history, memoryResult.history)
+  assert.deepEqual(memoryHost.conversationRecords.projection.history.map(entry => entry.message), memoryResult.history)
+  assert.deepEqual(memoryHost.conversationRecords.projection.usage, memoryHost.session.usage)
+  const recordResume = await CliHost.resume({ store: new FileSessionStore(directory), id: memoryHost.session.id,
+    provider: { async generate() { assert.fail('Replay must never execute') } } })
+  assert.deepEqual(recordResume.conversationRecords.projection, memoryHost.conversationRecords.projection)
+  await recordResume.shutdown()
   await memoryHost.drainMemory()
   const cjsMemory = createRequire(import.meta.url)('@ayayaq/vivi/extensions/memory')
   assert.equal(cjsMemory.encodeMemories(cjsMemory.decodeMemories('{"version":1,"memories":[]}')), encodeMemories(decodeMemories('{"version":1,"memories":[]}')))
   assert.equal(cjsMemory.formatMemoryContext([]), formatMemoryContext([]))
   assert.equal(typeof createMemoryService, 'function')
+  const skills = new FileSkillStore(join(directory, 'agent-skills'))
+  const skillCatalog = await skills.snapshot()
+  assert.equal(skillCatalog.skills.find(item => item.name === 'skill-creator').readOnly, true)
+  assert.equal(skillCatalog.document('skill-creator').content, skillCreatorSource.content)
+  const cjsSkills = createRequire(import.meta.url)('@ayayaq/vivi/extensions/skills')
+  assert.deepEqual(cjsSkills.parseSkillDocument(skillCreatorSource.content), parseSkillDocument(skillCreatorSource.content))
+  let skillRounds = 0
+  const skillsHost = await CliHost.create({ store: new FileSessionStore(directory), skills, enableSkills: true,
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async ({ messages, tools }) => {
+      assert(tools.some(tool => tool.name === 'read_skill'))
+      assert(!tools.some(tool => tool.name === 'save_skill'))
+      assert(messages.some(message => message.role === 'user' && message.content.includes('skill-creator')))
+      return ++skillRounds === 1 ? { content: '', toolCalls: [{ id: 'packed-skill-read', name: 'read_skill', arguments: {
+        name: 'skill-creator', path: 'SKILL.md', expectedRevision: skillCatalog.document('skill-creator').revision } }] }
+        : { content: 'Packed skills work', toolCalls: [] }
+    } } })
+  const skillsResult = await skillsHost.send('Use the bundled creator')
+  assert.equal(skillsResult.status, 'completed')
+  assert(!skillsResult.history.some(message => message.role === 'user' && message.content.startsWith('Available instruction-only skills')))
+  assert.equal(skills.writable, false)
+  assert.equal(typeof skills.prepare, 'undefined')
+  assert.equal(typeof skills.commit, 'undefined')
+  assert(!skillsResult.history.some(message => message.name === 'save_skill'))
+  await skills.drain({ close: true })
   const project = join(directory, 'project')
   await mkdir(project)
   await writeFile(join(project, 'readme.txt'), 'Packed workspace works')
@@ -243,6 +483,9 @@ try {
   const listing = await workspaceRegistry.executeTool({ id: 'packed-workspace', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
   assert.equal(JSON.parse(listing.content).untrusted, true)
   assert(!JSON.parse(listing.content).entries.some(item => item.path === 'ignored.log'))
+  const glob = await workspaceRegistry.executeTool({ id: 'packed-glob', name: 'workspace_glob', arguments: { pattern: '**/*.txt' } }, { signal: new AbortController().signal })
+  assert.deepEqual(JSON.parse(glob.content).matches, [{ path: 'readme.txt', kind: 'file' }])
+  assert.equal(JSON.parse(glob.content).truncated, false)
   assert.equal(WORKSPACE_LIMITS.maximumReadBytes, 8192)
   let workspaceRounds = 0
   const workspaceHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
@@ -253,6 +496,51 @@ try {
   assert.equal(workspaceResult.status, 'completed')
   assert.equal(JSON.parse(workspaceResult.history[2].content).content, 'Packed workspace works')
   assert.deepEqual((await new FileSessionStore(directory).load(workspaceHost.session.id)).history, workspaceResult.history)
+  const commands = await TrustedCommandWorkspace.open(project, process.env)
+  try {
+    let approvals = 0
+    const context = { launchId: 'packed-launch', sessionId: 'packed-session', runId: 'packed-run', accountRevision: 'packed-account',
+      canApprove: () => true, isCurrent: () => true, async approve() { approvals++; return true } }
+    const signal = new AbortController().signal
+    assert.equal(await commands.enable(context, signal), true)
+    const argv = ['spaces here', 'quote' + String.fromCharCode(34, 92), '😀']
+    let result = JSON.parse((await commands.start({ id: 'packed-command', name: 'command_start', arguments: {
+      executable: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)))', ...argv], yieldMs: 1000 } }, context, signal)).content)
+    let output = result.output
+    while (result.state === 'running') {
+      result = JSON.parse((await commands.poll(result.executionId, 'packed-launch:packed-session:packed-run', 2000)).content)
+      output += result.output
+    }
+    assert.equal(result.state, 'exited'); assert.equal(result.exitCode, 0)
+    assert.deepEqual(JSON.parse(output), argv); assert.equal(approvals, 2)
+  } finally { await commands.shutdown() }
+  let textRounds = 0
+  const textHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    approve: async request => { assert.match(request.description, /JSON-quoted lines/); return true },
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++textRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-create-text', name: 'workspace_create_text', arguments: { path: 'created.txt', content: 'packed old' } }] }
+      : { content: 'Packed text accepted', toolCalls: [] } } })
+  assert.equal((await textHost.send('Create created.txt with packed old')).status, 'completed')
+  assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed old')
+  const readRevision = JSON.parse((await workspace.execute('workspace_read', { path: 'created.txt' }, new AbortController().signal)).content).revision
+  let editRounds = 0, decisions = 0
+  const editHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
+    approve: async () => { throw new Error('Packed eligible edit unexpectedly needed manual review') },
+    decisionReview: { canAutoReview: true, accountRevision: () => 'packed-account', ledger: { async upsert() {} },
+      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate(request) {
+        decisions++; assert.equal(request.snapshot.preparedAction.effects[0].scope, 'workspace')
+        assert.equal(request.snapshot.inputData.before, 'old'); assert.equal(request.snapshot.inputData.after, 'new')
+        return { model: 'gpt-6-luna', answers: request.policy.checks.map(check => ({ name: check.name, type: 'predicate', probability: 1 })),
+          usage: { inputTokens: 1, outputTokens: 1 } }
+      } } },
+    settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++editRounds === 1
+      ? { content: '', toolCalls: [{ id: 'packed-edit-text', name: 'workspace_edit_text', arguments: {
+        path: 'created.txt', expectedRevision: readRevision, before: 'old', after: 'new' } }] }
+      : { content: 'Packed precise edit accepted', toolCalls: [] } } })
+  editHost.setApprovalMode('auto')
+  assert.equal((await editHost.send('Replace old with new in created.txt')).status, 'completed')
+  assert.equal(decisions, 1); assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed new')
+  assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
@@ -263,6 +551,26 @@ try {
   assert.equal(extensionResult.status, 'completed')
   assert.equal(extensionResult.history[2].content, 'packed extension works')
   assert.deepEqual((await new FileSessionStore(directory).load(extensionHost.session.id)).history, extensionResult.history)
+  let planRounds = 0
+  const planHost = await CliHost.create({ store: new FileSessionStore(directory), workspace, enableNotes: true,
+    settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],
+    approve: async () => { assert.fail('Packed Plan cannot request execution approval') },
+    provider: { async generate({ tools }) {
+      assert(!tools.some(tool => ['note_set', 'workspace_edit_text', 'packed_fixture', 'command_start', 'fetch_url', 'read_mcp_resource'].includes(tool.name)))
+      return ++planRounds === 1 ? { content: '', toolCalls: [
+        { id: 'packed-plan-read', name: 'workspace_read', arguments: { path: 'created.txt' } },
+        ...['note_set', 'packed_fixture', 'command_start', 'fetch_url', 'read_mcp_resource'].map(name => ({ id: 'packed-plan-' + name, name, arguments: {} }))
+      ] } : { content: 'Packed read-only plan', toolCalls: [] }
+    } } })
+  planHost.setTaskMode('plan')
+  const planResult = await planHost.send('Investigate without changing anything')
+  assert.equal(planResult.status, 'completed'); assert.equal(planHost.taskMode, 'plan')
+  assert.equal(planHost.session.noteRevision, 0); assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed new')
+  const planResults = planResult.history.filter(message => message.kind === 'tool_result')
+  assert.equal(planResults.length, 6); assert.equal(planResults[0].isError, undefined)
+  assert(planResults.slice(1).every(message => message.isError))
+  planHost.setTaskMode('execute'); assert.equal(planHost.approvalMode, 'manual')
+  await planHost.shutdown()
   const openai = createOpenAIProvider({ model: 'fake', apiKey: 'fake', fetch: async () => new Response(JSON.stringify({
     status: 'completed', output: [{ type: 'message', id: 'fake-message', role: 'assistant', content: [{ type: 'output_text', text: 'OpenAI shared', annotations: [] }] }]
   })) })
@@ -271,15 +579,17 @@ try {
   })) })
   assert.equal((await openai.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenAI shared')
   assert.equal((await router.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenRouter shared')
-} finally { await rm(directory, { recursive: true, force: true }) }
+} finally { await mcp.close(); await rm(directory, { recursive: true, force: true }) }
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, ReadOnlyWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CliMemoryStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession,
-  type SessionPersistence, type ApprovalRequest } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession, type CliQuestionHost,
+  type SessionPersistence, type ApprovalRequest, type TaskMode, type ConversationMode, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
+import { createQuestionExtension, QUESTION_LIMITS, type Question, type QuestionOption, type QuestionRequest, type QuestionHost, type QuestionResponse, type QuestionAnswer, type QuestionAnswerEntry } from '@ayayaq/vivi/extensions/questions'
+import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabilities, type Capability } from '@ayayaq/vivi/providers/models'
 const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
 const selection: Capability = reasoningSelectionSupport(capabilities, { mode: 'disabled' })
@@ -288,27 +598,75 @@ const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
 session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
 const usageText: string = formatUsage(aggregateUsage([session.usage, undefined]))
 const store: SessionPersistence = new FileSessionStore('/tmp/fake-types-only')
+const conversationStore: CliConversationStore = new FileCliConversationStore('/tmp/fake-types-only')
+const conversationView: CliConversationView = { state: 'shadow', observedSequence: 0, committedSequence: 0, durability: 'memory' }
+void conversationStore; void conversationView
 const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
+const skills: CliSkillStore = new FileSkillStore('/tmp/fake-types-only/agent-skills', { readOnlyRoots: [], secrets: [] })
+const catalog: Promise<SkillCatalog> = skills.snapshot()
+const writable: false = skills.writable
+void catalog; void writable
 const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
 const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')
 void workspace; void createWorkspaceExtension; void WORKSPACE_LIMITS
+const commandWorkspace: Promise<TrustedCommandWorkspace> = TrustedCommandWorkspace.open('/tmp/fake-types-only', {})
+const commandContext: CommandApprovalContext = { launchId: 'types', sessionId: 'types', runId: 'types', accountRevision: 'types',
+  canApprove: () => false, isCurrent: () => false, approve: async () => false }
+let preparedCommand: PreparedCommand | undefined
+void commandWorkspace; void commandContext; void preparedCommand
 const extension: ToolExtension = { id: 'typed-fixture', apiVersion: 1, tools: [] }
-const options: CliHostOptions = { provider, session, store, extensions: [extension], onEvent(event: AgentEvent) { void event },
+const mcp: McpManager = new McpManager({ store: new McpConfigStore('/tmp/fake-types-only'), env: {} })
+const catalogs: Promise<readonly McpCatalogSnapshot[]> = mcp.captureCatalogs(new AbortController().signal)
+let operation: McpPreparedOperation | undefined
+void catalogs; void operation; void createMcpExtension
+const outcomes: McpOutcomeStore = new FileMcpOutcomeStore('/tmp/fake-types-only')
+let lifecycle: McpInvocationLifecycle | undefined
+void lifecycle
+const questionOption: QuestionOption = { id: 'short', label: 'Short', description: 'Concise' }
+const question: Question = { id: 'style', header: 'Style', question: 'Which style?', options: [questionOption, { id: 'long', label: 'Long' }] }
+const questionRequest: QuestionRequest = { requestId: 'typed-request', callId: 'typed-call', questions: [question] }
+const questionAnswer: QuestionAnswer = { kind: 'text', text: 'Typed Unicode 你好' }
+const questionEntry: QuestionAnswerEntry = { id: question.id, answer: questionAnswer }
+const questionResponse: QuestionResponse = { requestId: questionRequest.requestId, status: 'answered', answers: [questionEntry] }
+const questionHost: QuestionHost = async (request, { signal }): Promise<QuestionResponse> => signal.aborted
+  ? { requestId: request.requestId, status: 'cancelled' } : { ...questionResponse, requestId: request.requestId }
+const cliQuestionHost: CliQuestionHost = { ask: questionHost, isAvailable: () => true, accountRevision: () => 'typed-account' }
+const questionExtension: ToolExtension = createQuestionExtension({ ask: questionHost })
+const questionLimit: number = QUESTION_LIMITS.questions
+// @ts-expect-error A question response cannot grant action authority.
+const questionApproval: QuestionResponse = { requestId: 'typed', status: 'cancelled', approved: true }
+void questionApproval; void questionExtension; void questionLimit
+const options: CliHostOptions = { provider, session, store, questionHost: cliQuestionHost, mcp, mcpOutcomes: outcomes, skills, enableSkills: true, extensions: [extension], onEvent(event: AgentEvent) { void event },
   async approve(request: ApprovalRequest, signal: AbortSignal) { void request; return !signal.aborted } }
 const host = new CliHost(options)
+const taskMode: TaskMode = host.taskMode
+const conversationMode: ConversationMode = 'plan'
+host.setTaskMode(taskMode)
 const result: Promise<AgentResult> = host.send('Types only')
 const io: ChatIO = new TerminalIO({ tui: false })
+io.setTaskMode?.(taskMode)
+const canAskQuestions: boolean | undefined = io.canAskQuestions
+const askQuestions: Promise<QuestionResponse> | undefined = io.askQuestions?.(questionRequest, new AbortController().signal)
+void canAskQuestions; void askQuestions
+void conversationMode
+const toolEvidence: CliToolEvidence = host.toolPresentationEvidence
+let toolDecision: CliToolDecision | undefined
+io.setToolEvidence?.(toolEvidence)
+const presentationView = cliToolPresentationView(JSON.stringify(createCliToolPresentation({ call: { id: 'typed', name: 'offline', arguments: {} },
+  source: { reference: 'owned://type-fixture' }, status: 'unknown', effect: 'unreported' })))
+void presentationView; void toolDecision
 void result; void io; void usageText; void selection; void createBuiltinToolset(false, [extension])
 `)
   const typeRoots = join(root, 'node_modules/@types')
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',
     '--target', 'ES2022', '--lib', 'ES2022,DOM', '--types', 'node', '--typeRoots', typeRoots, join(installed, 'consumer.ts')], temporary)
   if (process.env.VIVI_TEST_BUN) {
+    run(process.env.VIVI_TEST_BUN, [join(installed, 'consumer.mjs')], temporary)
     await writeFile(join(installed, 'tui-consumer.ts'), `
 import assert from 'node:assert/strict'
 import { createTestRenderer } from '@opentui/core/testing'
-import { CodeRenderable } from '@opentui/core'
+import { CodeRenderable, TextRenderable } from '@opentui/core'
 import { OpenTuiIO } from './dist/tui.js'
 import { WindowsInputDecoder } from './dist/windows-input.js'
 import { newSession } from './dist/session.js'
@@ -345,6 +703,24 @@ try {
   await setup.mockInput.typeText('PROVIDER model 1499')
   setup.mockInput.pressEnter()
   assert.deepEqual(await selecting, { kind: 'selected', value: 'vendor/model-1499', query: 'PROVIDER model 1499' })
+  io.toolPresentation(JSON.stringify({ version: 1, callId: 'packed-card', name: 'offline_tool', status: 'failed', effect: 'unknown',
+    source: { reference: 'owned://packed/presentation', revision: 'packed-1' }, arguments: { kind: 'text', text: 'review arguments' },
+    result: { kind: 'future-card', text: 'Packed safe fallback', data: { approved: true, execute: 'NEVER_EXECUTE' } } }))
+  const allText = node => [node instanceof TextRenderable ? node.plainText : '', ...node.getChildren().map(allText)].join(String.fromCharCode(10))
+  await setup.renderOnce(); await setup.renderOnce()
+  const collapsed = allText(setup.renderer.root.findDescendantById('vivi-transcript'))
+  assert(collapsed.includes('failed/unknown'))
+  assert(!collapsed.includes('owned://packed/presentation')); assert(!collapsed.includes('review arguments'))
+  assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0').getChildren().length, 0)
+  setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
+  const card = allText(setup.renderer.root.findDescendantById('vivi-transcript'))
+  assert(card.includes('Tool failed')); assert(card.includes('External effects are unknown'))
+  assert(card.includes('owned://packed/presentation')); assert(card.includes('unsupported presentation kind'))
+  assert(card.includes('Packed safe fallback')); assert(!card.includes('NEVER_EXECUTE'))
+  const toolHeader = setup.renderer.root.findDescendantById('vivi-tool-details-display-0')
+  await setup.mockMouse.click(toolHeader.x + toolHeader.width - 1, toolHeader.y)
+  await setup.renderOnce(); await setup.renderOnce()
+  assert.equal(setup.renderer.root.findDescendantById('vivi-tool-body-display-0').getChildren().length, 0)
   const request = { call: { id: 'packed-approval', name: 'memory_create', arguments: {} },
     description: 'Packed fake approval only', currentRevision: 'new memory' }
   const approve = io.approve(request, new AbortController().signal)
@@ -357,12 +733,42 @@ try {
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce()
   setup.mockInput.pressEnter()
   assert.equal(await deny, false)
+  assert.equal(io.canAskQuestions, Boolean(process.stdin.isTTY && process.stdout.isTTY))
+  const nativeRequest = { requestId: 'packed-native-question', callId: 'packed-native-call', questions: [
+    { id: 'style', header: 'Style', question: 'Which native style?', options: [{ id: 'short', label: 'Short' }, { id: 'long', label: 'Long' }] }
+  ] }
+  let globalCancels = 0
+  const stopCancel = io.onCancel(() => { globalCancels++ })
+  const nativeAnswer = io.askQuestions(nativeRequest, new AbortController().signal)
+  const queuedApproval = io.approve({ call: { id: 'packed-after-question', name: 'note_set', arguments: {} },
+    description: 'Owned packed approval after question', currentRevision: 0 }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  assert(setup.renderer.root.findDescendantById('vivi-questions'))
+  assert.equal(setup.renderer.root.findDescendantById('vivi-approve'), undefined)
+  // The preceding mouse approval deliberately disarms new dialog mouse actions
+  // for 600ms, so the next independent human gesture must occur after that guard.
+  await new Promise(resolve => setTimeout(resolve, 650))
+  const long = setup.renderer.root.findDescendantById('vivi-question-option-1')
+  await setup.mockMouse.click(long.x + 1, long.y)
+  await setup.renderOnce(); await setup.renderOnce()
+  const submit = setup.renderer.root.findDescendantById('vivi-question-submit')
+  await setup.mockMouse.click(submit.x + 1, submit.y)
+  assert.deepEqual(await nativeAnswer, { requestId: nativeRequest.requestId, status: 'answered',
+    answers: [{ id: 'style', answer: { kind: 'option', optionId: 'long' } }] })
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  assert(setup.renderer.root.findDescendantById('vivi-approve'))
+  setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
+  const cancelling = io.askQuestions({ ...nativeRequest, requestId: 'packed-native-cancel' }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+  setup.mockInput.pressEscape()
+  assert.deepEqual(await cancelling, { requestId: 'packed-native-cancel', status: 'cancelled' })
+  assert.equal(globalCancels, 0); stopCancel()
   io.close()
 } finally { io.close(); setup.renderer.destroy() }
 `)
     run(process.env.VIVI_TEST_BUN, [join(installed, 'tui-consumer.ts')], temporary)
     assert.match(run(process.env.VIVI_TEST_BUN, [launcher, '--help'], temporary), /--provider/)
-    console.log('Packed native renderer, model search, mouse approvals and Bun CLI entrypoint passed')
+    console.log('Packed native renderer, model search, human questions/approval FIFO, mouse approvals and Bun CLI entrypoint passed')
   }
   const sha256 = candidate.artifact.sha256
   const bun = process.env.VIVI_TEST_BUN ? run(process.env.VIVI_TEST_BUN, ['--version']).trim() : undefined

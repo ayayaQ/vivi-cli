@@ -4,23 +4,37 @@ import { homedir } from 'node:os'
 import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers/openrouter'
 import type { ModelProvider } from '@ayayaq/vivi'
+import { createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
+import type { DecisionProvider } from '@ayayaq/vivi/decisions'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
+import { FileSkillStore } from './skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
-import { TerminalIO, runChatLoop } from './terminal.js'
+import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMode } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
-import type { Catalog } from './models.js'
-import { documentedOpenAIModel } from './models.js'
+import type { Catalog, ModelEntry } from './models.js'
+import { ModelCatalog, hydrateModelCapabilities, modelAccessDenied, modelToolsEnabled, unknownModel } from './models.js'
 import type { CredentialStore } from './credentials.js'
+import type { ApprovalMode } from './auto-review.js'
+import { assertReviewTransportCurrent } from './auto-review.js'
+import { FileDecisionLedger } from './decision-ledger.js'
+import { McpConfigStore } from './mcp-config.js'
+import { McpManager } from './mcp-manager.js'
+import type { McpManagerOptions } from './mcp-manager.js'
+import { manageMcp } from './mcp-controls.js'
 
 export interface CliOptions {
+  /** Launch-only request to open enrollment; never a saved approval. */
+  approvalMode: ApprovalMode
   provider?: CliProviderName
   model?: string
   reasoning?: string
@@ -32,6 +46,10 @@ export interface CliOptions {
   tui: boolean
   enableNotes: boolean
   enableMemory: boolean
+  /** Launch-only command proposal availability, never process execution authority. */
+  enableCommands: boolean
+  enableSkills: boolean
+  skillsDirectories: string[]
   enableTools: boolean
   startNew: boolean
   maxRounds: number
@@ -51,16 +69,22 @@ Usage: vivi --provider openai|openrouter --model MODEL [options]
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
-  --workspace PATH            Read-only folder for this launch (default: launch directory)
+  --workspace PATH            Folder for reads and reviewed text edits (default: launch directory)
   --no-workspace              Disable workspace files for this launch
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
+  --approval-mode MODE        manual (default) or auto; auto still needs fresh interactive enrollment
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
   --tools / --no-tools        Declare tool support / use chat only
-  --enable-notes              Enable session-only revisioned notes with allow/deny prompts
+  --enable-notes              Enable session-only reviewed notes (default)
+  --disable-notes             Disable session notes for this launch
   --enable-memory             Use reviewed app-wide saved context (plaintext local storage)
   --disable-memory            Override saved memory defaults for this launch
+  --enable-commands           Allow command proposals (default); every start needs human approval
+  --disable-commands          Disable command proposals for this launch
+  --skills-dir PATH           Explicit read-only standard skills root (repeatable, max 8)
+  --no-skills                 Disable skills for this launch
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
   --help                      Show this help
 
@@ -71,8 +95,17 @@ Streaming is display-only. Notes never access other files; piped approval is den
 Saved memory is off by default. When enabled, it is sent to the selected provider.
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
 Selected files may be sent to your provider and saved in session history.
-Workspace tools omit symlinks, private/ignored files, writes and commands; this is not an OS sandbox.
+Workspace tools omit symlinks and private/ignored files; text writes require review; this is not an OS sandbox.
+/commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval, even in Auto; piped approval is denied.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
+/mode selects Manual / Auto review / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
+Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
+Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
+/skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
+/mcp configures trusted installed stdio servers; fresh human startup approval is required.
+MCP connections start disabled each launch. Connected catalogs can expose model tools and exact resource reads; every remote operation needs human approval, even in Auto. Credentials are unsupported.
+Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
+The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 /** Only CLI callers supplying their captured launch directory get a default workspace. */
@@ -80,7 +113,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    stream: true, tui: true, enableNotes: false, enableMemory: false, enableTools: true, startNew: false, maxRounds: 25, help: false,
+    approvalMode: 'manual', stream: true, tui: true, enableNotes: true, enableMemory: false, enableCommands: true, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
     ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
@@ -117,14 +150,30 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--session-dir': options.sessionDirectory = value(); break
       case '--workspace': explicitWorkspace = true; options.workspace = value(); break
       case '--no-workspace': noWorkspace = true; delete options.workspace; break
+      case '--enable-commands': options.enableCommands = true; break
+      case '--disable-commands': options.enableCommands = false; break
       case '--prompt': options.prompt = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
+      case '--approval-mode': {
+        const mode = value()
+        if (mode !== 'manual' && mode !== 'auto') throw new Error('Approval mode must be manual or auto')
+        options.approvalMode = mode
+        break
+      }
       case '--tui': options.tui = true; break
       case '--no-tui': options.tui = false; break
       case '--enable-notes': options.enableNotes = true; break
+      case '--disable-notes': options.enableNotes = false; break
       case '--enable-memory': options.enableMemory = true; break
       case '--disable-memory': options.enableMemory = false; break
+      case '--no-skills': options.enableSkills = false; break
+      case '--skills-dir': {
+        if (options.skillsDirectories.length >= 8) throw new Error('At most eight explicit skills directories are supported')
+        const directory = value()
+        options.skillsDirectories.push(launchDirectory === undefined ? resolve(directory) : resolve(launchDirectory, directory))
+        break
+      }
       case '--tools': options.enableTools = true; break
       case '--no-tools': options.enableTools = false; break
       case '--max-rounds': {
@@ -145,7 +194,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   if (options.resume && (options.provider !== undefined || options.model !== undefined || options.reasoning !== undefined)) {
     throw new Error('Resumed sessions retain their provider, model and reasoning; omit selection flags')
   }
-  if (!options.resume && ((!options.model && !interactiveSetup) || (options.model !== undefined &&
+  const mcpPrompt = options.prompt !== undefined && isMcpCommand(options.prompt)
+  if (!options.resume && ((!options.model && !interactiveSetup && !mcpPrompt) || (options.model !== undefined &&
     (!options.model || options.model.length > 200 || options.model.trim() !== options.model)))) {
     throw new Error('A new session requires --model with a bounded model identifier')
   }
@@ -155,7 +205,6 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
     !options.reasoningCapabilities.includes(options.reasoning as ReasoningEffort)) {
     throw new Error('Selected reasoning requires explicit --reasoning-capabilities from your model’s supported efforts')
   }
-  if (options.enableNotes && !options.enableTools) throw new Error('Session notes require declared tool support; omit --enable-notes or --no-tools')
   // Never echo a rejected value. Credential-bearing flags are refused before provider construction.
   const secrets = environmentSecrets(env)
   for (const argument of args) {
@@ -185,10 +234,39 @@ export function providerForSession(session: CliSession, options: CliOptions, env
     requireSupportedParameters: options.enableTools || (session.reasoning !== undefined && session.reasoning !== 'default') })
 }
 
+/** Dedicated fixed-model review on the selected existing account; never discover or copy credentials. */
+export function decisionProviderForSession(session: CliSession, env: NodeJS.ProcessEnv, beforeRequest?: () => void): DecisionProvider {
+  const name = session.provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
+  const apiKey = (): string => {
+    beforeRequest?.()
+    const key = env[name]
+    if (!key) throw new Error(`The selected ${session.provider} account has no existing API key`)
+    return key
+  }
+  const guardedFetch: typeof fetch = (input, init) => { beforeRequest?.(); return globalThis.fetch(input, init) }
+  return session.provider === 'openai' ? createOpenAIDecisionProvider({ apiKey, timeoutMs: 8_000, fetch: guardedFetch })
+    : createOpenRouterDecisionProvider({ apiKey, timeoutMs: 8_000, fetch: guardedFetch })
+}
+
+/** Construct only when an enrolled eligible action actually requests review. */
+export function deferredDecisionProvider(session: CliSession, env: NodeJS.ProcessEnv,
+  factory: typeof decisionProviderForSession): DecisionProvider {
+  const model = session.provider === 'openai' ? 'gpt-6-luna' : 'typesafe/jev-1.13'
+  return { id: session.provider, model,
+    evaluate: (request, signal) => {
+      // A new request-bound closure cannot be confused with a later review after timeout.
+      const provider = factory(session, env, () => assertReviewTransportCurrent(request))
+      if (provider.id !== session.provider || provider.model !== model) throw new Error('Decision provider does not match the selected account and fixed review model')
+      return provider.evaluate(request, signal)
+    } }
+}
+
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
   dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
+    decisionProviderFactory?: typeof decisionProviderForSession;
     credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
+    mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
@@ -209,6 +287,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   let io: ChatIO | undefined
   let release: (() => Promise<void>) | undefined
   let host: CliHost | undefined
+  let mcp: McpManager | undefined
   const secrets = environmentSecrets(env)
   const closeIO = (): boolean => {
     const closing = io
@@ -240,36 +319,88 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const status = await runApplication({ io: tui, options, args, env, secrets,
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
         ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
+        ...(dependencies.mcpManagerFactory ? { mcpManagerFactory: dependencies.mcpManagerFactory } : {}),
         registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
-        providerFactory: dependencies.providerFactory ?? providerForSession })
+        providerFactory: dependencies.providerFactory ?? providerForSession,
+        decisionProviderFactory: dependencies.decisionProviderFactory ?? decisionProviderForSession })
       const cleanupFailed = closeIO()
       return cleanupFailed && status === 0 ? 1 : status
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
+    mcp = (dependencies.mcpManagerFactory ?? (options => new McpManager(options)))({
+      store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets
+    })
+    if (options.prompt !== undefined && await runMcpCommand(io, options.prompt, {
+      mcp: () => manageMcp(mcp!, io!, options.workspace)
+    })) return 0
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
+    const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
     const fresh = options.resume ? undefined : newSession({
       provider: options.provider ?? 'openai', model: options.model!,
       ...(options.reasoning ? { reasoning: options.reasoning } : {})
     })
     release = await store.acquire(options.resume ?? fresh!.id)
     const session = options.resume ? await store.load(options.resume) : fresh!
-    const metadata = session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined
-    const enableTools = !args.includes('--no-tools') && (metadata?.tools === 'supported' ||
-      metadata?.tools !== 'unsupported' && (args.includes('--tools') || args.includes('--enable-notes')))
-    const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools }
+    let metadata: ModelEntry
+    const controller = new AbortController()
+    const dispose = io.onCancel(() => controller.abort())
+    const surfaceClosed = (): boolean => io instanceof TerminalIO ? io.isDisposed : io?.isClosed === true
+    try {
+      if (session.provider === 'openrouter') io.write('Loading openrouter model capabilities…\n')
+      const key = session.provider === 'openai' ? env.OPENAI_API_KEY : env.OPENROUTER_API_KEY
+      const hydrated = await hydrateModelCapabilities(dependencies.catalog ?? new ModelCatalog(),
+        session.provider, session.model, key, controller.signal)
+      if (surfaceClosed() || controller.signal.aborted) return 130
+      metadata = hydrated.model
+      if (hydrated.catalog?.warning) io.write(`${redactSecrets(hydrated.catalog.warning, secrets)}. Using a stale cached catalog\n`)
+      else if (hydrated.catalog?.state === 'cached') io.write('Using the cached model catalog (up to 15 minutes old)\n')
+    } catch (error) {
+      if (surfaceClosed() || controller.signal.aborted) return 130
+      // An unavailable catalog permits chat only or this launch's explicit
+      // declaration. Authentication denial must never fall back to a request.
+      if (modelAccessDenied(error)) throw error
+      metadata = unknownModel(session.model)
+      io.write(`${redactSecrets(error instanceof Error ? error.message : 'Model capabilities could not be loaded', secrets)}\n`)
+    } finally { dispose() }
+    if (metadata.conversation === 'unsupported') throw new Error('This model is incompatible with vivi’s text-conversation endpoint. Choose a supported model')
+    const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
+      declared: args.includes('--tools') })
+    const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools,
+      reasoningCapabilities: metadata.reasoning === 'supported' ? [...metadata.efforts] : options.reasoningCapabilities,
+      stream: metadata.streaming === 'unsupported' ? false : options.stream }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
-    host = new CliHost({ provider, store, session, secrets, enableNotes: effective.enableNotes,
-      enableTools, enableMemory: options.enableMemory, memory, ...(workspace ? { workspace } : {}),
+    const accountRevision = randomUUID()
+    const commandEnv = captureCommandEnvironment(env)
+    host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+      enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
+      onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
+      ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,
+        isAvailable: () => io?.canAutoReview === true && !io.isClosed } } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
+      onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
+      ...(io.canAutoReview === true ? { decisionReview: {
+        provider: deferredDecisionProvider(session, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
+        ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
+        accountRevision: () => accountRevision, isAvailable: () => io?.canAutoReview === true && !io.isClosed
+      } } : {}),
+      ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
+        ask: (request, { signal }) => io!.askQuestions!(request, signal),
+        isAvailable: () => io?.canAskQuestions === true && !io.isClosed,
+        accountRevision: () => accountRevision
+      } } : {}),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => io!.event(event) })
-    await store.save(host.session)
-    io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\n`)
-    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · read only for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
-    const result = await runChatLoop(host, io, options.prompt)
+    await host.initialize()
+    io.setApprovalMode?.('manual')
+    io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
+    if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+    if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
+    const result = await runChatLoop(host, io, options.prompt, {
+      mcp: () => manageMcp(mcp!, io!, options.workspace)
+    })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {
     const message = redactSecrets(error instanceof Error ? error.message : 'CLI failed', secrets)
@@ -277,9 +408,20 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     else process.stderr.write(`${message}\n`)
     return 1
   } finally {
-    await host?.drainMemory().catch(() => undefined)
+    let mcpCleanupFailed = false
+    try { await mcp?.close() }
+    catch (error) {
+      mcpCleanupFailed = true
+      const message = redactSecrets(error instanceof Error ? error.message : 'Owned server cleanup failed', secrets)
+      try {
+        if (io && !io.failed) io.write(`MCP cleanup failed: ${message}\n`)
+        else process.stderr.write(`MCP cleanup failed: ${message}\n`)
+      } catch { process.stderr.write('MCP cleanup failed; terminal reporting was unavailable\n') }
+    }
+    await host?.shutdown().catch(() => undefined)
     await release?.().catch(() => undefined)
     closeIO()
+    if (mcpCleanupFailed) return 1
   }
 }
 

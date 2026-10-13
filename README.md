@@ -17,17 +17,22 @@ bun dist/launcher.js
 
 ## Usage
 
-Each launch starts a fresh conversation. Use `/provider` to set up your API key,
-then choose a model.
+Each launch starts a fresh conversation. An unconfigured interactive launch opens
+the existing provider/key and model pickers automatically. Escape cancels; use
+`/provider` to retry. Configured launches use saved defaults without repeating setup.
 
 - `/provider` — choose OpenAI or OpenRouter and enter a key
 - `/models` — search and select a model
 - `/effort` — choose a supported reasoning effort
+- `/mode` — choose Manual or enroll optional Auto review for the current conversation
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
 - `/settings` — change defaults for future conversations
 - `/memories` — manage this launch’s app-wide saved context
+- `/commands` — inspect or disable reviewed unsandboxed command proposals
+- `/skills` — inspect instruction-only skills and prepare creator drafts
+- `/mcp` — configure and explicitly connect trusted installed stdio servers for reviewed tools and resource reads
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -45,22 +50,52 @@ The full-screen status shows an animated Working indicator and total elapsed
 turn time, including time spent waiting for approval. Waiting for approval and
 Cancelling have separate labels. The timer stops when the turn settles or the UI
 closes, including non-streaming requests and failed turns.
+The full-screen terminal tab shows `vivi · session name`, with `[~]` at the
+start while working and `[!]` when a dialog needs input. The title is bounded and
+updates only when its state or session name changes. The prior title is restored
+on exit where the terminal supports xterm title stacks. Line and JSON output do
+not change the terminal title.
 
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
-terminal reports those modifiers. Tab completes slash commands.
+terminal reports those modifiers. Tab completes slash commands. Shift+Tab cycles
+Manual / Auto review / Plan while the composer is idle and preserves an unfinished
+draft. Entering Auto still needs the fresh enrollment confirmation. Entering Plan
+revokes Auto enrollment; leaving Plan returns to Manual. During a turn and inside
+dialogs, the shortcut does not change mode. `/mode cycle` provides the same cycle
+through the command interface. `/mode` opens all three choices in full-screen mode;
+`/mode plan` enters planning directly and `/mode manual` returns to reviewed execution.
+
+Plan is a read-only task policy, separate from Manual/Auto approval. It advertises
+and dispatches only enabled local reads: informational clarification, arithmetic, current time, session-note
+reads, memory listing, skill listing/reading, and bounded workspace reads/searches.
+Existing feature opt-ins, model tool support, secret screening and read permissions
+still apply. Workspace/note/memory mutations, every unsandboxed command, public URL
+GETs, MCP calls/resources and imported extensions are unavailable, even if described
+as read-only. The assistant describes its plan in a normal response and stays in
+Plan until you explicitly change mode. Switching does not execute old proposals.
+Choosing Auto from Plan leaves Plan only after successful fresh enrollment;
+cancelling, denying or closing that confirmation keeps Plan active.
+Plan does not mean zero filesystem writes: normal conversation checkpoints,
+transcripts, local store locks/recovery and shutdown bookkeeping still run. Explicit
+host controls such as session renaming and memory management keep their existing
+review rules. Explicit new/resumed conversations start in Manual execution mode.
+Model and reasoning-effort changes preserve Plan when it is selected, while
+revoking any Auto review enrollment.
+The assistant can ask 1–3 clarification questions in the native full-screen UI.
+Choose an option, write an answer, skip, or cancel; review the answers and select
+Submit to send them. Questions work in Manual, Auto review and Plan, and never
+approve an action or enroll Auto review. Questions and action approvals share one
+input queue. Line mode, pipes and headless hosts omit this capability.
+
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
-to preserve reported Enter modifiers. ConPTY forwards mode queries to the outer
-terminal, so an "already enabled" reply does not establish that its separate
-application-facing encoder is enabled. Vivi explicitly requests that consumer
-encoder for the full-screen UI and resets it to standard input on close;
-ConPTY keeps its outer transport enabled. The query cannot reveal a prior inner
-encoder state. Physical Shift+Enter behavior on Windows Terminal 1.24 remains
-unverified until a user retest. Bracketed paste retains literal Unicode and
-line breaks even when ConPTY mixes raw text with native character records;
-chat drafts normalize CRLF or CR to LF, and pasted input never confirms approval.
-Other terminals use the supported Kitty keyboard
+to preserve reported Enter modifiers. ConPTY has separate outer and application-facing
+encoders; vivi requests the application encoder even after an "already enabled"
+reply, then resets it on close. The query cannot reveal that encoder's prior state.
+Physical Shift+Enter behavior on Windows Terminal 1.24 remains unverified after a
+user-reported failure. Raw-framed bracketed paste retains Unicode and line breaks;
+chat drafts normalize CRLF or CR to LF. Other terminals use the supported Kitty keyboard
 protocol automatically, or Ctrl+J when modifiers are unavailable. Alt+Enter may be
 intercepted by the terminal's own fullscreen shortcut.
 The composer grows as explicit or wrapped lines are added, up to ten editable
@@ -83,7 +118,7 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 ### Mouse controls
 
 The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Memory or Settings below the composer to open an action when the draft
+Effort, Mode, Memory or Settings below the composer to open an action when the draft
 is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
@@ -111,7 +146,7 @@ will succeed. Provider default sends no reasoning override. The explicit disable
 is offered only when supported, including optional OpenRouter token-budget models that
 have no named effort choices. A documented non-streaming model uses complete responses;
 unknown streaming keeps your selected stream setting.
-Saved OpenRouter selections are checked against the provider catalog before the
+OpenRouter selections in both full-screen and line mode are checked against the provider catalog before the
 first session opens, so supported workspace tools are available on the first
 turn. Explicit tools-off choices stay off; unavailable or unknown metadata stays
 chat-only unless tool support was explicitly declared for this launch.
@@ -133,9 +168,98 @@ node dist/launcher.js --provider openrouter --model PROVIDER/MODEL --prompt 'Hel
 Use `node dist/launcher.js --help` for all options, including `--resume UUID` and
 `--session-dir PATH`.
 
-## Read-only workspace tools
+## Optional MCP tools
 
-The CLI uses the current working directory where you launch vivi as its read-only
+Use `/mcp` in full-screen or line mode to add an already installed executable,
+its separate arguments, working directory and explicit legacy or pinned modern
+protocol. Entries start disabled every launch. Enable requires fresh human
+approval showing that exact launch; Disable closes the owned process tree.
+For Bun servers, use `--no-install` followed by an absolute installed JS/TS
+script path and its separate arguments. Inline code and package commands are unsupported.
+Windows Node servers should explicitly allow `SYSTEMROOT` (included in the minimal
+profile/temp option); an empty environment can prevent Node 26.4 from starting.
+For account-independent line management, run
+`node dist/launcher.js --no-tui --prompt /mcp`; no model or provider key is needed.
+
+Starting a trusted server runs its code with your OS permissions before any
+tool-call approval. It can access files and network; this is not a sandbox.
+Connected, ready catalogs expose bounded tool aliases and schemas to the agent.
+Every remote tool call and resource read requires human approval, including in Auto
+review. Reads use exact discovered resource URIs; templates are metadata only.
+Unsupported schemas are quarantined; stale catalogs and changed connections block
+calls. Results are bounded, untrusted data; uncertain outcomes disable the connection
+without retry. Send intent and outcomes are persisted separately from transcript
+checkpoints; interrupted sessions recover the known or uncertain result without
+replaying the operation. Requests cancelled before sending stay marked as not sent.
+OAuth, HTTP, credential environment values, repository auto-discovery,
+package installation and automatic reconnects remain unsupported.
+Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
+FullLanguage for owned Job Object cleanup.
+
+## Public page retrieval
+
+`fetch_url` retrieves bounded UTF-8 text, JSON or inert HTML text from one selected
+public HTTPS URL through host review. It sends the full path/query and network
+metadata; GET may have server-side effects. Every redirect is validated, and a
+changed origin needs a fresh decision. Limits are 3 redirects, 15 seconds active
+work, 16 KiB headers, 1 MiB body and 64 KiB text/result. No login, cookies,
+JavaScript, search, downloads or private/local addresses are supported. Returned
+text is untrusted; uncertain sends are recorded and never automatically replayed.
+
+## Optional Auto review
+
+Manual is always the default. `/mode` opens the current conversation’s mode
+choice. The full-screen picker defaults to Manual; choosing Auto review then
+requires a separate fresh, deny-default human confirmation of the disclosure.
+Line mode shows the same disclosure and requires fresh typed `allow` to enroll;
+`deny`, Escape, cancellation or closing keep Manual. `--approval-mode auto`
+requests this enrollment at launch, and does not bypass it. Piped, headless and
+unavailable approval surfaces stay Manual, even with that flag. Use `/mode` again
+to return to Manual. Approval mode is never stored in preferences or sessions,
+restored by `/resume`, or carried into a new conversation, provider, model or account.
+Replacing an API key revokes enrollment immediately, including if the subsequent
+model picker is cancelled; start a new conversation before enrolling again.
+
+When enrolled, only tool calls implementing the current user’s requested
+session `note_set`, app-wide memory create/edit, selected-workspace text creation/precise edits, or exact public URL GET requests may be automatically approved.
+The corresponding notes/memory/workspace and tool feature gates must already be enabled.
+Delete, `/memories` manager mutations, excluded actions and hard denials remain
+outside Auto review. A model recommendation never relaxes host policy or skips
+the exact proposal’s final freshness and revision checks.
+
+The review sends the exact current user request, tool arguments and prepared
+before/after changed text, workspace-relative paths and full-file hashes, or full URL/destination/method/limits/redirect scope to the currently selected existing account: OpenAI
+`gpt-6-luna`, or OpenRouter routed to TypeSafe `typesafe/jev-1.13`. It uses only
+that account’s existing key, with no copied credential store, account discovery,
+cross-provider fallback or live model selection. The fresh in-app confirmation
+asks for consent to share this bounded request/proposal text with those named
+recipients for decision review, including eligible agent proposals you did not
+request, to assess whether you authorized the exact change. It may contain personal or sensitive information
+about you or others. Known credentials are excluded; content recognized as
+sensitive stays Manual and is not sent to the decision provider. This lexical
+filter cannot reliably identify every private detail. Keep Manual if you do not
+want potentially private text shared. A conversation or provider/account change
+invalidates the versioned consent; this product setting is not global permission
+to transmit credentials or unrelated content. The automatic-save policy remains
+ordinary non-sensitive note/memory create/edit, scoped text creation/precise edits and exact public URL GET requests only; the sharing consent does not expand
+which actions may execute automatically. This adds API charges. Review
+is limited to two calls per turn, an eight-second deadline and 16 KiB for the
+full decision request. Larger exact evidence stays Manual without truncation;
+there is no hard prepaid USD cost guarantee. Returned review usage and any
+reported cost are recorded separately from chat/session usage.
+
+The versioned host heuristics require every check to reach at least `0.995` for
+OpenAI or `0.999` for OpenRouter; any check at or below `0.05` recommends rejection.
+These thresholds are uncalibrated and do not establish comparable behavior
+between providers. Model estimates can be wrong and do not prove authorization.
+A model rejection may still be reviewed by a human when host policy allows it.
+Uncertain, malformed, failed, stale or over-budget reviews use the ordinary
+human approval path; cancelled reviews cannot commit. The UI reports review
+progress and settled outcomes without exposing model reasoning or credentials.
+
+## Workspace tools
+
+The CLI uses the current working directory where you launch vivi as its selected
 workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
 disable workspace access for that launch. These flags cannot be combined. Relative
 paths are resolved from the launch directory, not the installed CLI or private
@@ -153,17 +277,18 @@ node dist/launcher.js --no-tui --model YOUR_MODEL --tools --workspace ./my-proje
 bun dist/launcher.js --no-workspace
 ```
 
-The assistant can list files, read UTF-8 text, and search literal text. Reads may be
+The assistant can list files, match file paths with `workspace_glob`, read UTF-8 text, and search literal text. Reads may be
 sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
-are treated as untrusted data. No writes, shell commands, automatic execution,
-network tools, plugin discovery, or permanent folder trust are added.
+are treated as untrusted data. Text creation and precise edits require host review.
+Commands need separate trust as described below. Workspace file tools do not grant
+deletion, renaming, network tools, plugin discovery or permanent folder trust.
 
 The default applies to CLI launches only. Library users of `CliHost` must still
 explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
 does not grant access to the application’s working directory.
 
-Root and nested `.gitignore` files apply to all three tools, including direct reads.
+Root and nested `.gitignore` files apply to all workspace tools, including direct reads.
 Symlinks, multi-link files, repository internals, common credential locations,
 `.env`/`.env.*`, key files, `node_modules`, and `.cache` are unavailable. Ignore rules
 cannot override these exclusions. The active CLI state folder is also excluded,
@@ -171,9 +296,31 @@ including a custom `--session-dir` inside the project. Ordinary config such as `
 `tsconfig.json` remains readable. This policy cannot identify every secret: move
 sensitive files outside the selected folder or exclude them with `.gitignore`.
 
-Output is bounded: listings have at most 100 entries; literal searches at most 50
+`workspace_create_text` proposes one new UTF-8 file; it never overwrites an existing
+entry or creates parent folders. `workspace_edit_text` replaces one unique literal
+`before` target with `after`. First read the file and use its returned `revision`
+(the SHA-256 of all raw bytes) as `expectedRevision`; stale or ambiguous edits fail.
+BOM, line endings and every byte outside the replacement are preserved. Files are
+bounded at 256 KiB and the complete JSON-quoted unified review diff at 48 KiB.
+Larger diffs are refused; exact Auto requests above 16 KiB stay Manual without
+truncation. Manual shows the diff and asks each time; piped/headless writes are denied.
+
+Publication uses an exclusive temporary sibling `.vivi-stage-*.tmp`, then exclusive
+hard-link creation or replacement rename. Staging is cleaned up; no persistent
+backup is retained. Creation fails closed if the filesystem cannot create hard links.
+An uncertain outcome requires reading the file before retrying. These are ordinary
+workspace checks, not hostile-filesystem containment or compare-and-swap guarantees;
+portable Windows directory crash durability is not claimed.
+
+`workspace_glob` matches file names without reading contents. Its pattern is relative
+to its optional `path`, with forward slashes and case-sensitive matching on every OS.
+Use `*`, `?`, or standalone `**`, such as `**/*test*.ts`; escapes, double quotes,
+negation, brackets, braces, extglobs and regex are unavailable. Dotfiles follow the same exclusions.
+It defaults to depth 8 and 50 results; returned paths stay workspace-relative.
+
+Output is bounded: listings and globs have at most 100 entries; literal searches at most 50
 matches; reads return up to 8 KiB from text files no larger than 256 KiB. Traversal
-is at most 8 levels per call and stops after 1,000 entries, 200 search files, 2 MiB
+is at most 8 levels per call and stops after 1,000 entries, 200 search/glob files, 2 MiB
 of searched text, or 10 seconds. `truncated: true` means the result is incomplete,
 including deeper directories not visited. Escape/Ctrl+C cancels a running turn.
 
@@ -184,15 +331,54 @@ changes. This is not an OS sandbox against hostile programs changing the tree;
 use a project folder you control. Exact policy and verification limits are in
 [RELEASING.md](RELEASING.md#read-only-workspace-policy).
 
+## Reviewed commands
+
+Command proposals are available from startup with a selected workspace, supported
+tools and an interactive approval surface. The first exact `command_start` approval
+includes the unsandboxed-execution disclosure; there is no separate enablement
+approval. Every new process still needs fresh human approval, even in Auto.
+`/commands off` or `--disable-commands` disables proposals; `/commands on` restores
+them for this launch/session. Execution permission is never saved or restored
+from history. Piped/headless input cannot approve a process.
+
+The approval shows the resolved executable, exact argv array, resolved working
+directory, environment variable names, and hard timeout. Execution uses
+`shell:false`; to use shell syntax, explicitly request a shell executable and its
+arguments. `command_poll` reads bounded output; `command_stop` halts that run’s
+process tree. IDs expire at the end of the agent run, which also stops any running
+processes. Output is untrusted and may be sent to your provider and saved in history.
+
+This is **unsandboxed**: commands have your OS account’s file and network access,
+including outside cwd. The fixed minimal environment excludes saved provider keys,
+but it does not prevent reading credential files. Only approve commands you trust.
+Cleanup covers inherited POSIX process groups and Windows Job Object descendants;
+commands deliberately escaping those boundaries or using external services remain
+outside that guarantee. Windows needs Windows 10+/Server 2016+ and built-in
+PowerShell FullLanguage; unsupported or locked-down native setup fails before execution.
+Windows argv uses standard C-runtime/managed parsing. `cmd.exe`, `command.com`,
+and `.bat`/`.cmd` files are unsupported; explicit PowerShell is supported.
+Windows PowerShell 5.1 may take tens of seconds preparing built-in modules on first
+use and emit progress on stderr. That output is preserved; request an explicit
+`timeoutMs` when needed (30 seconds by default, maximum 5 minutes).
+
+## Session notes
+
+Session-only notes are enabled by default for tool-capable models. Every note
+write still requires review; `--disable-notes`, saved notes-off defaults or
+`--no-tools` suppress them. Notes do not enable tools for unverified models and
+do not opt you into app-wide persistent-memory sharing.
+
 ## Persistent memory
 
 Memory is off by default. Use `--enable-memory` for a launch, or choose the future
 launch default in `/settings` in the full-screen UI. `--disable-memory` overrides
 an enabled saved default. `/memories` enables or disables the current launch and
 lets you list, add, edit and delete records. Back, Escape and Cancel never submit
-a change. Each create, edit and delete shows the exact proposal and requires a
-fresh interactive approval: select Approve in the full-screen UI, or type `allow`
-in line mode. Piped input cannot approve writes.
+a change. Manager create, edit and delete actions show the exact proposal and
+require a fresh interactive approval: select Approve in the full-screen UI, or
+type `allow` in line mode. Model-requested create/edit calls use the same human
+path unless eligible under explicitly enrolled Auto review. Piped input cannot
+approve writes or enroll Auto review.
 
 Memories are stored as plaintext in `memories.json` alongside the CLI’s private
 session files, normally `~/.vivi/sessions`. When enabled, saved context is sent to
@@ -232,6 +418,10 @@ npm run test:tui
 See [RELEASING.md](RELEASING.md) for packaging and release checks.
 Licensed under [Apache-2.0](LICENSE).
 
+Each CLI turn owns its shared extension registrations and cancellation listeners.
+Closing a turn seals dispatch and awaits admitted checkpoints and resource drains;
+MCP connections stay launch-owned. Trusted imports grant no extra permissions.
+
 ## Usage counts
 
 Round and turn displays show provider-reported token counts. `/session` shows the
@@ -240,3 +430,25 @@ included in input and total counts. A missing cache count is shown as `unreporte
 while an explicitly reported zero is shown as `0`. Each session cache count is
 complete only if every accepted provider round reported that field. Old sessions
 keep missing metrics unreported; no cache policy, price or savings is inferred.
+
+## Instruction-only Agent Skills
+
+`/skills` lists and inspects standard `<name>/SKILL.md` folders, prepares creator requests
+in the composer, and enables or disables skills for this launch. The app-wide folder is
+`<session-dir>/agent-skills`; `--skills-dir PATH` adds up to eight explicit read-only roots.
+No workspace, home, ancestor, or community discovery is performed. `--no-skills` disables
+skills. Metadata goes to the selected provider; instructions and UTF-8 text resources load
+progressively through `list_skills` and `read_skill`, without running scripts.
+
+The bundled read-only `skill-creator` drafts SKILL.md content in chat. Save the draft
+manually as `<name>/SKILL.md`, then refresh or start a new turn. Automatic skill saving is
+disabled on Windows, macOS, and Linux. There is no skill writer, save tool, or save approval.
+All skills are read-only to the agent. Existing workspace tools cannot target the owned
+private state profile. Skill hints grant no tools, permissions, or Auto eligibility.
+
+Discovery uses canonical filesystem identity for ordinary Windows path aliases, preserves
+original files, and reports unavailable roots, invalid formats, and duplicate names.
+Bounds are 100 skills including the creator, 64 KiB per UTF-8 document/resource, 2 MiB total
+documents, and 24 KiB catalog metadata; serialized tool reads must also fit the session
+transcript limit. Existing credential/private-state exclusions remain. Prior restricted
+assessments stay excluded; this release does not accept automatic skill saving.

@@ -137,20 +137,25 @@ test('working and waiting labels remain inside the compact footer after resize',
 })
 
 
-test('long session names never wrap metadata out of the two-row header after resize', async () => {
+test('long session names fit a title-only header and model metadata stays above the composer', async () => {
   const { io, setup, frame } = await fixture()
   const session = { ...newSession({ provider: 'openai', model: 'fixture', reasoning: 'high' }), title: 'Readable '.repeat(8).trim(), titleRevision: 1 }
   io.setSession(session)
   let displayed = await frame()
-  expect(displayed).toContain('openai / fixture'); expect(displayed).toContain(session.id)
+  expect(displayed).toContain('openai / fixture'); expect(displayed).not.toContain(session.id)
   const header = setup.renderer.root.findDescendantById('vivi-header') as TextRenderable
-  expect(header.plainText.split('\n')).toHaveLength(2)
-  expect(header.plainText.split('\n').every(line => line.length <= 100)).toBe(true)
+  expect(header.plainText).toBe(session.title)
+  expect(header.height).toBe(1)
+  const model = setup.renderer.root.findDescendantById('vivi-model') as TextRenderable
+  const composer = setup.renderer.root.findDescendantById('vivi-composer-box')!
+  expect(model.y + model.height).toBe(composer.y)
   io.setSession({ ...session, title: '名'.repeat(80) })
   setup.resize(40, 20); displayed = await frame()
   expect(displayed).toContain('openai / fixture'); expect(displayed).toContain('…')
-  expect(header.plainText.split('\n')).toHaveLength(2)
-  expect(header.plainText.split('\n')[1]!.length).toBeLessThanOrEqual(40)
+  expect(header.plainText.split('\n')).toHaveLength(1)
+  expect(header.plainText.length).toBeLessThanOrEqual(40)
+  expect(model.y + model.height).toBe(composer.y)
+  expect(displayed).not.toContain(session.id)
 })
 
 test('fitted session-name headers never cut a joined Unicode grapheme', async () => {
@@ -159,6 +164,6 @@ test('fitted session-name headers never cut a joined Unicode grapheme', async ()
   io.setSession({ ...newSession({ provider: 'openai', model: 'fixture' }), title: emoji.repeat(25), titleRevision: 1 })
   await frame()
   const header = setup.renderer.root.findDescendantById('vivi-header') as TextRenderable
-  const prefix = header.plainText.split('\n')[1]!.split('…')[0]!
+  const prefix = header.plainText.split('…')[0]!
   expect(prefix).toBe(emoji.repeat(prefix.length / emoji.length))
 })

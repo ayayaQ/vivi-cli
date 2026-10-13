@@ -22,12 +22,12 @@ async function fixture(t, secrets = []) {
   return { directory, workspace, registry: createToolRegistry([createWorkspaceExtension(workspace)]) }
 }
 
-test('selected workspace exposes only list, text read and literal search', async t => {
+test('selected workspace exposes only list, text read, literal search and path glob', async t => {
   const { directory, registry } = await fixture(t)
   await fs.mkdir(join(directory, 'src'))
   await fs.writeFile(join(directory, 'package.json'), '{"name":"fixture"}\n')
   await fs.writeFile(join(directory, 'src', 'readme.txt'), 'First line\nRead-only fixture\nLast line\n')
-  assert.deepEqual(registry.tools.map(tool => tool.name), ['workspace_list', 'workspace_read', 'workspace_search'])
+  assert.deepEqual(registry.tools.map(tool => tool.name), ['workspace_list', 'workspace_read', 'workspace_search', 'workspace_glob'])
   const list = (await run(registry, 'workspace_list')).data
   assert.equal(list.untrusted, true)
   assert.equal(list.source, 'selected_workspace')

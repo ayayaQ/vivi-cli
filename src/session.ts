@@ -6,12 +6,16 @@ import { join, resolve } from 'node:path'
 import type { HistoryMessage, Usage } from '@ayayaq/vivi'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import { validSessionTitle } from './session-display.js'
+import { FileMcpOutcomeStore, reconcileMcpOutcomes } from './mcp-outcomes.js'
+import { FilePublicUrlOutcomeStore, reconcilePublicUrlOutcomes } from './public-url-outcomes.js'
 
 export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
 export type CliProviderName = 'openai' | 'openrouter'
 export interface CliSession {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
+  /** Schema-2 points to an existing shadow anchor; it grants no replay/send authority. */
+  recordAnchor?: { version: 1; eventId: string }
   id: string
   provider: CliProviderName
   model: string
@@ -82,8 +86,14 @@ export function validateSession(value: unknown): CliSession {
   json(value)
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
-    'history', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision'])
-  check(value.schemaVersion === 1, 'unsupported schema version')
+    'history', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
+  check(value.schemaVersion === 1 || value.schemaVersion === 2, 'unsupported schema version')
+  if (value.schemaVersion === 1) check(!('recordAnchor' in value), 'schema-1 must not contain a record anchor')
+  else {
+    check(object(value.recordAnchor), 'schema-2 requires a record anchor')
+    keys(value.recordAnchor, ['version', 'eventId'])
+    check(value.recordAnchor.version === 1 && identifier(value.recordAnchor.eventId), 'invalid record anchor')
+  }
   check(isSessionId(value.id), 'invalid id')
   check(value.provider === 'openai' || value.provider === 'openrouter', 'unsupported provider')
   check(identifier(value.model), 'invalid model')
@@ -159,7 +169,8 @@ export function newSession(settings: { provider: CliProviderName; model: string;
 
 export interface SessionPersistence {
   load(id: string): Promise<CliSession>
-  save(session: CliSession): Promise<void>
+  /** A supplied guard must be repeated after queued/awaited I/O at the actual replacement boundary. */
+  save(session: CliSession, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<void>
 }
 
 /** The atomic replacement succeeded; only its durability confirmation failed. */
@@ -237,12 +248,17 @@ export class FileSessionStore implements SessionPersistence {
       catch { throw new Error('Session is not valid JSON') }
       const session = validateSession(parsed)
       if (session.id !== id) throw new Error('Session id does not match its filename')
-      session.history = closeInterruptedHistory(session.history)
+      session.history = reconcileMcpOutcomes(closeInterruptedHistory(session.history), id,
+        await new FileMcpOutcomeStore(this.directory, this.secrets).load(id))
+      session.history = reconcilePublicUrlOutcomes(session.history, id,
+        await new FilePublicUrlOutcomeStore(this.directory, this.secrets).load(id))
       validateSession(session)
       return session
     } finally { await file.close() }
   }
-  async save(input: CliSession): Promise<void> {
+  async save(input: CliSession, options: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void } = {}): Promise<void> {
+    const assertCurrent = (): void => { options.signal?.throwIfAborted(); options.assertCurrent?.() }
+    assertCurrent()
     const session = validateSession(input)
     const encoded = JSON.stringify(session)
     // Replace JSON-escaped values too; no credential value can survive in opaque state or errors.
@@ -263,6 +279,7 @@ export class FileSessionStore implements SessionPersistence {
       throw new Error('Session size limit includes mandatory pending recovery results')
     }
     await this.prepare()
+    assertCurrent()
     const target = this.path(session.id)
     try {
       const info = await lstat(target)
@@ -275,8 +292,12 @@ export class FileSessionStore implements SessionPersistence {
     let committed = false
     try {
       await file.writeFile(`${safe}\n`, 'utf8')
+      assertCurrent()
       await file.sync()
+      assertCurrent()
       await file.close()
+      // Recheck immediately before the actual resource replacement, after all awaited I/O.
+      assertCurrent()
       await rename(temporary, target)
       committed = true
       // Ensure rename is durable where directory fsync is supported.

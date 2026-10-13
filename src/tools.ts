@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
-import { createToolRegistry, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
+import { createExtensionScope, type ExtensionCleanup, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
 import { WORKSPACE_TOOL_NAMES } from './workspace.js'
+import { COMMAND_TOOL_NAMES } from './commands.js'
+import { PUBLIC_URL_TOOL_NAME } from './public-url-tools.js'
+import { WORKSPACE_MUTATION_TOOL_NAMES } from './workspace-edit.js'
+import { QUESTION_TOOL_NAME } from './questions.js'
+import { isPlanTool, planModeRefusal } from './task-mode.js'
+import type { TaskMode } from './task-mode.js'
 export { calculate }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
@@ -10,12 +16,16 @@ export interface ApprovalRequest {
   call: ToolCall
   description: string
   currentRevision: number | string
+  /** Presentation only: the host-prepared workspace diff already included in description. */
+  workspaceDiff?: string
 }
 export interface ToolHost {
   enableNotes: boolean
   readNotes(): NoteSnapshot
   commitNote(key: string, value: string, expectedRevision: number): Promise<number>
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
+  /** Prepared note writes go through host-owned review/commit, never a replacement IO judge. */
+  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | undefined>
   now?(): Date
 }
 const objectSchema = (properties: Record<string, unknown>, required: string[]): ToolDefinition['parameters'] =>
@@ -29,7 +39,7 @@ function hostTools(enableNotes = false): ToolDefinition[] {
   if (enableNotes) tools.push(
     { name: 'note_read', description: 'Read this CLI session’s host-owned notes and revision. No filesystem access.',
       parameters: objectSchema({}, []) },
-    { name: 'note_set', description: 'Set one session note after explicit human approval. Use the latest note revision.',
+    { name: 'note_set', description: 'Propose one session note change for host review. Use the latest note revision; never claim a save before its success result.',
       parameters: objectSchema({ key: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,40}$' },
         value: { type: 'string', maxLength: 4096 }, expectedRevision: { type: 'integer', minimum: 0 } },
       ['key', 'value', 'expectedRevision']) })
@@ -37,31 +47,66 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 }
 
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
-export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension): {
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension, taskMode: TaskMode = 'execute', questions?: ToolExtension): {
   tools: ToolDefinition[]
+  readonly signal: AbortSignal
+  defer(cleanup: ExtensionCleanup): void
+  dispose(): Promise<void>
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
 } {
-  const registry = createToolRegistry([calculatorExtension, ...extensions], {
-    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES]
+  if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
+  const scope = createExtensionScope({
+    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
+      PUBLIC_URL_TOOL_NAME, QUESTION_TOOL_NAME, 'list_mcp_resources', 'read_mcp_resource', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
-  const memoryRegistry = memory ? createToolRegistry([memory]) : undefined
-  const workspaceRegistry = workspace ? createToolRegistry([workspace]) : undefined
-  return {
-    tools: [...registry.tools, ...hostTools(enableNotes), ...(memoryRegistry?.tools ?? []), ...(workspaceRegistry?.tools ?? [])],
-    executeTool: (call, signal, host) => memoryRegistry?.has(call.name)
-      ? memoryRegistry.executeTool(call, { signal }) : workspaceRegistry?.has(call.name)
-        ? workspaceRegistry.executeTool(call, { signal }) : executeHostTool(call, signal, host, registry)
+  const builtins = createExtensionScope({ reservedNames: ['save_skill'] })
+  scope.defer(() => builtins.dispose())
+  try {
+    scope.register(calculatorExtension)
+    if (taskMode !== 'plan') for (const extension of extensions) scope.register(extension)
+    for (const extension of [memory, workspace, skills, questions, ...(taskMode === 'plan' ? [] : [commands, mcp, publicUrl])]) if (extension) {
+      builtins.register(taskMode === 'plan' ? { ...extension, tools: extension.tools.filter(tool => isPlanTool(tool.definition.name)) } : extension)
+    }
+    const registry = scope.snapshot(), builtinRegistry = builtins.snapshot()
+    const tools = [...registry.tools, ...hostTools(enableNotes), ...builtinRegistry.tools]
+      .filter(tool => taskMode !== 'plan' || isPlanTool(tool.name))
+    const allowed = new Set(tools.map(tool => tool.name))
+    return {
+      tools,
+      signal: scope.signal,
+      defer: cleanup => scope.defer(cleanup),
+      dispose: () => scope.dispose(),
+      executeTool: async (call, signal, host) => {
+        scope.signal.throwIfAborted()
+        signal.throwIfAborted()
+        // Advertisement is not the enforcement boundary: a direct or retained
+        // dispatcher cannot invoke an omitted tool or reuse another turn's approval.
+        if (taskMode === 'plan' && !allowed.has(call.name)) return planModeRefusal()
+        // Host tools and built-in packs are restricted by this same turn owner.
+        const ownedSignal = AbortSignal.any([signal, scope.signal])
+        return builtinRegistry.has(call.name) ? builtinRegistry.executeTool(call, { signal: ownedSignal })
+          : executeHostTool(call, ownedSignal, host, registry)
+      }
+    }
+  } catch (error) {
+    // No caller resource can have transferred yet. Seal every partial registration.
+    void scope.dispose().catch(() => {})
+    throw error
   }
 }
 
 export function builtinTools(enableNotes = false): ToolDefinition[] {
-  return structuredClone(createBuiltinToolset(enableNotes).tools)
+  const toolset = createBuiltinToolset(enableNotes)
+  try { return structuredClone(toolset.tools) }
+  finally { void toolset.dispose() }
 }
 
-export function executeBuiltin(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult> {
-  return createBuiltinToolset(host.enableNotes).executeTool(call, signal, host)
+export async function executeBuiltin(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult> {
+  const toolset = createBuiltinToolset(host.enableNotes)
+  try { return await toolset.executeTool(call, signal, host) }
+  finally { await toolset.dispose() }
 }
 
 function error(code: string, message: string): ToolResult {
@@ -100,6 +145,11 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
       const before = host.readNotes()
       if (before.revision !== expectedRevision) return error('revision_conflict', 'Read the latest notes before changing them')
       if (!Object.hasOwn(before.notes, key) && Object.keys(before.notes).length >= 64) throw new Error('Session has reached its note limit')
+      if (host.reviewNote) {
+        const revision = await host.reviewNote(call, before, key, value, signal)
+        return revision === undefined ? error('approval_denied', 'This note change was not approved')
+          : { content: JSON.stringify({ success: true, key, revision }) }
+      }
       if (!await host.approve({ call, description: `Set session note ${JSON.stringify(key)} to ${JSON.stringify(value)}`,
         currentRevision: before.revision }, signal)) return error('approval_denied', 'Human denied this note change')
       if (signal.aborted) return error('cancelled', 'Cancelled before note change')
@@ -109,6 +159,7 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
     }
     return error('unavailable_tool', 'Tool is unavailable')
   } catch (failure) {
+    signal.throwIfAborted()
     return error('invalid_arguments', failure instanceof Error ? failure.message : 'Tool request failed')
   }
 }
