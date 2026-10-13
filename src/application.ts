@@ -29,6 +29,8 @@ import { McpConfigStore } from './mcp-config.js'
 import { McpManager } from './mcp-manager.js'
 import type { McpManagerOptions } from './mcp-manager.js'
 import { manageMcp } from './mcp-controls.js'
+import { McpOAuthControls } from './mcp-oauth-controls.js'
+import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -54,6 +56,8 @@ export interface ApplicationOptions {
   decisionProviderFactory?: typeof decisionProviderForSession
   /** Trusted launch wiring only; never configured by the model. */
   mcpManagerFactory?(options: McpManagerOptions): McpManager
+  /** Trusted launch/fixture browser and network hooks; no credentials or persisted OAuth settings. */
+  mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
   reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
@@ -95,24 +99,41 @@ Keys are masked and saved only in an available OS credential store, or used for 
 `
 
 /** Navigation and host policy; the shared core owns conversation/tool execution. */
+interface ApplicationSecretRegistration {
+  readonly secrets: string[]
+  register(values: readonly string[]): void
+  targets(values: readonly string[]): void
+}
 export async function runApplication(input: ApplicationOptions): Promise<number> {
-  const manager = (input.mcpManagerFactory ?? (options => new McpManager(options)))({
-    store: new McpConfigStore(input.options.sessionDirectory, input.secrets), env: input.env, secrets: input.secrets
+  let manager: McpManager
+  const registration: ApplicationSecretRegistration = { secrets: [...input.secrets], targets: () => undefined,
+    register: values => {
+      const fresh = values.filter(value => value && !registration.secrets.includes(value))
+      registration.secrets.push(...fresh)
+      manager.addSecrets(fresh); registration.targets(fresh); input.io.addSecrets?.(fresh)
+      for (const secret of fresh) input.registerSecret?.(secret)
+    } }
+  const oauth = new McpOAuthControls({ dynamicRegistration: 'explicit', ...input.mcpOAuth, secrets: registration.secrets, registerSecrets: registration.register })
+  manager = (input.mcpManagerFactory ?? (options => new McpManager(options)))({
+    store: new McpConfigStore(input.options.sessionDirectory, registration.secrets), env: input.env,
+    secrets: registration.secrets, ...oauth.managerOptions()
   })
+  oauth.bind(manager)
   try {
     if (input.options.prompt !== undefined && await runMcpCommand(input.io, input.options.prompt, {
-      mcp: () => manageMcp(manager, input.io, input.options.workspace)
+      mcp: () => manageMcp(manager, input.io, input.options.workspace, oauth)
     })) return 0
-    return await runManagedApplication(input, manager)
+    return await runManagedApplication(input, manager, oauth, registration)
   }
-  finally { await manager.close() }
+  finally { try { await oauth.close() } finally { await manager.close() } }
 }
 
-async function runManagedApplication(input: ApplicationOptions, mcp: McpManager): Promise<number> {
+async function runManagedApplication(input: ApplicationOptions, mcp: McpManager, oauth: McpOAuthControls,
+  registration: ApplicationSecretRegistration): Promise<number> {
   const { io, options, args, providerFactory } = input
   const env = { ...input.env }
   const commandEnv = captureCommandEnvironment(input.env)
-  const secrets = [...input.secrets]
+  const secrets = registration.secrets
   const credentials = input.credentials ?? createCredentialStore()
   const catalog = input.catalog ?? new ModelCatalog()
   const store = new FileSessionStore(options.sessionDirectory, secrets)
@@ -127,10 +148,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   const knownModels = new Map<string, ModelEntry>()
   const modelKey = (provider: CliProviderName, id: string): string => `${provider}:${id}`
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
-  const register = (key: string): void => {
-    if (!key || secrets.includes(key)) return
-    secrets.push(key); preferences.addSecrets([key]); memory.addSecrets([key]); decisions.addSecrets([key]); skills.addSecrets([key]); mcp.addSecrets([key]); io.addSecrets?.([key]); input.registerSecret?.(key)
-  }
+  const register = (key: string): void => registration.register([key])
   let settings = structuredClone(DEFAULT_PREFERENCES)
   let savedSettings: TuiPreferences | undefined
   try { savedSettings = await preferences.load(); settings = savedSettings ? structuredClone(savedSettings) : settings }
@@ -174,6 +192,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
   let release: (() => Promise<void>) | undefined
   let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
   let sessionCleanupFailed = false
+  registration.targets = values => {
+    preferences.addSecrets(values); memory.addSecrets(values); decisions.addSecrets(values); skills.addSecrets(values)
+    workspace?.addSecrets(values); host?.refreshSecretFilters(); candidate?.host?.refreshSecretFilters()
+  }
   const discardCandidate = async (): Promise<void> => {
     if (!candidate) return
     try {
@@ -671,7 +693,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager)
         if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
         if (command === '/skills') { await manageSkills(); continue }
         if (isMcpCommand(command)) {
-          await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace) })
+          await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace, oauth) })
           continue
         }
         if (command === '/memories') { await manageMemories(); continue }

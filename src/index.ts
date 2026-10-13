@@ -30,6 +30,13 @@ export { createMcpExtension, MCP_GUIDANCE } from './mcp-tools.js'
 export type { McpCatalogKind, McpCatalogEntry, McpCategory, McpCatalogSnapshot } from './mcp-catalog.js'
 export { McpConfigStore } from './mcp-config.js'
 export type { McpServerConfig, McpConfiguration, McpLaunchIdentity, McpStdioServerConfig, McpHttpServerConfig, McpStdioLaunchIdentity, McpHttpLaunchIdentity } from './mcp-config.js'
+export { McpOAuthSession, McpOAuthError } from './mcp-oauth-session.js'
+export type { McpOAuthSessionOptions, McpOAuthSignInPlan, McpOAuthState, McpOAuthAuthorizationSnapshot } from './mcp-oauth-session.js'
+export { McpOAuthControls } from './mcp-oauth-controls.js'
+export type { McpOAuthPublicClient, McpOAuthControlsOptions } from './mcp-oauth-controls.js'
+export { McpOAuthRegistration } from './mcp-oauth-registration.js'
+export type { McpOAuthRegistrationSettings, McpOAuthRegistrationOptions, McpOAuthRegistrationPlan,
+  McpOAuthRegisteredClient, McpOAuthRegistrationState } from './mcp-oauth-registration.js'
 
 export { FileMcpOutcomeStore, McpOutcomeCommitError, MAX_MCP_OUTCOME_ROWS, MAX_MCP_OUTCOME_BYTES } from './mcp-outcomes.js'
 export type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'

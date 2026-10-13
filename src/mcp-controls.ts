@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { randomUUID } from 'node:crypto'
 import type { ChatIO } from './terminal.js'
-import { MCP_ENV_NAMES, mcpDisplayJson, validateMcpServer } from './mcp-config.js'
+import { MCP_ENV_NAMES, isMcpHttpServer, mcpDisplayJson, validateMcpServer } from './mcp-config.js'
 import type { McpServerConfig } from './mcp-config.js'
 import { McpManager, mcpStartDisclosure } from './mcp-manager.js'
 import type { McpServerStatus } from './mcp-manager.js'
 import type { McpCatalogKind } from './mcp-catalog.js'
+import type { McpOAuthControls } from './mcp-oauth-controls.js'
 
 interface McpIO extends ChatIO {
   choose?<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
   askText?(title: string, initial?: string): Promise<string | undefined>
 }
 /** The same user-authored controls work in full-screen and accessible line mode. */
-export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: string): Promise<void> {
+export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: string, oauth?: McpOAuthControls): Promise<void> {
   const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
   const choose = async <T>(title: string, choices: readonly { name: string; description?: string; value: T }[]): Promise<T | undefined> => {
     controller.signal.throwIfAborted()
@@ -98,6 +99,50 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       io.write(`MCP HTTP server ${server.id} saved disabled. Use Enable and connect for fresh endpoint approval\n`)
     }
   }
+  const configureOAuth = async (serverId: string): Promise<void> => {
+    if (!oauth) return
+    const id = await text('Pre-registered public OAuth client ID (no client secret)')
+    if (id === undefined || !id) return
+    const issuer = await text('Pinned OAuth issuer (HTTPS; exact registered issuer)')
+    if (issuer === undefined || !issuer) return
+    const portText = await text('Exact registered IPv4 loopback callback port (1 to 65535)')
+    if (portText === undefined || !portText) return
+    const redirectPort = Number(portText)
+    if (!/^[0-9]+$/.test(portText) || !Number.isInteger(redirectPort) || redirectPort < 1 || redirectPort > 65535)
+      throw new Error('MCP OAuth callback port must be from 1 to 65535')
+    const redirectPath = await text('Exact registered callback path (begins with /; no query or fragment)')
+    if (redirectPath === undefined || !redirectPath) return
+    const scopeText = await text('Requested OAuth scopes (space-separated; blank for none)')
+    if (scopeText === undefined) return
+    const scopes = scopeText.trim() ? scopeText.trim().split(/ +/) : []
+    const save = await choose('Use this public OAuth client for this launch? Nothing is saved or started', [
+      { name: 'Cancel', value: false }, { name: 'Use launch-only public client settings', description: 'Explicit sign-in and separate connection approval are still required', value: true }
+    ])
+    if (save && !controller.signal.aborted && !io.isClosed) {
+      await oauth.configureClient(serverId, { id, issuer, redirectPort, redirectPath, scopes })
+      io.write(`MCP ${serverId} public OAuth client set for this launch. Use Sign in and connect when ready\n`)
+    }
+  }
+  const registerOAuth = async (serverId: string): Promise<void> => {
+    if (!oauth?.canRegisterPublicClient()) return
+    const issuer = await text('Pinned OAuth issuer for public client registration (HTTPS; exact issuer)')
+    if (issuer === undefined || !issuer) return
+    const portText = await text('Fixed IPv4 callback port on 127.0.0.1 (1 to 65535; no automatic port)')
+    if (portText === undefined || !portText) return
+    const redirectPort = Number(portText)
+    if (!/^[0-9]+$/.test(portText) || !Number.isInteger(redirectPort) || redirectPort < 1 || redirectPort > 65535)
+      throw new Error('MCP OAuth callback port must be from 1 to 65535')
+    const redirectPath = await text('Exact callback path (begins with /; no query or fragment)')
+    if (redirectPath === undefined || !redirectPath) return
+    const scopeText = await text('Explicit requested OAuth scopes (space-separated; blank for none)')
+    if (scopeText === undefined) return
+    const scopes = scopeText.trim() ? scopeText.trim().split(/ +/) : []
+    const clientName = await text('Public OAuth client display name', 'vivi-cli')
+    if (clientName === undefined || !clientName) return
+    const registered = await oauth.registerPublicClient(serverId, { issuer, redirectPort, redirectPath, scopes, clientName }, io, controller.signal)
+    io.write(registered ? `MCP ${serverId} public OAuth client registered for this launch. Returning to the menu; use Sign in and connect for separate fresh approvals. The issuer may retain the registration after local disconnect\n`
+      : `MCP ${serverId} public OAuth client registration declined; no registration request sent\n`)
+  }
   const browse = async (status: McpServerStatus, kind: McpCatalogKind): Promise<void> => {
     const category = status.snapshot?.categories[kind]
     if (!category) return
@@ -108,7 +153,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     ])
     if (entry === undefined || entry < 0) return
     const selected = category.entries[entry]
-    if (selected) io.write(`Server: ${status.server.id}\n${kind === 'tools' ? 'Tool name' : kind === 'resources' ? 'Resource URI' : 'URI template'}: ${mcpDisplayJson(selected.remoteKey)}\nStatus: ${selected.state}${selected.reason ? ` · ${selected.reason}` : ''}\n${kind === 'resourceTemplates' ? 'URI templates are metadata-only; expansion is unavailable' : 'Ready tools and discovered concrete resources are available to the agent with separate human approval'}\n`)
+    if (selected) io.write(`Server: ${status.server.id}\n${kind === 'tools' ? 'Tool name' : kind === 'resources' ? 'Resource URI' : 'URI template'}: ${mcpDisplayJson(selected.remoteKey)}\nStatus: ${selected.state}${selected.reason ? ` · ${selected.reason}` : ''}\n${kind === 'resourceTemplates' ? 'Admitted scalar URI templates can be expanded for a separately reviewed resource read; browsing retrieves no contents. Unsupported templates remain metadata only' : 'Ready tools and discovered concrete resources are available to the agent with separate human approval'}\n`)
   }
   const cleanupUnavailableConfiguration = async (): Promise<void> => {
     for (;;) {
@@ -155,7 +200,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · connections start disabled each launch\n`)
       const selected = await choose('MCP connections', [
         { name: 'Back', value: 'back' }, { name: 'Add trusted installed server', value: 'add' },
-        ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` })),
+        ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state}${oauth && isMcpHttpServer(status.server) ? ` · sign-in ${oauth.status(status.server.id).state}` : ''} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` })),
         { name: 'Add trusted HTTP endpoint', value: 'add-http' }
       ])
       if (selected === undefined || selected === 'back') return
@@ -173,9 +218,25 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
           { name: 'Discover resource metadata', description: 'List resource names/URIs and templates; retrieve no contents', value: 'resources' },
           { name: 'Browse URI templates', value: 'resourceTemplates' }
         ] : []),
+        ...(oauth && isMcpHttpServer(status.server) && status.server.endpoint.startsWith('https:') ? [
+          { name: 'Set public OAuth client for this launch', description: 'Exact existing registration and requested scopes; saving starts nothing', value: 'oauth-client' },
+          { name: 'Sign in and connect for this launch', description: 'Fresh browser sign-in approval, then separate fresh HTTP connection approval', value: 'sign-in' },
+          ...(oauth.canRegisterPublicClient() ? [{ name: 'Register public OAuth client',
+            description: 'Discover, review exact public metadata, then send one registration request; returns to menu', value: 'oauth-register' }] : []),
+          ...(oauth.hasActiveAttempt(serverId)
+            ? [{ name: 'Cancel OAuth attempt and disconnect', value: 'cancel-sign-in' }] : [])
+        ] : []),
         { name: 'Remove saved server entry', description: 'Disconnect first; no server files are deleted', value: 'remove' }
       ])
       if (action === undefined || action === 'back') continue
+      if (action === 'oauth-client') { await configureOAuth(serverId); continue }
+      if (action === 'oauth-register') { await registerOAuth(serverId); continue }
+      if (action === 'sign-in' && oauth) {
+        const connected = await oauth.signInAndConnect(serverId, io, controller.signal)
+        io.write(connected ? `MCP ${serverId} signed in and connected for this launch\n` : `MCP ${serverId} sign-in or connection declined; credentials cleared\n`)
+        continue
+      }
+      if (action === 'cancel-sign-in' && oauth) { await manager.disconnect(serverId); io.write(`MCP ${serverId} OAuth attempt cancelled and disconnected\n`); continue }
       if (action === 'connect') {
         const connected = await manager.connect(serverId, async (launch, signal) => {
           const approved = await io.approve({ call: { id: randomUUID(), name: 'connect_mcp_server', arguments: {
