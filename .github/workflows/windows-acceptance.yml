@@ -131,3 +131,26 @@ jobs:
         run: |
           $directory = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
           if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
+
+  oauth-session:
+    # SDK-real synthetic HTTPS metadata/token responses and owned loopback callbacks only.
+    # No external MCP requests, real sign-in, client registration or credential storage.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['26.4.0', '26']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node --test test/mcp-oauth.test.mjs
+      - run: bun test ./test/mcp-oauth.test.mjs
