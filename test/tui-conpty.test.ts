@@ -6,10 +6,10 @@ import { OpenTuiIO } from '../src/tui.js'
 import { createWindowsInputBridge } from '../src/windows-input.js'
 import { conptyFixture } from './helpers/conpty-fixture.mjs'
 
-async function fixture() {
+async function fixture(status = 1) {
   const setup = await createTestRenderer({ width: 100, height: 30, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
-  const io = new OpenTuiIO(setup.renderer), conpty = conptyFixture(createWindowsInputBridge)
+  const io = new OpenTuiIO(setup.renderer), conpty = conptyFixture(createWindowsInputBridge, status)
   conpty.bridge.stdin.on('data', (chunk: Buffer) => setup.renderer.stdin.emit('data', chunk))
   Object.assign(io, { windowsInput: conpty.bridge })
   conpty.bridge.stdin.setRawMode(true); conpty.bridge.start()
@@ -142,4 +142,27 @@ test('ConPTY held Enter cannot confirm a subsequent approval after inner reporti
     f.conpty.key(13, 0, 0, 0); f.conpty.tap(13, 13)
     expect(await approving).toBe(true)
   } finally { f.close() }
+})
+
+
+test('unconfirmed modern transport leaves Ctrl+J and raw-framed paste usable without mode changes', async () => {
+  for (const status of [0, 2]) {
+    const f = await fixture(status)
+    try {
+      const reading = f.io.readLine('Message'); let submitted = false
+      void reading.then(() => { submitted = true })
+      await f.frame(); await f.setup.mockInput.typeText('first')
+      f.conpty.tap(74, 10, 8); await f.frame()
+      expect(submitted).toBe(false)
+      f.conpty.paste('second\r\nthird'); await f.frame()
+      expect((f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText)
+        .toBe('first\nsecond\nthird')
+      expect(f.conpty.bridge.diagnostic.enableRequested).toBe(false)
+      f.conpty.tap(13, 13)
+      expect(await reading).toBe('first\nsecond\nthird')
+      f.io.close()
+      expect(f.conpty.writes).toEqual(['\x1b[?9001$p'])
+      expect(f.conpty.source.isRaw).toBe(false)
+    } finally { f.close() }
+  }
 })

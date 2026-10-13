@@ -9,7 +9,9 @@ import { Transform } from 'node:stream'
 // ConPTY forwards DECRQM to its hosting terminal and suppresses its own replies.
 // A reported 9001=1 therefore describes the outer WT→ConPTY link, while ConPTY's
 // application-facing encoder may still be off. Explicitly enable that inner
-// stage for this full-screen application's lifetime, then reset it on close.
+// stage for this full-screen application's lifetime after a mode-1 reply, then
+// reset it on close. A mode-2 reply does not establish the modern outer topology;
+// leave reporting off and retain legacy Enter/Ctrl+J input in that case.
 // ConPTY reasserts the outer mode when forwarding the reset; its inner prior
 // state cannot be queried this way, so this is consumer ownership, not a snapshot.
 // https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/host/outputStream.cpp
@@ -258,7 +260,7 @@ export function createWindowsInputBridge(source: NodeJS.ReadStream,
     waiting = false
     modeReply = status
     clearTimeout(queryTimer)
-    if (status === 1 || status === 2) { ownsConsumerMode = true; enableRequested = true; write(ENABLE_MODE) }
+    if (status === 1) { ownsConsumerMode = true; enableRequested = true; write(ENABLE_MODE) }
   }, () => ownsConsumerMode)
   const stdin = new Transform({
     transform(chunk: Buffer, _encoding, callback) {

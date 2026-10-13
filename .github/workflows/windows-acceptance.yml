@@ -77,10 +77,11 @@ jobs:
       # Real URL engine, host admission, DNS/TLS/HTTP adapters and owned response fixtures only; no external requests.
       - run: node --test --test-concurrency=1 test/public-url-contract.test.mjs test/public-url.test.mjs test/public-url-html.test.mjs test/public-url-transport.test.mjs test/public-url-host.test.mjs test/public-url-outcomes.test.mjs
       - run: bun test ./test/public-url-contract.test.mjs ./test/public-url.test.mjs ./test/public-url-html.test.mjs ./test/public-url-transport.test.mjs ./test/public-url-host.test.mjs ./test/public-url-outcomes.test.mjs
-      - name: Verify real private Windows ConPTY transport
+      - name: Verify real stock Windows fallback transport
         run: |
           $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
-          node --test test/windows-conpty-native.test.mjs
+          $env:VIVI_TEST_POWERSHELL = (Get-Command pwsh -CommandType Application).Source
+          node --test test/windows-conpty-fallback-native.test.mjs
       # Windows npm scripts do not expand the shell wildcard used by test:tui.
       - run: bun test ./test/tui.test.ts ./test/tui-theme.test.ts ./test/tui-diff.test.ts ./test/application-tui.test.ts ./test/tui-mouse.test.ts ./test/tui-composer-feedback.test.ts ./test/tui-input-diagnostic.test.ts ./test/tui-conpty.test.ts ./test/windows-conpty-fixture.test.ts ./test/session-status-tui.test.ts ./test/auto-review-controls-tui.test.ts ./test/auto-review-status-tui.test.ts ./test/skills-tui.test.ts ./test/tool-presentation-tui.test.ts
       - run: bun test ./test/mcp-controls-tui.test.ts
@@ -122,6 +123,7 @@ jobs:
       - name: Verify real pinned mode1 transport
         run: |
           $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
+          $env:VIVI_TEST_POWERSHELL = (Get-Command pwsh -CommandType Application).Source
           $env:VIVI_TEST_CONPTY_PINNED_DIRECTORY = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
           node --test test/windows-conpty-packaged-native.test.mjs
       - name: Remove the private Microsoft backend

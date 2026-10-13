@@ -92,7 +92,11 @@ cannot distinguish them from that byte alone. For a native Windows TTY, vivi
 requests [Windows input-record reporting](https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md)
 to preserve reported Enter modifiers. ConPTY has separate outer and application-facing
 encoders; vivi requests the application encoder even after an "already enabled"
-reply, then resets it on close. The query cannot reveal that encoder's prior state.
+mode-1 reply, then resets it on close. The query cannot reveal that encoder's prior
+state. This targets modern Windows Terminal's active outer transport. Mode-2,
+unsupported or unanswered queries leave reporting off; use Ctrl+J for a newline
+when Enter and Shift+Enter arrive identically. Legacy native-framed paste support
+is outside this scope.
 Physical Shift+Enter behavior on Windows Terminal 1.24 remains unverified after a
 user-reported failure. Raw-framed bracketed paste retains Unicode and line breaks;
 chat drafts normalize CRLF or CR to LF. Other terminals use the supported Kitty keyboard

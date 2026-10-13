@@ -2,19 +2,19 @@
 
 Status: one strict pinned WT1.24 lane passed on historical head `057ff573`; a duplicate timed out before confirmed C# entry. Stock Conhost 10.0.26100.1 failed its unchanged paste/restoration gate. Revalidation on current main is pending. A Linux skip is not Windows evidence.
 
-The native test has a distinct name, `windows-conpty-native.test.mjs`, so it does not replace the existing topology simulation. It is included in the Windows acceptance workflow alongside that simulation.
+The active modern gate is `windows-conpty-packaged-native.test.mjs`; stock Windows runs the distinct `windows-conpty-fallback-native.test.mjs` gate. The original strict stock test `windows-conpty-native.test.mjs` remains unchanged for historical diagnosis, outside the supported-modern merge gates. Its prior failures remain evidence of unsupported legacy native-framed paste, not successful acceptance.
 
 ## Run on Windows x64
 
-Use the repository's existing Node 26.4.0 and Bun 1.4.2 setup and installed dependencies. Windows PowerShell 5.1 and OS CreatePseudoConsole are required. The host is compiled locally by Add-Type, without a native package or downloaded binary.
+Use the repository's existing Node 26.4.0 and Bun 1.4.2 setup and installed dependencies. An installed PowerShell and OS CreatePseudoConsole are required. Active CI explicitly selects its already-installed PowerShell 7 with `VIVI_TEST_POWERSHELL`; no software is installed by that selection. The unchanged strict stock diagnostic uses Windows PowerShell 5.1. The host is compiled locally by Add-Type, without a native package or downloaded binary.
 
-Normal candidate regression:
+Stock fallback regression:
 
 ```powershell
-node --test test/windows-conpty-native.test.mjs
+node --test test/windows-conpty-fallback-native.test.mjs
 ```
 
-The same test and child can target a separate baseline checkout without editing it:
+The retained historical strict stock diagnostic can target a separate baseline checkout without editing it:
 
 ```powershell
 $env:VIVI_TEST_CONPTY_REPOSITORY = 'C:\path\cli-windows-input-baseline'
@@ -25,7 +25,7 @@ $env:VIVI_TEST_CONPTY_EXPECT = 'fixed'
 node --test C:\path\candidate\test\windows-conpty-native.test.mjs
 ```
 
-Both checkouts need their unchanged installed dependencies. `VIVI_TEST_BUN` may select an absolute Bun executable. The wrapper reports the observed Bun, OS and system conhost versions. It never downloads a runtime. For existing Windows CI, add the native test to the explicit Node test invocation or run it as a separate step after dependency setup. The existing Bun/Node pins do not need changes.
+Both checkouts need their unchanged installed dependencies. `VIVI_TEST_BUN` may select an absolute Bun executable. The wrapper reports the observed Bun, OS and system conhost versions. It never downloads a runtime. The active stock fallback gate requires a local mode-2 reply, no consumer enable/reset, identical raw Enter and Shift+Enter, raw Ctrl+J linefeed, literal raw-framed paste and complete restoration. It does not claim native modifiers. The existing Bun/Node pins do not change.
 
 Cross-platform fixture checks, independently labelled synthetic:
 
@@ -83,6 +83,6 @@ The restoration claim is the standard topology of inner consumer disabled and ou
 
 The additional test rechecks the archive and extracted file hashes before launching the private host. The host loads the selected DLL by absolute path, verifies the loaded module identity, and requires/pins its sibling `OpenConsole.exe`; missing peers fail before process creation. This prevents the documented silent fallback to inbox conhost. Create and close come from the same selected DLL, kept loaded until joined teardown. Normal host invocation still uses Kernel32. Production `OpenTuiIO.create`, genuine TTY guards, exact mode1/paste/repeat/inner-reset/outer-reassertion assertions and bounded cleanup remain intact.
 
-The historical passing pinned lane does not turn a failing stock paste test into a pass and does not test physical Windows Terminal keys. Supervisor phase metadata covers archive verification and compilation without extending its deadline.
+The historical passing pinned lane does not turn a failing legacy native-paste diagnostic into a pass and does not test physical Windows Terminal keys. The scoped implementation acquires consumer reporting only for mode 1; other replies retain legacy input. Supervisor phase metadata covers archive verification and compilation without extending its deadline.
 
 Primary provenance: [exact Microsoft release and asset digest](https://github.com/microsoft/terminal/releases/tag/v1.24.12741.0), [package entry paths](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/winconpty/package/winconpty.nuspec), [DLL exports](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/winconpty/dll/winconpty.def), [API declarations](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/inc/conpty-static.h), and [sibling/fallback selection](https://github.com/microsoft/terminal/blob/v1.24.12741.0/src/winconpty/winconpty.cpp#L49-L102).

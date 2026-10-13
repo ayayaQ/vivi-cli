@@ -200,7 +200,7 @@ test('query timeout and late replies never enable reporting or interrupt ordinar
     source.write('before')
     source.write('\x1b[?9001;') // Delayed mode reply must not win after the query window.
     t.mock.timers.tick(5001)
-    source.write('2$y')
+    source.write('1$y')
     source.write('after\n')
     await nextTick()
     assert.equal(text(), 'beforeafter\n')
@@ -208,7 +208,7 @@ test('query timeout and late replies never enable reporting or interrupt ordinar
     assert.equal(input.failure, undefined)
     assert.equal(source.isRaw, true)
     input.close()
-    source.write('\x1b[?9001;2$y')
+    source.write('\x1b[?9001;1$y')
     t.mock.timers.tick(5000)
     assert.deepEqual(writes, ['\x1b[?9001$p'])
     assert.equal(source.isRaw, false)
@@ -273,7 +273,7 @@ test('an enable-write failure still attempts reset and restores raw/input owners
   try {
     input.stdin.setRawMode(true)
     input.start()
-    source.write('\x1b[?9001;2$y')
+    source.write('\x1b[?9001;1$y')
     await nextTick()
     assert.deepEqual(writes, ['\x1b[?9001$p', '\x1b[?9001h', '\x1b[?9001l'])
     assert.equal(reporting, false)
@@ -302,7 +302,7 @@ test('a transient reset-write failure is retried before closing while permanent 
     try {
       input.stdin.setRawMode(true)
       input.start()
-      source.write('\x1b[?9001;2$y')
+      source.write('\x1b[?9001;1$y')
       if (permanent) assert.throws(() => input.close(), { message: 'Windows console reporting restoration failed' })
       else input.close()
       assert.equal(resets, 2)
@@ -328,7 +328,7 @@ test('process-exit hook resets an owned mode and releases neutral stdin in a fak
     const writes = []
     const input = createWindowsInputBridge(source, text => writes.push(text))
     input.stdin.resume(); input.stdin.setRawMode(true); input.start()
-    source.write('\\x1b[?9001;2$y')
+    source.write('\\x1b[?9001;1$y')
     process.once('exit', () => writeSync(1, JSON.stringify({ writes, raw: source.isRaw,
       flowing: source.readableFlowing, detached: source.listenerCount('data') === 0, destroyed: input.stdin.destroyed })))
     process.exit(0)
@@ -339,7 +339,7 @@ test('process-exit hook resets an owned mode and releases neutral stdin in a fak
     raw: false, flowing: false, detached: true, destroyed: true })
 })
 
-test('bridge requests supported consumer reporting, resets its request, preserves raw mode and detaches input', async () => {
+test('bridge requests modern outer-enabled consumer reporting, resets its request, preserves raw mode and detaches input', async () => {
   for (const status of [0, 1, 2, 3, 4]) {
     const { source, input, writes, text } = fixture()
     try {
@@ -351,10 +351,10 @@ test('bridge requests supported consumer reporting, resets its request, preserve
       await nextTick()
       assert.equal(text(), '\x1b[13;2u')
       assert.equal(source.isRaw, true)
-      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 1 || status === 2 ? ['\x1b[?9001h'] : [])])
+      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 1 ? ['\x1b[?9001h'] : [])])
       input.close()
       input.close()
-      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 1 || status === 2 ? ['\x1b[?9001h', '\x1b[?9001l'] : [])])
+      assert.deepEqual(writes, ['\x1b[?9001$p', ...(status === 1 ? ['\x1b[?9001h', '\x1b[?9001l'] : [])])
       assert.equal(source.isRaw, false)
       assert.equal(source.isPaused(), true)
       assert.equal(input.stdin.destroyed, true)
@@ -442,7 +442,7 @@ test('a delayed split paste-end marker cannot leave subsequent Windows keys in p
 })
 
 test('owned reporting buffers delayed bare-ESC paste and key-record prefixes instead of applying legacy timeout', async () => {
-  for (const status of [1, 2]) {
+  for (const status of [1]) {
     const { source, input, text } = fixture()
     try {
       input.stdin.setRawMode(true); input.start()
@@ -483,7 +483,7 @@ test('source EOF and closure restore owned reporting and settle the input bridge
     try {
       input.stdin.setRawMode(true)
       input.start()
-      source.write('\x1b[?9001;2$y')
+      source.write('\x1b[?9001;1$y')
       if (ending === 'end') source.end()
       else source.destroy()
       await nextTick()
@@ -505,7 +505,7 @@ test('bridge input failures restore reporting and never expose input bytes in er
   const input = createWindowsInputBridge(source, text => writes.push(text), () => { failed = true })
   try {
     input.start()
-    source.write('\x1b[?9001;2$y')
+    source.write('\x1b[?9001;1$y')
     source.emit('error', new Error('fake-secret-must-not-be-copied'))
     await nextTick()
     assert.equal(failed, true)

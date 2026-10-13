@@ -83,7 +83,9 @@ test('pinned Microsoft WT1.24 ConPTY preserves the exact mode1 Bun transport', {
   const env = environment()
   const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT
   assert.ok(systemRoot && isAbsolute(systemRoot), 'Windows must provide SystemRoot')
-  const powershell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const powershell = process.env.VIVI_TEST_POWERSHELL ?? join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  assert.ok(isAbsolute(powershell), 'Select an absolute installed PowerShell executable')
+  await access(powershell)
   const requestedBun = process.env.VIVI_TEST_BUN ?? 'bun'
   let bun = requestedBun
   if (!isAbsolute(bun)) {

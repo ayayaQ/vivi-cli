@@ -39,16 +39,18 @@ test('inner consumer reporting preserves opaque multiline paste, other replies a
   } finally { f.close() }
 })
 
-test('unsupported outer mode stays legacy and a disposed query cannot acquire consumer reporting', async () => {
-  const unsupported = conptyFixture(createWindowsInputBridge, 0)
-  try {
-    unsupported.bridge.stdin.setRawMode(true); unsupported.bridge.start(); await tick()
-    unsupported.tap(13, 13, 16); await tick()
-    assert.equal(unsupported.text(), '\r')
-    assert.equal(unsupported.bridge.diagnostic.enableRequested, false)
-    assert.equal(unsupported.bridge.diagnostic.enterRecordsObserved, 0)
-    assert.deepEqual(unsupported.writes, ['\x1b[?9001$p'])
-  } finally { unsupported.close() }
+test('unconfirmed modern outer mode keeps legacy Enter/Ctrl+J and a disposed query cannot acquire consumer reporting', async () => {
+  for (const status of [0, 2, 3, 4]) {
+    const unsupported = conptyFixture(createWindowsInputBridge, status)
+    try {
+      unsupported.bridge.stdin.setRawMode(true); unsupported.bridge.start(); await tick()
+      unsupported.tap(13, 13); unsupported.tap(13, 13, 16); unsupported.tap(74, 10, 8); unsupported.paste('first\r\nsecond🙂'); await tick()
+      assert.equal(unsupported.text(), '\r\r\n\x1b[200~first\r\nsecond🙂\x1b[201~')
+      assert.equal(unsupported.bridge.diagnostic.enableRequested, false)
+      assert.equal(unsupported.bridge.diagnostic.enterRecordsObserved, 0)
+      assert.deepEqual(unsupported.writes, ['\x1b[?9001$p'])
+    } finally { unsupported.close() }
+  }
   const disposed = conptyFixture(createWindowsInputBridge)
   try {
     disposed.bridge.stdin.setRawMode(true); disposed.bridge.start(); disposed.bridge.close(); await tick()
