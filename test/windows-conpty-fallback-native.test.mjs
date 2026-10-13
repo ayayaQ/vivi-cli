@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { basicProbes, repeatProbes, paste, pasteText, finish, restorationProbe }
+import { basicProbes, paste, pasteText, finish, restorationProbe }
   from './fixtures/windows-conpty/protocol.mjs'
 
 const fixtures = fileURLToPath(new URL('./fixtures/windows-conpty/', import.meta.url))
@@ -20,6 +20,7 @@ const environment = () => {
 }
 
 // This is a distinct fallback contract, not a successful native-modifier assertion.
+// Native repeat identity belongs to the unchanged modern gate, not this raw fallback.
 export function assertFallbackTransportReport(host, child) {
   assert.equal(host.hostFailed, undefined)
   assert.equal(host.ExitCode, 0)
@@ -46,8 +47,7 @@ export function assertFallbackTransportReport(host, child) {
   assert.deepEqual(child.probes.map(tuple), [
     ['enter', false, false, 'press', 'raw'],
     ['enter', false, false, 'press', 'raw'],
-    ['linefeed', false, false, 'press', 'raw'],
-    ...Array.from({ length: 5 }, () => ['enter', false, false, 'press', 'raw'])
+    ['linefeed', false, false, 'press', 'raw']
   ], 'Shift+Enter is indistinguishable from Enter here; Ctrl+J stays raw linefeed')
   assert.equal(child.paste.count, 1)
   assert.equal(child.paste.matchesKnownFixture, true)
@@ -89,7 +89,7 @@ test('stock Windows ConPTY keeps raw Enter/Ctrl+J fallback, literal paste and cl
   const configuration = join(directory, 'configuration.json')
   try {
     await writeFile(configuration, JSON.stringify({ bun, child: join(fixtures, 'probe.ts'), repository, prefix,
-      basic: basicProbes, repeats: repeatProbes, paste, finish, restore: restorationProbe, expectReset: false }), { mode: 0o600 })
+      basic: basicProbes, repeats: '', paste, finish, restore: restorationProbe, expectReset: false }), { mode: 0o600 })
     // No shell, no windows terminal UI, no keyboard hooks, and no redirected child stdin.
     const hostProcess = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-File',
       join(fixtures, 'host.ps1'), '-Configuration', configuration], {
