@@ -3,8 +3,9 @@ import { spawn } from 'node:child_process'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/client'
 import type { JSONRPCMessage, Transport } from '@modelcontextprotocol/client'
-import type { McpLaunchIdentity } from './mcp-config.js'
+import type { McpLaunchIdentity }  from './mcp-config.js'
 import type { WindowsMcpProcess } from './mcp-windows.js'
+import { isMcpHttpLaunch } from './mcp-config.js'
 import { verifyMcpGroupDead } from './mcp-process-group.js'
 
 const REQUESTS = new Set(['initialize', 'server/discover', 'tools/list', 'resources/list', 'resources/templates/list', 'tools/call', 'resources/read'])
@@ -24,7 +25,8 @@ export class McpStdioTransport implements Transport {
   private started = false
   private starting: Promise<void> | undefined
   private readonly buffer = new ReadBuffer({ maxBufferSize: 1024 * 1024 })
-  constructor(private readonly launch: McpLaunchIdentity) {}
+  private readonly launch: import('./mcp-config.js').McpStdioLaunchIdentity
+  constructor(launch: McpLaunchIdentity) { if (isMcpHttpLaunch(launch)) throw new Error('MCP stdio transport requires an installed server'); this.launch = launch as import('./mcp-config.js').McpStdioLaunchIdentity }
   get stderr(): null { return null }
   get pid(): number | undefined { return this.child?.pid }
   async start(): Promise<void> {

@@ -143,3 +143,17 @@ test('Back from unavailable-config cleanup preserves the retained owned handle f
   assert.deepEqual(io.choices[0].choices.map(choice => choice.value), ['back', 'cleanup:docs'])
   assert(!io.output.includes('disabled for this launch'))
 })
+
+test('HTTP endpoint controls save a disabled credential-free endpoint without sending', async t => {
+  const subject = await fixture(t), io = ioFixture([2, 0, 1, 0], ['remote', 'Remote fixture', 'https://mcp.example.test/endpoint'])
+  await manageMcp(subject.manager, io)
+  const saved = await subject.store.load()
+  assert.equal(saved.servers.length, 1); assert.equal(saved.servers[0].transport, 'http'); assert.equal(saved.servers[0].protocol, '2026-07-28')
+  assert.equal(saved.servers[0].allowLoopbackHttp, false); assert.equal(subject.starts(), 0); assert.equal(io.approvals.length, 0)
+  assert.match(io.output, /HTTP server remote saved disabled/)
+})
+test('HTTP controls require explicit literal-loopback allowance before saving HTTP', async t => {
+  const subject = await fixture(t), io = ioFixture([2, 0, 0], ['remote', 'Remote fixture', 'http://127.0.0.1:43210/mcp'])
+  await manageMcp(subject.manager, io)
+  assert.equal((await subject.store.load()).servers.length, 0); assert.equal(subject.starts(), 0)
+})

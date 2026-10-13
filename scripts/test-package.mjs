@@ -106,7 +106,7 @@ try {
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts',
     'src/questions.ts', 'dist/questions.js', 'dist/questions.d.ts',
     'src/input-queue.ts', 'dist/input-queue.js', 'dist/input-queue.d.ts']) assert(paths.has(path), `Missing ${path}`)
-  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes', 'templates']) {
+  for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'http-transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes', 'templates']) {
     for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
       assert(paths.has(path), `Missing ${path}`)
     }
@@ -420,6 +420,34 @@ try {
   const unknownLog = (await readFile(join(directory, 'unknown-log'), 'utf8')).trim().split('\\n').map(JSON.parse)
   assert.equal(unknownLog.filter(message => message.method === 'tools/call').length, 1)
   await mcp.disconnect('unknown')
+  let httpEffects = 0
+  const remoteMcp = new McpManager({ store: new McpConfigStore(join(directory, 'http-state')), env: {}, httpFetch: async (input, init) => {
+    assert.equal(String(input), 'https://mcp.example.test/packed'); assert.equal(init.method, 'POST'); assert.equal(init.redirect, 'manual')
+    const message = JSON.parse(init.body)
+    const result = message.method === 'server/discover' ? { supportedVersions: ['2026-07-28'], capabilities: { tools: {}, resources: {} }, ttlMs: 0, cacheScope: 'private' }
+      : message.method === 'tools/list' ? { tools: [{ name: 'packed_http_echo', inputSchema: { type: 'object', additionalProperties: false } }], ttlMs: 0, cacheScope: 'private' }
+      : message.method === 'resources/templates/list' ? { resourceTemplates: [{ uriTemplate: 'fixture:///{name}', name: 'Packed HTTP template' }], ttlMs: 0, cacheScope: 'private' }
+      : message.method === 'resources/read' ? (httpEffects++, { contents: [{ uri: message.params.uri, text: 'Packed HTTP template accepted' }], ttlMs: 0, cacheScope: 'private' })
+      : message.method === 'tools/call' ? (httpEffects++, { content: [{ type: 'text', text: 'Packed HTTP fixture accepted' }] })
+      : assert.fail('Unexpected HTTP request ' + message.method)
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { ...result, resultType: 'complete' } }), { headers: { 'content-type': 'application/json' } })
+  } })
+  try {
+    await remoteMcp.configure({ transport: 'http', id: 'packed_http', label: 'Owned packed HTTP fixture', endpoint: 'https://mcp.example.test/packed', protocol: '2026-07-28', allowLoopbackHttp: false })
+    assert.equal(await remoteMcp.connect('packed_http', async launch => { assert.equal(launch.authRevision, 'anonymous'); return true }, new AbortController().signal), true)
+    const [snapshot] = await remoteMcp.captureCatalogs(new AbortController().signal), entry = snapshot.categories.tools.entries[0]
+    const operation = remoteMcp.prepareOperation(snapshot, entry, 'tools', { id: 'packed-http-call', name: entry.alias, arguments: {} })
+    const outcome = await remoteMcp.invoke(operation, new AbortController().signal, () => {})
+    assert.equal(JSON.parse(outcome.content).confirmedOutcome, true); assert.equal(httpEffects, 1)
+    await remoteMcp.refresh('packed_http', ['resourceTemplates'], new AbortController().signal)
+    const [templateSnapshot] = await remoteMcp.captureCatalogs(new AbortController().signal), template = templateSnapshot.categories.resourceTemplates.entries[0]
+    const templateOperation = remoteMcp.prepareOperation(templateSnapshot, template, 'resourceTemplates', { id: 'packed-http-template', name: 'read_mcp_resource_template',
+      arguments: { serverId: 'packed_http', uriTemplate: template.remoteKey, variables: { name: 'from HTTP/é' } } })
+    assert.equal(templateOperation.resourceUri, 'fixture:///from%20HTTP%2F%C3%A9')
+    const templateOutcome = await remoteMcp.invoke(templateOperation, new AbortController().signal, () => {})
+    assert.equal(JSON.parse(templateOutcome.content).confirmedOutcome, true); assert.equal(httpEffects, 2)
+    assert.equal(JSON.parse(templateOutcome.content).remoteKey, templateOperation.resourceUri)
+  } finally { await remoteMcp.close() }
   const host = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' },
     provider: { generate: async () => ({ content: 'Packed host works', toolCalls: [],
