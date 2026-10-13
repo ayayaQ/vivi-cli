@@ -21,10 +21,17 @@ async function fixture(t, { secrets = [], available = true, approved = true, app
 const call = (args, id = 'fixture-start') => ({ id, name: 'command_start', arguments: { executable: process.execPath,
   args: ['--input-type=module', '-e', 'console.log("fixture-output")'], yieldMs: 1000, ...args } })
 const parse = result => JSON.parse(result.content)
-async function terminal(subject, result) {
+function assertPendingOutputBound(value) {
+  const bytes = Buffer.byteLength(value.output)
+  assert(bytes <= COMMAND_LIMITS.maximumPendingBytes,
+    `Pending response has ${bytes} bytes; maximum is ${COMMAND_LIMITS.maximumPendingBytes}`)
+}
+async function terminal(subject, result, observe) {
   let value = parse(result)
+  if (observe) await observe(value)
   while (value.state === 'running') {
     const next = parse(await subject.workspace.poll(value.executionId, 'fixture-launch:fixture-session:fixture-run', 2000))
+    if (observe) await observe(next)
     next.output = value.output + next.output; value = next
   }
   return value
@@ -197,9 +204,37 @@ test('a known credential prefix held at stream end is withheld rather than expos
 })
 test('pending output is bounded and total output overflow stops the process', async t => {
   const subject = await fixture(t); await enable(subject)
-  const initial = await terminal(subject, await subject.workspace.start(call({ args: ['-e', 'process.stdout.write("x".repeat(2*1024*1024));setInterval(()=>{},1000)'], yieldMs: 1000 }), subject.context, subject.signal))
+  const initial = await terminal(subject, await subject.workspace.start(call({ args: ['-e', 'process.stdout.write("x".repeat(2*1024*1024));setInterval(()=>{},1000)'], yieldMs: 1000 }), subject.context, subject.signal), assertPendingOutputBound)
   assert.equal(initial.state, 'output_limit'); assert(initial.truncated)
-  assert(Buffer.byteLength(initial.output) <= COMMAND_LIMITS.maximumPendingBytes)
+})
+test('each poll stays bounded when terminal output accumulates across a controlled burst', async t => {
+  const subject = await fixture(t); await enable(subject)
+  const gate = join(subject.root, 'release-output')
+  // The second burst cannot begin until the host has drained the first burst.
+  // This forces multiple responses without relying on a sleep/readiness guess.
+  const script = `import { existsSync } from 'node:fs';
+    process.stdout.write('x'.repeat(${COMMAND_LIMITS.maximumPendingBytes}));
+    const waiting = setInterval(() => { if (existsSync(${JSON.stringify(gate)})) {
+      clearInterval(waiting); process.stdout.write('x'.repeat(${2 * COMMAND_LIMITS.maximumOutputBytes}));
+    } }, 10); setInterval(() => {}, 1000)`
+  let released = false, firstBurstBytes = 0
+  const responseBytes = []
+  const outcome = await terminal(subject, await subject.workspace.start(call({ args: ['--input-type=module', '-e', script], yieldMs: 0 }), subject.context, subject.signal), async value => {
+    assertPendingOutputBound(value)
+    const bytes = Buffer.byteLength(value.output); responseBytes.push(bytes)
+    if (!released) {
+      firstBurstBytes += bytes
+      assert(firstBurstBytes <= COMMAND_LIMITS.maximumPendingBytes)
+      if (firstBurstBytes === COMMAND_LIMITS.maximumPendingBytes) {
+        released = true; await writeFile(gate, 'release')
+      }
+    }
+  })
+  assert(released); assert.equal(firstBurstBytes, COMMAND_LIMITS.maximumPendingBytes)
+  assert(responseBytes.filter(bytes => bytes > 0).length >= 2)
+  assert.equal(outcome.state, 'output_limit'); assert(outcome.truncated)
+  assert(Buffer.byteLength(outcome.output) > COMMAND_LIMITS.maximumPendingBytes)
+  assert.equal(Buffer.byteLength(outcome.output), responseBytes.reduce((total, bytes) => total + bytes, 0))
 })
 test('argv is passed literally without quote concatenation or automatic shell expansion', async t => {
   const subject = await fixture(t); await enable(subject)
