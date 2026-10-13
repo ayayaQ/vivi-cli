@@ -58,7 +58,7 @@ The supervisor explicitly supplies null standard handles with `STARTF_USESTDHAND
 
 ## Limits
 
-This uses the runner's OS Kernel32/ConPTY backend, not necessarily Windows Terminal 1.24's packaged OpenConsole/ConPTY build. It emulates an outer terminal and does not test physical Windows Terminal keys, its forceVT preference, actual terminal focus, IME/layout mappings, account integration, or visual presentation. C#/PowerShell compilation and actual mode forwarding on that OS must succeed before calling it real Windows evidence. Old or different ConPTY implementations may fail the required transport assertions; do not convert that failure into a successful skip.
+The retained strict stock diagnostic uses the runner's OS Kernel32/ConPTY backend. The active modern gate uses the hash-pinned Windows Terminal 1.24 OpenConsole/ConPTY pair described below. It emulates an outer terminal and does not test physical Windows Terminal keys, its forceVT preference, actual terminal focus, IME/layout mappings, account integration, or visual presentation. C#/PowerShell compilation and actual mode forwarding on that OS must succeed before calling it real Windows evidence. Old or different ConPTY implementations may fail the required transport assertions; do not convert that failure into a successful skip.
 
 The exact native paste assertion is an important gate: source review identifies a CR/LF re-encoding path after inner 9001 enable. The bridge therefore decodes native character records inside paste only while it owns consumer reporting, preserving literal characters instead of generating key actions. A passing pure-parser fixture does not resolve the actual transport question. Keep the native assertion strict if the first Windows run fails.
 
