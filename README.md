@@ -32,7 +32,7 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/memories` — manage this launch’s app-wide saved context
 - `/commands` — inspect or disable reviewed unsandboxed command proposals
 - `/skills` — inspect instruction-only skills and prepare creator drafts
-- `/mcp` — configure and explicitly connect trusted installed stdio servers for reviewed tools and resource reads
+- `/mcp` — configure and explicitly connect trusted installed stdio servers or HTTP endpoints for reviewed tools and resource reads
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -199,8 +199,26 @@ calls. Results are bounded, untrusted data; uncertain outcomes disable the conne
 without retry. Send intent and outcomes are persisted separately from transcript
 checkpoints; interrupted sessions recover the known or uncertain result without
 replaying the operation. Requests cancelled before sending stay marked as not sent.
-OAuth, HTTP, credential environment values, repository auto-discovery,
-package installation and automatic reconnects remain unsupported.
+HTTP entries use an exact trusted Streamable HTTP endpoint. HTTPS is required;
+unencrypted HTTP is available only for explicitly allowed literal `127.0.0.1` or
+`[::1]` endpoints. URL credentials, queries, fragments and arbitrary headers are
+unavailable. Legacy seven-field stdio entries remain compatible. HTTP servers
+receive protocol/catalog requests only after fresh endpoint approval. Redirects,
+background GET streams, automatic sign-in, stream resumption and operation replay
+are disabled. Modern `2026-07-28` uses POST JSON or request-scoped SSE without
+transport sessions; legacy compatibility accepts an in-memory session ID and
+uses the same POST endpoint without an old separate HTTP+SSE fallback. Explicit
+metadata refresh remains available. Responses are byte-bounded before SDK parsing
+and cancellation aborts the request and its response stream.
+
+Embedders may provide a trusted session-only `httpAuthorization(server)` snapshot
+with `{ revision, bearerToken? }`. Tokens stay outside saved server configuration,
+approval bindings, transcripts and model context; the revision must change whenever
+account, issuer, scope or token changes. A changed/expired snapshot revokes the old
+connection, requires fresh approval, and never replays an operation. The standard
+`/mcp` HTTP controls currently connect without credentials. OAuth sign-in,
+credential environment values, repository auto-discovery, package installation
+and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
 FullLanguage for owned Job Object cleanup.
 

@@ -290,3 +290,15 @@ first-use progress CLIXML; the 30-second default and shorter timeout/cleanup gat
 stay unchanged. Installed Node/Bun and compiled consumer tests use the same private
 canonical npm archive. These checks do not claim real-user terminal/vault behavior,
 hostile-code isolation, macOS cleanup or live-provider accuracy.
+
+## Remote MCP HTTP validation
+
+The host keeps SDK `2.3.1` and shared core boundaries unchanged. The additive HTTP
+configuration and session-only authorization snapshot are host-owned. The send
+wrapper forwards `hasPerRequestStream`, request signals and protocol-version
+headers. A second one-shot ticket and authority check at the actual fetch boundary
+prevent SDK-internal replay, delayed authorization changes and SSE resumption.
+No live MCP server, OAuth account, real credential or paid model call is exercised.
+`test/mcp-http.test.mjs` uses the real pinned SDK with owned Fetch/Response fixtures
+for modern and legacy POST JSON/SSE, challenges, bounds and cancellation. External
+server interoperability remains separate evidence.

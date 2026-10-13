@@ -69,6 +69,35 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       io.write(`MCP server ${server.id} saved disabled. Use Enable and connect for a fresh startup approval\n`)
     }
   }
+  const addHttp = async (): Promise<void> => {
+    const id = await text('Local server ID (a-z, 0-9, underscore or hyphen; max 16)')
+    if (id === undefined || !id.trim()) return
+    const label = await text('Server label', id)
+    if (label === undefined) return
+    const endpoint = await text('Trusted MCP Streamable HTTP endpoint (HTTPS; no credentials or query string)')
+    if (endpoint === undefined || !endpoint.trim()) return
+    let allowLoopbackHttp = false
+    if (endpoint.startsWith('http:')) {
+      const allowed = await choose('Allow unencrypted HTTP to this literal loopback endpoint?', [
+        { name: 'Cancel', value: false }, { name: 'Allow 127.0.0.1 or ::1 only', description: 'Other HTTP destinations are unavailable', value: true }
+      ])
+      if (!allowed) return
+      allowLoopbackHttp = true
+    }
+    const protocol = await choose<McpServerConfig['protocol']>('HTTP protocol compatibility', [
+      { name: 'Pin modern 2026-07-28', description: 'No sessions, redirects, fallback or stream resumption', value: '2026-07-28' },
+      { name: 'Legacy 2025 compatibility', description: 'Streamable HTTP POST only; no separate HTTP+SSE transport', value: 'legacy' }
+    ])
+    if (protocol === undefined) return
+    const server = validateMcpServer({ transport: 'http', id, label, endpoint, protocol, allowLoopbackHttp })
+    const save = await choose(`Save disabled HTTP server ${server.id} at ${endpoint}?`, [
+      { name: 'Cancel', value: false }, { name: 'Add HTTP endpoint disabled', description: 'Connecting and every operation require fresh approval', value: true }
+    ])
+    if (save && !controller.signal.aborted && !io.isClosed) {
+      await manager.configure(server)
+      io.write(`MCP HTTP server ${server.id} saved disabled. Use Enable and connect for fresh endpoint approval\n`)
+    }
+  }
   const browse = async (status: McpServerStatus, kind: McpCatalogKind): Promise<void> => {
     const category = status.snapshot?.categories[kind]
     if (!category) return
@@ -126,17 +155,19 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · connections start disabled each launch\n`)
       const selected = await choose('MCP connections', [
         { name: 'Back', value: 'back' }, { name: 'Add trusted installed server', value: 'add' },
-        ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` }))
+        ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` })),
+        { name: 'Add trusted HTTP endpoint', value: 'add-http' }
       ])
       if (selected === undefined || selected === 'back') return
       if (selected === 'add') { await add(); continue }
+      if (selected === 'add-http') { await addHttp(); continue }
       const status = statuses.find(value => value.server.id === selected.slice(7))
       if (!status) continue
       const serverId = status.server.id
       const action = await choose(`${status.server.id} · ${status.state}`, [
         { name: 'Back', value: 'back' },
         ...(status.state === 'disabled' ? [{ name: 'Enable and connect for this launch', description: 'Requires fresh startup approval', value: 'connect' }]
-          : [{ name: 'Disable for this launch', description: 'Close and clean up the owned server process', value: 'disable' }]),
+          : [{ name: 'Disable for this launch', description: 'Close the owned connection and clean up its resources', value: 'disable' }]),
         ...(status.state === 'connected' ? [
           { name: 'Refresh tool metadata', value: 'refresh' }, { name: 'Browse tool names', value: 'tools' },
           { name: 'Discover resource metadata', description: 'List resource names/URIs and templates; retrieve no contents', value: 'resources' },

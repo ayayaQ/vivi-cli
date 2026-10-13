@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { randomUUID } from 'node:crypto'
 import { Client, isSpecType, CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from '@modelcontextprotocol/client'
-import type { JSONRPCMessage, JsonSchemaType, Tool, Transport } from '@modelcontextprotocol/client'
+import type { FetchLike, JSONRPCMessage, JsonSchemaType, Tool, Transport } from '@modelcontextprotocol/client'
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv'
 import { prepareMcpOperation, mcpOperationRequest, mcpOperationRevisions as sharedOperationRevisions, assertMcpOperationCurrent as sharedAssertCurrent } from '@ayayaq/vivi/extensions/mcp'
 import type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
 import { validateMcpSchema } from './mcp-schema.js'
 import { expandMcpTemplate } from './mcp-templates.js'
 import type { JsonObject, ToolCall, ToolResult } from '@ayayaq/vivi'
-import { McpConfigStore, mcpDigest, mcpDisplayJson, mcpFreeze, prepareMcpLaunch } from './mcp-config.js'
-import type { McpConfiguration, McpLaunchIdentity, McpServerConfig } from './mcp-config.js'
+import { McpConfigStore, mcpDigest, mcpDisplayJson, mcpFreeze, prepareMcpLaunch, isMcpHttpServer, isMcpHttpLaunch, mcpText } from './mcp-config.js'
+import type { McpConfiguration, McpLaunchIdentity, McpServerConfig, McpHttpServerConfig } from './mcp-config.js'
 import { assertMcpJson, collectMcpCategory, emptyMcpCategory, MCP_LIMITS } from './mcp-catalog.js'
 import type { McpCatalogEntry, McpCatalogKind, McpCatalogSnapshot } from './mcp-catalog.js'
 import { McpStdioTransport } from './mcp-transport.js'
+import { McpHttpTransport } from './mcp-http-transport.js'
 import { assertMcpOperationResult, MCP_OPERATION_LIMITS, mcpContainsSecret, mcpFailure, projectMcpResult } from './mcp-content.js'
 
 export type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
@@ -41,12 +42,21 @@ export interface McpServerStatus {
   readonly message?: string
   readonly snapshot?: McpCatalogSnapshot
 }
+/** Host-owned, session-only authorization. Rotate revision whenever account, issuer, scope or token changes. */
+export interface McpHttpAuthorization {
+  readonly revision: string
+  readonly bearerToken?: string
+}
 export interface McpManagerOptions {
   readonly store: McpConfigStore
   readonly env: NodeJS.ProcessEnv
   readonly secrets?: readonly string[]
   /** Trusted application wiring only; not a model extension or persisted option. */
   readonly transportFactory?: (launch: McpLaunchIdentity) => Transport
+  /** Trusted session-only wiring; no credentials are saved in MCP configuration or approval bindings. */
+  readonly httpAuthorization?: (server: McpHttpServerConfig) => McpHttpAuthorization
+  /** Trusted application/fixture wiring only. */
+  readonly httpFetch?: FetchLike
 }
 interface Connection {
   readonly client: Client
@@ -55,6 +65,8 @@ interface Connection {
   readonly controller: AbortController
   readonly generation: string
   readonly launch: McpLaunchIdentity
+  readonly authorization?: McpHttpAuthorization
+  readonly http?: McpHttpTransport
   catalogGeneration: number
   snapshot?: McpCatalogSnapshot
   state: 'connecting' | 'connected' | 'error'
@@ -67,7 +79,11 @@ const kinds: readonly McpCatalogKind[] = ['tools', 'resources', 'resourceTemplat
 class ConfigurationLoadError extends Error {}
 export const MCP_START_WARNING = 'Starting this trusted server runs its installed code with your OS permissions, before any tool-call approval. It can access your files and network. This is not a sandbox. Ready tool metadata is advertised to the selected model; discovered resource metadata can also be listed in its context. Every tool call and resource read requires separate human approval; returned text enters the local transcript and selected provider context.'
 export function mcpStartDisclosure(launch: McpLaunchIdentity): string {
-  const disclosure = `${MCP_START_WARNING}\nServer: ${launch.server.id} · ${mcpDisplayJson(launch.server.label)}\nExecutable: ${mcpDisplayJson(launch.server.executable)}\nArguments: ${launch.server.args.map(mcpDisplayJson).join(' ') || '(none)'}\nWorking directory: ${mcpDisplayJson(launch.server.cwd)}\nProtocol: ${launch.server.protocol}\nEnvironment: ${Object.entries(launch.environment).map(([name, value]) => `${name}=${mcpDisplayJson(value)}`).join(', ') || '(empty)'}\nThis connection is for this launch only; a new launch or configuration change requires fresh approval.`
+  if (isMcpHttpLaunch(launch)) {
+    return `Connect to this trusted MCP HTTP endpoint for this launch only. This sends protocol and catalog requests to the endpoint. Ready tool metadata is advertised to the selected model; discovered resource metadata can also enter its context. Every tool call and resource read requires separate human approval; returned text enters the local transcript and selected provider context.\nServer: ${launch.server.id} · ${mcpDisplayJson(launch.server.label)}\nEndpoint: ${mcpDisplayJson(launch.server.endpoint)}\nProtocol: ${launch.server.protocol}\nAuthorization revision: ${mcpDisplayJson(launch.authRevision)}\n${launch.server.allowLoopbackHttp ? 'Literal loopback HTTP is explicitly allowed; other HTTP destinations are unavailable.\n' : ''}No redirects, automatic sign-in, operation replay or stream resumption. Configuration or authorization changes require fresh connection and operation approval.`
+  }
+  const stdio = launch as import('./mcp-config.js').McpStdioLaunchIdentity
+  const disclosure = `${MCP_START_WARNING}\nServer: ${stdio.server.id} · ${mcpDisplayJson(stdio.server.label)}\nExecutable: ${mcpDisplayJson(stdio.server.executable)}\nArguments: ${stdio.server.args.map(mcpDisplayJson).join(' ') || '(none)'}\nWorking directory: ${mcpDisplayJson(stdio.server.cwd)}\nProtocol: ${stdio.server.protocol}\nEnvironment: ${Object.entries(stdio.environment).map(([name, value]) => `${name}=${mcpDisplayJson(value)}`).join(', ') || '(empty)'}\nThis connection is for this launch only; a new launch or configuration change requires fresh approval.`
   if (disclosure.length > 48 * 1024) throw new Error('MCP approval display exceeds its limit; use a smaller configuration')
   return disclosure
 }
@@ -111,10 +127,25 @@ export class McpManager {
       throw new ConfigurationLoadError('MCP configuration is unavailable or invalid; all server connections are disabled')
     }
   }
+  private authorization(server: McpHttpServerConfig): McpHttpAuthorization {
+    const value = this.options.httpAuthorization?.(server) ?? { revision: 'anonymous' }
+    if (!mcpText(value.revision, 256) || !/^[A-Za-z0-9._:-]+$/.test(value.revision) ||
+      value.bearerToken !== undefined && (!mcpText(value.bearerToken, 8192) || !/^[A-Za-z0-9._~+/-]+=*$/.test(value.bearerToken))) throw new Error('MCP HTTP session authorization is unavailable')
+    if (value.bearerToken) this.addSecrets([value.bearerToken])
+    if (this.secrets.some(secret => secret && value.revision.includes(secret))) throw new Error('MCP HTTP authorization revision must not contain credentials')
+    return Object.freeze({ revision: value.revision, ...(value.bearerToken ? { bearerToken: value.bearerToken } : {}) })
+  }
+  private assertAuthorization(connection: Connection): void {
+    if (!isMcpHttpServer(connection.launch.server)) return
+    const current = this.authorization(connection.launch.server)
+    if (current.revision !== connection.authorization?.revision || current.bearerToken !== connection.authorization?.bearerToken) throw new Error('MCP HTTP authorization changed; connect and approve a fresh operation')
+  }
   async reload(): Promise<void> {
     const current = await this.loadConfiguration()
     if (this.configuration.revision && current.revision !== this.configuration.revision) await this.revokeConnections()
     this.configuration = current
+    try { for (const connection of this.connections.values()) this.assertAuthorization(connection) }
+    catch { await this.revokeConnections() }
   }
   statuses(): readonly McpServerStatus[] {
     return mcpFreeze(this.configuration.servers.map(server => {
@@ -140,12 +171,15 @@ export class McpManager {
     if (!server) throw new Error('MCP server is no longer configured')
     if (this.connections.has(id)) throw new Error('Disable the current MCP connection before reconnecting')
     const revision = this.configuration.revision
-    const launch = await prepareMcpLaunch(server, revision, this.options.env, this.secrets)
+    const authorization = isMcpHttpServer(server) ? this.authorization(server) : undefined
+    const launch = await prepareMcpLaunch(server, revision, this.options.env, this.secrets, authorization?.revision)
     signal.throwIfAborted()
     if (!await approve(launch, signal)) return false
     signal.throwIfAborted(); this.assertOpen(); await this.reload()
     if (this.configuration.revision !== revision || this.connections.has(id)) throw new Error('MCP launch changed; request fresh connection approval')
-    const current = await prepareMcpLaunch(server, revision, this.options.env, this.secrets)
+    const currentAuthorization = isMcpHttpServer(server) ? this.authorization(server) : undefined
+    if (authorization?.revision !== currentAuthorization?.revision || authorization?.bearerToken !== currentAuthorization?.bearerToken) throw new Error('MCP HTTP authorization changed; request fresh connection approval')
+    const current = await prepareMcpLaunch(server, revision, this.options.env, this.secrets, currentAuthorization?.revision)
     if (current.digest !== launch.digest) throw new Error('MCP executable, working directory or environment changed; request fresh approval')
     if ((await this.loadConfiguration()).revision !== revision) throw new Error('MCP configuration changed; request fresh approval')
     signal.throwIfAborted(); this.assertOpen()
@@ -154,7 +188,21 @@ export class McpManager {
       jsonSchemaValidator: { getValidator: <T>(schema: JsonSchemaType) => new AjvJsonSchemaValidator().getValidator<T>(schema) },
       inputRequired: { autoFulfill: false }, enforceStrictCapabilities: true,
       versionNegotiation: { mode: server.protocol === 'legacy' ? 'legacy' : { pin: server.protocol } } })
-    const owned = (this.options.transportFactory ?? (value => new McpStdioTransport(value)))(launch)
+    const owned: Transport = this.options.transportFactory?.(launch) ?? (isMcpHttpLaunch(launch)
+      ? new McpHttpTransport(launch, { ...(this.options.httpFetch ? { fetch: this.options.httpFetch } : {}),
+        token: () => { this.assertAuthorization(connection); return authorization?.bearerToken },
+        beforeOperation: async message => {
+          await this.reload()
+          const pending = connection.pending
+          if (!pending) throw new Error('MCP HTTP operation has no approval')
+          this.assertSendCurrent(connection, pending, message)
+        },
+        operationStarted: message => {
+          const pending = connection.pending
+          if (!pending || !('id' in message) || message.id === undefined) throw new Error('MCP HTTP operation has no approval')
+          this.assertSendCurrent(connection, pending, message)
+          pending.sent = true; pending.requestId = message.id
+        } }) : new McpStdioTransport(launch))
     // Owned startup and protocol negotiation have separate, equally bounded
     // phases. Native readiness must not consume the protocol/category budget.
     const deadline = new AbortController()
@@ -174,7 +222,8 @@ export class McpManager {
     const closeOwned = async (): Promise<void> => { await owned.close() }
     // The pinned SDK starts detached cleanup after a failed legacy handshake.
     // Observe that rejection here; host ownership paths still await strict cleanup.
-    const transport: Transport = { start: async () => {
+    const transport: Transport = { ...(owned.hasPerRequestStream ? { hasPerRequestStream: true } : {}),
+      ...(owned.setProtocolVersion ? { setProtocolVersion: (version: string) => owned.setProtocolVersion!(version) } : {}), start: async () => {
       combined.throwIfAborted()
       await owned.start()
       combined.throwIfAborted()
@@ -193,15 +242,15 @@ export class McpManager {
         // Persisting the intent is asynchronous; repeat every authority/privacy check after it.
         await this.reload()
         this.assertSendCurrent(connection, pending, message)
-        pending.sent = true; pending.requestId = message.id
-        await owned.send(message, options)
+        if (!(owned instanceof McpHttpTransport)) { pending.sent = true; pending.requestId = message.id }
+        await owned.send(message, owned instanceof McpHttpTransport ? { ...options, requestSignal: AbortSignal.any([pending.signal, ...(options?.requestSignal ? [options.requestSignal] : [])]) } : options)
       })()
       pending.boundaryWork = task.finally(() => { pending.boundaryFinished = true })
       // The SDK attaches its own rejection handler; retain ours without an unhandled rejection.
       void pending.boundaryWork.catch(() => undefined)
       return pending.boundaryWork
     } }
-    const connection: Connection = { client, transport, closeOwned, launch, controller: new AbortController(), generation: randomUUID(), catalogGeneration: 0, state: 'connecting' }
+    const connection: Connection = { client, transport, closeOwned, launch, ...(owned instanceof McpHttpTransport ? { http: owned } : {}), ...(authorization ? { authorization } : {}), controller: new AbortController(), generation: randomUUID(), catalogGeneration: 0, state: 'connecting' }
     owned.onclose = () => transport.onclose?.()
     owned.onerror = error => transport.onerror?.(error)
     owned.onmessage = (message: JSONRPCMessage) => {
@@ -242,6 +291,7 @@ export class McpManager {
       armDeadline('startup')
       await client.connect(transport, { signal: combined, timeout: MCP_LIMITS.pageMs, maxTotalTimeout: MCP_LIMITS.categoryMs })
       clearDeadline()
+      await connection.http?.drainCleanup()
       combined.throwIfAborted()
       if (this.connections.get(id) !== connection || this.configuration.revision !== revision) throw new Error('MCP connection changed during startup')
       connection.state = 'connected'
@@ -294,7 +344,7 @@ export class McpManager {
         const previous = categories[kind]
         categories[kind] = mcpFreeze({ ...previous, state: previous.entries.length ? 'stale' : 'error',
           reason: combined.aborted ? 'Metadata discovery cancelled or timed out' : 'Metadata discovery failed, changed or exceeded its bounds' })
-      }
+      } finally { await connection.http?.drainCleanup() }
     }
     if (connection.catalogGeneration !== generation || this.configuration.revision !== snapshot.configRevision || connection.state !== 'connected') return
     const total = kinds.reduce((bytes, kind) => bytes + Buffer.byteLength(JSON.stringify(categories[kind].entries)), 0)
@@ -326,6 +376,7 @@ export class McpManager {
   private assertOperationCurrent(operation: McpPreparedOperation): void {
     this.assertOpen()
     const connection = this.connections.get(operation.serverId)
+    if (connection) this.assertAuthorization(connection)
     sharedAssertCurrent(operation, connection?.snapshot, connection?.launch.digest ?? '',
       connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision, expandMcpTemplate)
   }
@@ -437,6 +488,10 @@ export class McpManager {
         'MCP request was not sent: approval, catalog, configuration, connection or arguments became unavailable'), false)
     } finally {
       invocation.abort()
+      if (connection?.transport && connection.pending === pending) {
+        const ownedHttp = connection.http
+        await ownedHttp?.finishOperation(pending?.requestId)
+      }
       if (connection && connection.pending === pending) delete connection.pending
     }
     // Newly known credentials can be registered by result/review callbacks. Keep

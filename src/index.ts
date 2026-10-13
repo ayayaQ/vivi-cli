@@ -25,11 +25,11 @@ export type { ApprovalMode, ReviewNotice } from './auto-review.js'
 export type { TaskMode, ConversationMode } from './task-mode.js'
 
 export { McpManager, mcpStartDisclosure, mcpOperationDisclosure } from './mcp-manager.js'
-export type { McpManagerOptions, McpServerStatus, McpPreparedOperation, McpInvocationLifecycle } from './mcp-manager.js'
+export type { McpManagerOptions, McpServerStatus, McpPreparedOperation, McpInvocationLifecycle, McpHttpAuthorization } from './mcp-manager.js'
 export { createMcpExtension, MCP_GUIDANCE } from './mcp-tools.js'
 export type { McpCatalogKind, McpCatalogEntry, McpCategory, McpCatalogSnapshot } from './mcp-catalog.js'
 export { McpConfigStore } from './mcp-config.js'
-export type { McpServerConfig, McpConfiguration, McpLaunchIdentity } from './mcp-config.js'
+export type { McpServerConfig, McpConfiguration, McpLaunchIdentity, McpStdioServerConfig, McpHttpServerConfig, McpStdioLaunchIdentity, McpHttpLaunchIdentity } from './mcp-config.js'
 
 export { FileMcpOutcomeStore, McpOutcomeCommitError, MAX_MCP_OUTCOME_ROWS, MAX_MCP_OUTCOME_BYTES } from './mcp-outcomes.js'
 export type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
