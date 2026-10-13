@@ -25,7 +25,7 @@ test('offline native diagnostic ignores ordinary text and paste, collects known 
   bridge.stdin.on('data', chunk => setup.renderer.stdin.emit('data', chunk))
   Object.assign(io, { windowsInput: bridge })
   try {
-    bridge.stdin.setRawMode(true); bridge.start(); source.write('\x1b[?9001;2$y')
+    bridge.stdin.setRawMode(true); bridge.start(); source.write('\x1b[?9001;1$y')
     const pending = io.diagnoseInput()
     await setup.renderOnce(); await setup.renderOnce()
     const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
@@ -42,7 +42,7 @@ test('offline native diagnostic ignores ordinary text and paste, collects known 
     ])
     expect(JSON.stringify(report)).not.toContain('private')
     expect(writes).toEqual(['\x1b[?9001$p', '\x1b[?9001h', '\x1b[?9001l'])
-    expect(report.windows?.modeReply).toBe(2)
+    expect(report.windows?.modeReply).toBe(1)
     expect(report.windows?.enterRecordsObserved).toBe(4)
     expect(report.windows?.closed).toBe(true)
     expect(source.isRaw).toBe(false)
