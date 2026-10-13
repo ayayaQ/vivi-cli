@@ -83,7 +83,7 @@ async function fixture(t, input = {}) {
           type: 'object', properties: { query: { type: 'string', maxLength: 100 } }, required: ['query'], additionalProperties: false
         } }] }
         else if (message.method === 'resources/list') result = { resources: [{ name: 'Owned exact resource', uri: resourceUri }] }
-        else if (message.method === 'resources/templates/list') result = { resourceTemplates: [] }
+        else if (message.method === 'resources/templates/list') result = { resourceTemplates: [{ name: 'Owned recovery template', uriTemplate: 'fixture://owned/{name}' }] }
         else { queueMicrotask(() => peer.onmessage?.({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Unsupported owned fixture method' } })); return }
         queueMicrotask(() => peer.onmessage?.({ jsonrpc: '2.0', id: message.id, result: { ...result,
           ...(message.method.endsWith('/list') ? { ttlMs: 0, cacheScope: 'private' } : {}), resultType: 'complete' } }))
@@ -97,6 +97,7 @@ async function fixture(t, input = {}) {
   await manager.configure(server)
   assert.equal(await manager.connect(server.id, async () => true, signal()), true)
   if (input.resource) await manager.refresh(server.id, ['resources'], signal())
+  if (input.template) await manager.refresh(server.id, ['resourceTemplates'], signal())
   const streamIn = new PassThrough(), streamOut = new PassThrough()
   let output = ''
   streamOut.on('data', bytes => { output += bytes.toString() })
@@ -108,7 +109,8 @@ async function fixture(t, input = {}) {
     provider: { async generate(value) {
       state.rounds++; providerInputs.push(structuredClone(value))
       return input.generate ? input.generate(value, subject) : state.rounds === 1
-        ? answer([input.resource ? toolCall('owned-resource-call', 'read_mcp_resource', { serverId: server.id, uri: resourceUri }) : toolCall()])
+        ? answer([input.template ? toolCall('owned-call-1', 'read_mcp_resource_template',
+          { serverId: server.id, uriTemplate: 'fixture://owned/{name}', variables: { name: 'exact-resource' } }) : input.resource ? toolCall('owned-resource-call', 'read_mcp_resource', { serverId: server.id, uri: resourceUri }) : toolCall()])
         : answer([], 'Owned fixture finished')
     } },
     async approve(request, abortSignal) {
@@ -596,4 +598,63 @@ test('actual CLI corrected cancellation-result callback cannot leave newly-known
   await restored.host.send('Continue with the confirmed privacy-screened result')
   assert(!mcpContainsSecret(restored.providerInputs, secrets))
   assert.equal(subject.frames.length, 1)
+})
+
+for (const change of ['abort', 'configuration', 'manager', 'catalog']) test(`actual CLI template final ${change} guard runs after durable intent`, async t => {
+  const blocked = gate(t)
+  let paused = false
+  const subject = await fixture(t, { template: true, async saveOutcome(id, records, options, base) {
+    await base.save(id, records, options)
+    if (!paused && records.some(record => record.state === 'intent')) { paused = true; blocked.enter(); await blocked.wait }
+  } })
+  const pending = subject.send(); await blocked.entered
+  assert.equal(subject.frames.length, 0)
+  if (change === 'abort') subject.host.cancel()
+  else if (change === 'configuration') await subject.changeConfig()
+  else if (change === 'manager') subject.options.mcp = undefined
+  else { subject.notify(); await new Promise(resolve => setImmediate(resolve)) }
+  blocked.release()
+  const result = await pending
+  assert.equal(subject.frames.length, 0); notSent(result)
+  notSent((await subject.sessionStore.load(subject.host.session.id)).history)
+  const restored = await resume(t, subject)
+  await restored.host.send('Continue from the unattempted template read')
+  notSent(restored.providerInputs[0].messages); assert.equal(subject.frames.length, 0)
+})
+for (const protocol of ['legacy', '2026-07-28']) test(`actual CLI ${protocol} template read abort after one frame retains unknown outcome without replay`, async t => {
+  const subject = await fixture(t, { template: true, protocol, async invoke(_message, subject) { queueMicrotask(() => subject.host.cancel()); return undefined } })
+  const result = await subject.send()
+  assert.equal(result.status, 'cancelled'); assert.equal(subject.frames.length, 1)
+  assert.equal(subject.frames[0].method, 'resources/read'); assert.equal(subject.frames[0].params.uri, resourceUri)
+  unknown(result); unknown((await subject.sessionStore.load(subject.host.session.id)).history)
+  assert.match(subject.output(), /do not retry/i)
+  const restored = await resume(t, subject)
+  await restored.host.send('Continue without retrying the template read')
+  unknown(restored.providerInputs[0].messages)
+  assert.equal(subject.frames.length, 1); assert.equal(subject.approvals.length, 1)
+})
+for (const settlementFails of [false, true]) test(`actual CLI template failed terminal checkpoint recovers ${settlementFails ? 'unknown' : 'confirmed'} outcome`, async t => {
+  const subject = await fixture(t, { template: true,
+    async saveSession(session) { if (session.history.some(message => message.kind === 'tool_result')) throw new Error('Owned template terminal checkpoint failure') },
+    async saveOutcome(id, records, options, base) {
+      if (settlementFails && records.some(record => record.state === 'settled')) throw new Error('Owned template outcome checkpoint failure')
+      return base.save(id, records, options)
+    }
+  })
+  const terminal = await subject.send().then(result => result, error => error)
+  assert(terminal instanceof Error || terminal.status === 'error')
+  assert.equal(subject.frames.length, 1); assert.equal(subject.frames[0].params.uri, resourceUri)
+  const records = await subject.outcomes.load(subject.host.session.id)
+  assert.equal(records.length, 1); assert.equal(records[0].toolName, 'read_mcp_resource_template')
+  assert.equal(records[0].state, settlementFails ? 'intent' : 'settled')
+  const restored = await resume(t, subject)
+  const recovered = resultOf(restored.host.session.history).body
+  assert.notEqual(recovered.requestSent, false); assert.equal(recovered.doNotRetry, true)
+  assert.equal(recovered.unknownOutcome === true, settlementFails)
+  assert.equal(recovered.confirmedOutcome === true, !settlementFails)
+  await restored.host.send('Continue without repeating the recovered template operation')
+  const carried = resultOf(restored.providerInputs[0].messages).body
+  assert.equal(carried.unknownOutcome === true, settlementFails)
+  assert.equal(carried.confirmedOutcome === true, !settlementFails)
+  assert.equal(subject.frames.length, 1); assert.equal((await subject.outcomes.load(subject.host.session.id)).length, 0)
 })

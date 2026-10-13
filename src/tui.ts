@@ -1752,7 +1752,7 @@ export class OpenTuiIO implements ChatIO {
       if (!entry.review || reviewNoticeSettled(entry.review)) continue
       const unknown = entry.review.state === 'saving'
       const publicUrl = entry.review.toolName === 'fetch_url'
-      const mcp = entry.review.toolName.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource'].includes(entry.review.toolName)
+      const mcp = entry.review.toolName.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template'].includes(entry.review.toolName)
       this.reviewNotice(publicUrl
         ? unknown ? 'Public URL admission could not be confirmed; no fetch result was confirmed'
           : outcome === 'cancelled' ? 'Review cancelled; this public URL request was not approved' : 'Review ended before this public URL request was approved'

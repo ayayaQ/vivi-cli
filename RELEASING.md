@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.9.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.13.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,16 +12,25 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.9.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.13.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
-The verified registry tarball is 233,863 bytes (262 files), SHA-256
-`50ce7d16682214ce2053f79dbb3d6a01f0a8ea6cb495b263009463121e4fe88e`.
+The verified registry tarball is 339,711 bytes (367 files), SHA-256
+`f21eb617997a1da955bbc3af0d7c3cec20339723b3aacd6d9a331830bb406701`.
 The shared MCP catalog, preparation and result projection helpers are consumed
 from the registry. Its exact `yaml@2.9.1` dependency and unchanged
 reviewed integrity are bundled transitively and checked alongside the core.
 
+MCP template admission and exact operation binding come from the shared registry
+release. The CLI supplies a synchronous, no-I/O scalar RFC 6570 levels 1–3
+expander using exact BSD-3-Clause registry dependency `url-template@3.1.1`
+with no runtime dependencies. Its license remains in its npm installation and
+local standalone notices. Malformed reserved percent escapes are withheld by
+the shared URI gate. Unsupported syntax, missing/extra values and nonstring values fail
+closed. Template reads use the existing manual approval and durable outcome
+path, binding the captured descriptor, values and expanded URI through the final
+stdio write; stale/cancelled approvals cannot send, and uncertain sends never replay.
 MCP startup, exact human approval, transport writes and recovery remain host-owned.
 `FileSessionStore` uses bounded, private per-session outcome evidence to preserve
 cancellation and uncertain sends across failed transcript checkpoints. A custom

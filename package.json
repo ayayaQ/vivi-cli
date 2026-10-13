@@ -44,11 +44,12 @@
     "test:standalone": "bun scripts/test-standalone.ts"
   },
   "dependencies": {
-    "@ayayaq/vivi": "0.12.0",
+    "@ayayaq/vivi": "0.13.0",
     "@modelcontextprotocol/client": "2.3.1",
     "@opentui/core": "0.5.14",
     "ignore": "7.0.12",
     "picomatch": "4.0.7",
+    "url-template": "3.1.1",
     "web-tree-sitter": "0.25.10"
   },
   "bundledDependencies": [

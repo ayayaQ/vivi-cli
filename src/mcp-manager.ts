@@ -3,9 +3,10 @@ import { randomUUID } from 'node:crypto'
 import { Client, isSpecType, CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from '@modelcontextprotocol/client'
 import type { JSONRPCMessage, JsonSchemaType, Tool, Transport } from '@modelcontextprotocol/client'
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv'
-import { prepareMcpOperation, mcpOperationRevisions as sharedOperationRevisions, assertMcpOperationCurrent as sharedAssertCurrent } from '@ayayaq/vivi/extensions/mcp'
+import { prepareMcpOperation, mcpOperationRequest, mcpOperationRevisions as sharedOperationRevisions, assertMcpOperationCurrent as sharedAssertCurrent } from '@ayayaq/vivi/extensions/mcp'
 import type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
 import { validateMcpSchema } from './mcp-schema.js'
+import { expandMcpTemplate } from './mcp-templates.js'
 import type { JsonObject, ToolCall, ToolResult } from '@ayayaq/vivi'
 import { McpConfigStore, mcpDigest, mcpDisplayJson, mcpFreeze, prepareMcpLaunch } from './mcp-config.js'
 import type { McpConfiguration, McpLaunchIdentity, McpServerConfig } from './mcp-config.js'
@@ -74,7 +75,8 @@ export function mcpOperationDisclosure(operation: McpPreparedOperation): string 
   const description = `${operation.catalogKind === 'tools' ? 'Call MCP tool' : 'Read MCP resource'} on trusted server ${mcpDisplayJson(operation.serverId)}.\n` +
     'This sends the exact request below to that server. Tool effects cannot be verified from metadata; read-only and other annotations are not authority. Resource fetches are server operations, including file URIs, not scoped workspace reads.\n' +
     'Bounded returned text/structured data is untrusted and will enter this local transcript and the selected provider context. No binary data or linked resources are fetched. Approval is for one attempt; cancellation cannot undo effects and uncertain outcomes are never retried automatically.\n' +
-    `Exact ${operation.catalogKind === 'tools' ? 'tool name' : 'resource URI'}: ${mcpDisplayJson(operation.remoteKey)}\n` +
+    `Exact ${operation.catalogKind === 'tools' ? 'tool name' : operation.catalogKind === 'resourceTemplates' ? 'resource template' : 'resource URI'}: ${mcpDisplayJson(operation.remoteKey)}\n` +
+    (operation.catalogKind === 'resourceTemplates' ? `Expanded resource URI: ${mcpDisplayJson(operation.resourceUri)}\n` : '') +
     `Arguments: ${mcpDisplayJson(operation.call.arguments)}\nCatalog descriptor (untrusted): ${mcpDisplayJson(operation.descriptor)}\nBinding: ${mcpDisplayJson(operation.binding)}`
   if (Buffer.byteLength(description) > 96 * 1024) throw new Error('MCP approval display exceeds its limit')
   return description
@@ -308,35 +310,35 @@ export class McpManager {
     return mcpFreeze([...this.connections.values()].filter(connection => connection.state === 'connected' && connection.snapshot)
       .map(connection => connection.snapshot!))
   }
-  prepareOperation(snapshot: McpCatalogSnapshot, entry: McpCatalogEntry, catalogKind: 'tools' | 'resources',
+  prepareOperation(snapshot: McpCatalogSnapshot, entry: McpCatalogEntry, catalogKind: McpCatalogKind,
     call: ToolCall, remoteKey = entry.remoteKey): McpPreparedOperation {
     if (remoteKey !== entry.remoteKey) throw new Error('MCP resource selection differs from the captured URI')
     const connection = this.connections.get(snapshot.serverId)
-    const operation = prepareMcpOperation(snapshot, entry, catalogKind, call, connection?.launch.digest ?? '', validateMcpSchema)
+    const operation = prepareMcpOperation(snapshot, entry, catalogKind, call, connection?.launch.digest ?? '', validateMcpSchema, expandMcpTemplate)
     this.assertOperationCurrent(operation); this.assertOperationPrivacy(operation)
     return operation
   }
   operationRevisions(operation: McpPreparedOperation): JsonObject {
     const connection = this.connections.get(operation.serverId)
     return sharedOperationRevisions(operation, connection?.snapshot, connection?.launch.digest ?? '',
-      connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision)
+      connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision, expandMcpTemplate)
   }
   private assertOperationCurrent(operation: McpPreparedOperation): void {
     this.assertOpen()
     const connection = this.connections.get(operation.serverId)
     sharedAssertCurrent(operation, connection?.snapshot, connection?.launch.digest ?? '',
-      connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision)
+      connection?.state === 'connected' && !connection.controller.signal.aborted && !this.closed, this.configuration.revision, expandMcpTemplate)
   }
   private assertSendCurrent(connection: Connection, pending: PendingOperation, message: JSONRPCMessage): void {
     if (connection.pending !== pending || pending.sent || !('method' in message)) throw new Error('MCP operation approval changed before send')
     pending.signal.throwIfAborted(); pending.assertCurrent(); this.assertOperationCurrent(pending.operation)
     const operation = pending.operation
-    const expected: Record<string, unknown> = operation.catalogKind === 'tools'
-      ? { name: operation.remoteKey, arguments: operation.call.arguments } : { uri: operation.remoteKey }
+    const request = mcpOperationRequest(operation)
+    const expected: Record<string, unknown> = { ...request.params }
     if (operation.snapshot.protocolVersion === '2026-07-28') expected._meta = {
       [PROTOCOL_VERSION_META_KEY]: operation.snapshot.protocolVersion,
       [CLIENT_INFO_META_KEY]: { name: 'vivi-cli-discovery', version: '0.1.0-dev.0' }, [CLIENT_CAPABILITIES_META_KEY]: {} }
-    if (message.method !== (operation.catalogKind === 'tools' ? 'tools/call' : 'resources/read') ||
+    if (message.method !== request.method ||
       mcpDigest(message.params) !== mcpDigest(expected)) throw new Error('MCP outgoing request differs from approval')
     this.assertOperationPrivacy(operation)
   }
@@ -356,7 +358,7 @@ export class McpManager {
     const body = result as Record<string, unknown>
     if (operation.snapshot.protocolVersion === '2026-07-28') {
       if (body.resultType !== 'complete') throw new Error('Unsupported MCP result type')
-      if (operation.catalogKind === 'resources' && (!Number.isSafeInteger(body.ttlMs) || (body.ttlMs as number) < 0 ||
+      if (operation.catalogKind !== 'tools' && (!Number.isSafeInteger(body.ttlMs) || (body.ttlMs as number) < 0 ||
         !['private', 'public'].includes(body.cacheScope as string))) throw new Error('Invalid MCP resource cache metadata')
     } else {
       if (body.structuredContent !== undefined && (!body.structuredContent || typeof body.structuredContent !== 'object' || Array.isArray(body.structuredContent))) throw new Error('Invalid legacy structured content')
@@ -369,9 +371,9 @@ export class McpManager {
     }
     // Privacy and URI checks are host-owned and run even when SDK abort wins the race.
     if (mcpContainsSecret(result, this.secrets)) throw new Error('MCP result contains a known credential')
-    if (operation.catalogKind === 'resources' && (body.contents as Record<string, unknown>[]).some(item => item.uri !== operation.remoteKey)) throw new Error('MCP resource URI differs from approval')
+    if (operation.catalogKind !== 'tools' && (body.contents as Record<string, unknown>[]).some(item => item.uri !== (operation.resourceUri ?? operation.remoteKey))) throw new Error('MCP resource URI differs from approval')
     let projection: ToolResult
-    try { projection = projectMcpResult(operation.serverId, method, operation.remoteKey, result, this.secrets) }
+    try { projection = projectMcpResult(operation.serverId, method, operation.resourceUri ?? operation.remoteKey, result, this.secrets) }
     catch {
       // The raw SDK result is fully validated above. Projection envelope overhead
       // may exceed its separate budget; withhold content while retaining status.
@@ -394,7 +396,7 @@ export class McpManager {
     return { ...result, content: JSON.stringify(projection) }
   }
   private assertOperationPrivacy(operation: McpPreparedOperation): void {
-    if (mcpContainsSecret([operation.call, operation.descriptor, operation.binding, operation.snapshot], this.secrets)) throw new Error('MCP request contains a known credential')
+    if (mcpContainsSecret([operation.call, operation.descriptor, operation.binding, operation.snapshot, operation.resourceUri ?? null], this.secrets)) throw new Error('MCP request contains a known credential')
   }
   /** One exact approved request, never an SDK retry or cache-served resource body. */
   async invoke(operation: McpPreparedOperation, signal: AbortSignal, assertCurrent: () => void,
@@ -413,7 +415,7 @@ export class McpManager {
       const options = { signal: combined, timeout: MCP_OPERATION_LIMITS.operationMs, maxTotalTimeout: MCP_OPERATION_LIMITS.operationMs }
       if (operation.catalogKind === 'tools') await connection.client.callTool({ name: operation.remoteKey, arguments: operation.call.arguments },
         { ...options, toolDefinition: operation.descriptor as unknown as Tool })
-      else await connection.client.readResource({ uri: operation.remoteKey }, { ...options, cacheMode: 'bypass' })
+      else await connection.client.readResource({ uri: operation.resourceUri ?? operation.remoteKey }, { ...options, cacheMode: 'bypass' })
       // A response may arrive while an underlying write is backpressured. Keep the
       // write owned, but let cancellation/deadline close it rather than deadlock.
       await this.drainBoundary(pending, combined)

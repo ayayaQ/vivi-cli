@@ -57,7 +57,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
   const scope = createExtensionScope({
     reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
-      PUBLIC_URL_TOOL_NAME, QUESTION_TOOL_NAME, 'list_mcp_resources', 'read_mcp_resource', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
+      PUBLIC_URL_TOOL_NAME, QUESTION_TOOL_NAME, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.

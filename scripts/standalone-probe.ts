@@ -40,6 +40,7 @@ if (process.argv[2] === '--command-fixture') {
 function expectCompiledCreator(content: string | undefined): void { assert.equal(content, skillCreatorSource.content) }
 const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-memory-'))
 const mcpMethods: string[] = []
+const mcpReadUris: unknown[] = []
 let mcpBadOutput = false
 let mcpCancellationHost: CliHost | undefined
 // Compiler/runtime acceptance uses an owned in-memory invocation peer, never a live server.
@@ -48,6 +49,7 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
     send: async message => {
       if (!('method' in message)) return
       mcpMethods.push(message.method)
+      if (message.method === 'resources/read') mcpReadUris.push((message.params as { uri?: unknown } | undefined)?.uri)
       if (!('id' in message)) return
       if (message.method === 'tools/call' && mcpCancellationHost) { mcpCancellationHost.cancel(); return }
       const result = message.method === 'initialize'
@@ -59,8 +61,10 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
           : message.method === 'tools/call'
             ? { resultType: 'complete', content: [{ type: 'text', text: 'Owned compiled echo' }], structuredContent: { echo: mcpBadOutput ? 7 : 'compiled' } }
             : message.method === 'resources/read'
-              ? { resultType: 'complete', contents: [{ uri: 'fixture:///document', text: 'Owned compiled resource' }], ttlMs: 60000, cacheScope: 'private' }
-              : { resultType: 'complete', resources: [{ name: 'Owned document', uri: 'fixture:///document' }] }
+              ? { resultType: 'complete', contents: [{ uri: (message.params as { uri: string }).uri, text: 'Owned compiled resource' }], ttlMs: 60000, cacheScope: 'private' }
+              : message.method === 'resources/templates/list'
+                ? { resultType: 'complete', resourceTemplates: [{ name: 'Owned compiled template', uriTemplate: 'fixture:///{name}' }] }
+                : { resultType: 'complete', resources: [{ name: 'Owned document', uri: 'fixture:///document' }] }
       const id = message.id
       queueMicrotask(() => transport.onmessage?.({ jsonrpc: '2.0', id, result }))
     } }
@@ -126,7 +130,7 @@ try {
   assert.equal(await mcp.connect('compiled', async () => false, new AbortController().signal), false)
   assert.equal(await mcp.connect('compiled', async () => true, new AbortController().signal), true)
   assert.equal(mcp.statuses()[0]!.snapshot!.categories.tools.entries[0]!.state, 'available')
-  await mcp.refresh('compiled', ['resources'], new AbortController().signal)
+  await mcp.refresh('compiled', ['resources', 'resourceTemplates'], new AbortController().signal)
   assert.equal(mcp.statuses()[0]!.snapshot!.categories.resources.entries[0]!.remoteKey, 'fixture:///document')
   const alias = mcp.statuses()[0]!.snapshot!.categories.tools.entries[0]!.alias
   let mcpRounds = 0, mcpApprovals = 0
@@ -136,11 +140,12 @@ try {
       assert(tools.some(tool => tool.name === alias))
       if (++mcpRounds === 1) return { content: '', toolCalls: [{ id: 'compiled-mcp-call', name: alias, arguments: { query: 'compiled' } },
         { id: 'compiled-mcp-list', name: 'list_mcp_resources', arguments: { serverId: 'compiled' } }] }
-      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'compiled-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'compiled', uri: 'fixture:///document' } }] }
+      if (mcpRounds === 2) return { content: '', toolCalls: [{ id: 'compiled-mcp-read', name: 'read_mcp_resource', arguments: { serverId: 'compiled', uri: 'fixture:///document' } },
+        { id: 'compiled-mcp-template', name: 'read_mcp_resource_template', arguments: { serverId: 'compiled', uriTemplate: 'fixture:///{name}', variables: { name: 'compiled template/é' } } }] }
       return { content: 'Compiled MCP invocation accepted', toolCalls: [] }
     } } })
   const mcpResult = await mcpHost.send('Use the owned compiled MCP fixture')
-  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 2)
+  assert.equal(mcpResult.status, 'completed'); assert.equal(mcpApprovals, 3)
   assert.match(JSON.stringify(mcpResult.history), /Owned compiled echo/)
   assert.match(JSON.stringify(mcpResult.history), /Owned compiled resource/)
   let denyRounds = 0
@@ -151,7 +156,8 @@ try {
       : { content: 'Compiled MCP denied', toolCalls: [] } } } })
   assert.equal((await deniedMcpHost.send('Review the owned echo')).status, 'completed')
   assert.equal(mcpMethods.filter(method => method === 'tools/call').length, 1)
-  assert.equal(mcpMethods.filter(method => method === 'resources/read').length, 1)
+  assert.equal(mcpMethods.filter(method => method === 'resources/read').length, 2)
+  assert.deepEqual(mcpReadUris, ['fixture:///document', 'fixture:///compiled%20template%2F%C3%A9'])
   mcpBadOutput = true
   const [unknownCatalog] = await mcp.captureCatalogs(new AbortController().signal)
   const unknownEntry = unknownCatalog!.categories.tools.entries[0]!
@@ -282,7 +288,7 @@ try {
     store: new FileSessionStore(directory), settings: { provider: 'openai', model: 'fake' },
     approve: async () => { assert.fail('Compiled Plan cannot request execution approval') },
     provider: { async generate({ tools, messages }): Promise<ProviderResult> {
-      assert(!tools.some(tool => ['note_set', 'workspace_edit_text', 'command_start', 'fetch_url', 'read_mcp_resource'].includes(tool.name)))
+      assert(!tools.some(tool => ['note_set', 'workspace_edit_text', 'command_start', 'fetch_url', 'read_mcp_resource', 'read_mcp_resource_template'].includes(tool.name)))
       assert(messages.some(message => message.kind === 'message' && message.role === 'system' && message.content.startsWith('Plan mode is active')))
       return ++planRounds === 1 ? { content: '', toolCalls: [
         { id: 'compiled-plan-read', name: 'workspace_read', arguments: { path: 'created.txt' } },
@@ -392,5 +398,5 @@ try {
   assert.equal(globalCancels, 0); stopCancel()
   io.close()
   assert.equal(await io.readLine('Closed'), undefined)
-  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only Plan policy, informational host/native questions and approval FIFO separation, read-only skills creator/parser, trusted command execution, MCP invocation/read/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
+  console.log('Compiled native OpenTUI assets, Markdown, input, model search, workspace reads/text creation/precise edits, read-only Plan policy, informational host/native questions and approval FIFO separation, read-only skills creator/parser, trusted command execution, MCP invocation/read/template/denial/cancellation/recovery/unknown-outcome boundaries and cache usage passed')
 } finally { io.close(); setup.renderer.destroy() }

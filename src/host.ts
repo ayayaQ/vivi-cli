@@ -49,7 +49,7 @@ import type { PublicUrlOutcomeRecord, PublicUrlOutcomeStore } from './public-url
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
 const commandToolNames = new Set<string>(COMMAND_TOOL_NAMES)
-const isMcpTool = (name: string): boolean => name.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource'].includes(name)
+const isMcpTool = (name: string): boolean => name.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template'].includes(name)
 const isPublicUrlTool = (name: string): boolean => name === 'fetch_url' || name.startsWith('public_url_withheld_')
 const historyUsesPublicUrl = (history: readonly HistoryMessage[]): boolean => history.some(message =>
   message.kind === 'tool_result' && isPublicUrlTool(message.name) || message.kind === 'assistant' && message.toolCalls.some(call => isPublicUrlTool(call.name)))
@@ -821,13 +821,13 @@ export class CliHost {
       const toolset = this.toolsetRevision
       const resourceId = `cli-mcp:${operation.serverId}`
       const affectedData = { serverId: operation.serverId, catalogKind: operation.catalogKind,
-        remoteKey: operation.remoteKey, arguments: operation.call.arguments }
+        remoteKey: operation.remoteKey, ...(operation.catalogKind === 'resourceTemplates' ? { resourceUri: operation.resourceUri } : {}), arguments: operation.call.arguments }
       const preparedAction = (): PreparedActionMetadata => ({ complete: false, effects: [{
         kind: 'external', resourceId, scope: 'external', affectedData, review: 'manual'
       }] })
       const assertSecretFree = (): void => {
         manager.addSecrets(this.options.secrets ?? [])
-        if (mcpContainsSecret([operation.call, operation.descriptor, operation.binding, operation.snapshot], this.options.secrets ?? [])) {
+        if (mcpContainsSecret([operation.call, operation.descriptor, operation.binding, operation.snapshot, operation.resourceUri ?? null], this.options.secrets ?? [])) {
           throw new Error('MCP operation contains a known credential; it was blocked')
         }
       }

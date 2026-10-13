@@ -17,6 +17,27 @@ const fixtureEnvironment = process.platform === 'win32' && !process.versions.bun
 const fixtureEnv = fixtureEnvironment.length ? { SYSTEMROOT: Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
   ?? assert.fail('Windows Node fixture requires an explicitly captured SystemRoot') } : {}
 const signal = () => new AbortController().signal
+function discoveryFailureState(status, nativeResult) {
+  // Fixed host-authored categories only: never disclose status/error strings,
+  // server payloads, paths, arguments, or environment values in CI diagnostics.
+  const phases = new Map([
+    ['MCP server startup timed out; ordinary chat remains available', 'startup-timeout'],
+    ['MCP protocol handshake timed out; ordinary chat remains available', 'handshake-timeout'],
+    ['MCP connection cancelled', 'cancelled'],
+    ['MCP connection closed; reconnect requires fresh approval', 'closed'],
+    ['MCP connection failed or timed out; ordinary chat remains available', 'failed'],
+  ])
+  return {
+    connectionState: ['disabled', 'connecting', 'connected', 'error'].includes(status?.state) ? status.state : 'unknown',
+    connectionFailure: phases.get(status?.message) ?? 'unknown',
+    nativeResult: nativeResult && {
+      exitCode: Number.isSafeInteger(nativeResult.exitCode) ? nativeResult.exitCode : null,
+      signal: ['SIGTERM', 'SIGKILL'].includes(nativeResult.signal) ? nativeResult.signal : null,
+      errorPresent: Boolean(nativeResult.error),
+      cleanupUnverified: typeof nativeResult.error === 'string' && nativeResult.error.startsWith('Windows MCP helper closed without verified tree cleanup'),
+    },
+  }
+}
 function withFailureDiagnostic(close, report) {
   let reporting
   return async () => {
@@ -34,39 +55,69 @@ async function fixture(t, mode = 'normal', protocol = 'legacy') {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-discovery-'))
   const store = new McpConfigStore(directory, ['fixture-secret'])
   const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: [...scriptArgs, mode, join(directory, 'log'), join(directory, 'pid')], cwd: directory, protocol, environment: fixtureEnvironment }
-  let starts = 0
+  let starts = 0, reportConnectFailure = async () => {}
   const manager = new McpManager({ store, env: { ...fixtureEnv, OPENAI_API_KEY: 'fixture-secret', NODE_OPTIONS: '--invalid', PATH: '/unexpected' }, secrets: ['fixture-secret'], transportFactory: launch => {
     starts++
     const transport = new McpStdioTransport(launch)
     if (process.platform === 'win32') {
       // Fixture-only diagnostics: production transport still drains server stderr privately.
       const startedAt = Date.now(), start = transport.start.bind(transport), close = transport.close.bind(transport)
-      let nativeResult, completedAfterMs
+      const send = transport.send.bind(transport), outboundKinds = [], observedKinds = new Set()
+      const allowedKinds = new Set(['initialize', 'server/discover', 'notifications/initialized',
+        'tools/list', 'resources/list', 'resources/templates/list'])
+      let nativeResult, completedAfterMs, startRequestedAfterMs, readyAfterMs, startRejectedAfterMs, closeRequestedAfterMs
+      transport.send = (message, ...options) => {
+        if (allowedKinds.has(message.method) && !observedKinds.has(message.method)) {
+          observedKinds.add(message.method)
+          outboundKinds.push({ kind: message.method, afterMs: Date.now() - startedAt })
+        }
+        return send(message, ...options)
+      }
       transport.start = async () => {
-        try { await start() }
+        startRequestedAfterMs = Date.now() - startedAt
+        try { await start(); readyAfterMs = Date.now() - startedAt }
+        catch (error) { startRejectedAfterMs = Date.now() - startedAt; throw error }
         finally {
           void transport.windows?.completed.then(result => { nativeResult = result; completedAfterMs = Date.now() - startedAt })
         }
       }
-      transport.close = withFailureDiagnostic(close, async () => {
+      const report = async event => {
         const pidText = await readFile(join(directory, 'pid'), 'utf8').catch(() => '')
         const logText = await readFile(join(directory, 'log'), 'utf8').catch(() => '')
-        t.diagnostic(JSON.stringify({ event: 'owned-windows-discovery-cleanup-failure', mode, protocol,
-          elapsedMs: Date.now() - startedAt, completedAfterMs,
-          nativeResult: nativeResult && { ...nativeResult, error: nativeResult.error?.slice(0, 1024) },
+        t.diagnostic(JSON.stringify({ event, mode, protocol,
+          elapsedMs: Date.now() - startedAt, completedAfterMs, startRequestedAfterMs,
+          readyAfterMs, startRejectedAfterMs, closeRequestedAfterMs, outboundKinds,
+          ...discoveryFailureState(manager.statuses()[0], nativeResult),
           fixturePidRecorded: /^\d+(?:\n\d+)*\s*$/.test(pidText),
           fixtureStartRecorded: logText.split('\n').some(line => line.includes('"event":"start"')) }))
-      })
+      }
+      reportConnectFailure = () => report('owned-windows-discovery-connect-failure')
+      transport.close = withFailureDiagnostic(() => {
+        closeRequestedAfterMs ??= Date.now() - startedAt
+        return close()
+      }, () => report('owned-windows-discovery-cleanup-failure'))
     }
     return transport
   } })
   t.after(async () => { await manager.close(); await rm(directory, { recursive: true, force: true }) })
   await manager.reload(); await manager.configure(server)
-  return { directory, store, server, manager, starts: () => starts,
+  return { directory, store, server, manager, starts: () => starts, reportConnectFailure: () => reportConnectFailure(),
     log: async () => (await readFile(join(directory, 'log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line)) }
 }
 const tool = (name, schema = { type: 'object', properties: {} }) => ({ name, inputSchema: schema })
 const collect = (items, kind = 'tools', aliasFor) => collectMcpCategory('docs', kind, async () => ({ [kind]: items }), signal(), aliasFor)
+
+test('discovery failure diagnostics project only fixed categories and native flags', () => {
+  const privateValue = 'never-report-path-payload-environment-or-error'
+  const diagnostic = discoveryFailureState({ state: 'error', message: 'MCP server startup timed out; ordinary chat remains available', extra: privateValue },
+    { exitCode: 1, signal: 'SIGTERM', error: 'Windows MCP helper closed without verified tree cleanup: ' + privateValue, extra: privateValue })
+  assert.deepEqual(diagnostic, { connectionState: 'error', connectionFailure: 'startup-timeout',
+    nativeResult: { exitCode: 1, signal: 'SIGTERM', errorPresent: true, cleanupUnverified: true } })
+  assert.equal(JSON.stringify(diagnostic).includes(privateValue), false)
+  assert.deepEqual(discoveryFailureState({ state: privateValue, message: privateValue }, { exitCode: privateValue, signal: privateValue, error: privateValue }),
+    { connectionState: 'unknown', connectionFailure: 'unknown', nativeResult: { exitCode: null, signal: null, errorPresent: true, cleanupUnverified: false } })
+  assert.equal(discoveryFailureState({ message: 'MCP protocol handshake timed out; ordinary chat remains available' }).connectionFailure, 'handshake-timeout')
+})
 
 test('failed fixture close drains one shared diagnostic before concurrent callers reject', async () => {
   const failure = new Error('Owned inert cleanup failure')
@@ -132,7 +183,9 @@ test('safe launch environment is exact and credentials are absent', async t => {
 })
 for (const protocol of ['legacy', '2026-07-28']) test(`real harmless stdio discovery: ${protocol}, one process, no call/read or client capabilities`, {}, async t => {
   const subject = await fixture(t, 'pages', protocol)
-  assert.equal(await subject.manager.connect('docs', async () => true, signal()), true)
+  const connected = await subject.manager.connect('docs', async () => true, signal())
+  if (!connected) await subject.reportConnectFailure()
+  assert.equal(connected, true)
   const status = subject.manager.statuses()[0]
   assert.equal(status.state, 'connected'); assert.equal(status.snapshot.protocolVersion, protocol === 'legacy' ? '2025-11-25' : protocol)
   assert.equal(status.snapshot.categories.tools.state, 'ready'); assert.equal(status.snapshot.categories.tools.entries.length, 2)

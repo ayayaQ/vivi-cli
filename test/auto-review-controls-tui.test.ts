@@ -202,7 +202,7 @@ test('native workspace diff is shown exactly with terminal controls escaped and 
   expect(await pending).toBe(false)
 })
 
-for (const toolName of ['mcp_docs_offline_alias', 'list_mcp_resources', 'read_mcp_resource']) {
+for (const toolName of ['mcp_docs_offline_alias', 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template']) {
   for (const state of ['reviewing', 'needs_review', 'saving'] as const) {
     test(`interrupted ${toolName} ${state} uses remote-operation wording without claiming a save`, async () => {
       for (const outcome of ['cancelled', 'error', 'completed'] as const) {

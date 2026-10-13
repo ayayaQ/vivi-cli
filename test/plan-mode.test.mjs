@@ -48,7 +48,7 @@ test('Plan uses enabled local reads, blocks every mutation/remote/extension befo
     call('workspace_search', { query: 'Local' }), call('workspace_glob', { pattern: '*.txt' })]
   const blocked = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'save_skill',
     'workspace_create_text', 'workspace_edit_text', 'command_start', 'command_poll', 'command_stop',
-    'fetch_url', 'list_mcp_resources', 'read_mcp_resource', 'mcp_offline_read', 'custom_read', 'unknown_future_tool']
+    'fetch_url', 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', 'mcp_offline_read', 'custom_read', 'unknown_future_tool']
   let rounds = 0
   const subject = host({ store, memory, enableMemory: true, enableNotes: true, enableSkills: true,
     skills: { writable: false, diagnostics: [], addSecrets() {}, async snapshot() { return catalog }, async drain() {} },
