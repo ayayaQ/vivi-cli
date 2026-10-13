@@ -19,11 +19,17 @@ export interface McpOAuthCallbackOptions {
   readonly issuer: string
   readonly requireIssuer: boolean
   readonly port: number
+  readonly path?: string
   readonly signal: AbortSignal
   readonly isActive: () => boolean
   readonly registerSecrets: (values: readonly string[]) => void
 }
 export interface McpOAuthCallbackResult { readonly code: string; readonly iss?: string }
+export function validateMcpOAuthRedirectPath(path: string): string {
+  if (path.length > 512 || !/^\/(?:[A-Za-z0-9._~-]+\/?)*$/.test(path) ||
+    new URL(path, 'http://127.0.0.1').pathname !== path) throw new McpOAuthError('authorization-failed')
+  return path
+}
 const PAGE = 'MCP sign-in received. You can return to vivi.'
 const INVALID = 'This MCP sign-in callback is invalid.'
 const text = (value: string | null): value is string => !!value && value.length <= 4096 && !/[\u0000-\u0020\u007f-\u009f]/.test(value)
@@ -41,10 +47,11 @@ export class McpOAuthCallback {
   private settled = false
   private closing: Promise<void> | undefined
   private connections = 0
-  private readonly path = `/mcp-oauth/${randomBytes(24).toString('hex')}`
+  private readonly path: string
   private url: URL | undefined
   private readonly abort = (): void => { this.fail(new McpOAuthError('cancelled')); void this.close() }
   private constructor(private readonly options: McpOAuthCallbackOptions) {
+    this.path = options.path === undefined ? `/mcp-oauth/${randomBytes(24).toString('hex')}` : validateMcpOAuthRedirectPath(options.path)
     this.result = new Promise((resolve, reject) => { this.resolve = resolve; this.reject = reject })
     void this.result.catch(() => undefined)
     this.server = createServer({ maxHeaderSize: 8192 }, (request, response) => {
@@ -52,10 +59,11 @@ export class McpOAuthCallback {
       const raw = request.url ?? ''
       const hosts = request.rawHeaders.filter((_value, index) => index % 2 === 0 && request.rawHeaders[index]?.toLowerCase() === 'host')
       if (this.settled || options.signal.aborted || !options.isActive() || !this.url || request.method !== 'GET' ||
-        hosts.length !== 1 || request.headers.host !== this.url.host || !raw.startsWith('/') || raw.startsWith('//') ||
+        hosts.length !== 1 || request.headers.host !== this.url.host || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\') ||
         Buffer.byteLength(raw) > 8192 || raw.includes('#') || /%(?![\da-f]{2})/i.test(raw) ||
         request.headers['transfer-encoding'] || request.headers['content-length'] && request.headers['content-length'] !== '0') { reject(); return }
-      const parsed = new URL(raw, this.url)
+      let parsed
+      try { parsed = new URL(raw, this.url) } catch { reject(); return }
       if (parsed.origin !== this.url.origin || parsed.pathname !== this.path) { reject(); return }
       const params = parsed.searchParams
       if ([...new Set(params.keys())].some(key => params.getAll(key).length !== 1) ||

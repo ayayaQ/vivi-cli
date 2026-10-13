@@ -237,3 +237,59 @@ test('valid token endpoint default ports and hostname case use canonical fetch i
     assert.equal(value.calls.filter(call => call.method === 'POST').length, 1)
   }
 })
+
+
+test('malformed raw callback URL is rejected without crashing the owned server', async t => {
+  const { callback, valid } = await callbackFixture(t)
+  for (const path of ['/\\', '/%ZZ', '//other.invalid/path']) {
+    const status = await new Promise((resolve, reject) => {
+      const call = request({ hostname: valid.hostname, port: valid.port, path, headers: { Host: valid.host } }, response => { response.resume(); resolve(response.statusCode) })
+      call.once('error', reject); call.end()
+    })
+    assert.equal(status, 400)
+  }
+  assert.equal((await fetch(valid)).status, 200); assert.equal((await callback.result).code, 'fixture-secret-code')
+})
+
+
+test('preregistered exact redirect path is bound through browser callback and code exchange', async t => {
+  const redirectPath = '/registered/vivi-callback'
+  const value = fixture({ client: { redirectPath }, fetchFn: async (url, init) => {
+    if (url.href === metadata.token_endpoint) {
+      const body = new URLSearchParams(init.body)
+      assert.equal(new URL(body.get('redirect_uri')).pathname, redirectPath)
+    }
+  } }); t.after(() => value.session.disconnect())
+  for (let i = 0; i < 2; i++) {
+    await value.session.beginSignIn(await value.session.prepareSignIn())
+    assert.equal(new URL(value.browserUrls[i].searchParams.get('redirect_uri')).pathname, redirectPath)
+    assert.equal(value.session.status().state, 'connected')
+  }
+  assert.notEqual(value.browserUrls[0].searchParams.get('state'), value.browserUrls[1].searchParams.get('state'))
+  for (const redirectPath of ['//other.invalid/path', '/path?query', '/path#fragment', '/a/../callback', '/%2e%2e/callback', '/a\\b', '/a//b'])
+    assert.throws(() => fixture({ client: { redirectPath } }), codeError('authorization-failed'))
+})
+
+test('immediate listener startup cancellation releases the configured port', async () => {
+  const temporary = createServer(); await new Promise(resolve => temporary.listen(0, '127.0.0.1', resolve))
+  const port = temporary.address().port; await new Promise(resolve => temporary.close(resolve))
+  for (let i = 0; i < 10; i++) {
+    const abort = new AbortController()
+    const listening = McpOAuthCallback.listen({ state: 'fixture-secret-state', issuer, requireIssuer: true, port,
+      signal: abort.signal, isActive: () => true, registerSecrets: () => {} })
+    abort.abort(); await assert.rejects(listening, codeError('cancelled'))
+    await portAvailable(new URL(`http://127.0.0.1:${port}/`))
+  }
+})
+
+test('configuration changes during exchange prevent a late token commit without explicit disconnect', async t => {
+  const started = deferred(), release = deferred()
+  const value = fixture({ fetchFn: async url => { if (url.href === metadata.token_endpoint) {
+    started.resolve(); await release.promise; return json({ access_token: 'fixture-secret-late', token_type: 'Bearer' })
+  } } }); t.after(() => value.session.disconnect())
+  const signing = value.session.beginSignIn(await value.session.prepareSignIn())
+  await started.promise; value.stale(); release.resolve()
+  await assert.rejects(signing, codeError('cancelled'))
+  assert.equal(value.session.authorizationSnapshot().bearerToken, undefined)
+  await portAvailable(new URL(value.browserUrls[0].searchParams.get('redirect_uri')))
+})

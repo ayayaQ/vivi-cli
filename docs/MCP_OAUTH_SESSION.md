@@ -8,7 +8,7 @@ register a client, or store credentials on disk.
 
 An owner creates one `McpOAuthSession` for an immutable MCP endpoint and config
 revision, supplying a pre-registered public client ID/issuer, requested scopes,
-loopback port, fetch hook, browser-open hook, secret-registration hook, and a
+loopback port and optional exact registered callback path, fetch hook, browser-open hook, secret-registration hook, and a
 `configurationIsCurrent` guard.
 
 1. `prepareSignIn(signal)` performs bounded discovery and returns an immutable
@@ -57,7 +57,7 @@ warnings and token-exchange retries.
 - No HTTP redirects and no response over 64 KiB
 - Pre-registered public clients only; no client secrets, DCR or CIMD
 - S256 support must be advertised; issuer and exact protected resource are bound
-- IPv4 127.0.0.1 callback, exact random path and Host, GET only, bounded headers,
+- IPv4 127.0.0.1 callback, exact configured path (random when omitted) and Host, GET only, bounded headers,
   request URL and sockets, one valid response, duplicate query parameters rejected
 - Active-flow state and issuer checked before consuming either success or error
   callbacks; issuer is also validated by SDK exchange
@@ -71,11 +71,13 @@ warnings and token-exchange retries.
 
 ## Deferred integration decisions
 
-The first fixture adapter uses a random callback path and allows port 0 for tests.
-A real pre-registered client must support the generated redirect path and the
-configured port. Most registrations require an exact redirect URI, so its
-registration/redirect constraints must be checked for the selected server before
-wiring production sign-in. Port 0 must not be assumed compatible with a service.
+A pre-registered client can supply an exact `redirectPath`, with a bounded ASCII
+path that cannot contain URL authority, query, fragment, percent escapes or dot
+segments. That exact path is used in the listener, authorization request and token
+exchange; high-entropy state is mandatory even with a fixed path. When no path is
+configured, the listener uses a fresh random path (used by the initial fixtures).
+The selected client's registered URI must match the configured path and port;
+port 0 is useful in fixtures and must not be assumed compatible with a service.
 
 The user has not selected a real MCP server or persistence backend. Existing
 provider-specific key storage is not an OAuth store. No real authorization grant,

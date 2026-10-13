@@ -3,13 +3,13 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { discoverOAuthServerInfo, exchangeAuthorization, selectResourceURL, startAuthorization } from '@modelcontextprotocol/client'
 import type { AuthProvider, FetchLike, OAuthClientInformationContext, OAuthClientMetadata, OAuthClientProvider,
   OAuthDiscoveryState, StoredOAuthClientInformation, StoredOAuthTokens } from '@modelcontextprotocol/client'
-import { McpOAuthCallback, McpOAuthError } from './mcp-oauth-callback.js'
+import { McpOAuthCallback, McpOAuthError, validateMcpOAuthRedirectPath } from './mcp-oauth-callback.js'
 export { McpOAuthError } from './mcp-oauth-callback.js'
 
 export interface McpOAuthSessionOptions {
   readonly endpoint: string
   readonly configRevision: string
-  readonly client?: { readonly id: string; readonly issuer: string; readonly redirectPort: number }
+  readonly client?: { readonly id: string; readonly issuer: string; readonly redirectPort: number; readonly redirectPath?: string }
   readonly scopes: readonly string[]
   readonly fetchFn: FetchLike
   readonly openBrowser: (url: URL, signal: AbortSignal) => Promise<void>
@@ -108,6 +108,7 @@ export class McpOAuthSession {
       throw new McpOAuthError('authorization-failed')
     if (options.client) {
       remoteUrl(options.client.issuer)
+      if (options.client.redirectPath !== undefined) validateMcpOAuthRedirectPath(options.client.redirectPath)
       if (!options.client.id || options.client.id.length > 1024 || /[\u0000-\u0020\u007f-\u009f]/.test(options.client.id) ||
         !Number.isInteger(options.client.redirectPort) || options.client.redirectPort < 0 || options.client.redirectPort > 65535)
         throw new McpOAuthError('client-registration-required')
@@ -182,6 +183,7 @@ export class McpOAuthSession {
     try {
       this.assertProvider(provider)
       flow.callback = await McpOAuthCallback.listen({ state: flow.state, issuer: plan.issuer, port: this.client().redirectPort,
+        ...(this.client().redirectPath === undefined ? {} : { path: this.client().redirectPath! }),
         requireIssuer: provider.discoveryState()?.authorizationServerMetadata?.authorization_response_iss_parameter_supported === true,
         signal: flow.abort.signal, isActive: () => this.flow === flow && this.options.configurationIsCurrent(), registerSecrets: values => this.registerSecrets(values) })
       this.assertProvider(provider); provider.setRedirect(flow.callback.redirectUrl)
