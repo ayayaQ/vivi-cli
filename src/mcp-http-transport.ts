@@ -15,6 +15,8 @@ export interface McpHttpTransportOptions {
   /** Host approval/persistence recheck at the final HTTP wire boundary. */
   readonly operationStarted: (message: JSONRPCMessage) => void
   readonly beforeOperation: (message: JSONRPCMessage) => Promise<void>
+  /** Rejects credentials without any automatic auth flow, scope expansion or replay. */
+  readonly authorizationRejected?: () => void | Promise<void>
 }
 /** Streamable HTTP only: no redirects, background GET, resumption, replay or automatic auth. */
 export class McpHttpTransport implements Transport {
@@ -103,6 +105,13 @@ export class McpHttpTransport implements Transport {
     if ((headers.get('authorization') ?? undefined) !== (token ? `Bearer ${token}` : undefined)) throw new Error('MCP HTTP authorization changed before send')
     if ('method' in ticket.message && ['tools/call', 'resources/read'].includes(ticket.message.method)) this.options.operationStarted(ticket.message)
     const response = await (this.options.fetch ?? fetch)(input, { ...init, signal, redirect: 'manual' })
+    if (response.status === 401 || response.status === 403) {
+      // Even a late response to a cancelled request rejects its captured epoch.
+      // The owner checks that epoch before synchronously revoking current authority.
+      try { await this.options.authorizationRejected?.() }
+      finally { await this.cancelResponse(response) }
+      throw new Error('MCP HTTP needs sign-in; one-shot request was not replayed')
+    }
     if (signal.aborted) { await this.cancelResponse(response); signal.throwIfAborted() }
     if (response.status >= 300 && response.status < 400 || response.redirected) {
       await this.cancelResponse(response)

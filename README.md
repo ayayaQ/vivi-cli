@@ -215,10 +215,25 @@ Embedders may provide a trusted session-only `httpAuthorization(server)` snapsho
 with `{ revision, bearerToken? }`. Tokens stay outside saved server configuration,
 approval bindings, transcripts and model context; the revision must change whenever
 account, issuer, scope or token changes. A changed/expired snapshot revokes the old
-connection, requires fresh approval, and never replays an operation. The standard
-`/mcp` HTTP controls currently connect without credentials. OAuth sign-in,
-credential environment values, repository auto-discovery, package installation
-and automatic reconnects remain unsupported.
+connection, requires fresh approval, and never replays an operation.
+
+For an HTTPS entry, `/mcp` can configure an already registered public OAuth client
+or explicitly register one with a discovered registration endpoint. Registration
+first shows the exact public metadata for separate human approval, sends at most
+one POST, and returns to the menu. Client settings last for the current launch.
+You can then explicitly sign in through your browser. Approval
+shows the validated endpoint, issuer, browser destination, scopes, client ID and
+exact registered loopback callback. Successful sign-in still needs a separate
+fresh MCP connect approval. Cancel, disconnect, removal, configuration changes,
+expiry and app shutdown revoke the session; HTTP 401/403 requires explicit new
+sign-in and never replays the operation. Credentials and public client settings
+are kept in launch memory. This plumbing is tested with synthetic OAuth fixtures;
+OpenRouter is the first selected compatibility target; its exact loopback callback
+acceptance and live sign-in remain unverified. Its consent creates a seven-day API
+key with a default $10 spending cap, editable before granting access. A cap is not
+permission to spend. See [session-only OAuth details](docs/MCP_OAUTH_SESSION.md).
+Automatic registration, refresh, credential persistence, credential environment values, repository
+auto-discovery, package installation and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
 FullLanguage for owned Job Object cleanup.
 

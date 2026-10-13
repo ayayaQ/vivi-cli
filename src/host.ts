@@ -524,6 +524,13 @@ export class CliHost {
     this.commandProposalsEnabled = false
     await this.options.commandWorkspace?.disable()
   }
+  /** Refresh copied privacy sinks after the application updates its shared live secret array. */
+  refreshSecretFilters(): void {
+    const secrets = this.options.secrets ?? []
+    this.mcpOutcomes?.addSecrets?.(secrets); this.publicUrlOutcomes?.addSecrets?.(secrets)
+    this.options.memory?.addSecrets(secrets); this.options.skills?.addSecrets(secrets)
+    this.options.workspace?.addSecrets(secrets); this.options.decisionReview?.ledger.addSecrets?.(secrets)
+  }
   /** Cancels children before releasing a session or closing its approval surface. */
   async shutdown(): Promise<void> {
     if (this.eventContext.getStore()?.active) {

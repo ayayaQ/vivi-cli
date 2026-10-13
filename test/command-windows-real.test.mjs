@@ -100,6 +100,12 @@ function ordinaryPowerShellOutput(output) {
   const remainder = output.replace(expected, '')
   return remainder === '' || ((remainder.match(/<Obj /g)?.length ?? 0) <= 16 && progressEnvelope.test(remainder))
 }
+const targetEntryMarker = 'ordinary-powershell-target-ready\r\n'
+function ordinaryPowerShellTargetOutput(output) {
+  return Buffer.byteLength(output) <= 16_384 && output.split(targetEntryMarker).length === 2 &&
+    output.indexOf(targetEntryMarker) < output.indexOf('ordinary-powershell-fixture\r\n') &&
+    ordinaryPowerShellOutput(output.replace(targetEntryMarker, ''))
+}
 test('ordinary PowerShell output accepts only the exact stdout and completed first-use progress', () => {
   const record = '<Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj>'
   const expected = 'ordinary-powershell-fixture\r\n'
@@ -107,6 +113,9 @@ test('ordinary PowerShell output accepts only the exact stdout and completed fir
   assert(ordinaryPowerShellOutput(expected))
   assert(ordinaryPowerShellOutput(envelope + expected))
   assert(ordinaryPowerShellOutput(expected + envelope))
+  assert(ordinaryPowerShellTargetOutput(envelope + targetEntryMarker + expected))
+  assert(ordinaryPowerShellTargetOutput(targetEntryMarker + envelope + expected))
+  assert(ordinaryPowerShellTargetOutput(targetEntryMarker + expected + envelope))
   assert(ordinaryPowerShellOutput(expected + envelope.replace(record, record + record.replace('RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN>', 'RefId="1"><TNRef RefId="0" />'))))
   for (const output of [envelope, expected.repeat(2), 'other' + expected, expected + 'other', expected + envelope.repeat(17),
     expected + envelope.replace('S="progress"', 'S="error"'), expected + envelope.replace('S="progress"', 'S="warning"'),
@@ -118,6 +127,13 @@ test('ordinary PowerShell output accepts only the exact stdout and completed fir
     assert.equal(ordinaryPowerShellOutput(output), false)
   }
 })
+test('ordinary PowerShell target-entry marker must occur exactly once before the unchanged stdout', () => {
+  const expected = 'ordinary-powershell-fixture\r\n'
+  assert(ordinaryPowerShellTargetOutput(targetEntryMarker + expected))
+  for (const output of [expected, expected + targetEntryMarker, targetEntryMarker.repeat(2) + expected,
+    targetEntryMarker, targetEntryMarker + expected.repeat(2), targetEntryMarker + expected + 'other',
+    targetEntryMarker + expected + 'x'.repeat(16_384)]) assert.equal(ordinaryPowerShellTargetOutput(output), false)
+})
 test('ordinary unqualified PowerShell completes an explicitly approved bounded workspace request', { ...options, timeout: 80_000 }, async t => {
   // The direct-host baseline took 27s on the same Windows CI image. This
   // representative request chooses 50s within the existing public maximum;
@@ -127,7 +143,9 @@ test('ordinary unqualified PowerShell completes an explicitly approved bounded w
   assert.ok(timeoutMs <= COMMAND_LIMITS.maximumTimeoutMs)
   const workspace = await TrustedCommandWorkspace.open(process.cwd(), captureCommandEnvironment(process.env))
   t.after(() => workspace.shutdown())
-  const encoded = Buffer.from("Write-Output 'ordinary-powershell-fixture'", 'utf16le').toString('base64')
+  // A fixed BCL marker locates target script entry without importing a module.
+  // Write-Output remains the first unqualified cmdlet, with no startup warmup.
+  const encoded = Buffer.from("[Console]::Out.WriteLine('ordinary-powershell-target-ready'); Write-Output 'ordinary-powershell-fixture'", 'utf16le').toString('base64')
   const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
   const approvals = []
   const context = { launchId: 'native-fixture-launch', sessionId: 'native-fixture-session', runId: 'native-fixture-run', accountRevision: 'native-fixture-account',
@@ -155,21 +173,25 @@ test('ordinary unqualified PowerShell completes an explicitly approved bounded w
     output += result.output
   }
   // Only fixed owned-fixture state is reported. No request argv, environment
-  // values, arbitrary output, or helper/runtime behavior is changed.
+  // values or arbitrary output are logged; helper/runtime behavior is unchanged.
   t.diagnostic(JSON.stringify({ event: 'ordinary-powershell-terminal', node: process.version,
     elapsedMs: Math.round(performance.now() - startedAt), polls, state: result.state,
     exitCode: result.exitCode ?? null, truncated: result.truncated,
-    outputBytes: Buffer.byteLength(output), fixedStdoutObserved: output.includes('ordinary-powershell-fixture\r\n'),
-    validOwnedOutput: ordinaryPowerShellOutput(output) }))
+    outputBytes: Buffer.byteLength(output), targetEntryObserved: output.includes(targetEntryMarker),
+    fixedStdoutObserved: output.includes('ordinary-powershell-fixture\r\n'),
+    validOwnedOutput: ordinaryPowerShellTargetOutput(output) }))
   assert.equal(approvals.length, 2)
   assert.equal(result.state, 'exited')
   assert.equal(result.exitCode, 0)
   assert.equal(result.truncated, false)
-  if (!ordinaryPowerShellOutput(output)) {
+  assert.equal(output.split(targetEntryMarker).length, 2, 'Expected exactly one fixed target-entry marker')
+  assert.ok(output.indexOf(targetEntryMarker) < output.indexOf('ordinary-powershell-fixture\r\n'), 'Target entry must precede the unchanged stdout')
+  const originalOutput = output.replace(targetEntryMarker, '')
+  if (!ordinaryPowerShellOutput(originalOutput)) {
     const known = new Set(['Objs', 'Obj', 'TN', 'TNRef', 'T', 'MS', 'I64', 'PR', 'AV', 'AI', 'Nil', 'PI', 'PC', 'SR', 'SD'])
     t.diagnostic('first-use-progress-tag-shape:' + [...output.matchAll(/<([a-z0-9]+)\b/gi)].slice(0, 80).map(match => known.has(match[1]) ? match[1] : 'unknown').join(','))
   }
-  assert.ok(ordinaryPowerShellOutput(output), 'Expected exact stdout and only completed first-use module progress')
+  assert.ok(ordinaryPowerShellTargetOutput(output), 'Expected fixed target entry, exact stdout and only completed first-use module progress')
 })
 for (const mode of ['ordinary', 'argv']) test(`installed PowerShell7 ${mode} compatibility under the actual generated environment`, options, async t => {
   const info = await lstat(powershell7)

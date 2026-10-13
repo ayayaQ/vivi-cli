@@ -31,6 +31,8 @@ import { McpConfigStore } from './mcp-config.js'
 import { McpManager } from './mcp-manager.js'
 import type { McpManagerOptions } from './mcp-manager.js'
 import { manageMcp } from './mcp-controls.js'
+import { McpOAuthControls } from './mcp-oauth-controls.js'
+import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 
 export interface CliOptions {
   /** Launch-only request to open enrollment; never a saved approval. */
@@ -102,8 +104,8 @@ Workspace tools omit symlinks and private/ignored files; text writes require rev
 Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
-/mcp configures trusted installed stdio servers; fresh human startup approval is required.
-MCP connections start disabled each launch. Connected catalogs can expose model tools and exact resource reads; every remote operation needs human approval, even in Auto. Credentials are unsupported.
+/mcp configures trusted installed stdio servers and Streamable HTTP endpoints; fresh human connection approval is required.
+MCP connections start disabled each launch. HTTPS entries support explicit launch-only OAuth with an existing public client; sign-in and connecting need separate approval. Every remote operation needs human approval, even in Auto. MCP credentials are not saved.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
@@ -267,6 +269,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     decisionProviderFactory?: typeof decisionProviderForSession;
     credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
     mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
+    mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
@@ -288,6 +291,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   let release: (() => Promise<void>) | undefined
   let host: CliHost | undefined
   let mcp: McpManager | undefined
+  let oauth: McpOAuthControls | undefined
   const secrets = environmentSecrets(env)
   const closeIO = (): boolean => {
     const closing = io
@@ -320,6 +324,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
         ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
         ...(dependencies.mcpManagerFactory ? { mcpManagerFactory: dependencies.mcpManagerFactory } : {}),
+        ...(dependencies.mcpOAuth ? { mcpOAuth: dependencies.mcpOAuth } : {}),
         registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
         providerFactory: dependencies.providerFactory ?? providerForSession,
         decisionProviderFactory: dependencies.decisionProviderFactory ?? decisionProviderForSession })
@@ -328,16 +333,25 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
+    let secretTargets: (values: readonly string[]) => void = () => undefined
+    oauth = new McpOAuthControls({ dynamicRegistration: 'explicit', ...dependencies.mcpOAuth, secrets, registerSecrets: values => {
+      const fresh = values.filter(value => value && !secrets.includes(value))
+      secrets.push(...fresh); mcp!.addSecrets(fresh); secretTargets(fresh); io?.addSecrets?.(fresh)
+    } })
     mcp = (dependencies.mcpManagerFactory ?? (options => new McpManager(options)))({
-      store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets
+      store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets, ...oauth.managerOptions()
     })
+    oauth.bind(mcp)
     if (options.prompt !== undefined && await runMcpCommand(io, options.prompt, {
-      mcp: () => manageMcp(mcp!, io!, options.workspace)
+      mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })) return 0
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
     const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
+    secretTargets = values => {
+      memory.addSecrets(values); skills.addSecrets(values); workspace?.addSecrets(values); host?.refreshSecretFilters()
+    }
     const fresh = options.resume ? undefined : newSession({
       provider: options.provider ?? 'openai', model: options.model!,
       ...(options.reasoning ? { reasoning: options.reasoning } : {})
@@ -399,7 +413,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
     const result = await runChatLoop(host, io, options.prompt, {
-      mcp: () => manageMcp(mcp!, io!, options.workspace)
+      mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {
@@ -409,7 +423,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     return 1
   } finally {
     let mcpCleanupFailed = false
-    try { await mcp?.close() }
+    try { try { await oauth?.close() } finally { await mcp?.close() } }
     catch (error) {
       mcpCleanupFailed = true
       const message = redactSecrets(error instanceof Error ? error.message : 'Owned server cleanup failed', secrets)

@@ -20,6 +20,8 @@ import { conversationModeLabel } from './task-mode.js'
 import type { ConversationMode, TaskMode } from './task-mode.js'
 
 export interface ChatIO {
+  /** Dynamic credentials must reach copied display filters before any further output. */
+  addSecrets?(secrets: readonly string[]): void
   /** Display-only host evidence, re-screened by the consumer before rendering. */
   setToolEvidence?(evidence: CliToolEvidence): void
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
@@ -308,7 +310,7 @@ export class TerminalIO implements ChatIO {
   private readonly input: TtyReadable
   private readonly output: TtyWritable
   private readonly readline: Interface
-  private readonly secrets: readonly string[]
+  private secrets: readonly string[]
   private readonly tui: boolean
   private readonly stream: boolean
   private lines: string[] = []
@@ -370,6 +372,9 @@ export class TerminalIO implements ChatIO {
     this.keyHandler = (_text, key): void => { if (key.name === 'escape') cancel() }
     this.input.on('keypress', this.keyHandler)
     if (this.tui) this.output.write('\x1b[?1049h')
+  }
+  addSecrets(secrets: readonly string[]): void {
+    this.secrets = [...new Set([...this.secrets, ...secrets])].filter(Boolean)
   }
   private clearEditableInput(): void {
     if (!this.input.isTTY || !this.output.isTTY || this.disposed || this.ended) return

@@ -57,6 +57,8 @@ export interface McpManagerOptions {
   readonly httpAuthorization?: (server: McpHttpServerConfig) => McpHttpAuthorization
   /** Trusted application/fixture wiring only. */
   readonly httpFetch?: FetchLike
+  /** Launch-owned OAuth cleanup; no grants, secrets or persistence are handled by this manager. */
+  readonly httpAuthorizationInvalidated?: (serverId: string | undefined, reason: 'configuration' | 'disconnect' | 'closed' | 'needs-sign-in') => void | Promise<void>
 }
 interface Connection {
   readonly client: Client
@@ -71,6 +73,7 @@ interface Connection {
   snapshot?: McpCatalogSnapshot
   state: 'connecting' | 'connected' | 'error'
   message?: string
+  authorizationRejected?: boolean
   refresh?: Promise<void>
   pending?: PendingOperation
 }
@@ -105,7 +108,10 @@ export class McpManager {
   private closed = false
   constructor(private readonly options: McpManagerOptions) { this.secrets = [...options.secrets ?? []] }
   addSecrets(secrets: readonly string[]): void { this.secrets.push(...secrets.filter(value => value && !this.secrets.includes(value))); this.options.store.addSecrets(secrets) }
-  private async revokeConnections(): Promise<void> {
+  /** Opaque configuration identity only; never includes credential material. */
+  configurationRevision(): string { return this.configuration.revision }
+  private async revokeConnections(reason: 'configuration' | 'needs-sign-in' = 'configuration'): Promise<void> {
+    await this.options.httpAuthorizationInvalidated?.(undefined, reason)
     // Do not await refresh here: revocation can run inside that same task.
     const outcomes = await Promise.allSettled([...this.connections].map(async ([id, connection]) => {
       connection.state = 'error'; connection.message = 'MCP configuration changed or is unavailable'
@@ -145,7 +151,7 @@ export class McpManager {
     if (this.configuration.revision && current.revision !== this.configuration.revision) await this.revokeConnections()
     this.configuration = current
     try { for (const connection of this.connections.values()) this.assertAuthorization(connection) }
-    catch { await this.revokeConnections() }
+    catch { await this.revokeConnections('needs-sign-in') }
   }
   statuses(): readonly McpServerStatus[] {
     return mcpFreeze(this.configuration.servers.map(server => {
@@ -158,11 +164,13 @@ export class McpManager {
     this.assertOpen(); await this.reload()
     if (this.configuration.servers.some(value => value.id === server.id)) throw new Error('That MCP server ID already exists; remove it before adding a replacement')
     const updated = await this.options.store.save([...this.configuration.servers, server], this.configuration.revision)
+    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
     await this.disconnectAll(); this.configuration = updated
   }
   async remove(id: string): Promise<void> {
     this.assertOpen(); await this.reload()
     const updated = await this.options.store.save(this.configuration.servers.filter(server => server.id !== id), this.configuration.revision)
+    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
     await this.disconnectAll(); this.configuration = updated
   }
   async connect(id: string, approve: (launch: McpLaunchIdentity, signal: AbortSignal) => Promise<boolean>, signal: AbortSignal): Promise<boolean> {
@@ -196,6 +204,19 @@ export class McpManager {
           const pending = connection.pending
           if (!pending) throw new Error('MCP HTTP operation has no approval')
           this.assertSendCurrent(connection, pending, message)
+        },
+        authorizationRejected: async () => {
+          // A cancelled request can finish after replacement. Revoke only the
+          // exact connection and authorization epoch that sent this request.
+          if (this.connections.get(id) !== connection) return
+          const current = this.authorization(launch.server as McpHttpServerConfig)
+          if (current.revision !== authorization?.revision || current.bearerToken !== authorization?.bearerToken) return
+          connection.authorizationRejected = true; connection.state = 'error'
+          connection.message = 'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required'
+          connection.catalogGeneration++; delete connection.snapshot
+          const invalidation = this.options.httpAuthorizationInvalidated?.(id, 'needs-sign-in')
+          connection.controller.abort()
+          await invalidation
         },
         operationStarted: message => {
           const pending = connection.pending
@@ -282,7 +303,7 @@ export class McpManager {
     }
     client.setNotificationHandler('notifications/tools/list_changed', () => invalidate(['tools']))
     client.setNotificationHandler('notifications/resources/list_changed', () => invalidate(['resources', 'resourceTemplates']))
-    client.onclose = () => { connection.state = 'error'; connection.message = 'MCP connection closed; reconnect requires fresh approval'; invalidate(kinds); connection.controller.abort() }
+    client.onclose = () => { connection.state = 'error'; connection.message = connection.authorizationRejected ? 'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required' : 'MCP connection closed; reconnect requires fresh approval'; invalidate(kinds); connection.controller.abort() }
     client.onerror = () => { /* Untrusted server details are never logged, persisted or sent to a provider. */ }
     const combined = AbortSignal.any([signal, connection.controller.signal, deadline.signal])
     const abort = (): void => { void closeOwned().catch(() => undefined) }
@@ -303,7 +324,7 @@ export class McpManager {
       if (this.connections.get(id) !== connection || this.configuration.revision !== revision || connection.state !== 'connected') throw new Error('MCP connection changed during initial discovery')
       return true
     } catch {
-      connection.state = 'error'; connection.message = signal.aborted ? 'MCP connection cancelled'
+      connection.state = 'error'; connection.message = connection.authorizationRejected ? 'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required' : signal.aborted ? 'MCP connection cancelled'
         : deadline.signal.aborted ? `MCP ${deadlinePhase === 'startup' ? 'server startup' : 'protocol handshake'} timed out; ordinary chat remains available`
         : 'MCP connection failed or timed out; ordinary chat remains available'
       connection.controller.abort()
@@ -476,7 +497,7 @@ export class McpManager {
       // Stop detached SDK setup before draining it: it must never send after return.
       invocation.abort()
       if (pending && connection && (pending.sent && !pending.confirmed || pending.boundaryStarted && !pending.boundaryFinished)) {
-        connection.state = 'error'; connection.message = 'MCP operation interrupted; disable before reconnecting with fresh approval'
+        connection.state = 'error'; connection.message = connection.authorizationRejected ? 'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required' : 'MCP operation interrupted; disable before reconnecting with fresh approval'
         connection.catalogGeneration++; delete connection.snapshot; connection.controller.abort()
         try { await connection.closeOwned() } catch { connection.message += '; owned process cleanup remains unverified' }
       }
@@ -520,17 +541,18 @@ export class McpManager {
   }
   async disconnect(id: string): Promise<void> {
     const connection = this.connections.get(id)
+    await this.options.httpAuthorizationInvalidated?.(id, 'disconnect')
     if (!connection) return
     connection.controller.abort()
     await connection.closeOwned()
     await connection.refresh?.catch(() => undefined)
-    this.connections.delete(id)
+    if (this.connections.get(id) === connection) this.connections.delete(id)
   }
   private async disconnectAll(): Promise<void> {
     const outcomes = await Promise.allSettled([...this.connections.keys()].map(id => this.disconnect(id)))
     const failure = outcomes.find(outcome => outcome.status === 'rejected')
     if (failure?.status === 'rejected') throw failure.reason
   }
-  async close(): Promise<void> { this.closed = true; await this.disconnectAll() }
+  async close(): Promise<void> { this.closed = true; await this.options.httpAuthorizationInvalidated?.(undefined, 'closed'); await this.disconnectAll() }
   private assertOpen(): void { if (this.closed) throw new Error('MCP manager is closed') }
 }
