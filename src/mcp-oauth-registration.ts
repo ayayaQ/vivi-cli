@@ -18,6 +18,8 @@ export interface McpOAuthRegistrationOptions extends McpOAuthRegistrationSetting
   readonly fetchFn: FetchLike
   readonly registerSecrets: (values: readonly string[]) => void
   readonly configurationIsCurrent: () => boolean
+  /** Trusted, credential-free evidence delivered after exact public-response validation. */
+  readonly registered?: () => void
   readonly timeoutMs?: number
   readonly discovery?: OAuthDiscoveryState
   readonly discoveryResource?: string
@@ -147,6 +149,7 @@ export class McpOAuthRegistration {
         client.application_type !== 'native' || client.client_name !== plan.clientMetadata.client_name || !exactly(client.redirect_uris, [plan.redirectUri]) ||
         !exactly(client.grant_types, ['authorization_code']) || !exactly(client.response_types, ['code']) ||
         client.scope !== plan.clientMetadata.scope) throw new McpOAuthError('client-registration-failed')
+      this.options.registered?.(); this.assertCurrent(flow)
       const result = Object.freeze({ id: client.client_id, issuer: plan.issuer, redirectPort: this.options.redirectPort,
         redirectPath: this.options.redirectPath, scopes: this.options.scopes })
       this.clear(flow); this.assertCurrent(flow); this.flow = undefined; this.state = 'registered'; this.revision = randomUUID()

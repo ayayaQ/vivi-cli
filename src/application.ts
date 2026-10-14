@@ -32,6 +32,7 @@ import { manageMcp } from './mcp-controls.js'
 import { McpOAuthControls } from './mcp-oauth-controls.js'
 import { McpOAuthStore } from './mcp-oauth-store.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
+import { McpSetupService } from './mcp-setup.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -136,6 +137,7 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
 async function runManagedApplication(input: ApplicationOptions, mcp: McpManager, oauth: McpOAuthControls,
   registration: ApplicationSecretRegistration): Promise<number> {
   const { io, options, args, providerFactory } = input
+  const mcpSetup = { service: new McpSetupService(mcp, oauth), io }
   const env = { ...input.env }
   const commandEnv = captureCommandEnvironment(input.env)
   const secrets = registration.secrets
@@ -560,7 +562,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) { await discardCandidate(); return false }
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await discardCandidate(); return false }
-      nextHost = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
+      nextHost = new CliHost({ provider, store, session, secrets, mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,

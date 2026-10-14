@@ -67,10 +67,11 @@ through the command interface. `/mode` opens all three choices in full-screen mo
 
 Plan is a read-only task policy, separate from Manual/Auto approval. It advertises
 and dispatches only enabled local reads: informational clarification, arithmetic, current time, session-note
-reads, memory listing, skill listing/reading, and bounded workspace reads/searches.
+reads, memory listing, skill listing/reading, credential-free local MCP status,
+and bounded workspace reads/searches.
 Existing feature opt-ins, model tool support, secret screening and read permissions
 still apply. Workspace/note/memory mutations, every unsandboxed command, public URL
-GETs, MCP calls/resources and imported extensions are unavailable, even if described
+GETs, MCP setup changes and remote calls/resources, and imported extensions are unavailable, even if described
 as read-only. The assistant describes its plan in a normal response and stays in
 Plan until you explicitly change mode. Switching does not execute old proposals.
 Choosing Auto from Plan leaves Plan only after successful fresh enrollment;
@@ -179,6 +180,23 @@ The same provider-independent controls are available as `vivi mcp add NAME URL`,
 `list`, `connect`, `login`, `logout`, and `remove`. Add saves a disabled entry;
 no model or API key is needed. Technical overrides are in Advanced.
 
+You can also ask the agent to add an MCP URL or start guided setup. `mcp_list`
+reads fresh local entries, status and configuration revision without starting a
+process, refreshing metadata, signing in or making a network request. It works
+in Plan. `mcp_setup` proposes one add/connect/login/logout/remove action through
+the same trusted service as `/mcp` and the CLI. Each exact proposal needs fresh
+human approval, including in Auto; Plan cannot run setup actions. Add saves a
+disabled HTTPS entry. Connection and account-access approvals remain with you.
+The agent cannot supply credentials, arbitrary headers/settings or executable,
+download and installation commands. Newly connected tools are available on the
+next turn. Setup is offered only when interactive human review and durable local
+outcome evidence are available.
+
+Setup evidence records accepted proposals, durable intent and confirmed effects
+separately from transcript checkpoints. Cancellation or a failed cleanup cannot
+hide an already saved entry, issued grant, local sign-in change or established connection. Interrupted or uncertain
+setup is never resumed or replayed automatically; inspect `/mcp` before retrying.
+
 For local stdio servers, Advanced can add an already installed executable,
 its separate arguments, working directory and explicit legacy or pinned modern
 protocol. Entries start disabled every launch. Enable requires fresh human
@@ -245,8 +263,7 @@ disconnects all launch-owned MCP connections; the menu discloses affected server
 Fixture validation does not establish live provider/callback acceptance. Review
 provider permissions, expiry and spending limits before granting access; a cap is
 not permission to spend. See [OAuth setup details](docs/MCP_OAUTH_SESSION.md) and
-[saved sign-in details](docs/MCP_OAUTH_PERSISTENCE.md). Agent setup is a separate
-follow-up slice.
+[saved sign-in details](docs/MCP_OAUTH_PERSISTENCE.md).
 Credential environment values, repository auto-discovery, package installation
 and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell

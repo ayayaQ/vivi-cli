@@ -89,6 +89,17 @@ function base64(value: unknown, length?: number): Buffer {
   if (bytes.toString('base64') !== value || length !== undefined && bytes.length !== length) throw new McpOAuthStoreError('unavailable')
   return bytes
 }
+/** Trusted, operation-scoped evidence only. Contains no saved client or token data. */
+export interface McpOAuthStoreEffectReceipt {
+  readonly kind: 'saved-client-replaced' | 'saved-credentials-replaced' | 'refresh-intent-replaced' | 'saved-sign-in-forgotten'
+  readonly serverId: string
+  readonly recordRevision?: string
+  readonly durabilityUnverified: true
+}
+export interface McpOAuthStoreLifecycle {
+  assertCurrent(): void
+  effect(receipt: McpOAuthStoreEffectReceipt): void
+}
 export interface McpOAuthStoreOptions {
   /** Fixture/host seam. Production uses the existing OS helper; never plaintext fallback. */
   readonly keyStore?: (scope: string) => McpWrappingKeyStore
@@ -279,8 +290,10 @@ export class McpOAuthStore {
       return record.refreshPending ? mcpFreeze({ serverId, endpoint, client: record.client, revision: record.revision }) : record
     } catch (error) { throw error instanceof McpOAuthStoreError ? error : new McpOAuthStoreError('unavailable') }
   }
-  private async write(record: StoredRecord, isCurrent: () => boolean = () => true, lease?: LeaseGuard): Promise<void> {
-    if (lease) return lease.protect(() => this.write(record, isCurrent))
+  private async write(record: StoredRecord, isCurrent: () => boolean = () => true, lease?: LeaseGuard,
+    lifecycle?: McpOAuthStoreLifecycle, kind?: McpOAuthStoreEffectReceipt['kind']): Promise<void> {
+    if (lease) return lease.protect(() => this.write(record, isCurrent, undefined, lifecycle, kind))
+    lifecycle?.assertCurrent()
     if (!isCurrent()) throw new McpOAuthStoreError('changed')
     const parent = await this.directoryInfo(), key = await this.key(true, isCurrent), iv = randomBytes(12)
     const clear = Buffer.from(JSON.stringify(record)), temporary = join(this.directory, `.mcp-oauth.${randomUUID()}.tmp`)
@@ -296,8 +309,23 @@ export class McpOAuthStore {
       const after = await this.directoryInfo()
       if (!parent || !after || parent.dev !== after.dev || parent.ino !== after.ino) throw new McpOAuthStoreError('unavailable')
       if (!isCurrent()) throw new McpOAuthStoreError('changed')
-      await rename(temporary, this.path(record.serverId)); await this.syncDirectory()
+      lifecycle?.assertCurrent()
+      await rename(temporary, this.path(record.serverId))
+      await this.replaced({ kind: kind ?? (record.refreshPending ? 'refresh-intent-replaced' : record.tokens ? 'saved-credentials-replaced' : 'saved-client-replaced'),
+        serverId: record.serverId, recordRevision: record.revision, durabilityUnverified: true }, lifecycle)
     } finally { key.fill(0); clear.fill(0); await unlink(temporary).catch(() => undefined) }
+  }
+  /** Finish the same native mutation even if evidence delivery fails or cancels its owner. */
+  private async replaced(receipt: McpOAuthStoreEffectReceipt, lifecycle?: McpOAuthStoreLifecycle): Promise<void> {
+    let failed = false, failure: unknown
+    try { lifecycle?.effect(mcpFreeze(receipt)) } catch (error) { failed = true; failure = error }
+    await this.syncDirectory()
+    if (failed) throw failure
+  }
+  private async forget(serverId: string, lifecycle?: McpOAuthStoreLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
+    try { await unlink(this.path(serverId)) } catch (error) { if (missing(error)) return; throw error }
+    await this.replaced({ kind: 'saved-sign-in-forgotten', serverId, durabilityUnverified: true }, lifecycle)
   }
   private async syncDirectory(): Promise<void> {
     if (process.platform === 'win32') return
@@ -305,14 +333,14 @@ export class McpOAuthStore {
     try { await directory.sync() } finally { await directory.close() }
   }
   async saveClient(serverId: string, endpoint: string, input: McpOAuthSavedClient,
-    isCurrent: () => boolean = () => true, signal?: AbortSignal): Promise<McpOAuthSavedRecord> {
+    isCurrent: () => boolean = () => true, signal?: AbortSignal, lifecycle?: McpOAuthStoreLifecycle): Promise<McpOAuthSavedRecord> {
     endpoint = identity(serverId, endpoint)
     const client = validateMcpOAuthSavedClient(input, endpoint)
     return this.lock(async leaseCurrent => {
       const existing = (await readdir(this.directory)).filter(name => /^mcp-oauth-[a-z][a-z0-9_-]{0,15}\.json$/.test(name))
       if (!existing.includes(`mcp-oauth-${serverId}.json`) && existing.length >= 8) throw new McpOAuthStoreError('unavailable')
       const record = mcpFreeze({ serverId, endpoint, client, revision: randomUUID() })
-      await this.write(record, () => leaseCurrent() && isCurrent(), leaseCurrent); return record
+      await this.write(record, () => leaseCurrent() && isCurrent(), leaseCurrent, lifecycle); return record
     }, signal).catch(error => { throw error instanceof McpOAuthStoreError ? error : new McpOAuthStoreError('unavailable') })
   }
   private async current(serverId: string, endpoint: string, revision?: string): Promise<StoredRecord> {
@@ -321,16 +349,16 @@ export class McpOAuthStore {
     return record
   }
   async saveTokens(serverId: string, endpoint: string, expectedRevision: string, input: McpOAuthSavedTokens,
-    isCurrent: () => boolean = () => true, signal?: AbortSignal): Promise<McpOAuthSavedRecord> {
+    isCurrent: () => boolean = () => true, signal?: AbortSignal, lifecycle?: McpOAuthStoreLifecycle): Promise<McpOAuthSavedRecord> {
     endpoint = identity(serverId, endpoint); this.register(input)
     return this.lock(async leaseCurrent => {
       const previous = await this.current(serverId, endpoint, expectedRevision)
       const tokens = validateMcpOAuthSavedTokens(input, previous.client, previous.client.resource ?? endpoint)
       const record = mcpFreeze({ serverId, endpoint, client: previous.client, tokens, revision: randomUUID() })
-      await this.write(record, () => leaseCurrent() && isCurrent(), leaseCurrent); return record
+      await this.write(record, () => leaseCurrent() && isCurrent(), leaseCurrent, lifecycle); return record
     }, signal).catch(error => { throw error instanceof McpOAuthStoreError ? error : new McpOAuthStoreError('unavailable') })
   }
-  async clearTokens(serverId: string, endpoint: string, expectedRevision?: string): Promise<McpOAuthSavedRecord | undefined> {
+  async clearTokens(serverId: string, endpoint: string, expectedRevision?: string, lifecycle?: McpOAuthStoreLifecycle): Promise<McpOAuthSavedRecord | undefined> {
     endpoint = identity(serverId, endpoint)
     return this.lock(async leaseCurrent => {
       let previous: StoredRecord | undefined
@@ -343,27 +371,27 @@ export class McpOAuthStore {
         if (expectedRevision !== undefined) throw new McpOAuthStoreError('unavailable')
         if (!leaseCurrent()) throw new McpOAuthStoreError('changed')
         await leaseCurrent.protect(async () => {
-          await unlink(this.path(serverId)).catch(error => { if (!missing(error)) throw error }); await this.syncDirectory()
+          await this.forget(serverId, lifecycle)
         })
         return undefined
       }
       const record = mcpFreeze({ serverId, endpoint, client: previous.client, revision: randomUUID() })
-      await this.write(record, leaseCurrent, leaseCurrent); return record
+      await this.write(record, leaseCurrent, leaseCurrent, lifecycle, 'saved-sign-in-forgotten'); return record
     }).catch(error => { throw error instanceof McpOAuthStoreError ? error : new McpOAuthStoreError('unavailable') })
   }
-  async remove(serverId: string, isCurrent: () => boolean | Promise<boolean> = () => true): Promise<void> {
-    identity(serverId, 'https://identity.invalid/')
+  async remove(serverId: string, isCurrent: () => boolean | Promise<boolean> = () => true, lifecycle?: McpOAuthStoreLifecycle): Promise<void> {
+    identity(serverId, 'https://identity.invalid/'); lifecycle?.assertCurrent()
     if (!await isCurrent()) throw new McpOAuthStoreError('changed')
     // Inert add/list/unknown cleanup must not initialize a profile key or lease.
     if (!await this.directoryInfo() || !await this.bytes(serverId)) return
     await this.lock(async leaseCurrent => leaseCurrent.protect(async () => {
       if (!leaseCurrent() || !await isCurrent() || !leaseCurrent()) throw new McpOAuthStoreError('changed')
-      await unlink(this.path(serverId)).catch(error => { if (!missing(error)) throw error }); await this.syncDirectory()
+      await this.forget(serverId, lifecycle)
     }))
       .catch(error => { throw error instanceof McpOAuthStoreError ? error : new McpOAuthStoreError('unavailable') })
   }
   /** Validated host configuration only. Unrelated server edits retain approved sign-in. */
-  async reconcile(servers: readonly { readonly id: string; readonly endpoint: string }[]): Promise<void> {
+  async reconcile(servers: readonly { readonly id: string; readonly endpoint: string }[], lifecycle?: McpOAuthStoreLifecycle): Promise<void> {
     const expected = new Map(servers.map(server => [server.id, identity(server.id, server.endpoint)]))
     if (!await this.directoryInfo()) return
     await this.lock(async lease => {
@@ -374,30 +402,31 @@ export class McpOAuthStore {
         // Missing IDs can be forgotten even when the keyring is locked. Existing
         // unreadable records are preserved, never guessed to have a new identity.
         if (endpoint !== undefined && (await this.read(id))?.endpoint === endpoint) continue
-        await lease.protect(async () => { await unlink(this.path(id)); await this.syncDirectory() })
+        await lease.protect(async () => { await this.forget(id, lifecycle) })
       }
     })
   }
   async refreshTokens(serverId: string, endpoint: string, expectedRevision: string,
-    perform: (tokens: McpOAuthSavedTokens) => Promise<McpOAuthSavedTokens>, isCurrent: () => boolean = () => true, signal?: AbortSignal): Promise<McpOAuthSavedRecord> {
+    perform: (tokens: McpOAuthSavedTokens) => Promise<McpOAuthSavedTokens>, isCurrent: () => boolean = () => true, signal?: AbortSignal, lifecycle?: McpOAuthStoreLifecycle): Promise<McpOAuthSavedRecord> {
     endpoint = identity(serverId, endpoint)
     return this.lock(async leaseCurrent => {
       const previous = await this.current(serverId, endpoint, expectedRevision)
       if (previous.refreshPending || !previous.tokens?.refreshToken) throw new McpOAuthStoreError('needs-sign-in')
       const pending = mcpFreeze({ ...previous, revision: randomUUID(), refreshPending: true as const })
       if (!leaseCurrent() || !isCurrent()) throw new McpOAuthStoreError('changed')
-      await this.write(pending, () => leaseCurrent() && isCurrent(), leaseCurrent)
+      await this.write(pending, () => leaseCurrent() && isCurrent(), leaseCurrent, lifecycle)
       try {
         if (!leaseCurrent() || !isCurrent()) throw new McpOAuthStoreError('changed')
+        lifecycle?.assertCurrent()
         const input = await perform(previous.tokens); this.register(input)
         const tokens = validateMcpOAuthSavedTokens(input, previous.client, previous.client.resource ?? endpoint)
         if (tokens.scopes.some(scope => !previous.tokens!.scopes.includes(scope))) throw new McpOAuthStoreError('needs-sign-in')
         const record = mcpFreeze({ serverId, endpoint, client: previous.client, tokens, revision: randomUUID() })
-        await this.write(record, () => leaseCurrent() && isCurrent(), leaseCurrent); return record
+        await this.write(record, () => leaseCurrent() && isCurrent(), leaseCurrent, lifecycle); return record
       } catch {
         // Any uncertain POST/rotation or failed durable save requires fresh sign-in. No retry.
         const cleared = mcpFreeze({ serverId, endpoint, client: previous.client, revision: randomUUID() })
-        if (leaseCurrent()) await this.write(cleared, leaseCurrent, leaseCurrent).catch(() => undefined)
+        if (leaseCurrent()) await this.write(cleared, leaseCurrent, leaseCurrent, lifecycle && { assertCurrent() {}, effect: receipt => lifecycle.effect(receipt) }, 'saved-sign-in-forgotten').catch(() => undefined)
         throw new McpOAuthStoreError('needs-sign-in')
       }
     }, signal).catch(error => { throw error instanceof McpOAuthStoreError ? error : new McpOAuthStoreError('unavailable') })

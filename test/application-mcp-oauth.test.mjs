@@ -112,7 +112,7 @@ async function fixture(t, { approved = true, prompt = false, tool = false, cance
       return { async generate(input) {
         generated++; inputs.push(structuredClone(input))
         if (tool && generated === 2) {
-          const remote = input.tools.find(item => item.name.startsWith('mcp_'))
+          const remote = input.tools.find(item => item.name.startsWith('mcp_remote_'))
           assert(remote, 'The freshly authenticated catalog was absent from model tools')
           return { content: '', toolCalls: [{ id: 'owned-app-tool-call', name: remote.name, arguments: { query: 'ordinary' } }] }
         }
@@ -144,7 +144,9 @@ test('application sign-in updates an existing host privacy boundary, exposes fre
   assert(subject.registered.includes(token)); assert(subject.registered.includes(refresh)); assert(subject.registered.includes(code))
   assert(subject.io.protected.includes(token)); assert(subject.io.protected.includes(refresh)); assert(subject.io.protected.includes(code))
   assert(subject.inputs.every(input => input.tools.every(item => !/sign_in_mcp|oauth|refresh_token/.test(item.name))))
-  assert(!subject.inputs[0].tools.some(item => item.name.startsWith('mcp_')))
+  assert(!subject.inputs[0].tools.some(item => item.name.startsWith('mcp_remote_')))
+  assert(subject.inputs[0].tools.some(item => item.name === 'mcp_list'))
+  assert(!subject.inputs[0].tools.some(item => item.name === 'mcp_setup'), 'noninteractive IO cannot expose setup effects')
   clean([subject.io.output, subject.io.approvals, subject.io.sessions, subject.io.events, subject.io.results, subject.inputs])
   await inspectFiles(subject.directory)
   assert.equal(subject.managerOptions().httpAuthorization(server).bearerToken, undefined)

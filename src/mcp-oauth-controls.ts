@@ -6,11 +6,11 @@ import { isMcpHttpServer, mcpDisplayJson } from './mcp-config.js'
 import type { McpHttpServerConfig, McpServerConfig } from './mcp-config.js'
 import { mcpContainsSecret } from './mcp-content.js'
 import { McpManager, mcpStartDisclosure } from './mcp-manager.js'
-import type { McpManagerOptions } from './mcp-manager.js'
+import type { McpConfigurationLifecycle, McpManagerOptions } from './mcp-manager.js'
 import { McpOAuthError, McpOAuthSession } from './mcp-oauth-session.js'
 import type { McpOAuthSessionOptions, McpOAuthState } from './mcp-oauth-session.js'
 import { McpOAuthStoreError } from './mcp-oauth-store.js'
-import type { McpOAuthSavedRecord, McpOAuthStore } from './mcp-oauth-store.js'
+import type { McpOAuthSavedRecord, McpOAuthStore, McpOAuthStoreLifecycle } from './mcp-oauth-store.js'
 import { validateMcpOAuthRedirectPath } from './mcp-oauth-callback.js'
 import { McpOAuthRegistration } from './mcp-oauth-registration.js'
 import type { McpOAuthRegistrationSettings } from './mcp-oauth-registration.js'
@@ -26,6 +26,19 @@ export interface McpOAuthPublicClient {
   readonly redirectPath: string
   readonly scopes: readonly string[]
   readonly resource?: string
+}
+/** Trusted boundary evidence only. Never contains credential or provider response data. */
+export interface McpOAuthEffectReceipt {
+  readonly kind: 'authorization-granted' | 'authorization-refreshed' | 'public-client-registered' |
+    'saved-client-replaced' | 'saved-credentials-replaced' | 'refresh-intent-replaced' | 'saved-sign-in-forgotten'
+  readonly serverId: string
+  readonly revision: string
+  readonly recordRevision?: string
+  readonly durabilityUnverified?: boolean
+}
+export interface McpOAuthOperationLifecycle {
+  assertCurrent(): void
+  effect(receipt: McpOAuthEffectReceipt): void
 }
 export interface McpOAuthControlsOptions {
   /** Human-only opt-in. Transport challenges and sign-in never register a client. */
@@ -53,6 +66,9 @@ interface Registration {
   saved?: McpOAuthSavedRecord
 }
 interface Attempt {
+  active: boolean
+  readonly lifecycle?: McpOAuthOperationLifecycle
+  readonly persistence: Set<Promise<unknown>>
   readonly abort: AbortController
   readonly revision: string
   registration?: McpOAuthRegistration
@@ -150,17 +166,41 @@ export class McpOAuthControls {
     this.registrations.set(serverId, { client: Object.freeze({ ...client, scopes: Object.freeze([...client.scopes]) }),
       endpoint, configRevision, revision: randomUUID(), state: 'disconnected' })
   }
-  private persistence(entry: Registration): Pick<McpOAuthSessionOptions, 'saveCredentials' | 'refreshCredentials'> {
+  private lifecycleCurrent(lifecycle?: McpOAuthOperationLifecycle): boolean {
+    try { lifecycle?.assertCurrent(); return true } catch { return false }
+  }
+  private observe(serverId: string, revision: string, lifecycle: McpOAuthOperationLifecycle | undefined, kind: McpOAuthEffectReceipt['kind']): void {
+    lifecycle?.effect(Object.freeze({ kind, serverId, revision }))
+    lifecycle?.assertCurrent()
+  }
+  private storeLifecycle(lifecycle: McpOAuthOperationLifecycle | undefined, revision: string, cleanup = false): McpOAuthStoreLifecycle | undefined {
+    return lifecycle ? { assertCurrent: () => { if (!cleanup) lifecycle.assertCurrent() },
+      effect: receipt => lifecycle.effect(Object.freeze({ ...receipt, revision })) } : undefined
+  }
+  private trackPersistence<T>(attempt: Attempt, work: Promise<T>): Promise<T> {
+    attempt.persistence.add(work)
+    void work.then(() => attempt.persistence.delete(work), () => attempt.persistence.delete(work))
+    return work
+  }
+  /** Aborted SDK waits cannot abandon a protected native save past final setup settlement. */
+  private async drainPersistence(attempt: Attempt): Promise<void> {
+    while (attempt.persistence.size) await Promise.allSettled([...attempt.persistence])
+  }
+  private persistence(entry: Registration, attempt: Attempt): Pick<McpOAuthSessionOptions, 'saveCredentials' | 'refreshCredentials'> {
     const store = this.options.savedStore
     if (!store || !entry.saved) return {}
     return {
       saveCredentials: async (tokens, context) => {
         const saved = entry.saved!
-        entry.saved = await store.saveTokens(saved.serverId, entry.endpoint, saved.revision, tokens, context.isCurrent, context.signal)
+        entry.saved = await this.trackPersistence(attempt, store.saveTokens(saved.serverId, entry.endpoint, saved.revision, tokens,
+          context.isCurrent, context.signal, this.storeLifecycle(attempt.lifecycle, entry.configRevision)))
+        attempt.lifecycle?.assertCurrent()
       },
       refreshCredentials: async (perform, context) => {
         const saved = entry.saved!
-        entry.saved = await store.refreshTokens(saved.serverId, entry.endpoint, saved.revision, perform, context.isCurrent, context.signal)
+        entry.saved = await this.trackPersistence(attempt, store.refreshTokens(saved.serverId, entry.endpoint, saved.revision, perform,
+          context.isCurrent, context.signal, this.storeLifecycle(attempt.lifecycle, entry.configRevision)))
+        attempt.lifecycle?.assertCurrent()
         return entry.saved.tokens!
       }
     }
@@ -178,9 +218,10 @@ export class McpOAuthControls {
     const attempt = this.attempts.get(serverId)
     return attempt?.registration?.status() ?? { state: 'idle', revision: attempt?.revision ?? this.anonymousRevision }
   }
-  private claim(serverId: string): Attempt {
+  private claim(serverId: string, lifecycle?: McpOAuthOperationLifecycle): Attempt {
+    lifecycle?.assertCurrent()
     if (this.attempts.has(serverId) || this.cleanups.has(serverId)) throw new McpOAuthError('invalid-plan')
-    const attempt = { abort: new AbortController(), revision: randomUUID() }
+    const attempt: Attempt = { active: true, abort: new AbortController(), revision: randomUUID(), persistence: new Set(), ...(lifecycle ? { lifecycle } : {}) }
     this.attempts.set(serverId, attempt)
     return attempt
   }
@@ -245,6 +286,12 @@ export class McpOAuthControls {
       finally { if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
     }
   }
+  /** Local listing must not revoke expired tokens or cancel a stale active flow. */
+  peekStatus(serverId: string): { readonly state: McpOAuthState | 'unconfigured'; readonly revision: string } {
+    const entry = this.registrations.get(serverId)
+    return entry?.session?.peekStatus() ?? { state: entry?.state ?? (this.signInRequired.has(serverId) ? 'needs-sign-in' : 'unconfigured'),
+      revision: entry?.revision ?? this.anonymousRevision }
+  }
   status(serverId: string): { readonly state: McpOAuthState | 'unconfigured'; readonly revision: string } {
     const entry = this.registrations.get(serverId)
     return entry?.session?.status() ?? { state: entry?.state ?? (this.signInRequired.has(serverId) ? 'needs-sign-in' : 'unconfigured'), revision: entry?.revision ?? this.anonymousRevision }
@@ -255,7 +302,22 @@ export class McpOAuthControls {
       return { revision: this.anonymousRevision }
     return entry.session?.authorizationSnapshot() ?? { revision: entry.revision }
   }
-  async invalidate(serverId?: string, reason: InvalidationReason = 'disconnect', nextServers?: readonly McpServerConfig[]): Promise<void> {
+  invalidate(serverId?: string, reason: InvalidationReason = 'disconnect', nextServers?: readonly McpServerConfig[]): Promise<void> {
+    // Capture ownership before synchronous revocation. Even delayed denial cleanup
+    // belongs to this attempt until its entire CAS invalidation has settled.
+    const owners = [...this.attempts.entries()].filter(([id, attempt]) => (serverId === undefined || id === serverId) &&
+      !(reason === 'disconnect' && this.internalDisconnect?.serverId === id && this.internalDisconnect.attempt === attempt))
+    const work = this.performInvalidate(serverId, reason, nextServers)
+    for (const [, attempt] of owners) this.trackPersistence(attempt, work)
+    return work
+  }
+  private async performInvalidate(serverId?: string, reason: InvalidationReason = 'disconnect', nextServers?: readonly McpServerConfig[]): Promise<void> {
+    // A known configuration commit adopts its new identity before cleanup settles.
+    // Capture changed IDs synchronously while the manager still exposes the old set.
+    const next = reason === 'configuration' && nextServers
+      ? new Map(nextServers.filter(isMcpHttpServer).map(server => [server.id, server.endpoint])) : undefined
+    const changed = next ? this.manager?.statuses().filter(status => isMcpHttpServer(status.server) &&
+      next.get(status.server.id) !== status.server.endpoint).map(status => status.server.id) ?? [] : []
     if (reason === 'closed') this.closed = true
     if (reason === 'needs-sign-in' && serverId !== undefined) this.signInRequired.add(serverId)
     if (reason === 'configuration' || reason === 'closed') {
@@ -291,44 +353,49 @@ export class McpOAuthControls {
       await store.settle()
       const entry = entries.find(([id]) => id === serverId)?.[1]
       if (entry?.saved) {
-        const saved = await store.clearTokens(serverId, entry.endpoint, entry.saved.revision)
+        const attempt = active.find(([id]) => id === serverId)?.[1]
+        const work = store.clearTokens(serverId, entry.endpoint, entry.saved.revision,
+          this.storeLifecycle(attempt?.lifecycle, entry.configRevision, true))
+        const saved = await (attempt ? this.trackPersistence(attempt, work) : work)
         if (saved) entry.saved = saved; else delete entry.saved
       }
     }
     if (reason === 'configuration' && nextServers) {
-      const next = new Map(nextServers.filter(isMcpHttpServer).map(server => [server.id, server.endpoint]))
-      const changed = this.manager?.statuses().filter(status => isMcpHttpServer(status.server) &&
-        next.get(status.server.id) !== status.server.endpoint).map(status => status.server.id) ?? []
       if (changed.length) { await store.settle(); for (const id of changed) await store.remove(id) }
     }
   }
   /** Local sign-out, including a fresh command process with no RAM registration. */
-  async logout(serverId: string): Promise<void> {
-    await this.withCleanup(serverId, () => this.logoutOwned(serverId))
+  async logout(serverId: string, lifecycle?: McpOAuthOperationLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
+    await this.withCleanup(serverId, () => this.logoutOwned(serverId, lifecycle))
   }
   private async withCleanup(serverId: string, action: () => Promise<void>): Promise<void> {
     if (this.cleanups.has(serverId)) throw new McpOAuthError('invalid-plan')
     this.cleanups.add(serverId)
     try { await action() } finally { this.cleanups.delete(serverId) }
   }
-  private async logoutOwned(serverId: string): Promise<void> {
+  private async logoutOwned(serverId: string, lifecycle?: McpOAuthOperationLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
     const manager = this.owner()
     const closing = manager.disconnect(serverId)
     await closing
     await this.options.savedStore?.settle()
     await manager.reload()
+    lifecycle?.assertCurrent()
     const server = manager.statuses().find(status => status.server.id === serverId)?.server
+    const effects = this.storeLifecycle(lifecycle, manager.configurationRevision())
     if (server && isMcpHttpServer(server)) {
-      const saved = await this.options.savedStore?.clearTokens(serverId, server.endpoint)
+      const saved = await this.options.savedStore?.clearTokens(serverId, server.endpoint, undefined, effects)
       const entry = this.registrations.get(serverId)
       if (entry) { if (saved) entry.saved = saved; else delete entry.saved; entry.state = 'needs-sign-in' }
       this.signInRequired.add(serverId)
-    } else await this.options.savedStore?.remove(serverId)
+    } else await this.options.savedStore?.remove(serverId, () => this.lifecycleCurrent(lifecycle), effects)
   }
   async forgetSaved(serverId: string): Promise<void> {
     await this.withCleanup(serverId, () => this.forgetOwned(serverId))
   }
-  private async forgetOwned(serverId: string, expectedRevision?: string): Promise<void> {
+  private async forgetOwned(serverId: string, expectedRevision?: string, lifecycle?: McpOAuthOperationLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
     const manager = this.owner()
     await manager.disconnect(serverId)
     await this.options.savedStore?.settle()
@@ -336,33 +403,37 @@ export class McpOAuthControls {
       await manager.reload()
       if (manager.configurationRevision() !== expectedRevision) throw new Error('MCP configuration changed; review the current configuration')
     }
-    await this.options.savedStore?.remove(serverId, async () => !this.closed &&
-      (expectedRevision === undefined || await manager.configurationMatches(expectedRevision)))
+    await this.options.savedStore?.remove(serverId, async () => !this.closed && this.lifecycleCurrent(lifecycle) &&
+      (expectedRevision === undefined || await manager.configurationMatches(expectedRevision)),
+      this.storeLifecycle(lifecycle, expectedRevision ?? manager.configurationRevision()))
     const entry = this.registrations.get(serverId)
     if (entry) delete entry.saved
   }
-  async remove(serverId: string, expectedRevision?: string): Promise<void> {
+  async remove(serverId: string, expectedRevision?: string, lifecycle?: McpConfigurationLifecycle,
+    operationLifecycle?: McpOAuthOperationLifecycle): Promise<void> {
+    operationLifecycle?.assertCurrent()
     const manager = this.owner()
     await manager.reload()
     const revision = expectedRevision ?? manager.configurationRevision()
     if (manager.configurationRevision() !== revision) throw new Error('MCP configuration changed; review the current configuration')
     await this.withCleanup(serverId, async () => {
-      await this.forgetOwned(serverId, revision)
-      await manager.remove(serverId, revision)
+      await this.forgetOwned(serverId, revision, operationLifecycle)
+      operationLifecycle?.assertCurrent()
+      await manager.remove(serverId, revision, lifecycle)
     })
   }
   /** Restore only after a human Connect action. Listing never reads/unlocks keys. */
-  async connectSaved(serverId: string, io: ChatIO, signal: AbortSignal): Promise<boolean | undefined> {
+  async connectSaved(serverId: string, io: ChatIO, signal: AbortSignal, lifecycle?: McpOAuthOperationLifecycle): Promise<boolean | undefined> {
     const store = this.options.savedStore
     if (!store) return undefined
-    const manager = this.owner(), attempt = this.claim(serverId), combined = AbortSignal.any([signal, attempt.abort.signal])
+    const manager = this.owner(), attempt = this.claim(serverId, lifecycle), combined = AbortSignal.any([signal, attempt.abort.signal])
     let connected = false
     try {
       combined.throwIfAborted(); await manager.reload()
       const server = manager.statuses().find(status => status.server.id === serverId)?.server
       if (!server || !isMcpHttpServer(server) || !server.endpoint.startsWith('https:')) return undefined
       const configRevision = manager.configurationRevision()
-      const current = (): boolean => !this.closed && !combined.aborted && !io.isClosed &&
+      const current = (): boolean => this.lifecycleCurrent(lifecycle) && !this.closed && !combined.aborted && !io.isClosed &&
         this.attempts.get(serverId) === attempt && manager.configurationRevision() === configRevision
       await this.disconnectOwned(serverId, attempt)
       if (!current()) throw new McpOAuthError('cancelled')
@@ -402,13 +473,15 @@ export class McpOAuthControls {
         throw new McpOAuthStoreError('changed')
       // Prune stale disk identities only under an approved connection action.
       await store.reconcile(manager.statuses().map(status => status.server).filter(isMcpHttpServer)
-        .filter(item => item.endpoint.startsWith('https:')).map(item => ({ id: item.id, endpoint: item.endpoint })))
+        .filter(item => item.endpoint.startsWith('https:')).map(item => ({ id: item.id, endpoint: item.endpoint })), this.storeLifecycle(lifecycle, configRevision))
       if ((await store.load(serverId, server.endpoint))?.revision !== saved.revision) throw new McpOAuthStoreError('changed')
-      const session = new McpOAuthSession({ endpoint: server.endpoint, configRevision, client: saved.client,
+      const session = new McpOAuthSession({ endpoint: server.endpoint, configRevision,
+        authorizationIssued: kind => this.observe(serverId, configRevision, lifecycle, kind), client: saved.client,
         scopes: saved.client.scopes, discoveryResource: saved.client.resource ?? server.endpoint, initialCredentials: saved.tokens,
-        ...(discovery ? { discovery: discovery.info } : {}), ...this.persistence(entry), fetchFn: checkedFetch,
+        ...(discovery ? { discovery: discovery.info } : {}), ...this.persistence(entry, attempt), fetchFn: checkedFetch,
         openBrowser: async () => { throw new McpOAuthError('authorization-failed') }, registerSecrets: values => this.register(values),
-        configurationIsCurrent: () => !this.closed && manager.configurationRevision() === configRevision && this.registrations.get(serverId) === entry,
+        configurationIsCurrent: () => !this.closed && manager.configurationRevision() === configRevision && this.registrations.get(serverId) === entry &&
+          (!attempt.active || current()),
         ...(this.options.now ? { now: this.options.now } : {}), ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }) })
       entry.session = session; attempt.session = session
       if (!discovery && saved.tokens.expiresAt !== undefined && (this.options.now ?? Date.now)() >= saved.tokens.expiresAt - 30_000)
@@ -418,7 +491,7 @@ export class McpOAuthControls {
       const epoch = session.authorizationSnapshot().revision
       connected = await manager.connect(serverId, async (launch, approvalSignal) => current() && !approvalSignal.aborted &&
         launch.configRevision === configRevision && JSON.stringify(launch.server) === JSON.stringify(server) &&
-        session.authorizationSnapshot().revision === epoch && session.status().state === 'connected', combined)
+        session.authorizationSnapshot().revision === epoch && session.status().state === 'connected', combined, { assertCurrent: () => { if (!current()) throw new McpOAuthError('cancelled') } })
       if (connected) {
         const generation = manager.statuses().find(status => status.server.id === serverId)?.snapshot?.connectionGeneration
         connected = false
@@ -431,15 +504,15 @@ export class McpOAuthControls {
       return connected
     } finally {
       try { if (!connected) await this.disconnectOwned(serverId, attempt) }
-      finally { if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
+      finally { await this.drainPersistence(attempt); attempt.active = false; if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
     }
   }
   /** URL-first human setup: discover, prepare a supported public client, then sign
    * in and connect under one exact disclosed approval. Browser consent stays human.
    * No transport challenge invokes this method or replays a refused operation.
    */
-  async guidedSignInAndConnect(serverId: string, io: ChatIO, signal: AbortSignal, mode?: 'session-only'): Promise<boolean> {
-    const manager = this.owner(), attempt = this.claim(serverId)
+  async guidedSignInAndConnect(serverId: string, io: ChatIO, signal: AbortSignal, mode?: 'session-only', lifecycle?: McpOAuthOperationLifecycle): Promise<boolean> {
+    const manager = this.owner(), attempt = this.claim(serverId, lifecycle)
     const combined = AbortSignal.any([signal, attempt.abort.signal])
     let connected = false, registrationSubmitted = false, registrationCompleted = false
     try {
@@ -447,7 +520,7 @@ export class McpOAuthControls {
       const server = manager.statuses().find(status => status.server.id === serverId)?.server
       if (!server || !isMcpHttpServer(server) || !server.endpoint.startsWith('https:')) throw new McpOAuthError('authorization-failed')
       const configRevision = manager.configurationRevision()
-      const current = (): boolean => !this.closed && !combined.aborted && !io.isClosed &&
+      const current = (): boolean => this.lifecycleCurrent(lifecycle) && !this.closed && !combined.aborted && !io.isClosed &&
         this.attempts.get(serverId) === attempt && manager.configurationRevision() === configRevision
       const assertCurrent = (): void => { if (!current()) throw new McpOAuthError('cancelled') }
       const checkedFetch: FetchLike = async (input, init) => {
@@ -526,6 +599,7 @@ export class McpOAuthControls {
           issuer: discovery.issuer, scopes: discovery.scopes, redirectPort: this.options.redirectPort ?? 52147,
           redirectPath: this.options.redirectPath ?? '/oauth/callback', clientName: 'vivi-cli',
           discovery: discovery.info, discoveryResource: discovery.resource, fetchFn: checkedFetch,
+          registered: () => this.observe(serverId, configRevision, lifecycle, 'public-client-registered'),
           registerSecrets: values => this.register(values), configurationIsCurrent: current,
           ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }) })
         attempt.registration = registration
@@ -551,20 +625,22 @@ export class McpOAuthControls {
       if (!client || client.issuer !== discovery.issuer) throw new McpOAuthError('authorization-failed')
       if (mcpContainsSecret([description, discovery, client, registrationPlan], this.knownSecrets)) throw new McpOAuthError('authorization-failed')
       client = { ...client, scopes, resource: discovery.resource }
-      const saved = remember ? await store!.saveClient(serverId, server.endpoint, client, current, combined) : undefined
+      const saved = remember ? await this.trackPersistence(attempt, store!.saveClient(serverId, server.endpoint, client, current, combined,
+        this.storeLifecycle(lifecycle, configRevision))) : undefined
       await manager.reload(); assertCurrent()
       this.installClient(serverId, client, server.endpoint, configRevision)
       const entry = this.registrations.get(serverId)!
       if (saved) entry.saved = saved
-      const session = new McpOAuthSession({ endpoint: server.endpoint, configRevision, client, scopes,
-        ...this.persistence(entry),
+      const session = new McpOAuthSession({ endpoint: server.endpoint, configRevision,
+        authorizationIssued: kind => this.observe(serverId, configRevision, lifecycle, kind), client, scopes,
+        ...this.persistence(entry, attempt),
         discovery: discovery.info, discoveryResource: discovery.resource, fetchFn: checkedFetch,
         openBrowser: async (url, browserSignal) => { assertCurrent();
           if (mcpContainsSecret([client, server.endpoint, url.origin + url.pathname], this.knownSecrets)) throw new McpOAuthError('authorization-failed')
           io.write('Opening your browser. Review access there, then return to vivi. Escape or Ctrl-C cancels\n');
           await (this.options.openBrowser ?? openMcpOAuthBrowser)(url, browserSignal); assertCurrent() },
         registerSecrets: values => this.register(values), configurationIsCurrent: () => !this.closed &&
-          manager.configurationRevision() === configRevision && this.registrations.get(serverId) === entry,
+          manager.configurationRevision() === configRevision && this.registrations.get(serverId) === entry && (!attempt.active || current()),
         ...(this.options.now ? { now: this.options.now } : {}), ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }) })
       entry.session = session; attempt.session = session
       const plan = await session.prepareSignIn(combined); assertCurrent()
@@ -573,7 +649,7 @@ export class McpOAuthControls {
       // still pins and rechecks a fresh token-bound launch before any MCP send.
       connected = await manager.connect(serverId, async (launch, approvalSignal) => current() &&
         !approvalSignal.aborted && launch.configRevision === configRevision &&
-        JSON.stringify(launch.server) === JSON.stringify(server) && session.status().state === 'connected', combined)
+        JSON.stringify(launch.server) === JSON.stringify(server) && session.status().state === 'connected', combined, { assertCurrent })
       if (connected) {
         const generation = manager.statuses().find(status => status.server.id === serverId)?.snapshot?.connectionGeneration
         connected = false
@@ -590,20 +666,21 @@ export class McpOAuthControls {
       try {
         await attempt.registration?.cancelRegistration()
         if (!connected) await this.disconnectOwned(serverId, attempt)
-      } finally { if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
+      } finally { await this.drainPersistence(attempt); attempt.active = false; if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
     }
   }
-  async signInAndConnect(serverId: string, io: ChatIO, signal: AbortSignal): Promise<boolean> {
+  async signInAndConnect(serverId: string, io: ChatIO, signal: AbortSignal, lifecycle?: McpOAuthOperationLifecycle): Promise<boolean> {
     const manager = this.owner()
-    const attempt = this.claim(serverId), combined = AbortSignal.any([signal, attempt.abort.signal])
+    const attempt = this.claim(serverId, lifecycle), combined = AbortSignal.any([signal, attempt.abort.signal])
     let connected = false
     try {
       combined.throwIfAborted(); await manager.reload(); await this.disconnectOwned(serverId, attempt)
       const entry = this.registrations.get(serverId)
       if (!entry) throw new McpOAuthError('client-registration-required')
-      const current = (): boolean => !this.closed && !combined.aborted && !io.isClosed &&
+      const current = (): boolean => this.lifecycleCurrent(lifecycle) && !this.closed && !combined.aborted && !io.isClosed &&
         this.registrations.get(serverId) === entry && manager.configurationRevision() === entry.configRevision
       const session = new McpOAuthSession({ endpoint: entry.endpoint, configRevision: entry.configRevision,
+        authorizationIssued: kind => this.observe(serverId, entry.configRevision, lifecycle, kind),
         client: entry.client, scopes: entry.client.scopes, fetchFn: async (input, init) => {
           await manager.reload(); if (!current()) throw new McpOAuthError('cancelled')
           const response = await (this.options.fetchFn ?? fetchMcpOAuthNative)(input, init)
@@ -614,7 +691,9 @@ export class McpOAuthControls {
             throw new McpOAuthError('authorization-failed')
           await (this.options.openBrowser ?? openMcpOAuthBrowser)(url, browserSignal)
         }, registerSecrets: values => this.register(values),
-        configurationIsCurrent: current, ...(this.options.now ? { now: this.options.now } : {}),
+        configurationIsCurrent: () => !this.closed && manager.configurationRevision() === entry.configRevision &&
+          this.registrations.get(serverId) === entry && (!attempt.active || current()),
+        ...(this.options.now ? { now: this.options.now } : {}),
         ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }) })
       entry.session = session; attempt.session = session
       const plan = await session.prepareSignIn(combined)
@@ -634,7 +713,7 @@ export class McpOAuthControls {
           serverId, launchDigest: launch.digest, configRevision: launch.configRevision
         } }, currentRevision: launch.digest, description: mcpStartDisclosure(launch) }, approvalSignal)
         return approved && !approvalSignal.aborted && !io.isClosed && current()
-      }, combined)
+      }, combined, { assertCurrent: () => { if (!current()) throw new McpOAuthError('cancelled') } })
       if (connected) {
         const generation = manager.statuses().find(status => status.server.id === serverId)?.snapshot?.connectionGeneration
         connected = false // A failed final recheck must still revoke the new grant.
@@ -659,7 +738,7 @@ export class McpOAuthControls {
           const entry = this.registrations.get(serverId)
           if (entry && entry === cleanupEntry && needsSignIn) entry.state = 'needs-sign-in'
         }
-      } finally { if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
+      } finally { await this.drainPersistence(attempt); attempt.active = false; if (this.attempts.get(serverId) === attempt) this.attempts.delete(serverId) }
     }
   }
 

@@ -41,6 +41,13 @@ export interface McpConfiguration {
   readonly revision: string
   readonly servers: readonly McpServerConfig[]
 }
+/** A rename was observed. Later durability or lock cleanup failure cannot undo
+ * that evidence or justify automatically repeating the configuration change. */
+export class McpConfigCommitError extends Error {
+  constructor(readonly configuration: McpConfiguration) {
+    super('MCP configuration was saved, but durability or cleanup could not be verified')
+  }
+}
 const MAX_CONFIG_BYTES = 64 * 1024
 const controls = /[\u0000-\u001f\u007f-\u009f]/
 export function mcpText(value: unknown, limit: number): value is string {
@@ -157,7 +164,7 @@ export class McpConfigStore {
       return mcpFreeze({ revision: mcpDigest(servers), servers })
     } finally { await file.close() }
   }
-  async save(servers: readonly McpServerConfig[], expectedRevision: string): Promise<McpConfiguration> {
+  async save(servers: readonly McpServerConfig[], expectedRevision: string, assertCurrent?: () => void): Promise<McpConfiguration> {
     if (servers.length > 8) fail()
     const validated = servers.map(server => validateMcpServer(server, this.secrets))
     if (new Set(validated.map(server => server.id)).size !== validated.length) fail()
@@ -169,7 +176,9 @@ export class McpConfigStore {
     const lockPath = join(this.directory, 'mcp-servers.lock')
     const lease = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
     const leaseInfo = await lease.stat()
+    let committed: McpConfiguration | undefined
     try {
+      assertCurrent?.()
       if ((await this.load()).revision !== expectedRevision) throw new Error('MCP configuration changed; reload /mcp')
       const temporary = join(this.directory, `.mcp.${randomUUID()}.tmp`)
       const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
@@ -177,17 +186,28 @@ export class McpConfigStore {
         await file.writeFile(encoded, 'utf8'); await file.sync(); await file.close()
         const after = await directoryInfo(this.directory)
         if (!after || after.dev !== parent.dev || after.ino !== parent.ino || (await this.load()).revision !== expectedRevision) throw new Error('MCP configuration changed while saving')
+        // Repeat the trusted host's turn/approval guard at the actual commit.
+        assertCurrent?.()
         await rename(temporary, join(this.directory, 'mcp-servers.json'))
+        committed = mcpFreeze({ revision: mcpDigest(validated), servers: validated })
         if (process.platform !== 'win32') {
           const handle = await open(this.directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
           try { await handle.sync() } finally { await handle.close() }
         }
-        return mcpFreeze({ revision: mcpDigest(validated), servers: validated })
+        return committed
       } finally { await file.close().catch(() => undefined); await unlink(temporary).catch(() => undefined) }
+    } catch (error) {
+      if (committed) throw new McpConfigCommitError(committed)
+      throw error
     } finally {
-      await lease.close()
-      const current = await lstat(lockPath).catch(() => undefined)
-      if (current?.dev === leaseInfo.dev && current.ino === leaseInfo.ino) await unlink(lockPath)
+      try {
+        await lease.close()
+        const current = await lstat(lockPath).catch(() => undefined)
+        if (current?.dev === leaseInfo.dev && current.ino === leaseInfo.ino) await unlink(lockPath)
+      } catch (error) {
+        if (committed) throw new McpConfigCommitError(committed)
+        throw error
+      }
     }
   }
 }

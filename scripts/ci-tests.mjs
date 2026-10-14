@@ -19,6 +19,7 @@ const currentCompatibility = new Set([
   'platform-acceptance.test.mjs', 'windows-input.test.mjs', 'windows-conpty.test.mjs'
 ])
 const isOAuth = name => name.includes('mcp-oauth')
+const isAgentMcpSetup = name => name.startsWith('mcp-setup-')
 const isMcp = name => name.startsWith('mcp-') || isOAuth(name)
 
 export async function ciTestGroups(directory = new URL('../test/', import.meta.url)) {
@@ -33,9 +34,9 @@ export async function ciTestGroups(directory = new URL('../test/', import.meta.u
     'linux-node': node.map(path),
     'windows-mcp': node.filter(isMcp).map(path),
     'windows-headless': node.filter(name => !isMcp(name) && !nativeConpty.has(name) && !linuxOnly.has(name)).map(path),
-    'windows-current': node.filter(name => currentCompatibility.has(name) || isOAuth(name)).map(path),
+    'windows-current': node.filter(name => currentCompatibility.has(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'bun-tui': tui.map(path),
-    'bun-boundaries': node.filter(name => name.startsWith('public-url') || name === 'mcp-http.test.mjs' || isOAuth(name)).map(path),
+    'bun-boundaries': node.filter(name => name.startsWith('public-url') || name === 'mcp-http.test.mjs' || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'windows-stock': ['./test/windows-conpty-fallback-native.test.mjs'],
     'windows-modern': ['./test/windows-conpty-packaged-native.test.mjs'],
     'linux-only': node.filter(name => linuxOnly.has(name)).map(path),

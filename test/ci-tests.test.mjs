@@ -26,12 +26,12 @@ test('CI inventories every Node and Bun test with explicit Windows native owners
   }
 })
 
-test('current Windows runtime retains native process boundaries and all OAuth fixtures', async () => {
+test('current Windows and Bun retain native process boundaries and all OAuth/setup fixtures', async () => {
   const groups = await ciTestGroups()
   for (const name of ['mcp-windows-real', 'mcp-windows-node-env', 'command-windows-real', 'platform-acceptance']) {
     assert(groups['windows-current'].includes(`./test/${name}.test.mjs`))
   }
-  for (const file of groups['linux-node'].filter(file => file.includes('mcp-oauth'))) {
+  for (const file of groups['linux-node'].filter(file => file.includes('mcp-oauth') || file.includes('mcp-setup-'))) {
     assert(groups['windows-mcp'].includes(file))
     assert(groups['windows-current'].includes(file))
     assert(groups['bun-boundaries'].includes(file))
@@ -47,7 +47,8 @@ test('pending HTTP and five OAuth files enter all required runtime groups withou
   t.after(() => rm(directory, { recursive: true, force: true }))
   const names = await readdir(new URL('./', import.meta.url))
   const added = ['mcp-http', 'mcp-oauth', 'mcp-oauth-controls', 'application-mcp-oauth',
-    'mcp-oauth-registration', 'mcp-oauth-registration-controls'].map(name => `${name}.test.mjs`)
+    'mcp-oauth-registration', 'mcp-oauth-registration-controls', 'mcp-setup-tools', 'mcp-setup-service',
+    'mcp-setup-host', 'mcp-setup-connect-guards', 'mcp-setup-oauth-effects'].map(name => `${name}.test.mjs`)
   for (const name of new Set([...names.filter(name => /\.test\.(mjs|ts)$/.test(name)), ...added])) {
     await writeFile(join(directory, name), '')
   }
@@ -55,7 +56,7 @@ test('pending HTTP and five OAuth files enter all required runtime groups withou
   for (const name of added) {
     const file = `./test/${name}`
     for (const group of ['linux-node', 'windows-mcp', 'bun-boundaries']) assert(groups[group].includes(file))
-    if (name.includes('mcp-oauth')) assert(groups['windows-current'].includes(file))
+    if (name.includes('mcp-oauth') || name.startsWith('mcp-setup-')) assert(groups['windows-current'].includes(file))
     assert(!groups['windows-headless'].includes(file))
   }
 })
