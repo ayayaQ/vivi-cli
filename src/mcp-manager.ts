@@ -8,7 +8,7 @@ import type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
 import { validateMcpSchema } from './mcp-schema.js'
 import { expandMcpTemplate } from './mcp-templates.js'
 import type { JsonObject, ToolCall, ToolResult } from '@ayayaq/vivi'
-import { McpConfigStore, mcpDigest, mcpDisplayJson, mcpFreeze, prepareMcpLaunch, isMcpHttpServer, isMcpHttpLaunch, mcpText } from './mcp-config.js'
+import { McpConfigCommitError, McpConfigStore, mcpDigest, mcpDisplayJson, mcpFreeze, prepareMcpLaunch, isMcpHttpServer, isMcpHttpLaunch, mcpText } from './mcp-config.js'
 import type { McpConfiguration, McpLaunchIdentity, McpServerConfig, McpHttpServerConfig } from './mcp-config.js'
 import { assertMcpJson, collectMcpCategory, emptyMcpCategory, MCP_LIMITS } from './mcp-catalog.js'
 import type { McpCatalogEntry, McpCatalogKind, McpCatalogSnapshot } from './mcp-catalog.js'
@@ -21,6 +21,19 @@ export type { McpPreparedOperation } from '@ayayaq/vivi/extensions/mcp'
 export interface McpInvocationLifecycle {
   beforeSend(): Promise<void>
   settle(result: ToolResult): Promise<void>
+}
+/** Trusted setup owner only. Neither guard nor receipt is model-supplied. */
+export interface McpConfigurationLifecycle {
+  assertCurrent(): void
+  saved(configuration: McpConfiguration): void
+}
+/** One setup attempt's trusted owner guard. Released after initial discovery;
+ * an approved surviving connection is not bound to a completed chat turn. */
+export interface McpConnectionLifecycle { assertCurrent(): void }
+export class McpConfigurationChangeError extends Error {
+  constructor(readonly configuration: McpConfiguration, readonly durabilityUnverified: boolean) {
+    super('MCP configuration was saved, but durability or connection cleanup could not be verified')
+  }
 }
 interface PendingOperation {
   readonly operation: McpPreparedOperation
@@ -116,6 +129,16 @@ export class McpManager {
     try { const current = await this.options.store.load(); return !this.closed && current.revision === revision }
     catch { return false }
   }
+  /** Fresh, read-only local projection. In particular, this must not use reload:
+   * externally changed/invalid configuration cannot trigger cleanup in Plan. */
+  async localStatuses(): Promise<{ readonly revision: string; readonly statuses: readonly McpServerStatus[] }> {
+    const current = await this.options.store.load()
+    return mcpFreeze({ revision: current.revision, statuses: current.servers.map(server => {
+      const connection = this.connections.get(server.id)
+      const owned = connection?.launch.configRevision === current.revision ? connection : undefined
+      return { server, state: owned?.state ?? 'disabled' }
+    }) })
+  }
   private async revokeConnections(reason: 'configuration' | 'needs-sign-in' = 'configuration', nextServers?: readonly McpServerConfig[]): Promise<void> {
     let invalidationFailed = false, invalidationError: unknown
     try { await this.options.httpAuthorizationInvalidated?.(undefined, reason, nextServers) }
@@ -157,59 +180,90 @@ export class McpManager {
   }
   async reload(): Promise<void> {
     const current = await this.loadConfiguration()
-    if (this.configuration.revision && current.revision !== this.configuration.revision) await this.revokeConnections('configuration', current.servers)
+    if (this.configuration.revision && current.revision !== this.configuration.revision ||
+      [...this.connections.values()].some(connection => connection.launch.configRevision !== current.revision)) await this.revokeConnections('configuration', current.servers)
     this.configuration = current
     try { for (const connection of this.connections.values()) this.assertAuthorization(connection) }
     catch { await this.revokeConnections('needs-sign-in') }
   }
   statuses(): readonly McpServerStatus[] {
-    return mcpFreeze(this.configuration.servers.map(server => {
+    const configured = new Set(this.configuration.servers.map(server => server.id))
+    return mcpFreeze([...this.configuration.servers.map((server): McpServerStatus => {
       const connection = this.connections.get(server.id)
       return { server, state: connection?.state ?? 'disabled', ...(connection?.message ? { message: connection.message } : {}),
         ...(connection?.snapshot ? { snapshot: connection.snapshot } : {}) }
-    }))
+    }), ...[...this.connections].filter(([id]) => !configured.has(id)).map(([, connection]) => ({
+      server: connection.launch.server, state: 'error' as const,
+      message: 'MCP entry was removed; owned connection cleanup remains unverified. Use Disable to retry cleanup'
+    }))])
   }
-  async configure(server: McpServerConfig, expectedRevision?: string): Promise<void> {
+  async configure(server: McpServerConfig, expectedRevision?: string, lifecycle?: McpConfigurationLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
     this.assertOpen(); await this.reload()
     if (expectedRevision !== undefined && expectedRevision !== this.configuration.revision) throw new Error('MCP configuration changed; review the current configuration')
     if (this.configuration.servers.some(value => value.id === server.id)) throw new Error('That MCP server ID already exists; remove it before adding a replacement')
-    const updated = await this.options.store.save([...this.configuration.servers, server], expectedRevision ?? this.configuration.revision)
-    try { await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers) }
-    finally { await this.disconnectAll(); this.configuration = updated }
+    await this.saveConfiguration([...this.configuration.servers, server], expectedRevision ?? this.configuration.revision, lifecycle)
   }
-  async remove(id: string, expectedRevision?: string): Promise<void> {
+  async remove(id: string, expectedRevision?: string, lifecycle?: McpConfigurationLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
     this.assertOpen(); await this.reload()
     if (expectedRevision !== undefined && expectedRevision !== this.configuration.revision) throw new Error('MCP configuration changed; review the current configuration')
-    const updated = await this.options.store.save(this.configuration.servers.filter(server => server.id !== id), expectedRevision ?? this.configuration.revision)
-    try { await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers) }
-    finally { await this.disconnectAll(); this.configuration = updated }
+    await this.saveConfiguration(this.configuration.servers.filter(server => server.id !== id), expectedRevision ?? this.configuration.revision, lifecycle)
   }
-  async update(server: McpServerConfig, expectedRevision: string): Promise<void> {
+  async update(server: McpServerConfig, expectedRevision: string, lifecycle?: McpConfigurationLifecycle): Promise<void> {
+    lifecycle?.assertCurrent()
     this.assertOpen(); await this.reload()
     if (expectedRevision !== this.configuration.revision || !this.configuration.servers.some(value => value.id === server.id))
       throw new Error('MCP configuration changed; review the current configuration')
-    const updated = await this.options.store.save(this.configuration.servers.map(value => value.id === server.id ? server : value), expectedRevision)
-    try { await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers) }
-    finally { await this.disconnectAll(); this.configuration = updated }
+    await this.saveConfiguration(this.configuration.servers.map(value => value.id === server.id ? server : value), expectedRevision, lifecycle)
   }
-  async connect(id: string, approve: (launch: McpLaunchIdentity, signal: AbortSignal) => Promise<boolean>, signal: AbortSignal): Promise<boolean> {
-    this.assertOpen(); signal.throwIfAborted(); await this.reload()
+  private async saveConfiguration(servers: readonly McpServerConfig[], expectedRevision: string, lifecycle?: McpConfigurationLifecycle): Promise<void> {
+    let updated: McpConfiguration, durabilityUnverified = false
+    lifecycle?.assertCurrent()
+    try { updated = await this.options.store.save(servers, expectedRevision, lifecycle?.assertCurrent.bind(lifecycle)) }
+    catch (error) {
+      if (!(error instanceof McpConfigCommitError)) throw error
+      updated = error.configuration; durabilityUnverified = true
+    }
+    // Begin invalidation while its callback can still capture previous identities.
+    // The committed configuration and receipt do not wait for asynchronous cleanup.
+    let receiptFailed = false, cleanupFailed = false, invalidation: Promise<void> | undefined
+    try { invalidation = Promise.resolve(this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers)) }
+    catch { cleanupFailed = true }
+    void invalidation?.catch(() => undefined)
+    // Retain the exact known save before receipt/persistence/cleanup can fail.
+    this.configuration = updated
+    try { lifecycle?.saved(updated) } catch { receiptFailed = true }
+    for (const connection of this.connections.values()) {
+      connection.state = 'error'; connection.message = 'MCP configuration changed; reconnect requires fresh approval'
+      connection.catalogGeneration++; delete connection.snapshot; connection.controller.abort()
+    }
+    try { await invalidation } catch { cleanupFailed = true }
+    try { await this.disconnectAll() } catch { cleanupFailed = true }
+    if (durabilityUnverified || receiptFailed || cleanupFailed) throw new McpConfigurationChangeError(updated, durabilityUnverified)
+  }
+  async connect(id: string, approve: (launch: McpLaunchIdentity, signal: AbortSignal) => Promise<boolean>, signal: AbortSignal,
+    lifecycle?: McpConnectionLifecycle): Promise<boolean> {
+    let ownerGuard = lifecycle?.assertCurrent.bind(lifecycle), connecting = true
+    const assertOwner = (): void => { this.assertOpen(); signal.throwIfAborted(); ownerGuard?.() }
+    assertOwner(); await this.reload(); assertOwner()
     const server = this.configuration.servers.find(value => value.id === id)
     if (!server) throw new Error('MCP server is no longer configured')
     if (this.connections.has(id)) throw new Error('Disable the current MCP connection before reconnecting')
     const revision = this.configuration.revision
     const authorization = isMcpHttpServer(server) ? this.authorization(server) : undefined
     const launch = await prepareMcpLaunch(server, revision, this.options.env, this.secrets, authorization?.revision)
-    signal.throwIfAborted()
+    assertOwner()
     if (!await approve(launch, signal)) return false
-    signal.throwIfAborted(); this.assertOpen(); await this.reload()
+    assertOwner(); await this.reload(); assertOwner()
     if (this.configuration.revision !== revision || this.connections.has(id)) throw new Error('MCP launch changed; request fresh connection approval')
     const currentAuthorization = isMcpHttpServer(server) ? this.authorization(server) : undefined
     if (authorization?.revision !== currentAuthorization?.revision || authorization?.bearerToken !== currentAuthorization?.bearerToken) throw new Error('MCP HTTP authorization changed; request fresh connection approval')
     const current = await prepareMcpLaunch(server, revision, this.options.env, this.secrets, currentAuthorization?.revision)
+    assertOwner()
     if (current.digest !== launch.digest) throw new Error('MCP executable, working directory or environment changed; request fresh approval')
     if ((await this.loadConfiguration()).revision !== revision) throw new Error('MCP configuration changed; request fresh approval')
-    signal.throwIfAborted(); this.assertOpen()
+    assertOwner()
     if (this.configuration.revision !== revision || this.connections.has(id)) throw new Error('MCP launch changed; request fresh connection approval')
     const client = new Client({ name: 'vivi-cli-discovery', version: '0.1.0-dev.0' }, { capabilities: {},
       jsonSchemaValidator: { getValidator: <T>(schema: JsonSchemaType) => new AjvJsonSchemaValidator().getValidator<T>(schema) },
@@ -217,6 +271,7 @@ export class McpManager {
       versionNegotiation: { mode: server.protocol === 'legacy' ? 'legacy' : { pin: server.protocol } } })
     const owned: Transport = this.options.transportFactory?.(launch) ?? (isMcpHttpLaunch(launch)
       ? new McpHttpTransport(launch, { ...(this.options.httpFetch ? { fetch: this.options.httpFetch } : {}),
+        assertConnectCurrent: () => assertConnectBoundary(),
         token: () => { this.assertAuthorization(connection); return authorization?.bearerToken },
         beforeOperation: async message => {
           await this.reload()
@@ -264,11 +319,12 @@ export class McpManager {
     // Observe that rejection here; host ownership paths still await strict cleanup.
     const transport: Transport = { ...(owned.hasPerRequestStream ? { hasPerRequestStream: true } : {}),
       ...(owned.setProtocolVersion ? { setProtocolVersion: (version: string) => owned.setProtocolVersion!(version) } : {}), start: async () => {
-      combined.throwIfAborted()
+      assertConnectBoundary()
       await owned.start()
-      combined.throwIfAborted()
+      assertConnectBoundary()
       armDeadline('handshake')
     }, close: () => closeOwned().catch(() => undefined), send: (message, options) => {
+      try { assertConnectBoundary() } catch (error) { return Promise.reject(error) }
       if (!('method' in message) || !['tools/call', 'resources/read'].includes(message.method)) return owned.send(message, options)
       const pending = connection.pending
       if (!pending || pending.boundaryStarted || !('id' in message)) return Promise.reject(new Error('MCP operation has no one-shot approval'))
@@ -325,6 +381,14 @@ export class McpManager {
     client.onclose = () => { connection.state = 'error'; connection.message = connection.authorizationRejected ? 'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required' : 'MCP connection closed; reconnect requires fresh approval'; invalidate(kinds); connection.controller.abort() }
     client.onerror = () => { /* Untrusted server details are never logged, persisted or sent to a provider. */ }
     const combined = AbortSignal.any([signal, connection.controller.signal, deadline.signal])
+    const assertConnectBoundary = (): void => {
+      if (!connecting) return
+      combined.throwIfAborted(); assertOwner()
+      if (this.connections.get(id) !== connection || this.configuration.revision !== revision) throw new Error('MCP connection changed during startup')
+      this.assertAuthorization(connection)
+      // Credential screening can update trusted host state synchronously too.
+      assertOwner()
+    }
     const abort = (): void => { void closeOwned().catch(() => undefined) }
     combined.addEventListener('abort', abort, { once: true })
     try {
@@ -332,14 +396,14 @@ export class McpManager {
       await client.connect(transport, { signal: combined, timeout: MCP_LIMITS.pageMs, maxTotalTimeout: MCP_LIMITS.categoryMs })
       clearDeadline()
       await connection.http?.drainCleanup()
-      combined.throwIfAborted()
+      assertConnectBoundary()
       if (this.connections.get(id) !== connection || this.configuration.revision !== revision) throw new Error('MCP connection changed during startup')
       connection.state = 'connected'
       connection.snapshot = mcpFreeze({ serverId: id, configRevision: revision, connectionGeneration: connection.generation,
         protocolVersion: client.getNegotiatedProtocolVersion() ?? 'unknown', catalogGeneration: connection.catalogGeneration,
         categories: { tools: emptyMcpCategory(), resources: emptyMcpCategory(), resourceTemplates: emptyMcpCategory() } })
       await this.refresh(id, ['tools'], signal)
-      combined.throwIfAborted()
+      assertConnectBoundary()
       if (this.connections.get(id) !== connection || this.configuration.revision !== revision || connection.state !== 'connected') throw new Error('MCP connection changed during initial discovery')
       return true
     } catch {
@@ -349,7 +413,7 @@ export class McpManager {
       connection.controller.abort()
       await closeOwned()
       return false
-    } finally { clearDeadline(); combined.removeEventListener('abort', abort) }
+    } finally { connecting = false; ownerGuard = undefined; clearDeadline(); combined.removeEventListener('abort', abort) }
   }
   async refresh(id: string, selected: readonly McpCatalogKind[], signal: AbortSignal): Promise<void> {
     this.assertOpen(); signal.throwIfAborted(); await this.reload()

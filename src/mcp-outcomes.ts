@@ -73,6 +73,11 @@ export function mcpOutcomeMatchesCall(record: McpOutcomeRecord, call: ToolCall):
     record.recoveryCallDigest === exact
 }
 export function mcpOutcomeResult(record: McpOutcomeRecord): ToolResult {
+  if (!record.result && record.toolName === 'mcp_setup') return record.state === 'accepted'
+    ? { content: JSON.stringify({ success: false, source: 'mcp-setup', requestSent: false,
+      error: { code: 'cancelled', message: 'This MCP setup proposal was not executed' } }), isError: true }
+    : { content: JSON.stringify({ success: false, source: 'mcp-setup', unknownOutcome: true, doNotRetry: true,
+      error: { code: 'mcp_setup_unknown_outcome', message: 'MCP setup intent was recorded, but its outcome is unknown. Configuration or account access may have changed. Inspect /mcp before retrying' } }), isError: true }
   return record.result ?? (record.state === 'accepted' ? unattemptedMcpResult() : unresolvedMcpResult())
 }
 export function unresolvedMcpResult(): ToolResult {
@@ -101,6 +106,7 @@ export function reconcileMcpOutcomes(history: readonly HistoryMessage[], session
       try {
         const body = JSON.parse(message.content) as Record<string, unknown>
         if (body && typeof body === 'object' && (body.requestSent === false && body.unknownOutcome !== true ||
+          record.toolName === 'mcp_setup' && body.source === 'mcp-setup' && body.confirmedOutcome === true && body.doNotRetry === true && body.unknownOutcome !== true ||
           body.requestSent === true && body.doNotRetry === true && body.unknownOutcome !== true &&
           (body.confirmedOutcome === true || typeof body.success === 'boolean' && Array.isArray(body.content) && ['tools/call', 'resources/read'].includes(String(body.method))))) return structuredClone(message)
       } catch { /* A generic recovery result carries no stronger evidence. */ }

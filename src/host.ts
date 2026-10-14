@@ -34,6 +34,9 @@ import { mcpOperationDisclosure } from './mcp-manager.js'
 import type { McpManager, McpPreparedOperation } from './mcp-manager.js'
 import type { McpCatalogSnapshot } from './mcp-catalog.js'
 import { createMcpExtension, MCP_GUIDANCE } from './mcp-tools.js'
+import { createMcpSetupExtension, MCP_SETUP_GUIDANCE } from './mcp-setup-tools.js'
+import type { McpSetupService, McpSetupEffectReceipt } from './mcp-setup.js'
+import type { ChatIO } from './terminal.js'
 import { mcpContainsSecret } from './mcp-content.js'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOutcomeResult, reconcileMcpOutcomes, unattemptedMcpResult, unresolvedMcpResult, validateMcpOutcomes } from './mcp-outcomes.js'
@@ -84,8 +87,9 @@ function withholdMcpResult<T extends ToolResult>(result: T, secrets: readonly st
   if (!mcpContainsSecret([result.content, body ?? null], secrets)) return result
   const record = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : undefined
   const localListing = record?.source === 'mcp' && record.localMetadataOnly === true && Array.isArray(record.servers)
+  const setupConfirmed = record?.source === 'mcp-setup' && record.confirmedOutcome === true && record.doNotRetry === true && record.unknownOutcome !== true
   const notSent = !localListing && record?.requestSent === false && record.unknownOutcome !== true
-  const confirmed = localListing || record?.unknownOutcome !== true && (record?.confirmedOutcome === true && record.requestSent === true && record.doNotRetry === true ||
+  const confirmed = localListing || setupConfirmed || record?.unknownOutcome !== true && (record?.confirmedOutcome === true && record.requestSent === true && record.doNotRetry === true ||
     record?.source === 'mcp' && typeof record.success === 'boolean' && Array.isArray(record.content) &&
     ['tools/call', 'resources/read'].includes(String(record.method)))
   const succeeded = localListing || record?.success === true
@@ -93,9 +97,10 @@ function withholdMcpResult<T extends ToolResult>(result: T, secrets: readonly st
     ? { success: false, source: 'mcp', untrusted: true, contentWithheld: true, requestSent: false,
       error: { code: 'mcp_content_withheld', message: 'MCP request was not sent; its diagnostic content was withheld because it contains a known credential' } }
     : confirmed
-    ? { success: succeeded, source: 'mcp', untrusted: true, contentWithheld: true, confirmedOutcome: true,
-      ...(localListing ? { localMetadataOnly: true, requestSent: false } : { requestSent: true, doNotRetry: true }),
+    ? { success: succeeded, source: setupConfirmed ? 'mcp-setup' : 'mcp', untrusted: true, contentWithheld: true, confirmedOutcome: true,
+      ...(localListing ? { localMetadataOnly: true, requestSent: false } : setupConfirmed ? { doNotRetry: true } : { requestSent: true, doNotRetry: true }),
       message: localListing ? 'The local MCP metadata listing completed, but its content was withheld because it contains a known credential. No remote request was sent'
+        : setupConfirmed ? 'MCP setup has a confirmed effect; credential-containing content was withheld. Inspect /mcp before retrying'
         : 'MCP returned a confirmed response; its content was withheld because it contains a known credential. Do not repeat the operation to recover withheld content' }
     : { success: false, source: 'mcp', untrusted: true, contentWithheld: true, unknownOutcome: true, doNotRetry: true,
       error: { code: 'mcp_content_withheld', message: 'MCP content was withheld because it contains a known credential. The recorded outcome could not be confirmed; do not retry automatically' } }
@@ -257,6 +262,8 @@ export interface CliHostOptions {
   extensions?: readonly ToolExtension[]
   /** Only human-connected launch-local catalogs can become reviewed model tools. */
   mcp?: McpManager
+  /** Trusted launch setup controls. This grants no raw settings, credentials or process commands. */
+  mcpSetup?: { readonly service: McpSetupService; readonly io: ChatIO }
   /** Durable evidence sink; FileSessionStore receives a standalone sink automatically. */
   mcpOutcomes?: McpOutcomeStore
   onMcpNotice?(message: string): void
@@ -727,6 +734,94 @@ export class CliHost {
   private acceptedMcpRow(call: ToolCall): McpOutcomeRecord | undefined {
     return [...this.mcpRows.values()].find(row => row.runId === this.toolsetRevision && row.callId === call.id &&
       row.toolName === call.name && row.callDigest === mcpDigest(call))
+  }
+  private executeMcpSetup(call: ToolCall, signal: AbortSignal, setup: NonNullable<CliHostOptions['mcpSetup']>, ownerSignal: AbortSignal, bindingCurrent: () => boolean): Promise<ToolResult> {
+    const job = this.performMcpSetup(call, signal, setup, ownerSignal, bindingCurrent)
+    this.mcpJobs.add(job)
+    void job.then(() => this.mcpJobs.delete(job), () => this.mcpJobs.delete(job))
+    return job
+  }
+  private async performMcpSetup(call: ToolCall, signal: AbortSignal, setup: NonNullable<CliHostOptions['mcpSetup']>, ownerSignal: AbortSignal, bindingCurrent: () => boolean): Promise<ToolResult> {
+    const captured = structuredClone(call), accepted = this.acceptedMcpRow(captured)
+    const service = setup.service, execute = service.executeSetup, manager = service.manager, io = setup.io
+    const remoteManager = this.options.mcp
+    let configurationRevision = manager.configurationRevision()
+    let proposalRevisionAdmitted = false
+    if (!accepted && this.mcpRows.size >= MAX_MCP_OUTCOME_ROWS) return unattemptedMcpResult('mcp_outcome_capacity')
+    const rowId = accepted?.id ?? randomUUID(), toolset = this.toolsetRevision
+    const row: McpOutcomeRecord = accepted ?? { id: rowId, sessionId: this.current.id, runId: toolset,
+      callId: captured.id, toolName: captured.name, callDigest: mcpDigest(captured), bindingDigest: mcpDigest({ call: captured, toolset }), state: 'accepted' }
+    this.mcpCalls.set(rowId, captured); this.mcpRows.set(rowId, row)
+    let started = false, settled: ToolResult | undefined, known: ToolResult | undefined
+    const effects: McpSetupEffectReceipt[] = []
+    const assertCurrent = (): void => {
+      signal.throwIfAborted()
+      if (this.shutdownStarted || this.controller?.signal !== ownerSignal || this.toolsetRevision !== toolset ||
+        this.taskMode === 'plan' || this.options.enableTools === false || this.options.mcpSetup !== setup || !bindingCurrent() ||
+        setup.service !== service || service.executeSetup !== execute || service.manager !== manager || setup.io !== io ||
+        this.options.mcp !== remoteManager || manager.configurationRevision() !== configurationRevision &&
+        !(proposalRevisionAdmitted && manager.configurationRevision() === captured.arguments.expectedRevision) ||
+        io.canAutoReview !== true || io.isClosed || mcpDigest(call) !== mcpDigest(captured)) {
+        throw new Error('MCP setup proposal is no longer current')
+      }
+      if (mcpContainsSecret(captured, this.options.secrets ?? [])) throw new Error('MCP setup contains a known credential')
+    }
+    const persist = async (result: ToolResult): Promise<void> => {
+      // Capture before asynchronous persistence or cancellation can obscure the
+      // result. Recovery evidence is not a permit for any further setup effect.
+      settled = withholdMcpResult(structuredClone(result), this.options.secrets ?? [])
+      this.mcpRows.set(rowId, { ...row, state: 'settled', result: settled })
+      await this.persistMcpOutcomes()
+    }
+    const effect = (receipt: McpSetupEffectReceipt): void => {
+      const capturedReceipt = structuredClone(receipt)
+      if (mcpContainsSecret(capturedReceipt, this.options.secrets ?? [])) throw new Error('MCP setup receipt contains a known credential')
+      if (capturedReceipt.kind === 'configuration-saved') { configurationRevision = capturedReceipt.revision; proposalRevisionAdmitted = false }
+      effects.push(capturedReceipt)
+      known = { content: JSON.stringify({ success: false, source: 'mcp-setup', confirmedOutcome: true,
+        doNotRetry: true, setupIncomplete: true, knownEffects: effects }), isError: true }
+      // The observed effect outranks a later generic registry abort. Publish a
+      // partial receipt now; final settlement can refine it without replay.
+      this.mcpRows.set(rowId, { ...row, state: 'settled', result: known })
+      const work = this.persistMcpOutcomes().then(() => known!)
+      this.mcpJobs.add(work)
+      void work.then(() => this.mcpJobs.delete(work), () => this.mcpJobs.delete(work))
+    }
+    let outcome: ToolResult
+    try {
+      assertCurrent()
+      if (!this.mcpOutcomes) throw new Error('Durable MCP setup evidence is unavailable')
+      const result = await execute.call(service, captured, signal, { io, assertCurrent,
+        approve: async (request, approvalSignal) => {
+          assertCurrent()
+          const approved = await this.approveWithPresentation(request, approvalSignal)
+          assertCurrent(); return approved
+        }, beforeEffect: async () => {
+          assertCurrent()
+          if (!started) {
+            this.mcpRows.set(rowId, { ...row, state: 'intent' })
+            await this.persistMcpOutcomes()
+            // Only a durably admitted intent can precede a setup side effect.
+            assertCurrent(); started = true
+            // The trusted service called this only after preparing and reviewing
+            // the exact fresh disk snapshot. A manager may now reload that same
+            // approved identity, including a previously uninitialized embedder.
+            proposalRevisionAdmitted = true
+          }
+        }, effect, settle: persist })
+      outcome = settled ?? withholdMcpResult(result, this.options.secrets ?? [])
+    } catch {
+      outcome = settled ?? known ?? (started || this.mcpRows.get(rowId)?.state === 'intent'
+        ? { content: JSON.stringify({ success: false, source: 'mcp-setup', unknownOutcome: true, doNotRetry: true,
+          error: { code: 'mcp_setup_unknown_outcome', message: 'MCP setup may have changed configuration or reached a server. Inspect /mcp before retrying' } }), isError: true }
+        : unattemptedMcpResult(signal.aborted ? 'cancelled' : 'mcp_setup_unavailable'))
+    }
+    // Settle known effects even after the caller cancels. Never convert an
+    // admitted/observed effect into a no-attempt record or replay authorization.
+    if (settled === undefined) {
+      try { await persist(outcome) } catch { /* Known in-memory and durable prior intent remain authoritative. */ }
+    }
+    return settled ?? outcome
   }
   /** Await the host-owned operations the core may stop awaiting when cancelled. */
   async drainMcp(): Promise<void> {
@@ -1260,6 +1355,26 @@ export class CliHost {
       }) : undefined
       const publicUrl = taskMode !== 'plan' && enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes
         ? createPublicUrlExtension((call, signal) => this.executePublicUrl(call, signal, controller.signal)) : undefined
+      const setup = enableTools ? this.options.mcpSetup : undefined
+      const setupService = setup?.service, setupList = setupService?.listLocal, setupExecute = setupService?.executeSetup
+      const setupManager = setupService?.manager, setupIo = setup?.io, setupRemoteManager = this.options.mcp
+      const setupCurrent = (): boolean => !this.shutdownStarted && this.controller === controller && owner.state === 'open' &&
+        this.options.enableTools !== false && this.options.mcpSetup === setup && setup?.service === setupService && setupService?.listLocal === setupList &&
+        setupService?.executeSetup === setupExecute && setupService?.manager === setupManager && setup?.io === setupIo && this.options.mcp === setupRemoteManager
+      let mcpSetup = setup && setupService && setupList ? createMcpSetupExtension({
+        secrets: () => this.options.secrets ?? [],
+        listLocal: async signal => {
+          signal.throwIfAborted()
+          if (!setupCurrent()) throw new Error('MCP local status is no longer current')
+          const local = await setupList.call(setupService, signal)
+          signal.throwIfAborted()
+          if (!setupCurrent()) throw new Error('MCP local status is no longer current')
+          return { content: JSON.stringify({ source: 'mcp', localMetadataOnly: true, requestSent: false, ...local }) }
+        }, executeSetup: (call, signal) => this.executeMcpSetup(call, signal, setup, controller.signal, setupCurrent)
+      }) : undefined
+      if (mcpSetup && (!this.mcpOutcomes || setup?.io.canAutoReview !== true || setup.io.isClosed)) {
+        mcpSetup = { ...mcpSetup, tools: mcpSetup.tools.filter(tool => tool.definition.name === 'mcp_list') }
+      }
       const questionHost = this.options.questionHost
       const questionSession = this.current.id, questionModel = this.current.model, questionProvider = this.current.provider
       const questionReasoning = this.current.reasoning, questionProviderAdapter = this.options.provider, questionAsk = questionHost?.ask
@@ -1272,12 +1387,13 @@ export class CliHost {
       const questions = enableTools && questionHost && questionIsCurrent() ? createQuestionExtension({
         ask: (request, { signal }) => askCurrentQuestion(questionHost, request, signal, questionIsCurrent, () => this.options.secrets ?? [])
       }) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode, questions)
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode, questions, mcpSetup)
       if (questions) prefix.push({ kind: 'message', role: 'system', content: QUESTION_GUIDANCE })
       const allowedTools = new Set(enableTools ? toolset.tools.map(tool => tool.name) : [])
       if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: PUBLIC_URL_GUIDANCE })
       owner.defer(() => toolset.dispose())
       const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name) ?? [])
+      const outcomeMcpNames = new Set([...ownedMcpNames, ...(taskMode !== 'plan' && mcpSetup?.tools.some(tool => tool.definition.name === 'mcp_setup') ? ['mcp_setup'] : [])])
       if (catalog) {
         if (!this.options.skills?.writable) {
           try { this.options.onSkillsNotice?.('Automatic skill saving is disabled on every platform. The creator can draft standard SKILL.md text for manual saving') }
@@ -1298,6 +1414,7 @@ export class CliHost {
       }
       if (workspace) prefix.push({ kind: 'message', role: 'system', content: WORKSPACE_GUIDANCE })
       if (mcp) prefix.push({ kind: 'message', role: 'system', content: MCP_GUIDANCE })
+      if (mcpSetup) prefix.push({ kind: 'message', role: 'system', content: MCP_SETUP_GUIDANCE })
       if (commands) prefix.push({ kind: 'message', role: 'system', content: COMMAND_GUIDANCE })
       if (taskMode === 'plan') prefix.push({ kind: 'message', role: 'system', content: PLAN_MODE_GUIDANCE })
       // Accept the prompt and its title in one successful checkpoint. A failed
@@ -1377,7 +1494,7 @@ export class CliHost {
         executeTool: async (call, context) => {
           context.signal.throwIfAborted()
           if (taskMode === 'plan' && !allowedTools.has(call.name)) return planModeRefusal()
-          if (ownedMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
+          if (outcomeMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
           if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
             return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
               error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true }
@@ -1442,9 +1559,9 @@ export class CliHost {
             // Register all owned calls before any tool_started callback can abort,
             // including later calls the core never enters in a cancelled batch.
             const acceptedCalls = event.type === 'assistant' ? event.message.toolCalls : []
-            for (const call of acceptedCalls) if (ownedMcpNames.has(call.name)) pendingMcpDisplay.set(call.id, structuredClone(call))
-            this.acceptMcpCalls(acceptedCalls, ownedMcpNames, mcpContents)
-            if (admittedEvent.message.toolCalls.some(call => ownedMcpNames.has(call.name))) {
+            for (const call of acceptedCalls) if (outcomeMcpNames.has(call.name)) pendingMcpDisplay.set(call.id, structuredClone(call))
+            this.acceptMcpCalls(acceptedCalls, outcomeMcpNames, mcpContents)
+            if (admittedEvent.message.toolCalls.some(call => outcomeMcpNames.has(call.name))) {
               try { await this.persistMcpOutcomes() } catch { /* No send can occur without a later durable intent. */ }
             }
             this.current.history.push(structuredClone(admittedEvent.message))

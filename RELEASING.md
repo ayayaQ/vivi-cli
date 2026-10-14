@@ -39,6 +39,29 @@ otherwise the host fails closed. Embedders constructing `CliHost` directly shoul
 await `initialize()` before displaying recovered history; `create()` and `resume()`
 do this themselves.
 
+Agent-assisted setup uses a separate fixed `mcp_list` / `mcp_setup` tool pack,
+independent of connected server catalogs. The application supplies the same
+`McpSetupService` and trusted interactive IO used by explicit host controls.
+Direct embedders opt in with `mcpSetup: { service, io }`; without interactive
+review and durable `mcpOutcomes`, only local listing is available. Plan permits
+listing but never setup effects. Auto never reviews setup proposals. Model-supplied
+revision text is checked against a fresh host-prepared proposal and again at
+commit; it is not authority. No credentials or executable settings enter the pack.
+
+`test/mcp-setup-tools.test.mjs`, `test/mcp-setup-service.test.mjs` and
+`test/mcp-setup-host.test.mjs` exercise strict input/result projection, fresh
+human review, stale owners/revisions, intent failures, cancellation, known save
+and cleanup outcomes, privacy withholding, crash recovery and next-turn catalogs.
+These offline fixtures must retain known effects across terminal reconciliation,
+transcript/checkpoint failure and process restart. Outcome evidence never grants
+approval or authorizes replay. Live browser grants and issuer acceptance remain
+separate validation.
+`test/mcp-setup-connect-guards.test.mjs` additionally invalidates the exact owner
+after launch review, during native readiness and after SDK token waits at the
+final HTTP boundary. `test/mcp-setup-oauth-effects.test.mjs` covers fixed,
+credential-free grant/registration/store observations and draining cancelled
+native saves. Inert status projection never expires or revokes OAuth authority.
+
 Public URL GET tools similarly require durable `publicUrlOutcomes` evidence; file
 sessions supply a private sidecar automatically. Recovery never restores approval
 or replays a send. URL fixtures exercise the real host, bounded extractor and

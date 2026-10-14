@@ -113,7 +113,7 @@ export function cliToolPresentationView(encoded: string, collapsed = false, deta
 /** Reserved host-owned reads and informational clarification have no external operation to verify. This is display
  * context supplied by the CLI, never inferred from a foreign presentation name. */
 export function isCliLocalReadTool(name: string): boolean {
-  return ['request_user_input', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill',
+  return ['request_user_input', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'mcp_list',
     'workspace_list', 'workspace_read', 'workspace_search', 'workspace_glob'].includes(name)
 }
 export interface CliToolCardView {
@@ -137,7 +137,7 @@ function targetSummary(snapshot: ToolPresentation): string | undefined {
   const keys: Record<string, readonly string[]> = {
     workspace_list: ['path'], workspace_read: ['path'], workspace_search: ['query', 'path'], workspace_glob: ['pattern', 'path'],
     workspace_create_text: ['path'], workspace_edit_text: ['path'], note_set: ['key'], current_time: ['timezone'],
-    read_skill: ['name', 'path'], create_memory: ['title'], edit_memory: ['id'], delete_memory: ['id'], command_start: ['executable'] }
+    read_skill: ['name', 'path'], create_memory: ['title'], edit_memory: ['id'], delete_memory: ['id'], command_start: ['executable'], mcp_setup: ['action', 'id'] }
   if (snapshot.name === 'fetch_url' && typeof values.url === 'string') {
     try { const url = new URL(values.url); return oneLine(url.hostname + url.pathname) }
     catch { return undefined }

@@ -21,6 +21,8 @@ export interface McpOAuthSessionOptions {
   readonly discovery?: OAuthDiscoveryState
   readonly discoveryResource?: string
   readonly initialCredentials?: McpOAuthSavedTokens
+  /** Trusted evidence only; no credentials are delivered and no authority is granted. */
+  readonly authorizationIssued?: (kind: 'authorization-granted' | 'authorization-refreshed') => void
   /** Persist the validated bundle before its bearer authority becomes usable. */
   readonly saveCredentials?: (tokens: McpOAuthSavedTokens, context: McpOAuthPersistenceContext) => Promise<void>
   /** Host transaction must serialize refresh and make uncertain rotation unrecoverable. */
@@ -227,6 +229,7 @@ export class McpOAuthSession {
       provider.saveTokens({ ...tokens, issuer: plan.issuer }, { issuer: plan.issuer })
       const staged = flow.pendingTokens!, expiresAt = flow.expiresAt
       const credentials = this.savedTokens(staged, expiresAt)
+      this.options.authorizationIssued?.('authorization-granted'); this.assertProvider(provider)
       if (this.options.saveCredentials) await abortable(this.options.saveCredentials(credentials, Object.freeze({ signal: flow.abort.signal,
         isCurrent: () => this.flow === flow && !flow.abort.signal.aborted && this.options.configurationIsCurrent() })), flow.abort.signal)
       this.assertProvider(provider)
@@ -319,6 +322,7 @@ export class McpOAuthSession {
         const expiresAt = response.expires_in === undefined ? undefined : this.now() + response.expires_in * 1000
         const updated = this.savedTokens({ ...response, issuer: checked.issuer }, expiresAt, checked.scopes)
         if (updated.scopes.some(scope => !checked.scopes.includes(scope))) throw new McpOAuthError('authorization-failed')
+        this.options.authorizationIssued?.('authorization-refreshed'); assertCurrent()
         return updated
       }, Object.freeze({ signal: work.abort.signal, isCurrent: () => this.refreshing === work && this.revision === work.revision &&
         !work.abort.signal.aborted && this.options.configurationIsCurrent() })), work.abort.signal)
@@ -347,6 +351,13 @@ export class McpOAuthSession {
   bearerProvider(): AuthProvider {
     const revision = this.authorizationSnapshot().revision
     return { token: async () => { const current = this.authorizationSnapshot(); return current.revision === revision ? current.bearerToken : undefined } }
+  }
+  /** Inert projection for local listing. Never expires authority, rotates epochs or cancels work. */
+  peekStatus(): { readonly state: McpOAuthState; readonly revision: string } {
+    const expired = !!this.token && this.expiresAt !== undefined && this.now() >= this.expiresAt
+    const current = this.options.configurationIsCurrent()
+    return { state: !current ? this.flow || this.refreshing ? 'cancelled' : 'needs-sign-in' : expired ? 'needs-sign-in' : this.state,
+      revision: this.revision }
   }
   status(): { readonly state: McpOAuthState; readonly revision: string } {
     this.authorizationSnapshot(); return { state: this.state, revision: this.revision }

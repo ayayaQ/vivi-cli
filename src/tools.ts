@@ -7,6 +7,7 @@ import { COMMAND_TOOL_NAMES } from './commands.js'
 import { PUBLIC_URL_TOOL_NAME } from './public-url-tools.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES } from './workspace-edit.js'
 import { QUESTION_TOOL_NAME } from './questions.js'
+import { MCP_SETUP_TOOL_NAMES } from './mcp-setup-tools.js'
 import { isPlanTool, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
 export { calculate }
@@ -47,7 +48,7 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 }
 
 /** Explicit imports only; one fixed registry pairs advertised tools with their executors. */
-export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension, taskMode: TaskMode = 'execute', questions?: ToolExtension): {
+export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension, taskMode: TaskMode = 'execute', questions?: ToolExtension, mcpSetup?: ToolExtension): {
   tools: ToolDefinition[]
   readonly signal: AbortSignal
   defer(cleanup: ExtensionCleanup): void
@@ -57,7 +58,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
   const scope = createExtensionScope({
     reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
-      PUBLIC_URL_TOOL_NAME, QUESTION_TOOL_NAME, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
+      PUBLIC_URL_TOOL_NAME, QUESTION_TOOL_NAME, ...MCP_SETUP_TOOL_NAMES, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
@@ -66,7 +67,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   try {
     scope.register(calculatorExtension)
     if (taskMode !== 'plan') for (const extension of extensions) scope.register(extension)
-    for (const extension of [memory, workspace, skills, questions, ...(taskMode === 'plan' ? [] : [commands, mcp, publicUrl])]) if (extension) {
+    for (const extension of [memory, workspace, skills, questions, mcpSetup, ...(taskMode === 'plan' ? [] : [commands, mcp, publicUrl])]) if (extension) {
       builtins.register(taskMode === 'plan' ? { ...extension, tools: extension.tools.filter(tool => isPlanTool(tool.definition.name)) } : extension)
     }
     const registry = scope.snapshot(), builtinRegistry = builtins.snapshot()

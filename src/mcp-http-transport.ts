@@ -12,6 +12,8 @@ export interface McpHttpTransportOptions {
   /** Trusted session-only credential read. Never refreshes or starts an auth flow. */
   readonly token?: () => string | undefined
   readonly fetch?: FetchLike
+  /** Initial setup owner only. Manager releases it after initial discovery. */
+  readonly assertConnectCurrent?: () => void
   /** Host approval/persistence recheck at the final HTTP wire boundary. */
   readonly operationStarted: (message: JSONRPCMessage) => void
   readonly beforeOperation: (message: JSONRPCMessage) => Promise<void>
@@ -51,12 +53,14 @@ export class McpHttpTransport implements Transport {
     }
   }
   async start(): Promise<void> {
+    this.options.assertConnectCurrent?.()
     if (this.started || this.closed) throw new Error('MCP HTTP transport cannot be restarted')
     this.started = true
     await this.sdk.start()
   }
   setProtocolVersion(version: string): void { this.sdk.setProtocolVersion(version) }
   async send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
+    this.options.assertConnectCurrent?.()
     if (!this.started || this.closed) throw new Error('MCP HTTP connection is closed')
     if (!('method' in message) || !('id' in message ? requests : notifications).has(message.method) || options?.resumptionToken) throw new Error('MCP HTTP request is unsupported')
     if (message.method === 'notifications/cancelled') {
@@ -85,6 +89,8 @@ export class McpHttpTransport implements Transport {
   }
   private async wire(input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]): Promise<Response> {
     this.controller.signal.throwIfAborted()
+    // The SDK awaited its token provider before reaching this wire boundary.
+    this.options.assertConnectCurrent?.()
     const target = typeof input === 'string' ? input : input.href
     if (target !== this.launch.server.endpoint) throw new Error('MCP HTTP destination differs from the configured endpoint')
     const headers = new Headers(init?.headers)
@@ -103,6 +109,7 @@ export class McpHttpTransport implements Transport {
     // No asynchronous token refresh is allowed; authentication changes require a new connection/proposal.
     const token = this.options.token?.()
     if ((headers.get('authorization') ?? undefined) !== (token ? `Bearer ${token}` : undefined)) throw new Error('MCP HTTP authorization changed before send')
+    this.options.assertConnectCurrent?.()
     if ('method' in ticket.message && ['tools/call', 'resources/read'].includes(ticket.message.method)) this.options.operationStarted(ticket.message)
     const response = await (this.options.fetch ?? fetch)(input, { ...init, signal, redirect: 'manual' })
     if (response.status === 401 || response.status === 403) {
