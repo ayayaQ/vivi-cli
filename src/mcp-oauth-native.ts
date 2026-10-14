@@ -111,7 +111,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
   return async (input, init) => {
     // Accept the SDK's JSON strings and URLSearchParams; never arbitrary streams,
     // multipart bodies, credentials, redirects, or caller TLS/network options.
-    const url = mcpOAuthRemoteUrl(String(input)), hostname = url.hostname.replace(/^\[|\]$/g, '')
+    const url = mcpOAuthRemoteUrl(String(input)), port = Number(url.port || 443), hostname = url.hostname.replace(/^\[|\]$/g, '')
     const method = (init?.method ?? 'GET').toUpperCase()
     if (method !== 'GET' && method !== 'POST' || init?.redirect !== undefined && init.redirect !== 'manual' ||
       init?.credentials !== undefined && init.credentials !== 'omit' ||
@@ -180,7 +180,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
         const ready = (): void => {
           try {
             current()
-            if (sent || !request || request.destroyed || !socket || socket.destroyed || !socket.authorized || socket.remotePort !== 443 || !sameAddress(socket.remoteAddress, address) ||
+            if (sent || !request || request.destroyed || !socket || socket.destroyed || !socket.authorized || socket.remotePort !== port || !sameAddress(socket.remoteAddress, address) ||
               verifyIdentity(hostname, socket.getPeerCertificate()) !== undefined) fail()
             // No HTTP headers or POST bytes are queued before TLS authorization
             // and the pinned peer-IP check. No retries or alternate IP fallback.
@@ -197,7 +197,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
         signal.addEventListener('abort', abort, { once: true })
         try {
           current()
-          request = dependencies.request({ protocol: 'https:', hostname, port: 443, method, path: url.pathname,
+          request = dependencies.request({ protocol: 'https:', hostname, port, method, path: url.pathname,
             agent: false, family: isIP(address), autoSelectFamily: false,
             lookup: (_host, lookupOptions, callback) => {
               try {

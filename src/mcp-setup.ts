@@ -49,7 +49,8 @@ export class McpSetupService {
     await this.manager.reload(); signal.throwIfAborted()
     const server = this.manager.statuses().find(status => status.server.id === id)?.server
     if (!server) throw new Error('MCP server is no longer configured')
-    if (isMcpHttpServer(server) && server.endpoint.startsWith('https:') && this.oauth?.status(id).state === 'needs-sign-in')
+    const authState = this.oauth?.status(id).state
+    if (isMcpHttpServer(server) && server.endpoint.startsWith('https:') && authState && !['unconfigured', 'connected'].includes(authState))
       return this.login(id, io, signal)
     await this.manager.disconnect(id)
     const connected = await this.manager.connect(id, async (launch, approvalSignal) => {

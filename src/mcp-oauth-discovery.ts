@@ -3,7 +3,8 @@ import { buildDiscoveryUrls, discoverAuthorizationServerMetadata, discoverOAuthP
 import type { FetchLike, OAuthDiscoveryState, OAuthProtectedResourceMetadata } from '@modelcontextprotocol/client'
 import { McpOAuthError } from './mcp-oauth-callback.js'
 import { createMcpOAuthFetch, mcpOAuthAbortable, mcpOAuthRemoteUrl, validateMcpOAuthDiscovery } from './mcp-oauth-network.js'
-import { isPublicUrlAddress, PUBLIC_URL_REQUEST_HEADERS, requestPublicUrl, resolvePublicUrlHost } from './public-url-transport.js'
+import { isPublicUrlAddress, resolvePublicUrlHost } from './public-url-transport.js'
+import { fetchMcpOAuthNative } from './mcp-oauth-native.js'
 
 export interface McpOAuthMetadataReadOptions {
   readonly signal?: AbortSignal
@@ -104,29 +105,7 @@ function discoveryContext(options: McpOAuthMetadataReadOptions) {
     if (!addresses.length || addresses.some(address => !isPublicUrlAddress(address))) throw new McpOAuthError('authorization-failed')
     return addresses
   }
-  const nativeFetch = (responseBytes: number): FetchLike => async input => {
-    guard()
-    const url = mcpOAuthRemoteUrl(String(input instanceof Request ? input.url : input)), addresses = await publicAddresses(url)
-    guard()
-    const response = await mcpOAuthAbortable(requestPublicUrl({ url: url.href, hostname: url.hostname.replace(/^\[|\]$/g, ''),
-      origin: url.origin, address: addresses[0]!, method: 'GET', headers: PUBLIC_URL_REQUEST_HEADERS, signal,
-      assertCurrent: guard, onTransmit: guard }), signal)
-    try {
-      guard()
-      if (response.status >= 300 && response.status < 400) throw new McpOAuthError('authorization-failed')
-      const chunks: Uint8Array[] = []; let length = 0
-      const iterator = response.body[Symbol.asyncIterator]()
-      while (true) {
-        guard(); const item = await mcpOAuthAbortable(iterator.next(), signal); guard()
-        if (item.done) break
-        length += item.value.byteLength
-        if (length > responseBytes) throw new McpOAuthError('authorization-failed')
-        chunks.push(item.value)
-      }
-      return new Response(length ? Buffer.concat(chunks) : null, { status: response.status, headers: response.headers })
-    } finally { response.close() }
-  }
-  const fetchFor = (urls: readonly string[], responseBytes = 64 * 1024): FetchLike => createMcpOAuthFetch({ fetchFn: injectedFetch ?? nativeFetch(responseBytes),
+  const fetchFor = (urls: readonly string[], responseBytes = 64 * 1024): FetchLike => createMcpOAuthFetch({ fetchFn: injectedFetch ?? fetchMcpOAuthNative,
     signal, responseBytes, origins: [], getEndpoints: urls.map(value => mcpOAuthRemoteUrl(value).href), assertCurrent: guard,
     postEndpoint: () => undefined, registerSecrets: () => {} })
   return { guard, publicAddresses, injectedFetch, fetchFor,
@@ -189,7 +168,7 @@ export async function discoverMcpOAuth(endpoint: string, options: McpOAuthDiscov
         async () => { guard(); return response })
       guard()
       mcpOAuthRemoteUrl(resourceMetadata.resource)
-      if (resourceMetadata.resource !== candidate.resource || !resourceMetadata.authorization_servers?.length ||
+      if (mcpOAuthRemoteUrl(resourceMetadata.resource).href !== mcpOAuthRemoteUrl(candidate.resource).href || !resourceMetadata.authorization_servers?.length ||
         resourceMetadata.authorization_servers.length > 16 || resourceMetadata.bearer_methods_supported &&
         !resourceMetadata.bearer_methods_supported.includes('header') || resourceMetadata.dpop_bound_access_tokens_required === true)
         throw new McpOAuthError('authorization-failed')

@@ -113,7 +113,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     if (scopeText === undefined) return
     const scopes = scopeText.trim() ? scopeText.trim().split(/ +/) : []
     const save = await choose('Use this public OAuth client for this launch? Nothing is saved or started', [
-      { name: 'Cancel', value: false }, { name: 'Use launch-only public client settings', description: 'Explicit sign-in and separate connection approval are still required', value: true }
+      { name: 'Cancel', value: false }, { name: 'Use launch-only public client settings', description: 'A fresh reviewed sign-in and connection setup is still required', value: true }
     ])
     if (save && !controller.signal.aborted && !io.isClosed) {
       await oauth.configureClient(serverId, { id, issuer, redirectPort, redirectPath, scopes })
@@ -137,7 +137,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     const clientName = await text('Public OAuth client display name', 'vivi-cli')
     if (clientName === undefined || !clientName) return
     const registered = await oauth.registerPublicClient(serverId, { issuer, redirectPort, redirectPath, scopes, clientName }, io, controller.signal)
-    io.write(registered ? `MCP ${serverId} public OAuth client registered for this launch. Returning to the menu; use Sign in and connect for separate fresh approvals. The issuer may retain the registration after local disconnect\n`
+    io.write(registered ? `MCP ${serverId} public OAuth client registered for this launch. Returning to the menu; use Sign in and connect for a fresh reviewed setup. The issuer may retain the registration after local disconnect\n`
       : `MCP ${serverId} public OAuth client registration declined; no registration request sent\n`)
   }
   const browse = async (status: McpServerStatus, kind: McpCatalogKind): Promise<void> => {

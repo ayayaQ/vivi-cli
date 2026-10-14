@@ -154,7 +154,7 @@ test('unsafe endpoints are rejected before fetch, including private IP represent
     'https://mcp.invalid/mcp#', 'https://mcp.invalid/mcp?scope=read', 'https://mcp.invalid/mcp#section',
     'https://localhost/mcp', 'https://host.internal/mcp', 'https://host.local/mcp', 'https://127.0.0.1/mcp',
     'https://2130706433/mcp', 'https://0x7f000001/mcp', 'https://10.0.0.1/mcp', 'https://[::1]/mcp',
-    'https://[::ffff:127.0.0.1]/mcp', 'https://mcp.invalid:8443/mcp', 'https://mcp.invalid\\@other.invalid/mcp']) {
+    'https://[::ffff:127.0.0.1]/mcp', 'https://mcp.invalid\\@other.invalid/mcp']) {
     let fetched = false
     await assert.rejects(discoverMcpOAuth(url, { fetchFn: async () => { fetched = true; return Response.json({}) } }), safeFailure('authorization-failed'))
     assert.equal(fetched, false, url)
@@ -255,4 +255,35 @@ test('CIMD reader rejects non-JSON media, arrays, malformed, redirects, over 5 K
   await assert.rejects(fetchMcpOAuthClientMetadata('https://127.0.0.1/client', { fetchFn: async () => { calls++; return Response.json({}) } }), safeFailure('authorization-failed'))
   assert.equal(calls, 0)
   await assert.rejects(fetchMcpOAuthClientMetadata(url, { deadlineMs: 20, fetchFn: async () => new Promise(() => {}) }), safeFailure('timeout'))
+})
+
+test('root fallback accepts equivalent trailing slash but preserves the exact advertised resource', async () => {
+  const subject = fixture({ fetchFn: url => url === pathPrm ? Response.json({}, { status: 404 })
+    : url === rootPrm ? Response.json({ ...prm, resource: origin + '/' }) : undefined })
+  const discovered = await subject.discover()
+  assert.equal(discovered.resource, origin + '/'); assert.equal(discovered.info.resourceMetadata.resource, origin + '/')
+})
+
+test('root endpoint accepts origin-without-slash PRM while preserving the advertised resource', async () => {
+  const calls = [], rootEndpoint = origin + '/'
+  const result = await discoverMcpOAuth(rootEndpoint, { fetchFn: async input => {
+    const url = String(input); calls.push(url)
+    if (url === rootEndpoint) return new Response(null, { status: 405 })
+    if (url === rootPrm) return Response.json({ ...prm, resource: origin })
+    if (url === asMetadata) return Response.json(metadata)
+    return Response.json({}, { status: 404 })
+  } })
+  assert.equal(result.resource, origin); assert.deepEqual(calls, [rootEndpoint, rootPrm, asMetadata])
+})
+
+test('public HTTPS nondefault ports survive discovery and exact issuer/resource validation', async () => {
+  const target = 'https://mcp.port.fixture.invalid:8443/mcp', auth = 'https://auth.port.fixture.invalid:9443'
+  const result = await discoverMcpOAuth(target, { fetchFn: async input => {
+    const url = new URL(String(input))
+    if (url.href === target) return new Response(null, { status: 405 })
+    if (url.origin === new URL(target).origin) return Response.json({ resource: target, authorization_servers: [auth] })
+    if (url.origin === auth) return Response.json({ ...metadata, issuer: auth, authorization_endpoint: auth + '/authorize', token_endpoint: auth + '/token' })
+    assert.fail('Unexpected fixture destination')
+  } })
+  assert.equal(result.issuer, auth); assert.equal(result.resource, target)
 })

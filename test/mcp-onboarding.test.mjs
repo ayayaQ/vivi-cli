@@ -297,3 +297,21 @@ test('Advanced protocol keeps the outer server snapshot revision when configurat
   assert.equal(saved.servers[0].protocol, '2026-07-28')
   assert.equal(subject.requests.length, 0)
 })
+
+test('DCR management secret matching the approved token endpoint blocks browser and token transmission', async t => {
+  const subject = await fixture(t, { registrationResponse: { registration_access_token: metadata.token_endpoint } }), io = ioFixture([true])
+  await assert.rejects(subject.signIn(io), error => error.code === 'authorization-failed')
+  assert.equal(registrationPosts(subject).length, 1); assert.equal(tokenPosts(subject).length, 0)
+  assert.equal(subject.browserUrls.length, 0); assert.equal(subject.requests.length, 0)
+})
+
+test('guided root-resource sign-in preserves the validated advertised resource through PKCE and token exchange', async t => {
+  const origin = new URL(endpoint).origin
+  const subject = await fixture(t, { oauthFetch: url => url.href === `${origin}/.well-known/oauth-protected-resource/mcp`
+    ? Response.json({}, { status: 404 }) : url.href === `${origin}/.well-known/oauth-protected-resource`
+      ? Response.json({ resource: origin + '/', authorization_servers: [issuer], scopes_supported: ['read'] }) : undefined })
+  assert.equal(await subject.signIn(ioFixture([true])), true)
+  assert.equal(subject.browserUrls[0].searchParams.get('resource'), origin + '/')
+  assert.equal(new URLSearchParams(tokenPosts(subject)[0].body).get('resource'), origin + '/')
+  assert.equal(subject.manager.statuses()[0].state, 'connected')
+})

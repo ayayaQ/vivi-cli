@@ -144,6 +144,7 @@ export class McpOAuthControls {
     const url = mcpOAuthRemoteUrl(value)
     if (url.pathname === '/' || mcpContainsSecret(value, this.knownSecrets)) throw new McpOAuthError('authorization-failed')
     this.clientMetadataUrls.set(serverId, url.href)
+    this.signInRequired.add(serverId)
   }
   registrationStatus(serverId: string): { readonly state: string; readonly revision: string } {
     const attempt = this.attempts.get(serverId)
@@ -272,6 +273,8 @@ export class McpOAuthControls {
       const assertCurrent = (): void => { if (!current()) throw new McpOAuthError('cancelled') }
       const checkedFetch: FetchLike = async (input, init) => {
         await manager.reload(); assertCurrent()
+        const destination = String(input instanceof Request ? input.url : input)
+        if (mcpContainsSecret(destination, this.knownSecrets)) throw new McpOAuthError('authorization-failed')
         const response = await (this.options.fetchFn ?? fetchMcpOAuthNative)(input, init)
         await manager.reload()
         if (!current()) { void response.body?.cancel().catch(() => undefined); throw new McpOAuthError('cancelled') }
@@ -340,7 +343,7 @@ export class McpOAuthControls {
         await manager.reload(); assertCurrent()
       }
       if (!client || client.issuer !== discovery.issuer) throw new McpOAuthError('authorization-failed')
-      if (mcpContainsSecret(client, this.knownSecrets)) throw new McpOAuthError('authorization-failed')
+      if (mcpContainsSecret([description, discovery, client, registrationPlan], this.knownSecrets)) throw new McpOAuthError('authorization-failed')
       if (!existing) this.installClient(serverId, client, server.endpoint, configRevision)
       const entry = this.registrations.get(serverId)!
       const session = new McpOAuthSession({ endpoint: server.endpoint, configRevision, client, scopes,

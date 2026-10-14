@@ -8,7 +8,7 @@ export function mcpOAuthRemoteUrl(value: string): URL {
   try { url = new URL(value) } catch { throw new McpOAuthError('authorization-failed') }
   if (url.protocol !== 'https:' || url.username || url.password || value.includes('?') || value.includes('#') ||
     value.length > 4096 || /[\u0000-\u0020\u007f-\u009f\\]/.test(value)) throw new McpOAuthError('authorization-failed')
-  try { preparePublicUrl(value) } catch { throw new McpOAuthError('authorization-failed') }
+  try { const hostPolicy = new URL(url); hostPolicy.port = ''; preparePublicUrl(hostPolicy.href) } catch { throw new McpOAuthError('authorization-failed') }
   return url
 }
 export function mcpOAuthAbortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {

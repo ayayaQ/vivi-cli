@@ -136,7 +136,7 @@ test('native helper uses the shared resolver full A/AAAA admission before alloca
   assert.deepEqual(calls, [[4, 'example.com'], [6, 'example.com'], 'cancel'])
 })
 for (const value of ['http://example.com/token', 'https://127.0.0.1/token', 'https://example.local/token',
-  'https://example.com:444/token', 'https://name:password@example.com/token', 'https://example.com/token?x=1', 'https://example.com/token#x']) {
+  'https://name:password@example.com/token', 'https://example.com/token?x=1', 'https://example.com/token#x']) {
   test(`invalid OAuth endpoint never resolves or transmits: ${value}`, async () => {
     const f = fixture(); await assert.rejects(f.fetchFn(value, { method: 'POST', body: '{}' }), safeFailure())
     assert.deepEqual(f.state.lookups, []); assert.deepEqual(f.state.requests, [])
@@ -266,4 +266,14 @@ test('agent:false native path allocates a fresh agent and carries pinned lookup 
       assert(Buffer.concat(sockets[i].writes).toString().endsWith('\r\n\r\n{}'))
     }
   } finally { Agent.prototype.createConnection = original }
+})
+
+test('explicit approved public HTTPS port is pinned and peer-checked without changing public URL tool policy', async () => {
+  const f = fixture({ socketOptions: { remotePort: 8443 } })
+  assert.deepEqual(await (await f.fetchFn('https://example.com:8443/token', { method: 'POST', body: 'code=fixture' })).json(), { ok: true })
+  assert.equal(f.state.requests[0].port, 8443)
+  assert.equal(f.state.requests[0].headers.host, 'example.com:8443')
+  const wrong = fixture()
+  await assert.rejects(wrong.fetchFn('https://example.com:8443/token', { method: 'POST', body: 'code=fixture' }), safeFailure())
+  assert.equal(wrong.state.ends.length, 0)
 })
