@@ -160,16 +160,26 @@ export class McpManager {
         ...(connection?.snapshot ? { snapshot: connection.snapshot } : {}) }
     }))
   }
-  async configure(server: McpServerConfig): Promise<void> {
+  async configure(server: McpServerConfig, expectedRevision?: string): Promise<void> {
     this.assertOpen(); await this.reload()
+    if (expectedRevision !== undefined && expectedRevision !== this.configuration.revision) throw new Error('MCP configuration changed; review the current configuration')
     if (this.configuration.servers.some(value => value.id === server.id)) throw new Error('That MCP server ID already exists; remove it before adding a replacement')
-    const updated = await this.options.store.save([...this.configuration.servers, server], this.configuration.revision)
+    const updated = await this.options.store.save([...this.configuration.servers, server], expectedRevision ?? this.configuration.revision)
     await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
     await this.disconnectAll(); this.configuration = updated
   }
-  async remove(id: string): Promise<void> {
+  async remove(id: string, expectedRevision?: string): Promise<void> {
     this.assertOpen(); await this.reload()
-    const updated = await this.options.store.save(this.configuration.servers.filter(server => server.id !== id), this.configuration.revision)
+    if (expectedRevision !== undefined && expectedRevision !== this.configuration.revision) throw new Error('MCP configuration changed; review the current configuration')
+    const updated = await this.options.store.save(this.configuration.servers.filter(server => server.id !== id), expectedRevision ?? this.configuration.revision)
+    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
+    await this.disconnectAll(); this.configuration = updated
+  }
+  async update(server: McpServerConfig, expectedRevision: string): Promise<void> {
+    this.assertOpen(); await this.reload()
+    if (expectedRevision !== this.configuration.revision || !this.configuration.servers.some(value => value.id === server.id))
+      throw new Error('MCP configuration changed; review the current configuration')
+    const updated = await this.options.store.save(this.configuration.servers.map(value => value.id === server.id ? server : value), expectedRevision)
     await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
     await this.disconnectAll(); this.configuration = updated
   }

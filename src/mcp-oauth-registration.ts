@@ -19,6 +19,8 @@ export interface McpOAuthRegistrationOptions extends McpOAuthRegistrationSetting
   readonly registerSecrets: (values: readonly string[]) => void
   readonly configurationIsCurrent: () => boolean
   readonly timeoutMs?: number
+  readonly discovery?: OAuthDiscoveryState
+  readonly discoveryResource?: string
 }
 interface PublicClientMetadata {
   readonly redirect_uris: readonly string[]
@@ -109,9 +111,10 @@ export class McpOAuthRegistration {
     const detach = this.attach(flow, signal)
     try {
       this.assertCurrent(flow)
-      const info = await discoverOAuthServerInfo(this.options.endpoint, { fetchFn: this.fetchFor(flow) })
+      const info = this.options.discovery ? structuredClone(this.options.discovery)
+        : await discoverOAuthServerInfo(this.options.endpoint, { fetchFn: this.fetchFor(flow) })
       this.assertCurrent(flow)
-      const metadata = validateMcpOAuthDiscovery(info, this.options.endpoint, this.options.issuer)
+      const metadata = validateMcpOAuthDiscovery(info, this.options.endpoint, this.options.issuer, this.options.discoveryResource)
       if (!metadata.registration_endpoint) throw new McpOAuthError('client-registration-failed')
       const registrationEndpoint = mcpOAuthRemoteUrl(metadata.registration_endpoint).href
       const redirectUri = `http://127.0.0.1:${this.options.redirectPort}${this.options.redirectPath}`

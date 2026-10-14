@@ -174,7 +174,12 @@ Use `node dist/launcher.js --help` for all options, including `--resume UUID` an
 
 ## Optional MCP tools
 
-Use `/mcp` in full-screen or line mode to add an already installed executable,
+Use `/mcp` to add an HTTPS server URL and name, then choose Connect or Sign in.
+The same provider-independent controls are available as `vivi mcp add NAME URL`,
+`list`, `connect`, `login`, `logout`, and `remove`. Add saves a disabled entry;
+no model or API key is needed. Technical overrides are in Advanced.
+
+For local stdio servers, Advanced can add an already installed executable,
 its separate arguments, working directory and explicit legacy or pinned modern
 protocol. Entries start disabled every launch. Enable requires fresh human
 approval showing that exact launch; Disable closes the owned process tree.
@@ -217,23 +222,26 @@ approval bindings, transcripts and model context; the revision must change whene
 account, issuer, scope or token changes. A changed/expired snapshot revokes the old
 connection, requires fresh approval, and never replays an operation.
 
-For an HTTPS entry, `/mcp` can configure an already registered public OAuth client
-or explicitly register one with a discovered registration endpoint. Registration
-first shows the exact public metadata for separate human approval, sends at most
-one POST, and returns to the menu. Client settings last for the current launch.
-You can then explicitly sign in through your browser. Approval
-shows the validated endpoint, issuer, browser destination, scopes, client ID and
-exact registered loopback callback. Successful sign-in still needs a separate
-fresh MCP connect approval. Cancel, disconnect, removal, configuration changes,
-expiry and app shutdown revoke the session; HTTP 401/403 requires explicit new
-sign-in and never replays the operation. Credentials and public client settings
-are kept in launch memory. This plumbing is tested with synthetic OAuth fixtures;
-OpenRouter is the first selected compatibility target; its exact loopback callback
-acceptance and live sign-in remain unverified. Its consent creates a seven-day API
-key with a default $10 spending cap, editable before granting access. A cap is not
-permission to spend. See [session-only OAuth details](docs/MCP_OAUTH_SESSION.md).
-Automatic registration, refresh, credential persistence, credential environment values, repository
-auto-discovery, package installation and automatic reconnects remain unsupported.
+HTTPS sign-in discovers protected-resource and authorization-server metadata,
+selects advertised scopes, and prepares supported public client setup. One reviewed
+setup approval covers the exact public registration metadata when DCR is needed,
+browser sign-in, and connection to the same MCP endpoint. You still grant account
+access yourself in the browser. Existing issuer-bound public clients are preferred;
+a configured, validated hosted JSON client metadata document is used when supported,
+then advertised DCR. There is no assumed hosted vivi client identity. Unsupported
+issuers are guided to Advanced preregistration settings.
+
+Credentials and public client settings remain launch-only in this slice. Cancel,
+disconnect, removal, configuration changes, expiry and shutdown revoke local
+authority. HTTP 401/403 never replays an operation or signs in automatically.
+Local logout does not revoke issuer grants. Saving/editing configuration currently
+disconnects all launch-owned MCP connections; the menu discloses affected servers.
+Fixture validation does not establish live provider/callback acceptance. Review
+provider permissions, expiry and spending limits before granting access; a cap is
+not permission to spend. See [OAuth setup details](docs/MCP_OAUTH_SESSION.md).
+Saved authentication/refresh and agent setup are separate follow-up slices.
+Credential environment values, repository auto-discovery, package installation
+and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell
 FullLanguage for owned Job Object cleanup.
 

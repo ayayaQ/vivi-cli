@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-import { randomUUID } from 'node:crypto'
 import type { ChatIO } from './terminal.js'
 import { MCP_ENV_NAMES, isMcpHttpServer, mcpDisplayJson, validateMcpServer } from './mcp-config.js'
 import type { McpServerConfig } from './mcp-config.js'
-import { McpManager, mcpStartDisclosure } from './mcp-manager.js'
+import { McpManager } from './mcp-manager.js'
 import type { McpServerStatus } from './mcp-manager.js'
 import type { McpCatalogKind } from './mcp-catalog.js'
 import type { McpOAuthControls } from './mcp-oauth-controls.js'
+import { McpOAuthError } from './mcp-oauth-session.js'
+import { McpSetupService } from './mcp-setup.js'
 
 interface McpIO extends ChatIO {
   choose?<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -15,6 +16,7 @@ interface McpIO extends ChatIO {
 /** The same user-authored controls work in full-screen and accessible line mode. */
 export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: string, oauth?: McpOAuthControls): Promise<void> {
   const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
+  const setup = new McpSetupService(manager, oauth)
   const choose = async <T>(title: string, choices: readonly { name: string; description?: string; value: T }[]): Promise<T | undefined> => {
     controller.signal.throwIfAborted()
     if (io.isClosed) return
@@ -71,32 +73,27 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     }
   }
   const addHttp = async (): Promise<void> => {
-    const id = await text('Local server ID (a-z, 0-9, underscore or hyphen; max 16)')
-    if (id === undefined || !id.trim()) return
-    const label = await text('Server label', id)
-    if (label === undefined) return
-    const endpoint = await text('Trusted MCP Streamable HTTP endpoint (HTTPS; no credentials or query string)')
+    const endpoint = await text('MCP server URL (HTTPS)')
     if (endpoint === undefined || !endpoint.trim()) return
+    const id = await text('Server name (a-z, 0-9, underscore or hyphen; max 16)')
+    if (id === undefined || !id.trim()) return
     let allowLoopbackHttp = false
     if (endpoint.startsWith('http:')) {
       const allowed = await choose('Allow unencrypted HTTP to this literal loopback endpoint?', [
-        { name: 'Cancel', value: false }, { name: 'Allow 127.0.0.1 or ::1 only', description: 'Other HTTP destinations are unavailable', value: true }
+        { name: 'Cancel', value: false }, { name: 'Allow 127.0.0.1 or ::1 only', value: true }
       ])
       if (!allowed) return
       allowLoopbackHttp = true
     }
-    const protocol = await choose<McpServerConfig['protocol']>('HTTP protocol compatibility', [
-      { name: 'Pin modern 2026-07-28', description: 'No sessions, redirects, fallback or stream resumption', value: '2026-07-28' },
-      { name: 'Legacy 2025 compatibility', description: 'Streamable HTTP POST only; no separate HTTP+SSE transport', value: 'legacy' }
-    ])
-    if (protocol === undefined) return
-    const server = validateMcpServer({ transport: 'http', id, label, endpoint, protocol, allowLoopbackHttp })
-    const save = await choose(`Save disabled HTTP server ${server.id} at ${endpoint}?`, [
-      { name: 'Cancel', value: false }, { name: 'Add HTTP endpoint disabled', description: 'Connecting and every operation require fresh approval', value: true }
+    const server = validateMcpServer({ transport: 'http', id, label: id, endpoint, protocol: '2026-07-28', allowLoopbackHttp })
+    const revision = manager.configurationRevision()
+    const affected = manager.statuses().filter(status => status.state !== 'disabled').map(status => status.server.id)
+    const save = await choose(`Add ${server.id} at ${endpoint}?${affected.length ? ` Existing connections will disconnect: ${affected.join(', ')}` : ''}`, [
+      { name: 'Cancel', value: false }, { name: 'Add server', description: 'Save disabled, then choose Connect; sign-in is discovered when needed', value: true }
     ])
     if (save && !controller.signal.aborted && !io.isClosed) {
-      await manager.configure(server)
-      io.write(`MCP HTTP server ${server.id} saved disabled. Use Enable and connect for fresh endpoint approval\n`)
+      await setup.addHttp({ id, endpoint, allowLoopbackHttp }, revision)
+      io.write(`MCP ${server.id} saved disabled. Choose Connect to use it; technical overrides are in Advanced\n`)
     }
   }
   const configureOAuth = async (serverId: string): Promise<void> => {
@@ -116,7 +113,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     if (scopeText === undefined) return
     const scopes = scopeText.trim() ? scopeText.trim().split(/ +/) : []
     const save = await choose('Use this public OAuth client for this launch? Nothing is saved or started', [
-      { name: 'Cancel', value: false }, { name: 'Use launch-only public client settings', description: 'Explicit sign-in and separate connection approval are still required', value: true }
+      { name: 'Cancel', value: false }, { name: 'Use launch-only public client settings', description: 'A fresh reviewed sign-in and connection setup is still required', value: true }
     ])
     if (save && !controller.signal.aborted && !io.isClosed) {
       await oauth.configureClient(serverId, { id, issuer, redirectPort, redirectPath, scopes })
@@ -140,7 +137,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     const clientName = await text('Public OAuth client display name', 'vivi-cli')
     if (clientName === undefined || !clientName) return
     const registered = await oauth.registerPublicClient(serverId, { issuer, redirectPort, redirectPath, scopes, clientName }, io, controller.signal)
-    io.write(registered ? `MCP ${serverId} public OAuth client registered for this launch. Returning to the menu; use Sign in and connect for separate fresh approvals. The issuer may retain the registration after local disconnect\n`
+    io.write(registered ? `MCP ${serverId} public OAuth client registered for this launch. Returning to the menu; use Sign in and connect for a fresh reviewed setup. The issuer may retain the registration after local disconnect\n`
       : `MCP ${serverId} public OAuth client registration declined; no registration request sent\n`)
   }
   const browse = async (status: McpServerStatus, kind: McpCatalogKind): Promise<void> => {
@@ -197,11 +194,12 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         return
       }
       const statuses = manager.statuses()
-      io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · connections start disabled each launch\n`)
+      const snapshotRevision = manager.configurationRevision()
+      io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · choose a server to connect or sign in\n`)
       const selected = await choose('MCP connections', [
-        { name: 'Back', value: 'back' }, { name: 'Add trusted installed server', value: 'add' },
+        { name: 'Back', value: 'back' }, { name: 'Add MCP server (URL)', value: 'add-http' },
         ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state}${oauth && isMcpHttpServer(status.server) ? ` · sign-in ${oauth.status(status.server.id).state}` : ''} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` })),
-        { name: 'Add trusted HTTP endpoint', value: 'add-http' }
+        { name: 'Advanced · add installed server', description: 'Trusted existing executable; no package installation', value: 'add' }
       ])
       if (selected === undefined || selected === 'back') return
       if (selected === 'add') { await add(); continue }
@@ -209,53 +207,91 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       const status = statuses.find(value => value.server.id === selected.slice(7))
       if (!status) continue
       const serverId = status.server.id
+      const authState = oauth && isMcpHttpServer(status.server) ? oauth.status(serverId).state : undefined
+      const next = authState && !['unconfigured', 'connected'].includes(authState) ? 'Sign in' : status.state === 'error' ? 'Reconnect' : 'Connect'
       const action = await choose(`${status.server.id} · ${status.state}`, [
         { name: 'Back', value: 'back' },
-        ...(status.state === 'disabled' ? [{ name: 'Enable and connect for this launch', description: 'Requires fresh startup approval', value: 'connect' }]
-          : [{ name: 'Disable for this launch', description: 'Close the owned connection and clean up its resources', value: 'disable' }]),
+        ...(status.state === 'connected' ? [{ name: 'Disconnect', description: 'Close this connection and clear launch credentials', value: 'disable' }]
+          : [{ name: next, description: 'Review the endpoint; browser sign-in is guided when needed', value: next === 'Sign in' ? 'sign-in' : 'connect' }]),
         ...(status.state === 'connected' ? [
           { name: 'Refresh tool metadata', value: 'refresh' }, { name: 'Browse tool names', value: 'tools' },
-          { name: 'Discover resource metadata', description: 'List resource names/URIs and templates; retrieve no contents', value: 'resources' },
+          { name: 'Discover resource metadata', description: 'List names/URIs and templates; retrieve no contents', value: 'resources' },
           { name: 'Browse URI templates', value: 'resourceTemplates' }
         ] : []),
-        ...(oauth && isMcpHttpServer(status.server) && status.server.endpoint.startsWith('https:') ? [
-          { name: 'Set public OAuth client for this launch', description: 'Exact existing registration and requested scopes; saving starts nothing', value: 'oauth-client' },
-          { name: 'Sign in and connect for this launch', description: 'Fresh browser sign-in approval, then separate fresh HTTP connection approval', value: 'sign-in' },
-          ...(oauth.canRegisterPublicClient() ? [{ name: 'Register public OAuth client',
-            description: 'Discover, review exact public metadata, then send one registration request; returns to menu', value: 'oauth-register' }] : []),
-          ...(oauth.hasActiveAttempt(serverId)
-            ? [{ name: 'Cancel OAuth attempt and disconnect', value: 'cancel-sign-in' }] : [])
+        ...(isMcpHttpServer(status.server) ? [
+          { name: 'Advanced', description: 'Public client, hosted client metadata, issuer, callback and scopes', value: 'advanced' },
+          ...(oauth?.hasActiveAttempt(serverId) ? [{ name: 'Cancel sign-in', value: 'cancel-sign-in' }] : [])
         ] : []),
         { name: 'Remove saved server entry', description: 'Disconnect first; no server files are deleted', value: 'remove' }
       ])
       if (action === undefined || action === 'back') continue
-      if (action === 'oauth-client') { await configureOAuth(serverId); continue }
-      if (action === 'oauth-register') { await registerOAuth(serverId); continue }
+      try {
+      if (action === 'advanced') {
+        const advanced = await choose(`${serverId} · Advanced`, [
+          { name: 'Back', value: 'back' },
+          ...(oauth && isMcpHttpServer(status.server) && status.server.endpoint.startsWith('https:') ? [
+            { name: 'Public client settings', description: 'Existing public registration: client ID, issuer, callback and scopes', value: 'oauth-client' },
+            { name: 'Hosted client metadata document', description: 'Optional HTTPS JSON CIMD document; used only when supported', value: 'oauth-metadata' }
+          ] : []),
+          ...(oauth?.canRegisterPublicClient() ? [{ name: 'Register public client manually', description: 'Technical compatibility override; normal sign-in discovers this automatically', value: 'oauth-register' }] : [])
+          , { name: 'Protocol compatibility', description: 'Exact modern revision or explicit legacy compatibility', value: 'protocol' }
+        ])
+        if (advanced === 'oauth-client') await configureOAuth(serverId)
+        else if (advanced === 'oauth-register') await registerOAuth(serverId)
+        else if (advanced === 'oauth-metadata' && oauth) {
+          const url = await text('Hosted HTTPS client metadata URL (JSON; exact registered loopback callback)')
+          if (url) { oauth.setClientMetadataUrl(serverId, url); io.write(`MCP ${serverId} client metadata URL set for this launch. Choose Sign in when ready\n`) }
+        }
+        else if (advanced === 'protocol') {
+          const revision = snapshotRevision
+          const protocol = await choose<McpServerConfig['protocol']>('Protocol compatibility', [
+            { name: 'Back', value: status.server.protocol },
+            { name: 'Pin modern 2026-07-28', value: '2026-07-28' },
+            { name: 'Legacy 2025 compatibility', value: 'legacy' }
+          ])
+          if (protocol && protocol !== status.server.protocol) {
+            const affected = manager.statuses().filter(value => value.state !== 'disabled').map(value => value.server.id)
+            const approved = await choose(`Save ${protocol} for ${serverId}?${affected.length ? ` Connections will disconnect: ${affected.join(', ')}` : ''}`, [
+              { name: 'Cancel', value: false }, { name: 'Save protocol and disconnect', value: true }
+            ])
+            if (approved && !controller.signal.aborted && !io.isClosed) await manager.update({ ...status.server, protocol }, revision)
+          }
+        }
+        continue
+      }
       if (action === 'sign-in' && oauth) {
-        const connected = await oauth.signInAndConnect(serverId, io, controller.signal)
-        io.write(connected ? `MCP ${serverId} signed in and connected for this launch\n` : `MCP ${serverId} sign-in or connection declined; credentials cleared\n`)
+        const connected = await setup.login(serverId, io, controller.signal)
+        io.write(connected ? `MCP ${serverId} signed in and connected for this launch\n` : `MCP ${serverId} sign-in stopped; no connection is active\n`)
         continue
       }
       if (action === 'cancel-sign-in' && oauth) { await manager.disconnect(serverId); io.write(`MCP ${serverId} OAuth attempt cancelled and disconnected\n`); continue }
       if (action === 'connect') {
-        const connected = await manager.connect(serverId, async (launch, signal) => {
-          const approved = await io.approve({ call: { id: randomUUID(), name: 'connect_mcp_server', arguments: {
-            serverId: launch.server.id, launchDigest: launch.digest, configRevision: launch.configRevision
-          } }, currentRevision: launch.digest, description: mcpStartDisclosure(launch) }, signal)
-          return approved && !signal.aborted && !io.isClosed
-        }, controller.signal)
+        const connected = await setup.connect(serverId, io, controller.signal)
         const current = manager.statuses().find(value => value.server.id === selected.slice(7))
         io.write(connected ? `MCP ${serverId} connected · tools ${current?.snapshot?.categories.tools.state} · ${current?.snapshot?.categories.tools.entries.length ?? 0} metadata entries\n`
           : `MCP ${serverId} remains unavailable or disabled${current?.message ? ` · ${current.message}` : ''}\n`)
       } else if (action === 'disable') { await manager.disconnect(serverId); io.write(`MCP ${serverId} disabled for this launch\n`) }
       else if (action === 'remove') {
-        const confirmed = await choose(`Remove the saved entry ${serverId}?`, [{ name: 'Keep server', value: false }, { name: 'Remove entry and disconnect', value: true }])
-        if (confirmed) await manager.remove(serverId)
+        const revision = snapshotRevision
+        const affected = manager.statuses().filter(status => status.state !== 'disabled').map(status => status.server.id)
+        const confirmed = await choose(`Remove the saved entry ${serverId}?${affected.length ? ` Connections will disconnect: ${affected.join(', ')}` : ''}`, [{ name: 'Keep server', value: false }, { name: 'Remove entry and disconnect', value: true }])
+        if (confirmed && !controller.signal.aborted && !io.isClosed) await setup.remove(serverId, revision)
       } else if (action === 'refresh') await manager.refresh(serverId, ['tools'], controller.signal)
       else if (action === 'tools' || action === 'resources' || action === 'resourceTemplates') {
         if (action === 'resources') await manager.refresh(serverId, ['resources', 'resourceTemplates'], controller.signal)
         const fresh = manager.statuses().find(value => value.server.id === selected.slice(7))
         if (fresh) await browse(fresh, action)
+      }
+      } catch (error) {
+        // Native renderer failures must reach the application's fatal cleanup path.
+        // A closed failed surface is different from ordinary user cancellation.
+        if (io.failed) throw error
+        if (controller.signal.aborted || io.isClosed) return
+        if (error instanceof McpOAuthError && error.code === 'client-registration-uncertain')
+          io.write(`MCP ${serverId} registration may have been created, but its result could not be verified. Check the issuer before retrying; vivi will not automatically register again\n`)
+        else if (error instanceof McpOAuthError && error.code === 'client-registration-required')
+          io.write(`MCP ${serverId} needs public client setup. Choose Sign in for discovery, or use Advanced for an existing registration\n`)
+        else io.write(`MCP ${serverId} setup did not complete. Check the server URL and protocol or use Advanced for public client overrides. Ordinary chat remains available\n`)
       }
     }
   } finally { dispose() }

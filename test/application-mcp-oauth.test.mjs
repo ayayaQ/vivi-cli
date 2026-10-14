@@ -20,8 +20,8 @@ const metadata = { issuer, authorization_endpoint: `${issuer}/authorize`, token_
 const clean = value => assert(!JSON.stringify(value).includes('fixture-secret'), 'OAuth credentials escaped an application surface')
 test('CLI help describes HTTP and explicit launch-only OAuth without claiming credential persistence', () => {
   assert.match(HELP, /Streamable HTTP endpoints/)
-  assert.match(HELP, /explicit launch-only OAuth with an existing public client/)
-  assert.match(HELP, /sign-in and connecting need separate approval/)
+  assert.match(HELP, /guide launch-only OAuth discovery and public client setup/)
+  assert.match(HELP, /browser sign-in and connection use one reviewed setup approval/)
   assert.match(HELP, /MCP credentials are not saved/)
   assert.doesNotMatch(HELP, /Credentials are unsupported/)
 })
@@ -44,7 +44,7 @@ async function fixture(t, { approved = true, prompt = false, tool = false, cance
   t.after(() => rm(directory, { recursive: true, force: true }))
   const store = new McpConfigStore(directory), initial = await store.load()
   await store.save([server], initial.revision)
-  const selections = ['server:remote', 'oauth-client', true, 'server:remote', 'sign-in', 'back']
+  const selections = ['server:remote', 'advanced', 'oauth-client', true, 'server:remote', 'sign-in', 'back']
   const texts = ['owned-app-public-client', issuer, String(port), '/app/oauth/callback', 'read']
   const lines = tool ? ['Before sign-in', '/mcp', 'Use the connected fixture', '/exit'] : ['/mcp', 'After management', '/exit']
   const io = { output: '', choices: [], approvals: [], sessions: [], events: [], results: [], protected: [], closed: false,
@@ -88,6 +88,7 @@ async function fixture(t, { approved = true, prompt = false, tool = false, cance
       fetchFn: async (input, init) => {
         const url = new URL(String(input)); assert([new URL(endpoint).origin, issuer].includes(url.origin))
         oauthRequests.push({ url: url.href, method: init?.method ?? 'GET', body: init?.body })
+        if (url.href === endpoint) return new Response(null, { status: 405 })
         if (url.origin === new URL(endpoint).origin && url.pathname.startsWith('/.well-known/oauth-protected-resource'))
           return Response.json({ resource: endpoint, authorization_servers: [issuer] })
         if (url.origin === issuer && url.pathname.includes('/.well-known/')) return Response.json(metadata)
@@ -132,8 +133,8 @@ async function inspectFiles(path) {
 test('application sign-in updates an existing host privacy boundary, exposes fresh catalog and revokes auth on exit', async t => {
   const subject = await fixture(t, { tool: true })
   assert.equal(await runApplication(subject.input), 0)
-  assert.deepEqual(subject.io.approvals.map(item => item.call.name).slice(0, 2), ['sign_in_mcp_server', 'connect_mcp_server'])
-  assert.equal(subject.io.approvals.length, 3); assert.equal(subject.requests.filter(item => item.message.method === 'tools/call').length, 1)
+  assert.equal(subject.io.approvals[0].call.name, 'sign_in_mcp_server')
+  assert.equal(subject.io.approvals.length, 2); assert.equal(subject.requests.filter(item => item.message.method === 'tools/call').length, 1)
   assert.equal(subject.browserUrls.length, 1); assert.equal(subject.oauthRequests.filter(item => item.method === 'POST').length, 1)
   assert(subject.requests.every(item => item.headers.get('authorization') === `Bearer ${token}`))
   assert.equal(subject.providerCreations(), 1, 'OAuth UI must update the current host, rather than replace its conversation')
@@ -169,7 +170,7 @@ test('application /mcp prompt supports explicit OAuth without creating a provide
   assert.equal(await runApplication(subject.input), 0)
   assert.equal(subject.providerCreations(), 0); assert.equal(subject.io.sessions.length, 0)
   assert.equal(subject.browserUrls.length, 1); assert.equal(subject.requests.filter(item => item.message.method === 'tools/list').length, 1)
-  assert.deepEqual(subject.io.approvals.map(item => item.call.name), ['sign_in_mcp_server', 'connect_mcp_server'])
+  assert.deepEqual(subject.io.approvals.map(item => item.call.name), ['sign_in_mcp_server'])
   assert.equal(subject.managerOptions().httpAuthorization(server).bearerToken, undefined)
   assert(subject.registered.includes(token)); assert(subject.io.protected.includes(token))
   clean([subject.io.output, subject.io.approvals]); await inspectFiles(subject.directory)
@@ -197,7 +198,7 @@ for (const surface of ['interactive', 'line']) test(`${surface} main entrypoint 
   assert.equal(subject.providerCreations(), 0); assert.equal(subject.io.sessions.length, 0)
   assert.equal(subject.browserUrls.length, 1); assert.equal(subject.oauthRequests.filter(item => item.method === 'POST').length, 1)
   assert.equal(subject.requests.filter(item => item.message.method === 'tools/list').length, 1)
-  assert.deepEqual(subject.io.approvals.map(item => item.call.name), ['sign_in_mcp_server', 'connect_mcp_server'])
+  assert.deepEqual(subject.io.approvals.map(item => item.call.name), ['sign_in_mcp_server'])
   assert.equal(subject.managerOptions().httpAuthorization(server).bearerToken, undefined)
   assert(subject.io.protected.includes(token)); assert(subject.io.protected.includes(refresh)); assert(subject.io.protected.includes(code))
   assert.equal(subject.io.closed, true); clean([subject.io.output, subject.io.approvals]); await inspectFiles(subject.directory)

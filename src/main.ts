@@ -33,6 +33,7 @@ import type { McpManagerOptions } from './mcp-manager.js'
 import { manageMcp } from './mcp-controls.js'
 import { McpOAuthControls } from './mcp-oauth-controls.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
+import { isMcpCliCommand, runMcpCli } from './mcp-cli.js'
 
 export interface CliOptions {
   /** Launch-only request to open enrollment; never a saved approval. */
@@ -62,6 +63,7 @@ export const HELP = `vivi - a shared-agent terminal application
 
 Usage: vivi --provider openai|openrouter --model MODEL [options]
        vivi --resume SESSION_ID [options]
+       vivi mcp add|list|login|connect|logout|remove   Provider-independent MCP setup
        vivi                       Interactive setup and saved defaults (Bun)
 
   --provider NAME             openai (default) or openrouter
@@ -105,7 +107,7 @@ Public fetch_url reads bounded public HTTPS pages through host review; no login,
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
 /mcp configures trusted installed stdio servers and Streamable HTTP endpoints; fresh human connection approval is required.
-MCP connections start disabled each launch. HTTPS entries support explicit launch-only OAuth with an existing public client; sign-in and connecting need separate approval. Every remote operation needs human approval, even in Auto. MCP credentials are not saved.
+MCP connections start disabled each launch. HTTPS entries guide launch-only OAuth discovery and public client setup; browser sign-in and connection use one reviewed setup approval. Every remote operation needs human approval, even in Auto. MCP credentials are not saved.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
@@ -271,6 +273,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
     mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
+  // MCP setup is independent of chat credentials, sessions and full-screen startup.
+  if (isMcpCliCommand(args)) return runMcpCli(args, env, dependencies)
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
     if (args.length !== 1) { process.stderr.write('Use --diagnose-input by itself\n'); return 1 }

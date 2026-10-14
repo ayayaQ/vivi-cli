@@ -26,7 +26,7 @@ function ioFixture(selections = [], texts = []) {
 }
 test('plain configuration controls save only a disabled entry and do not start a server', async t=>{
   const subject=await fixture(t)
-  const io=ioFixture([1,0,0,1,0],['docs','My docs',process.execPath,subject.directory,String(scriptArgs.length),...scriptArgs])
+  const io=ioFixture([2,0,0,1,0],['docs','My docs',process.execPath,subject.directory,String(scriptArgs.length),...scriptArgs])
   await manageMcp(subject.manager,io)
   assert.equal(subject.starts(),0);assert.equal(io.approvals.length,0)
   const saved=await subject.store.load();assert.equal(saved.servers.length,1);assert.equal(saved.servers[0].id,'docs')
@@ -35,7 +35,7 @@ test('plain configuration controls save only a disabled entry and do not start a
 })
 for (const stop of [0,1,2,3,4]) test(`cancelled server configuration at field ${stop} leaves no saved entry`,async t=>{
   const subject=await fixture(t), values=['docs','My docs',process.execPath,subject.directory,'0'].slice(0,stop)
-  const io=ioFixture([1,0],values)
+  const io=ioFixture([2,0],values)
   await manageMcp(subject.manager,io)
   assert.equal((await subject.store.load()).servers.length,0);assert.equal(subject.starts(),0)
 })
@@ -145,15 +145,15 @@ test('Back from unavailable-config cleanup preserves the retained owned handle f
 })
 
 test('HTTP endpoint controls save a disabled credential-free endpoint without sending', async t => {
-  const subject = await fixture(t), io = ioFixture([2, 0, 1, 0], ['remote', 'Remote fixture', 'https://mcp.example.test/endpoint'])
+  const subject = await fixture(t), io = ioFixture([1, 1, 0], ['https://mcp.example.test/endpoint', 'remote'])
   await manageMcp(subject.manager, io)
   const saved = await subject.store.load()
   assert.equal(saved.servers.length, 1); assert.equal(saved.servers[0].transport, 'http'); assert.equal(saved.servers[0].protocol, '2026-07-28')
   assert.equal(saved.servers[0].allowLoopbackHttp, false); assert.equal(subject.starts(), 0); assert.equal(io.approvals.length, 0)
-  assert.match(io.output, /HTTP server remote saved disabled/)
+  assert.match(io.output, /remote saved disabled/)
 })
 test('HTTP controls require explicit literal-loopback allowance before saving HTTP', async t => {
-  const subject = await fixture(t), io = ioFixture([2, 0, 0], ['remote', 'Remote fixture', 'http://127.0.0.1:43210/mcp'])
+  const subject = await fixture(t), io = ioFixture([1, 0, 0], ['http://127.0.0.1:43210/mcp', 'remote'])
   await manageMcp(subject.manager, io)
   assert.equal((await subject.store.load()).servers.length, 0); assert.equal(subject.starts(), 0)
 })
