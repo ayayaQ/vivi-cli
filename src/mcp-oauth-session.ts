@@ -12,6 +12,8 @@ export interface McpOAuthSessionOptions {
   readonly configRevision: string
   readonly client?: { readonly id: string; readonly issuer: string; readonly redirectPort: number; readonly redirectPath?: string }
   readonly scopes: readonly string[]
+  readonly discovery?: OAuthDiscoveryState
+  readonly discoveryResource?: string
   readonly fetchFn: FetchLike
   readonly openBrowser: (url: URL, signal: AbortSignal) => Promise<void>
   readonly registerSecrets: (values: readonly string[]) => void
@@ -143,9 +145,10 @@ export class McpOAuthSession {
     const detach = this.attachSignal(flow, signal)
     try {
       this.assertProvider(provider); const client = this.client()
-      const info = await discoverOAuthServerInfo(this.options.endpoint, { fetchFn: this.fetchFor(flow) })
+      const info = this.options.discovery ? structuredClone(this.options.discovery)
+        : await discoverOAuthServerInfo(this.options.endpoint, { fetchFn: this.fetchFor(flow) })
       this.assertProvider(provider)
-      const metadata = validateMcpOAuthDiscovery(info, this.options.endpoint, client.issuer)
+      const metadata = validateMcpOAuthDiscovery(info, this.options.endpoint, client.issuer, this.options.discoveryResource)
       if (info.resourceMetadata) await selectResourceURL(this.options.endpoint, provider, info.resourceMetadata)
       this.assertProvider(provider); provider.saveDiscoveryState(info)
       const plan: McpOAuthSignInPlan = Object.freeze({ endpoint: this.options.endpoint, configRevision: this.options.configRevision,

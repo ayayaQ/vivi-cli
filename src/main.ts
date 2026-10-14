@@ -33,6 +33,7 @@ import type { McpManagerOptions } from './mcp-manager.js'
 import { manageMcp } from './mcp-controls.js'
 import { McpOAuthControls } from './mcp-oauth-controls.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
+import { isMcpCliCommand, runMcpCli } from './mcp-cli.js'
 
 export interface CliOptions {
   /** Launch-only request to open enrollment; never a saved approval. */
@@ -62,6 +63,7 @@ export const HELP = `vivi - a shared-agent terminal application
 
 Usage: vivi --provider openai|openrouter --model MODEL [options]
        vivi --resume SESSION_ID [options]
+       vivi mcp add|list|login|connect|logout|remove   Provider-independent MCP setup
        vivi                       Interactive setup and saved defaults (Bun)
 
   --provider NAME             openai (default) or openrouter
@@ -271,6 +273,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
     mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
+  // MCP setup is independent of chat credentials, sessions and full-screen startup.
+  if (isMcpCliCommand(args)) return runMcpCli(args, env, dependencies)
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
     if (args.length !== 1) { process.stderr.write('Use --diagnose-input by itself\n'); return 1 }
