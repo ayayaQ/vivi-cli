@@ -283,6 +283,9 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         if (fresh) await browse(fresh, action)
       }
       } catch (error) {
+        // Native renderer failures must reach the application's fatal cleanup path.
+        // A closed failed surface is different from ordinary user cancellation.
+        if (io.failed) throw error
         if (controller.signal.aborted || io.isClosed) return
         if (error instanceof McpOAuthError && error.code === 'client-registration-uncertain')
           io.write(`MCP ${serverId} registration may have been created, but its result could not be verified. Check the issuer before retrying; vivi will not automatically register again\n`)
