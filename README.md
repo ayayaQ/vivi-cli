@@ -231,15 +231,22 @@ a configured, validated hosted JSON client metadata document is used when suppor
 then advertised DCR. There is no assumed hosted vivi client identity. Unsupported
 issuers are guided to Advanced preregistration settings.
 
-Credentials and public client settings remain launch-only in this slice. Cancel,
-disconnect, removal, configuration changes, expiry and shutdown revoke local
-authority. HTTP 401/403 never replays an operation or signs in automatically.
+Approved public client settings and sign-in credentials can be saved in
+OS-protected encrypted storage for the current profile. Restarting still needs a
+fresh Connect approval; eligible credentials refresh once before connection,
+without repeating browser or public-client setup. Disconnect and shutdown clear
+RAM and retain saved sign-in. Sign out forgets saved tokens locally; removal or
+identity changes forget the affected record. Unrelated server edits retain it.
+HTTP 401/403 clears the denied saved credentials and never replays an operation
+or signs in automatically. Locked/unavailable secure storage needs an explicit
+session-only choice, also available with `vivi mcp login NAME --session-only`.
 Local logout does not revoke issuer grants. Saving/editing configuration currently
 disconnects all launch-owned MCP connections; the menu discloses affected servers.
 Fixture validation does not establish live provider/callback acceptance. Review
 provider permissions, expiry and spending limits before granting access; a cap is
-not permission to spend. See [OAuth setup details](docs/MCP_OAUTH_SESSION.md).
-Saved authentication/refresh and agent setup are separate follow-up slices.
+not permission to spend. See [OAuth setup details](docs/MCP_OAUTH_SESSION.md) and
+[saved sign-in details](docs/MCP_OAUTH_PERSISTENCE.md). Agent setup is a separate
+follow-up slice.
 Credential environment values, repository auto-discovery, package installation
 and automatic reconnects remain unsupported.
 Windows requires Windows 10+/Server 2016+ and built-in Windows PowerShell

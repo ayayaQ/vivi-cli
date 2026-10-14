@@ -37,6 +37,10 @@ jobs:
           VIVI_TEST_BUN: bun
           VIVI_TEST_CANDIDATE_DIR: ${{ runner.temp }}/canonical-npm-candidate
       - run: bun scripts/test-standalone.ts
+      - name: Verify compiled saved MCP sign-in with synthetic credentials
+        run: |
+          bun build --compile test/fixtures/mcp-saved-standalone-probe.mjs --outfile "${{ runner.temp }}/vivi-mcp-saved-fixture"
+          "${{ runner.temp }}/vivi-mcp-saved-fixture"
       - run: bun scripts/build-standalone.ts
       - run: ./build/vivi --help
       # Exact private archive plus nonsecret metadata/evidence only.
@@ -171,6 +175,13 @@ jobs:
           VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
           VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-minimum-package-evidence.json
       - run: bun scripts/test-standalone.ts
+      - name: Verify compiled Windows saved MCP sign-in with synthetic credentials
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'vivi-mcp-saved-fixture.exe'
+          bun build --compile test/fixtures/mcp-saved-standalone-probe.mjs --outfile $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: bun scripts/build-standalone.ts
       - run: .\build\vivi.exe --help
       - uses: actions/upload-artifact@v4

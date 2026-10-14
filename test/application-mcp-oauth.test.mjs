@@ -18,11 +18,13 @@ const metadata = { issuer, authorization_endpoint: `${issuer}/authorize`, token_
   response_types_supported: ['code'], grant_types_supported: ['authorization_code'], code_challenge_methods_supported: ['S256'],
   token_endpoint_auth_methods_supported: ['none'], authorization_response_iss_parameter_supported: true }
 const clean = value => assert(!JSON.stringify(value).includes('fixture-secret'), 'OAuth credentials escaped an application surface')
-test('CLI help describes HTTP and explicit launch-only OAuth without claiming credential persistence', () => {
+test('CLI help describes reviewed saved OAuth and explicit session-only choice without automatic reconnect', () => {
   assert.match(HELP, /Streamable HTTP endpoints/)
-  assert.match(HELP, /guide launch-only OAuth discovery and public client setup/)
+  assert.match(HELP, /guide reviewed browser sign-in and public client setup/)
   assert.match(HELP, /browser sign-in and connection use one reviewed setup approval/)
-  assert.match(HELP, /MCP credentials are not saved/)
+  assert.match(HELP, /saved in OS-protected encrypted storage/)
+  assert.match(HELP, /Explicit session-only sign-in/)
+  assert.match(HELP, /Sign out forgets saved tokens locally/)
   assert.doesNotMatch(HELP, /Credentials are unsupported/)
 })
 const json = (message, result) => Response.json({ jsonrpc: '2.0', id: message.id,

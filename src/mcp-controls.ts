@@ -7,6 +7,7 @@ import type { McpServerStatus } from './mcp-manager.js'
 import type { McpCatalogKind } from './mcp-catalog.js'
 import type { McpOAuthControls } from './mcp-oauth-controls.js'
 import { McpOAuthError } from './mcp-oauth-session.js'
+import { McpOAuthStoreError } from './mcp-oauth-store.js'
 import { McpSetupService } from './mcp-setup.js'
 
 interface McpIO extends ChatIO {
@@ -112,12 +113,14 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
     const scopeText = await text('Requested OAuth scopes (space-separated; blank for none)')
     if (scopeText === undefined) return
     const scopes = scopeText.trim() ? scopeText.trim().split(/ +/) : []
-    const save = await choose('Use this public OAuth client for this launch? Nothing is saved or started', [
-      { name: 'Cancel', value: false }, { name: 'Use launch-only public client settings', description: 'A fresh reviewed sign-in and connection setup is still required', value: true }
+    const remembered = oauth.savesSignIn()
+    const save = await choose(remembered ? 'Save these public client settings securely? Existing saved tokens for this server will be cleared; no sign-in is started'
+      : 'Use this public OAuth client for this launch? Nothing is saved or started', [
+      { name: 'Cancel', value: false }, { name: remembered ? 'Save public client settings' : 'Use launch-only public client settings', description: 'A fresh reviewed sign-in and connection setup is still required', value: true }
     ])
     if (save && !controller.signal.aborted && !io.isClosed) {
       await oauth.configureClient(serverId, { id, issuer, redirectPort, redirectPath, scopes })
-      io.write(`MCP ${serverId} public OAuth client set for this launch. Use Sign in and connect when ready\n`)
+      io.write(`MCP ${serverId} public OAuth client ${remembered ? 'saved securely; previous saved tokens cleared' : 'set for this launch'}. Use Sign in and connect when ready\n`)
     }
   }
   const registerOAuth = async (serverId: string): Promise<void> => {
@@ -219,6 +222,11 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
           { name: 'Browse URI templates', value: 'resourceTemplates' }
         ] : []),
         ...(isMcpHttpServer(status.server) ? [
+          ...(oauth?.savesSignIn() ? [
+            { name: 'Sign out', description: 'Forget saved sign-in locally; retain public client settings when readable', value: 'logout' },
+            { name: 'Sign in again', description: 'Fresh reviewed browser sign-in; replaces saved credentials securely', value: 'sign-in' },
+            { name: 'Session-only sign in', description: 'Explicitly keep this new sign-in in RAM for this launch', value: 'session-sign-in' }
+          ] : []),
           { name: 'Advanced', description: 'Public client, hosted client metadata, issuer, callback and scopes', value: 'advanced' },
           ...(oauth?.hasActiveAttempt(serverId) ? [{ name: 'Cancel sign-in', value: 'cancel-sign-in' }] : [])
         ] : []),
@@ -264,6 +272,12 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         io.write(connected ? `MCP ${serverId} signed in and connected for this launch\n` : `MCP ${serverId} sign-in stopped; no connection is active\n`)
         continue
       }
+      if (action === 'session-sign-in' && oauth) {
+        const connected = await setup.login(serverId, io, controller.signal, 'session-only')
+        io.write(connected ? `MCP ${serverId} signed in for this launch only\n` : `MCP ${serverId} sign-in stopped\n`)
+        continue
+      }
+      if (action === 'logout') { await setup.logout(serverId); io.write(`MCP ${serverId} signed out locally. Any issuer grant remains until revoked there\n`); continue }
       if (action === 'cancel-sign-in' && oauth) { await manager.disconnect(serverId); io.write(`MCP ${serverId} OAuth attempt cancelled and disconnected\n`); continue }
       if (action === 'connect') {
         const connected = await setup.connect(serverId, io, controller.signal)
@@ -287,7 +301,8 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         // A closed failed surface is different from ordinary user cancellation.
         if (io.failed) throw error
         if (controller.signal.aborted || io.isClosed) return
-        if (error instanceof McpOAuthError && error.code === 'client-registration-uncertain')
+        if (error instanceof McpOAuthStoreError) io.write(`${error.message}\n`)
+        else if (error instanceof McpOAuthError && error.code === 'client-registration-uncertain')
           io.write(`MCP ${serverId} registration may have been created, but its result could not be verified. Check the issuer before retrying; vivi will not automatically register again\n`)
         else if (error instanceof McpOAuthError && error.code === 'client-registration-required')
           io.write(`MCP ${serverId} needs public client setup. Choose Sign in for discovery, or use Advanced for an existing registration\n`)

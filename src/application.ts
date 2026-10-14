@@ -30,6 +30,7 @@ import { McpManager } from './mcp-manager.js'
 import type { McpManagerOptions } from './mcp-manager.js'
 import { manageMcp } from './mcp-controls.js'
 import { McpOAuthControls } from './mcp-oauth-controls.js'
+import { McpOAuthStore } from './mcp-oauth-store.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 
 export interface InteractiveIO extends ChatIO {
@@ -91,6 +92,7 @@ Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves 
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
+MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
 /menu opens actions; /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
@@ -113,7 +115,10 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
       manager.addSecrets(fresh); registration.targets(fresh); input.io.addSecrets?.(fresh)
       for (const secret of fresh) input.registerSecret?.(secret)
     } }
-  const oauth = new McpOAuthControls({ dynamicRegistration: 'explicit', ...input.mcpOAuth, secrets: registration.secrets, registerSecrets: registration.register })
+  const oauth = new McpOAuthControls({ dynamicRegistration: 'explicit',
+    // Existing custom embedders stay session-only unless they supply a store.
+    ...(input.mcpOAuth === undefined ? { savedStore: new McpOAuthStore(input.options.sessionDirectory, { registerSecrets: registration.register }) } : {}),
+    ...input.mcpOAuth, secrets: registration.secrets, registerSecrets: registration.register })
   manager = (input.mcpManagerFactory ?? (options => new McpManager(options)))({
     store: new McpConfigStore(input.options.sessionDirectory, registration.secrets), env: input.env,
     secrets: registration.secrets, ...oauth.managerOptions()

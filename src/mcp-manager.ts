@@ -58,7 +58,8 @@ export interface McpManagerOptions {
   /** Trusted application/fixture wiring only. */
   readonly httpFetch?: FetchLike
   /** Launch-owned OAuth cleanup; no grants, secrets or persistence are handled by this manager. */
-  readonly httpAuthorizationInvalidated?: (serverId: string | undefined, reason: 'configuration' | 'disconnect' | 'closed' | 'needs-sign-in') => void | Promise<void>
+  readonly httpAuthorizationInvalidated?: (serverId: string | undefined, reason: 'configuration' | 'disconnect' | 'closed' | 'needs-sign-in',
+    nextServers?: readonly McpServerConfig[]) => void | Promise<void>
 }
 interface Connection {
   readonly client: Client
@@ -110,8 +111,15 @@ export class McpManager {
   addSecrets(secrets: readonly string[]): void { this.secrets.push(...secrets.filter(value => value && !this.secrets.includes(value))); this.options.store.addSecrets(secrets) }
   /** Opaque configuration identity only; never includes credential material. */
   configurationRevision(): string { return this.configuration.revision }
-  private async revokeConnections(reason: 'configuration' | 'needs-sign-in' = 'configuration'): Promise<void> {
-    await this.options.httpAuthorizationInvalidated?.(undefined, reason)
+  /** Read-only commit guard; safe inside saved-store leases without cleanup recursion. */
+  async configurationMatches(revision: string): Promise<boolean> {
+    try { const current = await this.options.store.load(); return !this.closed && current.revision === revision }
+    catch { return false }
+  }
+  private async revokeConnections(reason: 'configuration' | 'needs-sign-in' = 'configuration', nextServers?: readonly McpServerConfig[]): Promise<void> {
+    let invalidationFailed = false, invalidationError: unknown
+    try { await this.options.httpAuthorizationInvalidated?.(undefined, reason, nextServers) }
+    catch (error) { invalidationFailed = true; invalidationError = error }
     // Do not await refresh here: revocation can run inside that same task.
     const outcomes = await Promise.allSettled([...this.connections].map(async ([id, connection]) => {
       connection.state = 'error'; connection.message = 'MCP configuration changed or is unavailable'
@@ -124,6 +132,7 @@ export class McpManager {
       // conceal an owned process whose cleanup could not be verified.
       throw new ConfigurationLoadError('MCP configuration changed or is unavailable, and owned process cleanup could not be verified')
     }
+    if (invalidationFailed) throw invalidationError
   }
   private async loadConfiguration(): Promise<McpConfiguration> {
     try { return await this.options.store.load() }
@@ -148,7 +157,7 @@ export class McpManager {
   }
   async reload(): Promise<void> {
     const current = await this.loadConfiguration()
-    if (this.configuration.revision && current.revision !== this.configuration.revision) await this.revokeConnections()
+    if (this.configuration.revision && current.revision !== this.configuration.revision) await this.revokeConnections('configuration', current.servers)
     this.configuration = current
     try { for (const connection of this.connections.values()) this.assertAuthorization(connection) }
     catch { await this.revokeConnections('needs-sign-in') }
@@ -165,23 +174,23 @@ export class McpManager {
     if (expectedRevision !== undefined && expectedRevision !== this.configuration.revision) throw new Error('MCP configuration changed; review the current configuration')
     if (this.configuration.servers.some(value => value.id === server.id)) throw new Error('That MCP server ID already exists; remove it before adding a replacement')
     const updated = await this.options.store.save([...this.configuration.servers, server], expectedRevision ?? this.configuration.revision)
-    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
-    await this.disconnectAll(); this.configuration = updated
+    try { await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers) }
+    finally { await this.disconnectAll(); this.configuration = updated }
   }
   async remove(id: string, expectedRevision?: string): Promise<void> {
     this.assertOpen(); await this.reload()
     if (expectedRevision !== undefined && expectedRevision !== this.configuration.revision) throw new Error('MCP configuration changed; review the current configuration')
     const updated = await this.options.store.save(this.configuration.servers.filter(server => server.id !== id), expectedRevision ?? this.configuration.revision)
-    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
-    await this.disconnectAll(); this.configuration = updated
+    try { await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers) }
+    finally { await this.disconnectAll(); this.configuration = updated }
   }
   async update(server: McpServerConfig, expectedRevision: string): Promise<void> {
     this.assertOpen(); await this.reload()
     if (expectedRevision !== this.configuration.revision || !this.configuration.servers.some(value => value.id === server.id))
       throw new Error('MCP configuration changed; review the current configuration')
     const updated = await this.options.store.save(this.configuration.servers.map(value => value.id === server.id ? server : value), expectedRevision)
-    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
-    await this.disconnectAll(); this.configuration = updated
+    try { await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration', updated.servers) }
+    finally { await this.disconnectAll(); this.configuration = updated }
   }
   async connect(id: string, approve: (launch: McpLaunchIdentity, signal: AbortSignal) => Promise<boolean>, signal: AbortSignal): Promise<boolean> {
     this.assertOpen(); signal.throwIfAborted(); await this.reload()

@@ -12,6 +12,8 @@ const MACOS_COMMAND_LINE_BYTES = 4095
 const MACOS_SECRET_PREFIX = 'vivi-cli-api-key-v1:'
 const LINUX_SECRET_INPUT_BYTES = 8191
 const service = 'vivi-cli'
+const MCP_KEY_SLOT_PREFIX = 'mcp-oauth-key-v1-'
+type NativeCredentialSlot = CliProviderName | `mcp-oauth-key-v1-${string}`
 
 // Only this fixed, nonsecret source enters PowerShell's argv/script-block logging. All request
 // parsing and secret I/O happen inside C#, never in cmdlet parameters or the PowerShell pipeline.
@@ -149,7 +151,8 @@ public static class ViviNativeCredentials {
       int second = Array.IndexOf(input, (byte)10, first + 1, length - first - 1);
       if (second < 0) return 2;
       string provider = Encoding.ASCII.GetString(input, first + 1, second - first - 1);
-      if (provider != "openai" && provider != "openrouter") return 2;
+      if (provider != "openai" && provider != "openrouter" &&
+          !System.Text.RegularExpressions.Regex.IsMatch(provider, "^mcp-oauth-key-v1-[0-9a-f]{64}$")) return 2;
       string target = "vivi-cli/" + provider;
       if (operation == "load" && second + 1 == length) return Load(target);
       if (operation == "save") return Save(target, input, second + 1, length - second - 1);
@@ -168,7 +171,7 @@ public static class ViviNativeCredentials {
   exit 2
 }`
 
-function windowsCredentialCommand(operation: 'status' | 'load' | 'save', provider?: CliProviderName,
+function windowsCredentialCommand(operation: 'status' | 'load' | 'save', provider?: NativeCredentialSlot,
   key?: string): CredentialCommand {
   // Use the installed system helper rather than a PATH-searchable executable or user PowerShell profile.
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
@@ -354,6 +357,9 @@ export class NativeCredentialStore implements CredentialStore {
 
   async load(provider: CliProviderName): Promise<string | undefined> {
     checkProvider(provider)
+    return this.loadSlot(provider)
+  }
+  private async loadSlot(provider: NativeCredentialSlot): Promise<string | undefined> {
     if (!this.supported) return undefined
     try {
       const result = await this.run(this.platform === 'darwin'
@@ -382,6 +388,9 @@ export class NativeCredentialStore implements CredentialStore {
 
   async save(provider: CliProviderName, input: string): Promise<void> {
     checkProvider(provider)
+    return this.saveSlot(provider, input)
+  }
+  private async saveSlot(provider: NativeCredentialSlot, input: string): Promise<void> {
     const key = validateApiKey(input)
     if (!this.supported) {
       throw new Error('Secure credential persistence is not supported on this platform. Use an API key for this session only.')
@@ -421,11 +430,41 @@ export class NativeCredentialStore implements CredentialStore {
       if (result.exitCode !== 0 || result.stderrPresent) throw new Error('Credential save failed')
       // A zero exit code is insufficient proof of persistence (especially for command-reader helpers).
       // Read-back stays in memory and is never returned, printed, or included in an error.
-      if (await this.load(provider) !== key) throw new Error('Credential verification failed')
+      if (await this.loadSlot(provider) !== key) throw new Error('Credential verification failed')
     } catch {
       throw new Error('Unable to save to OS credential storage. Use the API key for this session only.')
     }
   }
+
+  /** Narrow MCP wrapping-key seam. No arbitrary secret names or OAuth token bundles. */
+  mcpWrappingKey(scope: string): McpWrappingKeyStore {
+    if (!/^[0-9a-f]{64}$/.test(scope)) throw new Error('Invalid MCP credential storage scope')
+    const slot = `${MCP_KEY_SLOT_PREFIX}${scope}` as NativeCredentialSlot
+    return {
+      status: () => this.status(),
+      load: async () => {
+        const value = await this.loadSlot(slot)
+        if (value === undefined) return undefined
+        if (!/^[A-Za-z0-9+/]{43}=$/.test(value) || Buffer.from(value, 'base64').length !== 32 ||
+          Buffer.from(value, 'base64').toString('base64') !== value) throw new Error('MCP saved sign-in storage is unavailable')
+        return value
+      },
+      save: async value => {
+        if (!/^[A-Za-z0-9+/]{43}=$/.test(value) || Buffer.from(value, 'base64').length !== 32 ||
+          Buffer.from(value, 'base64').toString('base64') !== value) throw new Error('Invalid MCP wrapping key')
+        await this.saveSlot(slot, value)
+      }
+    }
+  }
+}
+
+export interface McpWrappingKeyStore {
+  status(): Promise<CredentialStoreStatus>
+  load(): Promise<string | undefined>
+  save(value: string): Promise<void>
+}
+export function createMcpWrappingKeyStore(scope: string, options: NativeCredentialStoreOptions = {}): McpWrappingKeyStore {
+  return new NativeCredentialStore(options).mcpWrappingKey(scope)
 }
 
 function checkProvider(provider: CliProviderName): void {
