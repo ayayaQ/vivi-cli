@@ -5,6 +5,7 @@ import { McpConfigStore, mcpDisplayJson, validateMcpEndpoint } from './mcp-confi
 import { McpManager } from './mcp-manager.js'
 import type { McpManagerOptions } from './mcp-manager.js'
 import { McpOAuthControls } from './mcp-oauth-controls.js'
+import { McpOAuthStore } from './mcp-oauth-store.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 import { McpSetupService } from './mcp-setup.js'
 import { environmentSecrets, redactSecrets } from './session.js'
@@ -22,12 +23,16 @@ export const MCP_HELP = `Usage: vivi mcp add NAME URL [options]
   --label TEXT                Display label for add (default NAME)
   --protocol VERSION          2026-07-28 (default) or legacy, for add
   --allow-loopback-http       Allow literal 127.0.0.1 or ::1 HTTP, for add
+  --session-only              Use RAM-only sign-in for login/connect
   --help                      Show this help
 
 No model, provider or API key is needed. Add saves a disabled HTTP server.
 List reads local configuration only. Login and connect need an interactive
 terminal, fresh human trust approval and browser consent when sign-in is needed.
 Logout and remove clear local authority; they do not revoke the issuer's grant.
+Approved sign-in is saved securely when OS credential storage is available.
+Restarting needs fresh Connect approval; eligible tokens refresh without setup.
+If secure storage is unavailable, session-only sign-in needs your explicit choice.
 Connections are owned by this command and close when it exits. Use /mcp in a chat
 to keep a reviewed connection available for that launch.
 `
@@ -42,6 +47,7 @@ export interface McpCliOptions {
   readonly allowLoopbackHttp: boolean
   readonly sessionDirectory: string
   readonly help: boolean
+  readonly sessionOnly?: boolean
 }
 export interface McpCliDependencies {
   readonly io?: ChatIO
@@ -62,7 +68,7 @@ export function parseMcpCliArguments(args: readonly string[], env: NodeJS.Proces
   let sessionDirectory = env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions')
   let label: string | undefined
   let protocol: McpCliOptions['protocol'] = '2026-07-28'
-  let allowLoopbackHttp = false, help = false, sawCommand = false
+  let allowLoopbackHttp = false, help = false, sawCommand = false, sessionOnly = false
   const positional: string[] = [], flags = new Set<string>()
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!
@@ -70,6 +76,7 @@ export function parseMcpCliArguments(args: readonly string[], env: NodeJS.Proces
     if (!argument.startsWith('-')) { positional.push(argument); continue }
     if (flags.has(argument)) throw new Error('MCP options must not be repeated; use vivi mcp --help')
     flags.add(argument)
+    if (argument === '--session-only') { sessionOnly = true; continue }
     const value = (): string => {
       const next = args[++index]
       if (!next || next.startsWith('-')) throw new Error('Missing MCP option value; use vivi mcp --help')
@@ -101,7 +108,8 @@ export function parseMcpCliArguments(args: readonly string[], env: NodeJS.Proces
   const id = positional[1]
   if (id !== undefined && !/^[a-z][a-z0-9_-]{0,15}$/.test(id)) throw new Error('MCP NAME must start with a lowercase letter and use up to 16 lowercase letters, digits, underscores or hyphens')
   const endpoint = action === 'add' ? validateMcpEndpoint(positional[2], allowLoopbackHttp) : undefined
-  return { action: action as Action, sessionDirectory, protocol, allowLoopbackHttp, help: false,
+  if (sessionOnly && !['login', 'connect'].includes(action!)) throw new Error('--session-only is only supported for MCP login/connect')
+  return { action: action as Action, sessionDirectory, protocol, allowLoopbackHttp, help: false, ...(sessionOnly ? { sessionOnly: true } : {}),
     ...(id === undefined ? {} : { id }), ...(endpoint === undefined ? {} : { endpoint }),
     ...(label === undefined ? {} : { label }) }
 }
@@ -130,11 +138,13 @@ export async function runMcpCli(args: readonly string[], env: NodeJS.ProcessEnv 
       return 1
     }
     if (options.action !== 'add' && options.action !== 'list') {
-      oauth = new McpOAuthControls({ dynamicRegistration: 'explicit', ...dependencies.mcpOAuth, secrets,
-        registerSecrets: values => {
+      const registerMcpSecrets = (values: readonly string[]): void => {
           const fresh = values.filter(value => value && !secrets.includes(value))
           secrets.push(...fresh); manager?.addSecrets(fresh); io?.addSecrets?.(fresh)
-        } })
+      }
+      oauth = new McpOAuthControls({ dynamicRegistration: 'explicit',
+        ...(dependencies.mcpOAuth === undefined ? { savedStore: new McpOAuthStore(options.sessionDirectory, { registerSecrets: registerMcpSecrets }) } : {}),
+        ...dependencies.mcpOAuth, secrets, registerSecrets: registerMcpSecrets })
     }
     manager = (dependencies.mcpManagerFactory ?? (settings => new McpManager(settings)))({
       store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets, ...oauth?.managerOptions()
@@ -162,7 +172,7 @@ export async function runMcpCli(args: readonly string[], env: NodeJS.ProcessEnv 
         return 0
       }
       case 'connect': case 'login': {
-        const connected = await service[options.action](options.id!, io, controller.signal)
+        const connected = await service[options.action](options.id!, io, controller.signal, options.sessionOnly ? 'session-only' : undefined)
         if (controller.signal.aborted || io.isClosed) return 130
         if (!connected) { io.write('MCP setup was not completed; no connection approval is retained\n'); return 1 }
         io.write(options.action === 'login' ? `MCP sign-in completed for ${mcpDisplayJson(options.id)}\n`

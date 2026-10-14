@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import { randomBytes, randomUUID } from 'node:crypto'
-import { discoverOAuthServerInfo, exchangeAuthorization, selectResourceURL, startAuthorization } from '@modelcontextprotocol/client'
+import { discoverOAuthServerInfo, exchangeAuthorization, refreshAuthorization, selectResourceURL, startAuthorization } from '@modelcontextprotocol/client'
 import type { AuthProvider, FetchLike, OAuthClientInformationContext, OAuthClientMetadata, OAuthClientProvider,
   OAuthDiscoveryState, StoredOAuthClientInformation, StoredOAuthTokens } from '@modelcontextprotocol/client'
 import { McpOAuthCallback, McpOAuthError, validateMcpOAuthRedirectPath } from './mcp-oauth-callback.js'
 import { createMcpOAuthFetch, mcpOAuthAbortable as abortable, mcpOAuthRemoteUrl as remoteUrl, validateMcpOAuthDiscovery } from './mcp-oauth-network.js'
+import { McpOAuthStoreError, validateMcpOAuthSavedTokens } from './mcp-oauth-store.js'
+import type { McpOAuthSavedTokens } from './mcp-oauth-store.js'
 export { McpOAuthError } from './mcp-oauth-callback.js'
 
+export interface McpOAuthPersistenceContext {
+  readonly signal: AbortSignal
+  readonly isCurrent: () => boolean
+}
 export interface McpOAuthSessionOptions {
   readonly endpoint: string
   readonly configRevision: string
@@ -14,6 +20,11 @@ export interface McpOAuthSessionOptions {
   readonly scopes: readonly string[]
   readonly discovery?: OAuthDiscoveryState
   readonly discoveryResource?: string
+  readonly initialCredentials?: McpOAuthSavedTokens
+  /** Persist the validated bundle before its bearer authority becomes usable. */
+  readonly saveCredentials?: (tokens: McpOAuthSavedTokens, context: McpOAuthPersistenceContext) => Promise<void>
+  /** Host transaction must serialize refresh and make uncertain rotation unrecoverable. */
+  readonly refreshCredentials?: (perform: (initial: McpOAuthSavedTokens) => Promise<McpOAuthSavedTokens>, context: McpOAuthPersistenceContext) => Promise<McpOAuthSavedTokens>
   readonly fetchFn: FetchLike
   readonly openBrowser: (url: URL, signal: AbortSignal) => Promise<void>
   readonly registerSecrets: (values: readonly string[]) => void
@@ -35,7 +46,7 @@ export interface McpOAuthSignInPlan {
   readonly revision: string
 }
 export type McpOAuthState = 'disconnected' | 'preparing' | 'prepared' | 'awaiting-user' | 'exchanging' |
-  'connected' | 'cancelled' | 'failed' | 'needs-sign-in'
+  'connected' | 'refreshing' | 'cancelled' | 'failed' | 'needs-sign-in'
 export interface McpOAuthAuthorizationSnapshot { readonly revision: string; readonly bearerToken?: string }
 interface Flow {
   readonly abort: AbortController
@@ -84,10 +95,12 @@ class SessionOAuthClientProvider implements OAuthClientProvider {
   discoveryState(): OAuthDiscoveryState | undefined { this.assert(); return this.discovery && structuredClone(this.discovery) }
   clear(): void { this.verifier = undefined; this.discovery = undefined; this.redirect = undefined }
 }
-/** Session-only explicit OAuth coordinator. No persistence, registration, refresh or MCP operation replay. */
+/** Explicit OAuth coordinator. Optional privileged persistence hooks; no MCP operation replay. */
 export class McpOAuthSession {
   private flow: Flow | undefined
   private token: string | undefined
+  private credentials: McpOAuthSavedTokens | undefined
+  private refreshing: { readonly abort: AbortController; readonly revision: string; timer: ReturnType<typeof setTimeout> | undefined } | undefined
   private expiresAt: number | undefined
   private revision = randomUUID()
   private state: McpOAuthState = 'disconnected'
@@ -107,7 +120,18 @@ export class McpOAuthSession {
     }
     this.timeoutMs = options.timeoutMs ?? 120_000
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0 || this.timeoutMs > 600_000) throw new McpOAuthError('authorization-failed')
-    this.options = { ...options, scopes: Object.freeze([...options.scopes]), ...(options.client ? { client: Object.freeze({ ...options.client }) } : {}) }
+    if (options.discoveryResource !== undefined && ![remoteUrl(options.endpoint).href, remoteUrl(options.endpoint).origin + '/'].includes(remoteUrl(options.discoveryResource).href)) throw new McpOAuthError('authorization-failed')
+    this.options = { ...options, ...(options.discovery ? { discovery: structuredClone(options.discovery) } : {}), scopes: Object.freeze([...options.scopes]), ...(options.client ? { client: Object.freeze({ ...options.client }) } : {}) }
+    if (options.discovery?.resourceMetadata && ![remoteUrl(options.endpoint).href, remoteUrl(options.endpoint).origin + '/'].includes(remoteUrl(options.discovery.resourceMetadata.resource).href)) throw new McpOAuthError('authorization-failed')
+    if (options.discovery && options.client) validateMcpOAuthDiscovery(options.discovery, options.endpoint, options.client.issuer, options.discoveryResource)
+    if (options.initialCredentials) {
+      this.registerSecrets([options.initialCredentials.accessToken, ...(options.initialCredentials.refreshToken ? [options.initialCredentials.refreshToken] : [])])
+      try {
+        const saved = validateMcpOAuthSavedTokens(options.initialCredentials, { ...this.client(), scopes: this.options.scopes }, this.resource())
+        this.installCredentials(saved)
+        this.authorizationSnapshot()
+      } catch { throw new McpOAuthError('authorization-failed') }
+    }
   }
   private now(): number { return (this.options.now ?? Date.now)() }
   client(): NonNullable<McpOAuthSessionOptions['client']> {
@@ -122,7 +146,20 @@ export class McpOAuthSession {
   private startDeadline(flow: Flow): void {
     flow.timer = setTimeout(() => { if (this.flow === flow) { flow.timedOut = true; flow.abort.abort(); this.clearToken(); this.state = 'failed'; void flow.callback?.close() } }, this.timeoutMs)
   }
-  private clearToken(): void { this.token = undefined; this.expiresAt = undefined; this.revision = randomUUID() }
+  private resource(): string { return this.options.discovery?.resourceMetadata?.resource ?? this.options.discoveryResource ?? this.options.endpoint }
+  private installCredentials(credentials: McpOAuthSavedTokens): void {
+    this.credentials = credentials; this.token = credentials.accessToken; this.expiresAt = credentials.expiresAt
+    this.revision = randomUUID(); this.state = 'connected'
+  }
+  private clearToken(forget = true): void {
+    this.token = undefined; this.expiresAt = undefined; this.revision = randomUUID()
+    if (forget) this.credentials = undefined
+  }
+  private savedTokens(tokens: StoredOAuthTokens, expiresAt?: number, grantedScopes = this.options.scopes): McpOAuthSavedTokens {
+    return validateMcpOAuthSavedTokens({ accessToken: tokens.access_token, ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
+      ...(expiresAt === undefined ? {} : { expiresAt }), issuer: this.client().issuer, clientId: this.client().id,
+      resource: this.resource(), scopes: tokens.scope === undefined ? [...grantedScopes] : tokens.scope.split(' ') }, { ...this.client(), scopes: this.options.scopes }, this.resource())
+  }
   private attachSignal(flow: Flow, signal?: AbortSignal): () => void {
     const abort = (): void => { if (this.flow === flow) { void this.cancelSignIn() } }
     signal?.addEventListener('abort', abort, { once: true })
@@ -189,8 +226,12 @@ export class McpOAuthSession {
         resource: info.resourceMetadata?.resource ?? this.options.endpoint, fetchFn: this.fetchFor(flow) })
       provider.saveTokens({ ...tokens, issuer: plan.issuer }, { issuer: plan.issuer })
       const staged = flow.pendingTokens!, expiresAt = flow.expiresAt
+      const credentials = this.savedTokens(staged, expiresAt)
+      if (this.options.saveCredentials) await abortable(this.options.saveCredentials(credentials, Object.freeze({ signal: flow.abort.signal,
+        isCurrent: () => this.flow === flow && !flow.abort.signal.aborted && this.options.configurationIsCurrent() })), flow.abort.signal)
+      this.assertProvider(provider)
       await this.cleanup(flow); this.assertProvider(provider)
-      this.token = staged.access_token; this.expiresAt = expiresAt; this.revision = randomUUID(); this.state = 'connected'; this.flow = undefined
+      this.installCredentials(credentials); this.flow = undefined
     } catch (error) { const safe = this.safeError(flow, error); await this.failed(flow, safe); throw safe }
     finally { detach() }
   }
@@ -206,9 +247,12 @@ export class McpOAuthSession {
     if (tokens.issuer !== this.client().issuer || ctx?.issuer !== this.client().issuer || tokens.token_type.toLowerCase() !== 'bearer' ||
       !tokens.access_token || !/^[A-Za-z0-9._~+/-]+=*$/.test(tokens.access_token) || tokens.access_token.length > 8192 ||
       tokens.scope !== undefined && tokens.scope.split(' ').some(scope => !this.options.scopes.includes(scope)) ||
+      tokens.refresh_token !== undefined && (typeof tokens.refresh_token !== 'string' || !/^[\x20-\x7e]+$/.test(tokens.refresh_token) || tokens.refresh_token.length > 8192) ||
       tokens.expires_in !== undefined && (!Number.isFinite(tokens.expires_in) || tokens.expires_in <= 0)) throw new McpOAuthError('authorization-failed')
     const flow = this.flow!
-    flow.pendingTokens = { access_token: tokens.access_token, token_type: 'Bearer', issuer: tokens.issuer }
+    flow.pendingTokens = { access_token: tokens.access_token, token_type: 'Bearer', issuer: tokens.issuer,
+      ...(tokens.scope === undefined ? {} : { scope: tokens.scope }),
+      ...((this.options.saveCredentials || this.options.refreshCredentials) && tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}) }
     if (tokens.expires_in !== undefined) {
       const expiresAt = this.now() + tokens.expires_in * 1000
       if (!Number.isFinite(expiresAt)) throw new McpOAuthError('authorization-failed')
@@ -222,17 +266,72 @@ export class McpOAuthSession {
       // Only the explicit authorization-code exchange POST is permitted; no registration or refresh.
       postEndpoint: () => this.state === 'exchanging' ? flow.provider.discoveryState()?.authorizationServerMetadata?.token_endpoint : undefined })
   }
-  private safeError(flow: Flow, error: unknown): McpOAuthError {
+  private safeError(flow: Flow, error: unknown): McpOAuthError | McpOAuthStoreError {
     if (flow.timedOut) return new McpOAuthError('timeout')
-    return error instanceof McpOAuthError ? error : new McpOAuthError(flow.abort.signal.aborted ? 'cancelled' : 'authorization-failed')
+    return error instanceof McpOAuthError || error instanceof McpOAuthStoreError ? error : new McpOAuthError(flow.abort.signal.aborted ? 'cancelled' : 'authorization-failed')
   }
   private async failed(flow: Flow, error: unknown): Promise<void> {
     flow.abort.abort(); await this.cleanup(flow)
     if (this.flow === flow) { this.flow = undefined; this.clearToken(); this.state = error instanceof McpOAuthError && error.code === 'cancelled' ? 'cancelled' : 'failed' }
   }
   async cancelSignIn(): Promise<void> {
+    const refreshing = this.refreshing; this.refreshing = undefined; refreshing?.abort.abort(); clearTimeout(refreshing?.timer)
     const flow = this.flow; this.flow = undefined; this.clearToken(); this.state = 'cancelled'
     flow?.abort.abort(); if (flow) await this.cleanup(flow)
+  }
+  /** Before a fresh connect approval only. Never called by HTTP 401/403 recovery or a token provider. */
+  async refresh(signal?: AbortSignal): Promise<void> {
+    if (!this.options.configurationIsCurrent() || signal?.aborted || this.flow || this.refreshing) throw new McpOAuthError('cancelled')
+    const initial = this.credentials
+    if (!initial) throw new McpOAuthError('authorization-failed')
+    if (initial.expiresAt === undefined || this.now() < initial.expiresAt - 30_000) return
+    if (!initial.refreshToken || !this.options.refreshCredentials) { await this.requireSignIn(); throw new McpOAuthError('authorization-failed') }
+    this.clearToken(false)
+    const work = { abort: new AbortController(), revision: this.revision, timer: undefined as ReturnType<typeof setTimeout> | undefined }
+    this.refreshing = work; this.state = 'refreshing'
+    const abort = (): void => work.abort.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    work.timer = setTimeout(abort, this.timeoutMs)
+    const assertCurrent = (): void => {
+      if (this.refreshing !== work || this.revision !== work.revision || work.abort.signal.aborted || !this.options.configurationIsCurrent()) throw new McpOAuthError('cancelled')
+    }
+    try {
+      const credentials = await abortable(this.options.refreshCredentials(async saved => {
+        assertCurrent()
+        const checked = validateMcpOAuthSavedTokens(saved, { ...this.client(), scopes: this.options.scopes }, this.resource())
+        if (checked.refreshToken !== initial.refreshToken || !checked.refreshToken) throw new McpOAuthError('invalid-plan')
+        let postEndpoint: string | undefined
+        const fetchFn = createMcpOAuthFetch({ fetchFn: this.options.fetchFn, signal: work.abort.signal,
+          origins: [remoteUrl(this.options.endpoint).origin, remoteUrl(this.client().issuer).origin], assertCurrent,
+          postEndpoint: () => postEndpoint, registerSecrets: values => this.registerSecrets(values) })
+        const info = this.options.discovery ? structuredClone(this.options.discovery)
+          : await discoverOAuthServerInfo(this.options.endpoint, { fetchFn })
+        assertCurrent()
+        const metadata = validateMcpOAuthDiscovery(info, this.options.endpoint, this.client().issuer, this.options.discoveryResource)
+        if (metadata.grant_types_supported && !metadata.grant_types_supported.includes('refresh_token')) throw new McpOAuthError('authorization-failed')
+        postEndpoint = metadata.token_endpoint
+        const response = await refreshAuthorization(info.authorizationServerUrl, { metadata,
+          clientInformation: { client_id: this.client().id, issuer: this.client().issuer }, refreshToken: checked.refreshToken,
+          resource: checked.resource, fetchFn })
+        this.registerSecrets([response.access_token, ...(response.refresh_token ? [response.refresh_token] : [])])
+        assertCurrent()
+        if (response.token_type.toLowerCase() !== 'bearer' || response.expires_in !== undefined && (!Number.isFinite(response.expires_in) || response.expires_in <= 0)) throw new McpOAuthError('authorization-failed')
+        const expiresAt = response.expires_in === undefined ? undefined : this.now() + response.expires_in * 1000
+        const updated = this.savedTokens({ ...response, issuer: checked.issuer }, expiresAt, checked.scopes)
+        if (updated.scopes.some(scope => !checked.scopes.includes(scope))) throw new McpOAuthError('authorization-failed')
+        return updated
+      }, Object.freeze({ signal: work.abort.signal, isCurrent: () => this.refreshing === work && this.revision === work.revision &&
+        !work.abort.signal.aborted && this.options.configurationIsCurrent() })), work.abort.signal)
+      assertCurrent()
+      const checked = validateMcpOAuthSavedTokens(credentials, { ...this.client(), scopes: this.options.scopes }, this.resource())
+      this.installCredentials(checked)
+    } catch (error) {
+      if (this.refreshing === work) { this.clearToken(); this.state = 'needs-sign-in' }
+      throw error instanceof McpOAuthError || error instanceof McpOAuthStoreError ? error : new McpOAuthError(work.abort.signal.aborted ? 'cancelled' : 'authorization-failed')
+    } finally {
+      clearTimeout(work.timer); signal?.removeEventListener('abort', abort)
+      if (this.refreshing === work) this.refreshing = undefined
+    }
   }
   async disconnect(): Promise<void> { const closing = this.cancelSignIn(); this.state = 'disconnected'; await closing }
   /** Revoke credentials synchronously after an operation is denied; never start sign-in or replay. */
@@ -240,7 +339,7 @@ export class McpOAuthSession {
   /** Synchronous trusted HTTP seam. Its revision must be included in catalog/operation identity. */
   authorizationSnapshot(): McpOAuthAuthorizationSnapshot {
     if (!this.options.configurationIsCurrent() || this.token && this.expiresAt !== undefined && this.now() >= this.expiresAt) {
-      if (this.token) { this.clearToken(); this.state = 'needs-sign-in' }
+      if (this.token) { this.clearToken(false); this.state = 'needs-sign-in' }
       if (this.flow) { void this.cancelSignIn() }
     }
     return { revision: this.revision, ...(this.token ? { bearerToken: this.token } : {}) }

@@ -1,8 +1,8 @@
 # MCP browser setup
 
-The first onboarding slice supports URL/name-first HTTP setup and launch-only
-browser authentication. Saved authentication/refresh and agent setup follow in
-separate slices. No live registration, grant, paid call, or physical-terminal
+URL/name-first HTTP setup supports reviewed browser authentication and optional
+OS-protected saved sign-in with pre-connect refresh. Agent setup follows in a
+separate slice. No live registration, grant, paid call, or physical-terminal
 acceptance is claimed by fixture tests.
 
 ## User flow
@@ -15,6 +15,9 @@ acceptance is claimed by fixture tests.
   standalone connections close when the command exits. Piped approval is denied
 - Advanced contains protocol, existing public client/issuer/callback/scopes,
   optional hosted JSON client metadata, and manual DCR overrides
+- Disconnect retains saved sign-in. Sign out forgets local tokens. Sign in again
+  replaces credentials through fresh browser consent; Session-only sign in saves
+  no new credentials. CLI login/connect also accepts `--session-only`
 
 Discovery reads a Bearer challenge and its protected-resource metadata URL, or
 path/root well-known metadata, then RFC8414/OIDC issuer metadata. Each candidate
@@ -53,13 +56,19 @@ Manual Advanced registration remains a separate reviewed compatibility action.
 - Secret registration before SDK results/display; no tokens in configuration,
   approvals, model context, transcripts or logs
 - Token-only normal HTTP provider: no interactive auth hooks, operation replay,
-  silent registration, refresh or automatic browser opening on 401/403
+  silent registration, refresh or automatic browser opening on 401/403. Explicit
+  approved Connect can restore/refresh the same saved grant before a fresh catalog
 
-Session credentials clear on disconnect, removal, configuration changes and
-shutdown. Public client settings remain only for the launch. Local logout does
+RAM credentials clear on disconnect, removal, configuration changes and shutdown.
+Approved public settings and tokens can persist in encrypted profile records;
+eligible refresh credentials survive restart. Locked/unavailable OS storage has
+no plaintext fallback and requires an explicit session-only choice. Local logout does
 not revoke issuer-side grants/keys or delete their registration. Configuration
 edits currently disconnect all MCP connections because their catalog/approval
 identities bind the whole configuration revision; affected servers are disclosed.
+Only the changed server identity loses saved sign-in; unrelated edits retain it.
+See [saved sign-in and refresh](MCP_OAUTH_PERSISTENCE.md) for storage, crash recovery
+and local logout semantics.
 
 ## Verification and compatibility
 

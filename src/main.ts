@@ -32,6 +32,7 @@ import { McpManager } from './mcp-manager.js'
 import type { McpManagerOptions } from './mcp-manager.js'
 import { manageMcp } from './mcp-controls.js'
 import { McpOAuthControls } from './mcp-oauth-controls.js'
+import { McpOAuthStore } from './mcp-oauth-store.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 import { isMcpCliCommand, runMcpCli } from './mcp-cli.js'
 
@@ -107,7 +108,7 @@ Public fetch_url reads bounded public HTTPS pages through host review; no login,
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
 /mcp configures trusted installed stdio servers and Streamable HTTP endpoints; fresh human connection approval is required.
-MCP connections start disabled each launch. HTTPS entries guide launch-only OAuth discovery and public client setup; browser sign-in and connection use one reviewed setup approval. Every remote operation needs human approval, even in Auto. MCP credentials are not saved.
+MCP connections start disabled each launch. HTTPS entries guide reviewed browser sign-in and public client setup; browser sign-in and connection use one reviewed setup approval. Approved sign-in can be saved in OS-protected encrypted storage and refreshed before a later approved Connect. Explicit session-only sign-in is available; Sign out forgets saved tokens locally. Every remote operation needs human approval, even in Auto.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
@@ -338,10 +339,13 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
     let secretTargets: (values: readonly string[]) => void = () => undefined
-    oauth = new McpOAuthControls({ dynamicRegistration: 'explicit', ...dependencies.mcpOAuth, secrets, registerSecrets: values => {
+    const registerMcpSecrets = (values: readonly string[]): void => {
       const fresh = values.filter(value => value && !secrets.includes(value))
       secrets.push(...fresh); mcp!.addSecrets(fresh); secretTargets(fresh); io?.addSecrets?.(fresh)
-    } })
+    }
+    oauth = new McpOAuthControls({ dynamicRegistration: 'explicit',
+      ...(dependencies.mcpOAuth === undefined ? { savedStore: new McpOAuthStore(options.sessionDirectory, { registerSecrets: registerMcpSecrets }) } : {}),
+      ...dependencies.mcpOAuth, secrets, registerSecrets: registerMcpSecrets })
     mcp = (dependencies.mcpManagerFactory ?? (options => new McpManager(options)))({
       store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets, ...oauth.managerOptions()
     })

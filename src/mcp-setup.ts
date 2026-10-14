@@ -4,6 +4,7 @@ import { isMcpHttpServer, validateMcpServer } from './mcp-config.js'
 import type { McpHttpServerConfig } from './mcp-config.js'
 import { McpManager, mcpStartDisclosure } from './mcp-manager.js'
 import type { McpOAuthControls } from './mcp-oauth-controls.js'
+import { McpOAuthStoreError } from './mcp-oauth-store.js'
 import type { ChatIO } from './terminal.js'
 
 export interface McpSetupHttpInput {
@@ -45,13 +46,23 @@ export class McpSetupService {
       endpoint: input.endpoint, protocol: input.protocol ?? '2026-07-28', allowLoopbackHttp: input.allowLoopbackHttp ?? false })
     await this.manager.configure(server, expectedRevision)
   }
-  async connect(id: string, io: ChatIO, signal: AbortSignal): Promise<boolean> {
+  async connect(id: string, io: ChatIO, signal: AbortSignal, mode?: 'session-only'): Promise<boolean> {
     await this.manager.reload(); signal.throwIfAborted()
     const server = this.manager.statuses().find(status => status.server.id === id)?.server
     if (!server) throw new Error('MCP server is no longer configured')
+    if (mode !== 'session-only' && isMcpHttpServer(server) && server.endpoint.startsWith('https:') && this.oauth) {
+      try {
+        const saved = await this.oauth.connectSaved(id, io, signal)
+        if (saved !== undefined) return saved
+      } catch (error) {
+        if (!(error instanceof McpOAuthStoreError) || !['unavailable', 'needs-sign-in'].includes(error.code)) throw error
+        io.write(`${error.message}\n`)
+        return this.login(id, io, signal)
+      }
+    }
     const authState = this.oauth?.status(id).state
     if (isMcpHttpServer(server) && server.endpoint.startsWith('https:') && authState && !['unconfigured', 'connected'].includes(authState))
-      return this.login(id, io, signal)
+      return this.login(id, io, signal, mode)
     await this.manager.disconnect(id)
     const connected = await this.manager.connect(id, async (launch, approvalSignal) => {
       const approved = await io.approve({ call: { id: randomUUID(), name: 'connect_mcp_server', arguments: {
@@ -60,13 +71,18 @@ export class McpSetupService {
       return approved && !approvalSignal.aborted && !io.isClosed
     }, signal)
     if (!connected && this.oauth?.status(id).state === 'needs-sign-in' && !signal.aborted && !io.isClosed)
-      return this.login(id, io, signal)
+      return this.login(id, io, signal, mode)
     return connected
   }
-  async login(id: string, io: ChatIO, signal: AbortSignal): Promise<boolean> {
+  async login(id: string, io: ChatIO, signal: AbortSignal, mode?: 'session-only'): Promise<boolean> {
     if (!this.oauth) throw new Error('MCP browser sign-in is unavailable in this host')
-    return this.oauth.guidedSignInAndConnect(id, io, signal)
+    return this.oauth.guidedSignInAndConnect(id, io, signal, mode)
   }
-  async logout(id: string): Promise<void> { await this.manager.disconnect(id) }
-  async remove(id: string, expectedRevision?: string): Promise<void> { await this.manager.remove(id, expectedRevision) }
+  async logout(id: string): Promise<void> { if (this.oauth) await this.oauth.logout(id); else await this.manager.disconnect(id) }
+  async remove(id: string, expectedRevision?: string): Promise<void> {
+    // Busy saved authority fails before deleting the visible server entry, so a
+    // normal menu/CLI retry can finish cleanup without manual filesystem repair.
+    if (this.oauth) await this.oauth.remove(id, expectedRevision)
+    else await this.manager.remove(id, expectedRevision)
+  }
 }
