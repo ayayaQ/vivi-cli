@@ -73,6 +73,7 @@ async function fixture(t, options = {}) {
       assert.equal(init.redirect, 'manual')
       assert([new URL(endpoint).origin, issuer].includes(url.origin), 'OAuth fixture attempted external networking')
       if (options.oauthFetch) { const response = await options.oauthFetch(url, init); if (response) return response }
+      if (url.href === endpoint) return new Response(null, { status: 405 })
       if (url.origin === new URL(endpoint).origin && url.pathname.startsWith('/.well-known/oauth-protected-resource'))
         return Response.json({ resource: endpoint, authorization_servers: [issuer] })
       if (url.origin === issuer && url.pathname.includes('/.well-known/')) return Response.json(metadata)
@@ -376,25 +377,25 @@ for (const protocol of ['legacy', '2026-07-28']) for (const status of [401, 403]
 test('HTTPS management offers explicit sign-in/client controls with Back as default and no automatic authorization', async t => {
   const subject = await fixture(t), io = ioFixture([], ['server:remote', 'back', 'back'])
   await manageMcp(subject.manager, io, undefined, subject.oauth)
-  const actions = io.choices.find(item => item.choices.some(choice => choice.value === 'oauth-client'))
-  assert(actions); assert(actions.choices.some(choice => choice.value === 'sign-in'))
+  const actions = io.choices.find(item => item.choices.some(choice => choice.value === 'advanced'))
+  assert(actions); assert(actions.choices.some(choice => choice.value === 'sign-in')); assert(!actions.choices.some(choice => choice.value === 'oauth-client'))
   assert(io.choices.every(item => item.initial === 0)); assert.equal(actions.choices[0].value, 'back')
   assert.equal(subject.browserUrls.length, 0); assert.equal(subject.oauthRequests.length, 0); assert.equal(subject.requests.length, 0)
   clean([io.output, io.choices])
 })
 
-for (const approved of [false, true]) test(`readLine-only OAuth controls configure public client and ${approved ? 'connect after two approvals' : 'deny before browser'}`, async t => {
+for (const approved of [false, true]) test(`readLine-only OAuth controls configure public client and ${approved ? 'connect after bundled approval' : 'deny before browser'}`, async t => {
   const subject = await fixture(t, { noClient: true }), port = await availablePort()
-  const io = ioFixture(approved ? [true, true] : [false]), prompts = []
+  const io = ioFixture(approved ? [true] : [false]), prompts = []
   delete io.choose; delete io.askText
-  const lines = ['3', '3', client.id, issuer, String(port), client.redirectPath, 'read', '2', '3', '4', '1']
+  const lines = ['3', '3', '2', client.id, issuer, String(port), client.redirectPath, 'read', '2', '3', '2', '1']
   io.readLine = async prompt => { prompts.push(prompt); return lines.shift() }
   await manageMcp(subject.manager, io, undefined, subject.oauth)
   assert.equal(lines.length, 0)
-  assert.equal(prompts.filter(value => value === 'Choose a number; blank cancels: ').length, 6)
+  assert.equal(prompts.filter(value => value === 'Choose a number; blank cancels: ').length, 7)
   assert.match(io.output, /1\. Back/); assert.match(io.output, /1\. Cancel/)
-  assert.match(io.output, /3\. Set public OAuth client/); assert.match(io.output, /4\. Sign in and connect/)
-  assert.deepEqual(io.approvals.map(item => item.call.name), approved ? ['sign_in_mcp_server', 'connect_mcp_server'] : ['sign_in_mcp_server'])
+  assert.match(io.output, /2\. Public client settings/); assert.match(io.output, /2\. Sign in/)
+  assert.deepEqual(io.approvals.map(item => item.call.name), ['sign_in_mcp_server'])
   assert.equal(subject.browserUrls.length, approved ? 1 : 0)
   assert.equal(subject.oauthRequests.filter(item => item.method === 'POST').length, approved ? 1 : 0)
   assert.equal(subject.requests.filter(item => item.message.method === 'tools/list').length, approved ? 1 : 0)

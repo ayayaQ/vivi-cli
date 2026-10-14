@@ -194,6 +194,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         return
       }
       const statuses = manager.statuses()
+      const snapshotRevision = manager.configurationRevision()
       io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · choose a server to connect or sign in\n`)
       const selected = await choose('MCP connections', [
         { name: 'Back', value: 'back' }, { name: 'Add MCP server (URL)', value: 'add-http' },
@@ -207,7 +208,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       if (!status) continue
       const serverId = status.server.id
       const authState = oauth && isMcpHttpServer(status.server) ? oauth.status(serverId).state : undefined
-      const next = authState === 'needs-sign-in' ? 'Sign in' : status.state === 'error' ? 'Reconnect' : 'Connect'
+      const next = authState && !['unconfigured', 'connected'].includes(authState) ? 'Sign in' : status.state === 'error' ? 'Reconnect' : 'Connect'
       const action = await choose(`${status.server.id} · ${status.state}`, [
         { name: 'Back', value: 'back' },
         ...(status.state === 'connected' ? [{ name: 'Disconnect', description: 'Close this connection and clear launch credentials', value: 'disable' }]
@@ -217,9 +218,9 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
           { name: 'Discover resource metadata', description: 'List names/URIs and templates; retrieve no contents', value: 'resources' },
           { name: 'Browse URI templates', value: 'resourceTemplates' }
         ] : []),
-        ...(oauth && isMcpHttpServer(status.server) && status.server.endpoint.startsWith('https:') ? [
+        ...(isMcpHttpServer(status.server) ? [
           { name: 'Advanced', description: 'Public client, hosted client metadata, issuer, callback and scopes', value: 'advanced' },
-          ...(oauth.hasActiveAttempt(serverId) ? [{ name: 'Cancel sign-in', value: 'cancel-sign-in' }] : [])
+          ...(oauth?.hasActiveAttempt(serverId) ? [{ name: 'Cancel sign-in', value: 'cancel-sign-in' }] : [])
         ] : []),
         { name: 'Remove saved server entry', description: 'Disconnect first; no server files are deleted', value: 'remove' }
       ])
@@ -228,15 +229,33 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       if (action === 'advanced') {
         const advanced = await choose(`${serverId} · Advanced`, [
           { name: 'Back', value: 'back' },
-          { name: 'Public client settings', description: 'Existing public registration: client ID, issuer, callback and scopes', value: 'oauth-client' },
-          { name: 'Hosted client metadata document', description: 'Optional HTTPS JSON CIMD document; used only when supported', value: 'oauth-metadata' },
+          ...(oauth && isMcpHttpServer(status.server) && status.server.endpoint.startsWith('https:') ? [
+            { name: 'Public client settings', description: 'Existing public registration: client ID, issuer, callback and scopes', value: 'oauth-client' },
+            { name: 'Hosted client metadata document', description: 'Optional HTTPS JSON CIMD document; used only when supported', value: 'oauth-metadata' }
+          ] : []),
           ...(oauth?.canRegisterPublicClient() ? [{ name: 'Register public client manually', description: 'Technical compatibility override; normal sign-in discovers this automatically', value: 'oauth-register' }] : [])
+          , { name: 'Protocol compatibility', description: 'Exact modern revision or explicit legacy compatibility', value: 'protocol' }
         ])
         if (advanced === 'oauth-client') await configureOAuth(serverId)
         else if (advanced === 'oauth-register') await registerOAuth(serverId)
         else if (advanced === 'oauth-metadata' && oauth) {
           const url = await text('Hosted HTTPS client metadata URL (JSON; exact registered loopback callback)')
           if (url) { oauth.setClientMetadataUrl(serverId, url); io.write(`MCP ${serverId} client metadata URL set for this launch. Choose Sign in when ready\n`) }
+        }
+        else if (advanced === 'protocol') {
+          const revision = snapshotRevision
+          const protocol = await choose<McpServerConfig['protocol']>('Protocol compatibility', [
+            { name: 'Back', value: status.server.protocol },
+            { name: 'Pin modern 2026-07-28', value: '2026-07-28' },
+            { name: 'Legacy 2025 compatibility', value: 'legacy' }
+          ])
+          if (protocol && protocol !== status.server.protocol) {
+            const affected = manager.statuses().filter(value => value.state !== 'disabled').map(value => value.server.id)
+            const approved = await choose(`Save ${protocol} for ${serverId}?${affected.length ? ` Connections will disconnect: ${affected.join(', ')}` : ''}`, [
+              { name: 'Cancel', value: false }, { name: 'Save protocol and disconnect', value: true }
+            ])
+            if (approved && !controller.signal.aborted && !io.isClosed) await manager.update({ ...status.server, protocol }, revision)
+          }
         }
         continue
       }
@@ -253,7 +272,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
           : `MCP ${serverId} remains unavailable or disabled${current?.message ? ` · ${current.message}` : ''}\n`)
       } else if (action === 'disable') { await manager.disconnect(serverId); io.write(`MCP ${serverId} disabled for this launch\n`) }
       else if (action === 'remove') {
-        const revision = manager.configurationRevision()
+        const revision = snapshotRevision
         const affected = manager.statuses().filter(status => status.state !== 'disabled').map(status => status.server.id)
         const confirmed = await choose(`Remove the saved entry ${serverId}?${affected.length ? ` Connections will disconnect: ${affected.join(', ')}` : ''}`, [{ name: 'Keep server', value: false }, { name: 'Remove entry and disconnect', value: true }])
         if (confirmed && !controller.signal.aborted && !io.isClosed) await setup.remove(serverId, revision)

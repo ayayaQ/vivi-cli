@@ -68,9 +68,8 @@ export function createMcpOAuthFetch(options: McpOAuthFetchOptions): FetchLike {
       ...(input instanceof Request ? [input.signal] : [])])
     if (signal.aborted) throw new McpOAuthError('cancelled')
     const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase()
-    if (method === 'GET' ? options.getEndpoints
-      ? !options.getEndpoints.includes(url.href) : !options.origins.includes(url.origin) && url.href !== post
-      : !options.origins.includes(url.origin) && url.href !== post) throw new McpOAuthError('authorization-failed')
+    if (method === 'GET' && (options.getEndpoints ? !options.getEndpoints.includes(url.href)
+      : !options.origins.includes(url.origin) && url.href !== post)) throw new McpOAuthError('authorization-failed')
     if (method !== 'GET') {
       if (method !== 'POST' || !post || url.href !== post || posted) throw new McpOAuthError('authorization-failed')
       posted = true // Consume before any asynchronous SDK continuation can retry.

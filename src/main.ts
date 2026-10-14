@@ -107,7 +107,7 @@ Public fetch_url reads bounded public HTTPS pages through host review; no login,
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
 /mcp configures trusted installed stdio servers and Streamable HTTP endpoints; fresh human connection approval is required.
-MCP connections start disabled each launch. HTTPS entries support explicit launch-only OAuth with an existing public client; sign-in and connecting need separate approval. Every remote operation needs human approval, even in Auto. MCP credentials are not saved.
+MCP connections start disabled each launch. HTTPS entries guide launch-only OAuth discovery and public client setup; browser sign-in and connection use one reviewed setup approval. Every remote operation needs human approval, even in Auto. MCP credentials are not saved.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `

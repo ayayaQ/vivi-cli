@@ -224,6 +224,23 @@ test('owned MCP cleanup failures change a successful command to failure without 
   assert.equal(io.closed, true)
 })
 
+test('failed CLI display and cancellation-listener cleanup still close the owned MCP manager', async t => {
+  const { directory } = await fixture(t), io = ioFixture()
+  let closes = 0, errors = ''
+  t.mock.method(process.stderr, 'write', value => { errors += value; return true })
+  io.write = () => { throw new Error('CLI display unavailable') }
+  io.onCancel = () => () => { throw new Error('Listener cleanup unavailable') }
+  assert.equal(await runMcpCli(['mcp', 'list', '--session-dir', directory], {}, {
+    io, mcpManagerFactory(options) {
+      const manager = new McpManager(options), close = manager.close.bind(manager)
+      manager.close = async () => { closes++; await close() }
+      return manager
+    }
+  }), 1)
+  assert.equal(closes, 1); assert.equal(io.closed, true)
+  assert.match(errors, /CLI display unavailable/); assert.match(errors, /terminal cleanup failed/)
+})
+
 test('TTY Node launcher runs MCP setup directly without Bun or provider credentials', { timeout: 10_000 }, async t => {
   const { directory } = await fixture(t), launcher = new URL('../dist/launcher.js', import.meta.url).href
   const script = `Object.defineProperty(process.stdin, 'isTTY', { value: true });

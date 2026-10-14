@@ -33,7 +33,7 @@ export class McpSetupService {
     return { revision: this.manager.configurationRevision(), servers: this.manager.statuses().map(status => {
       const http = isMcpHttpServer(status.server), signInState = http ? this.oauth?.status(status.server.id).state : undefined
       const nextAction = status.state === 'connected' ? undefined
-        : signInState === 'needs-sign-in' ? 'Sign in'
+        : signInState && !['unconfigured', 'connected'].includes(signInState) ? 'Sign in'
         : status.state === 'error' ? 'Reconnect' : 'Connect'
       return { id: status.server.id, label: status.server.label, transport: http ? 'http' : 'stdio',
         ...(http ? { endpoint: status.server.endpoint } : {}), protocol: status.server.protocol, state: status.state,

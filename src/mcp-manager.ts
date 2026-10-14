@@ -175,6 +175,14 @@ export class McpManager {
     await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
     await this.disconnectAll(); this.configuration = updated
   }
+  async update(server: McpServerConfig, expectedRevision: string): Promise<void> {
+    this.assertOpen(); await this.reload()
+    if (expectedRevision !== this.configuration.revision || !this.configuration.servers.some(value => value.id === server.id))
+      throw new Error('MCP configuration changed; review the current configuration')
+    const updated = await this.options.store.save(this.configuration.servers.map(value => value.id === server.id ? server : value), expectedRevision)
+    await this.options.httpAuthorizationInvalidated?.(undefined, 'configuration')
+    await this.disconnectAll(); this.configuration = updated
+  }
   async connect(id: string, approve: (launch: McpLaunchIdentity, signal: AbortSignal) => Promise<boolean>, signal: AbortSignal): Promise<boolean> {
     this.assertOpen(); signal.throwIfAborted(); await this.reload()
     const server = this.configuration.servers.find(value => value.id === id)

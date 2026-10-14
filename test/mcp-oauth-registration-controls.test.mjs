@@ -67,6 +67,7 @@ async function fixture(t, options = {}) {
     assert.equal(init.redirect, 'manual')
     oauthRequests.push({ url: url.href, method, body: init.body, signal: init.signal, headers: new Headers(init.headers) })
     if (options.oauthFetch) { const response = await options.oauthFetch(url, init); if (response) return response }
+    if (url.href === endpoint) return new Response(null, { status: 405 })
     if (url.origin === new URL(endpoint).origin && url.pathname.startsWith('/.well-known/oauth-protected-resource'))
       return Response.json({ resource: endpoint, authorization_servers: [issuer] })
     if (url.origin === issuer && url.pathname.includes('/.well-known/')) return Response.json(options.metadata ?? metadata)
@@ -177,7 +178,7 @@ test('approved registration makes exactly one SDK public-client POST, discards m
 
 test('registration menu returns before a separately selected sign-in and fresh connection/catalog approval', async t => {
   const subject = await fixture(t), settings = subject.settings
-  const io = ioFixture([true, true, true], ['server:remote', 'oauth-register', 'server:remote', 'sign-in', 'back'],
+  const io = ioFixture([true, true, true], ['server:remote', 'advanced', 'oauth-register', 'server:remote', 'sign-in', 'back'],
     [issuer, String(settings.redirectPort), settings.redirectPath, 'read', settings.clientName])
   const choose = io.choose.bind(io)
   io.choose = async (title, choices, initial) => {
@@ -188,10 +189,10 @@ test('registration menu returns before a separately selected sign-in and fresh c
     return choose(title, choices, initial)
   }
   await manageMcp(subject.manager, io, undefined, subject.oauth)
-  assert.deepEqual(io.approvals.map(item => item.call.name), ['register_mcp_oauth_client', 'sign_in_mcp_server', 'connect_mcp_server'])
+  assert.deepEqual(io.approvals.map(item => item.call.name), ['register_mcp_oauth_client', 'sign_in_mcp_server'])
   assert(io.choices.every(item => item.initial === 0)); assert(io.choices.every(item => item.choices[0].value === 'back'))
   assert.equal(registrationPosts(subject).length, 1); assert.equal(tokenPosts(subject).length, 1); assert.equal(subject.browserUrls.length, 1)
-  assert.match(io.approvals[1].description, /does not revoke provider-side grants or keys/)
+  assert.match(io.approvals[1].description, /does not revoke it/)
   assert.equal(subject.browserUrls[0].searchParams.get('client_id'), 'owned-registered-client-1')
   assert.equal(subject.requests.filter(item => item.message.method === 'tools/list').length, 1)
   assert(subject.requests.every(item => item.headers.get('authorization') === 'Bearer fixture-registration-secret-access-1'))
@@ -203,12 +204,12 @@ test('registration menu returns before a separately selected sign-in and fresh c
 test('readLine-only registration controls collect explicit fixed callback and return before a separately selected sign-in', async t => {
   const subject = await fixture(t), io = ioFixture([true, true, true]), prompts = [], settings = subject.settings
   delete io.choose; delete io.askText
-  const lines = ['3', '5', issuer, String(settings.redirectPort), settings.redirectPath, 'read', settings.clientName, '3', '4', '1']
+  const lines = ['3', '3', '4', issuer, String(settings.redirectPort), settings.redirectPath, 'read', settings.clientName, '3', '2', '1']
   io.readLine = async prompt => { prompts.push(prompt); return lines.shift() }
   await manageMcp(subject.manager, io, undefined, subject.oauth)
-  assert.equal(lines.length, 0); assert.match(io.output, /5\. Register public OAuth client/)
+  assert.equal(lines.length, 0); assert.match(io.output, /4\. Register public client manually/)
   assert(prompts.some(value => value.includes('127.0.0.1'))); assert(prompts.some(value => value.includes('Explicit requested OAuth scopes')))
-  assert.deepEqual(io.approvals.map(item => item.call.name), ['register_mcp_oauth_client', 'sign_in_mcp_server', 'connect_mcp_server'])
+  assert.deepEqual(io.approvals.map(item => item.call.name), ['register_mcp_oauth_client', 'sign_in_mcp_server'])
   assert.equal(registrationPosts(subject).length, 1); assert.equal(tokenPosts(subject).length, 1); assert.equal(subject.browserUrls.length, 1)
   await publicSurfaces(subject, io); await noListener(settings.redirectPort)
 })
@@ -229,14 +230,14 @@ for (const stage of ['registration', 'sign-in', 'connect']) test(`declining the 
   assert.equal(subject.oauth.authorization(server).bearerToken, undefined); await noListener(subject.settings.redirectPort)
 })
 
-test('Connect and missing-client Sign in never silently register, even after HTTP 401 with registration advertised', async t => {
+test('Connect challenge offers guided sign-in but denied setup never registers', async t => {
   const subject = await fixture(t, { httpFetch: async () => new Response('fixture-registration-secret-unauthorized', { status: 401,
     headers: { 'www-authenticate': `Bearer resource_metadata="${new URL(endpoint).origin}/.well-known/oauth-protected-resource"` } }) })
   const io = ioFixture([true], ['server:remote', 'connect', 'back'])
   await manageMcp(subject.manager, io, undefined, subject.oauth)
   await assert.rejects(subject.signIn(), error => error.code === 'client-registration-required')
-  assert.equal(subject.requests.length, 1); assert.equal(subject.oauthRequests.length, 0); assert.equal(subject.browserUrls.length, 0)
-  assert.deepEqual(io.approvals.map(item => item.call.name), ['connect_mcp_server']); clean([io.output, subject.manager.statuses()])
+  assert.equal(subject.requests.length, 1); assert.equal(subject.oauthRequests.length, 3); assert.equal(registrationPosts(subject).length, 0); assert.equal(subject.browserUrls.length, 0)
+  assert.deepEqual(io.approvals.map(item => item.call.name), ['connect_mcp_server', 'sign_in_mcp_server']); clean([io.output, subject.manager.statuses()])
 })
 
 test('registered-client HTTP 401 clears bearer without registration, sign-in or operation replay', async t => {
@@ -355,7 +356,7 @@ for (const field of ['issuer', 'redirectPath', 'scopes', 'clientName']) test(`kn
 
 for (const surface of ['application', 'interactive main', 'line main']) test(`${surface} explicitly enables human-only registration without creating provider or conversation`, async t => {
   const subject = await fixture(t), settings = subject.settings
-  const io = ioFixture([true], ['server:remote', 'oauth-register', 'back'],
+  const io = ioFixture([true], ['server:remote', 'advanced', 'oauth-register', 'back'],
     [issuer, String(settings.redirectPort), settings.redirectPath, 'read', settings.clientName])
   const args = ['--no-workspace', '--provider', 'openai', '--model', 'gpt-5.1', '--no-skills', '--no-stream', '--prompt', '/mcp',
     ...(surface === 'line main' ? ['--no-tui'] : [])]

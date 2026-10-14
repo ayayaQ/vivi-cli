@@ -14,6 +14,7 @@ import { McpOAuthRegistration } from './mcp-oauth-registration.js'
 import type { McpOAuthRegistrationSettings } from './mcp-oauth-registration.js'
 import { discoverMcpOAuth, fetchMcpOAuthClientMetadata } from './mcp-oauth-discovery.js'
 import { mcpOAuthRemoteUrl } from './mcp-oauth-network.js'
+import { fetchMcpOAuthNative } from './mcp-oauth-native.js'
 import type { ChatIO } from './terminal.js'
 
 export interface McpOAuthPublicClient {
@@ -93,6 +94,7 @@ export class McpOAuthControls {
   private readonly anonymousRevision = randomUUID()
   private readonly clientMetadataUrls = new Map<string, string>()
   private readonly uncertainRegistrations = new Set<string>()
+  private readonly signInRequired = new Set<string>()
   private closed = false
   constructor(private readonly options: McpOAuthControlsOptions) { this.secrets.push(...options.secrets ?? []) }
   bind(manager: McpManager): void {
@@ -122,7 +124,7 @@ export class McpOAuthControls {
     validateMcpOAuthRedirectPath(client.redirectPath)
     // Reuse the adapter's strict public client/issuer/scope checks without discovering or granting anything.
     const validation = new McpOAuthSession({ endpoint: server.endpoint, configRevision: manager.configurationRevision(), client,
-      scopes: client.scopes, fetchFn: this.options.fetchFn ?? fetch, openBrowser: this.options.openBrowser ?? openMcpOAuthBrowser,
+      scopes: client.scopes, fetchFn: this.options.fetchFn ?? fetchMcpOAuthNative, openBrowser: this.options.openBrowser ?? openMcpOAuthBrowser,
       registerSecrets: () => undefined, configurationIsCurrent: () => true })
     const configRevision = manager.configurationRevision(), previous = this.registrations.get(serverId)
     await validation.disconnect()
@@ -182,7 +184,7 @@ export class McpOAuthControls {
       const registration = new McpOAuthRegistration({ ...settings, endpoint: server.endpoint, configRevision,
         fetchFn: async (input, init) => {
           await manager.reload(); if (!current()) throw new McpOAuthError('cancelled')
-          const response = await (this.options.fetchFn ?? fetch)(input, init)
+          const response = await (this.options.fetchFn ?? fetchMcpOAuthNative)(input, init)
           await manager.reload(); if (!current()) { void response.body?.cancel().catch(() => undefined); throw new McpOAuthError('cancelled') }
           return response
         }, registerSecrets: values => this.register(values), configurationIsCurrent: current,
@@ -216,7 +218,7 @@ export class McpOAuthControls {
   }
   status(serverId: string): { readonly state: McpOAuthState | 'unconfigured'; readonly revision: string } {
     const entry = this.registrations.get(serverId)
-    return entry?.session?.status() ?? { state: entry?.state ?? 'unconfigured', revision: entry?.revision ?? this.anonymousRevision }
+    return entry?.session?.status() ?? { state: entry?.state ?? (this.signInRequired.has(serverId) ? 'needs-sign-in' : 'unconfigured'), revision: entry?.revision ?? this.anonymousRevision }
   }
   authorization(server: McpHttpServerConfig): { readonly revision: string; readonly bearerToken?: string } {
     const entry = this.registrations.get(server.id)
@@ -226,6 +228,11 @@ export class McpOAuthControls {
   }
   async invalidate(serverId?: string, reason: InvalidationReason = 'disconnect'): Promise<void> {
     if (reason === 'closed') this.closed = true
+    if (reason === 'needs-sign-in' && serverId !== undefined) this.signInRequired.add(serverId)
+    if (reason === 'configuration' || reason === 'closed') {
+      if (serverId === undefined) { this.signInRequired.clear(); this.clientMetadataUrls.clear() }
+      else { this.signInRequired.delete(serverId); this.clientMetadataUrls.delete(serverId) }
+    }
     const entries = serverId === undefined ? [...this.registrations.entries()] : [...this.registrations.entries()].filter(([id]) => id === serverId)
     // Revoke authority synchronously before the first asynchronous cleanup,
     // including registration discovery/approval before any client entry exists.
@@ -265,7 +272,7 @@ export class McpOAuthControls {
       const assertCurrent = (): void => { if (!current()) throw new McpOAuthError('cancelled') }
       const checkedFetch: FetchLike = async (input, init) => {
         await manager.reload(); assertCurrent()
-        const response = await (this.options.fetchFn ?? fetch)(input, init)
+        const response = await (this.options.fetchFn ?? fetchMcpOAuthNative)(input, init)
         await manager.reload()
         if (!current()) { void response.body?.cancel().catch(() => undefined); throw new McpOAuthError('cancelled') }
         return response
@@ -317,7 +324,7 @@ export class McpOAuthControls {
         mechanism = 'automatic public client registration'
       }
       const scopes = existing ? existing.client.scopes : discovery.scopes
-      const description = `Sign in and connect to this trusted MCP server. ${registrationPlan ? 'This sends the exact public client metadata below once to the validated registration endpoint, then opens browser sign-in.' : 'This opens browser sign-in using the public client below.'} After you grant access in the browser, vivi will connect to the same endpoint and discover tool metadata. Calls and resource reads still require their own approval. Credentials last for this launch only. The issuer may retain a public client registration or account grant; local logout does not revoke it. Review the provider’s permissions, expiry and any spending limits before granting access.\nServer: ${mcpDisplayJson(serverId)}\nEndpoint: ${mcpDisplayJson(server.endpoint)}\nResource: ${mcpDisplayJson(discovery.resource)}\nIssuer: ${mcpDisplayJson(discovery.issuer)}\nAuthorization endpoint: ${mcpDisplayJson(metadata.authorization_endpoint)}\nRequested scopes: ${mcpDisplayJson(scopes)}\nClient setup: ${mechanism}\n${registrationPlan ? `Registration endpoint: ${mcpDisplayJson(registrationPlan.registrationEndpoint)}\nPublic client metadata: ${mcpDisplayJson(registrationPlan.clientMetadata)}` : `Client ID: ${mcpDisplayJson(client!.id)}\nCallback: ${mcpDisplayJson(`http://127.0.0.1:${client!.redirectPort}${client!.redirectPath}`)}`}\nProtocol: ${server.protocol}\nConfiguration revision: ${mcpDisplayJson(configRevision)}`
+      const description = `Sign in and connect to this trusted MCP server. ${registrationPlan ? 'This sends the exact public client metadata below once to the validated registration endpoint, then opens browser sign-in.' : 'This opens browser sign-in using the public client below.'} After you grant access in the browser, vivi will connect to the same endpoint and discover tool metadata. Ready tool aliases and schemas will be exposed to your selected model/provider automatically; remote metadata is untrusted. Calls and resource reads still require their own approval. Credentials last for this launch only. The issuer may retain a public client registration or account grant; local logout does not revoke it. Review the provider’s permissions, expiry and any spending limits before granting access.\nServer: ${mcpDisplayJson(serverId)}\nEndpoint: ${mcpDisplayJson(server.endpoint)}\nResource: ${mcpDisplayJson(discovery.resource)}\nIssuer: ${mcpDisplayJson(discovery.issuer)}\nAuthorization endpoint: ${mcpDisplayJson(metadata.authorization_endpoint)}\nToken endpoint: ${mcpDisplayJson(metadata.token_endpoint)}\nRequested scopes: ${mcpDisplayJson(scopes)}\nClient setup: ${mechanism}\n${registrationPlan ? `Registration endpoint: ${mcpDisplayJson(registrationPlan.registrationEndpoint)}\nPublic client metadata: ${mcpDisplayJson(registrationPlan.clientMetadata)}` : `Client ID: ${mcpDisplayJson(client!.id)}\nCallback: ${mcpDisplayJson(`http://127.0.0.1:${client!.redirectPort}${client!.redirectPath}`)}`}\nProtocol: ${server.protocol}\nConfiguration revision: ${mcpDisplayJson(configRevision)}`
       if (mcpContainsSecret([description, discovery, client, registrationPlan], this.knownSecrets)) throw new McpOAuthError('authorization-failed')
       const approved = await cancellable(io.approve({ call: { id: randomUUID(), name: 'sign_in_mcp_server', arguments: {
         serverId, configRevision, authorizationRevision: attempt.revision,
@@ -325,6 +332,7 @@ export class McpOAuthControls {
       } }, currentRevision: attempt.revision, description }, combined), combined)
       await manager.reload(); assertCurrent()
       if (!approved) return false
+      if (mcpContainsSecret([description, discovery, client, registrationPlan], this.knownSecrets)) throw new McpOAuthError('authorization-failed')
       if (registrationPlan) {
         registrationSubmitted = true
         client = await attempt.registration!.beginRegistration(registrationPlan, combined)
@@ -332,13 +340,17 @@ export class McpOAuthControls {
         await manager.reload(); assertCurrent()
       }
       if (!client || client.issuer !== discovery.issuer) throw new McpOAuthError('authorization-failed')
+      if (mcpContainsSecret(client, this.knownSecrets)) throw new McpOAuthError('authorization-failed')
       if (!existing) this.installClient(serverId, client, server.endpoint, configRevision)
       const entry = this.registrations.get(serverId)!
       const session = new McpOAuthSession({ endpoint: server.endpoint, configRevision, client, scopes,
         discovery: discovery.info, discoveryResource: discovery.resource, fetchFn: checkedFetch,
-        openBrowser: async (url, browserSignal) => { assertCurrent(); io.write('Opening your browser. Review access there, then return to vivi. Escape or Ctrl-C cancels\n');
+        openBrowser: async (url, browserSignal) => { assertCurrent();
+          if (mcpContainsSecret([client, server.endpoint, url.origin + url.pathname], this.knownSecrets)) throw new McpOAuthError('authorization-failed')
+          io.write('Opening your browser. Review access there, then return to vivi. Escape or Ctrl-C cancels\n');
           await (this.options.openBrowser ?? openMcpOAuthBrowser)(url, browserSignal); assertCurrent() },
-        registerSecrets: values => this.register(values), configurationIsCurrent: () => current() && this.registrations.get(serverId) === entry,
+        registerSecrets: values => this.register(values), configurationIsCurrent: () => !this.closed &&
+          manager.configurationRevision() === configRevision && this.registrations.get(serverId) === entry,
         ...(this.options.now ? { now: this.options.now } : {}), ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }) })
       entry.session = session; attempt.session = session
       const plan = await session.prepareSignIn(combined); assertCurrent()
@@ -380,7 +392,7 @@ export class McpOAuthControls {
       const session = new McpOAuthSession({ endpoint: entry.endpoint, configRevision: entry.configRevision,
         client: entry.client, scopes: entry.client.scopes, fetchFn: async (input, init) => {
           await manager.reload(); if (!current()) throw new McpOAuthError('cancelled')
-          const response = await (this.options.fetchFn ?? fetch)(input, init)
+          const response = await (this.options.fetchFn ?? fetchMcpOAuthNative)(input, init)
           await manager.reload(); if (!current()) { void response.body?.cancel().catch(() => undefined); throw new McpOAuthError('cancelled') }
           return response
         }, openBrowser: async (url, browserSignal) => {
