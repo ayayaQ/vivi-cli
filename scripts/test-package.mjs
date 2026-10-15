@@ -490,6 +490,7 @@ try {
   assert.equal(typeof createMemoryService, 'function')
   const skills = new FileSkillStore(join(directory, 'agent-skills'))
   const skillCatalog = await skills.snapshot()
+  assert.equal(skills.discoveryComplete, true, JSON.stringify(skills.diagnostics))
   assert.equal(skillCatalog.skills.find(item => item.name === 'skill-creator').readOnly, true)
   assert.equal(skillCatalog.document('skill-creator').content, skillCreatorSource.content)
   const cjsSkills = createRequire(import.meta.url)('@ayayaq/vivi/extensions/skills')
@@ -513,6 +514,8 @@ try {
   assert(!skillsResult.history.some(message => message.name === 'save_skill'))
   await skills.drain({ close: true })
   const installedSkills = new InstalledSkillStore(directory)
+  await installedSkills.snapshot()
+  assert.deepEqual(installedSkills.diagnostics, [], 'Owned packed fixture discovery must complete before saving')
   const installedText = '---\\nname: packed-guide\\ndescription: Installed package fixture.\\n---\\nUse supplied facts.\\n'
   const installedDocument = parseSkillDocument(installedText)
   const installedReceipt = await installedSkills.commit({ name: 'packed-guide', before: null, expectedRevision: null, after: installedDocument }, { signal: new AbortController().signal })
