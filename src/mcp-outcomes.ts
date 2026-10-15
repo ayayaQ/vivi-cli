@@ -4,6 +4,7 @@ import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import type { HistoryMessage, ToolCall, ToolResult } from '@ayayaq/vivi'
+import type { AgentOutcomeEvidence } from '@ayayaq/vivi/events'
 import { assertMcpJson, mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { mcpContainsSecret } from './mcp-content.js'
 
@@ -80,13 +81,56 @@ export function mcpOutcomeResult(record: McpOutcomeRecord): ToolResult {
       error: { code: 'mcp_setup_unknown_outcome', message: 'MCP setup intent was recorded, but its outcome is unknown. Configuration or account access may have changed. Inspect /mcp before retrying' } }), isError: true }
   return record.result ?? (record.state === 'accepted' ? unattemptedMcpResult() : unresolvedMcpResult())
 }
+/** Only an exact owned ledger row is eligible. A valid MCP reply confirms the
+ * response status, never third-party effects advertised by the server. */
+export function cliMcpRecordOutcome(record: McpOutcomeRecord): Pick<AgentOutcomeEvidence, 'status' | 'effect'> {
+  if (record.state === 'accepted') return { status: 'cancelled', effect: 'not_attempted' }
+  if (record.state !== 'settled' || !record.result) return { status: 'unknown', effect: 'unknown' }
+  let body: Record<string, unknown>
+  try { body = JSON.parse(record.result.content) as Record<string, unknown> }
+  catch { return { status: 'unknown', effect: 'unknown' } }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { status: 'unknown', effect: 'unknown' }
+  const code = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+    ? (body.error as Record<string, unknown>).code : undefined
+  // Older hosts put this reserved local metadata reader in the remote ledger.
+  // Its projection has no success flag; absence of that flag is not a failure.
+  if (record.toolName === 'list_mcp_resources') {
+    const completed = body.source === 'mcp' && body.localMetadataOnly === true &&
+      (Array.isArray(body.servers) || body.contentWithheld === true && body.confirmedOutcome === true) &&
+      body.success !== false && !record.result.isError
+    return completed ? { status: 'succeeded', effect: 'confirmed' } : { status: 'failed', effect: 'not_attempted' }
+  }
+  const deniedCodes = ['approval_denied', 'mcp_setup_denied', 'mcp_credentials_blocked', 'mcp_setup_credentials_blocked']
+  const failureStatus = typeof code === 'string' && deniedCodes.includes(code) ? 'denied'
+    : code === 'cancelled' ? 'cancelled' : 'failed'
+  const knownEffects = Array.isArray(body.knownEffects) ? body.knownEffects
+    : body.effectReceipt && typeof body.effectReceipt === 'object' && !Array.isArray(body.effectReceipt) ? [body.effectReceipt] : []
+  if (body.requestSent === false && body.unknownOutcome !== true && !knownEffects.length) return { status: failureStatus, effect: 'not_attempted' }
+  if (body.unknownOutcome === true) return { status: 'unknown', effect: 'unknown' }
+  const setup = record.toolName === 'mcp_setup' && body.source === 'mcp-setup'
+  const confirmed = body.confirmedOutcome === true || !setup && body.source === 'mcp' &&
+    typeof body.success === 'boolean' && Array.isArray(body.content) && ['tools/call', 'resources/read'].includes(String(body.method))
+  if (!confirmed || typeof body.success !== 'boolean') return { status: 'unknown', effect: 'unknown' }
+  const succeeded = body.success === true && !record.result.isError
+  // Setup's confirmedOutcome can describe partial knownEffects. Preserve those
+  // details, but do not advertise complete effect knowledge for an incomplete flow.
+  const localSetupKinds = ['configuration-saved', 'logged-out', 'saved-client-replaced', 'saved-credentials-replaced',
+    'refresh-intent-replaced', 'saved-sign-in-forgotten']
+  const completeSetup = setup && succeeded && knownEffects.length > 0 &&
+    knownEffects.every(receipt => receipt && typeof receipt === 'object' && !Array.isArray(receipt) &&
+      localSetupKinds.includes(receipt.kind) && typeof receipt.serverId === 'string' &&
+      typeof receipt.revision === 'string' && receipt.durabilityUnverified !== true) &&
+    body.setupIncomplete !== true && body.cleanupUnverified !== true && body.durabilityUnverified !== true
+  return { status: succeeded ? 'succeeded' : failureStatus, effect: completeSetup ? 'confirmed' : 'unknown' }
+}
 export function unresolvedMcpResult(): ToolResult {
   return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true,
-    unknownOutcome: true, doNotRetry: true,
+    unknownOutcome: true, doNotRetry: true, serverEffects: 'unknown',
     error: { code: 'mcp_unknown_outcome', message: 'A durable MCP send intent exists, but its outcome could not be confirmed. The operation may have reached the server. Do not retry automatically; check the external resource first' } }), isError: true }
 }
 export function unattemptedMcpResult(code = 'cancelled'): ToolResult {
   return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
+    serverEffects: 'not_attempted',
     error: { code, message: 'This MCP request was not sent; approval, configuration, connection or the current turn became unavailable' } }), isError: true }
 }
 /** Identity is established only from the owned row and matching canonical assistant call. */

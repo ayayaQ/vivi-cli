@@ -16,6 +16,7 @@ import { mcpAlias } from '../dist/mcp-catalog.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 import { FileMcpOutcomeStore } from '../dist/mcp-outcomes.js'
 import { mcpContainsSecret } from '../dist/mcp-content.js'
+import { cliHistoryToolPresentation } from '../dist/tool-presentation.js'
 
 const answer = (content = 'Done', toolCalls = []) => ({ content, toolCalls })
 const call = (name, arguments_ = {}) => ({ id: name, name, arguments: arguments_ })
@@ -80,6 +81,33 @@ async function fixture(t, input = {}) {
 }
 
 function resultOf(result, name = alias) { return result.history.find(message => message.kind === 'tool_result' && message.name === name) }
+
+test('local captured MCP resource metadata has exact live, final and cold-resume read receipts without a remote operation', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-local-read-receipt-')), store = new FileSessionStore(directory)
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  let subject, live
+  const display = host => {
+    const index = host.session.history.findIndex(message => message.kind === 'tool_result' && message.name === 'list_mcp_resources')
+    return cliHistoryToolPresentation(host.session.history, index, host.session.id, host.toolPresentationEvidence)
+  }
+  subject = await fixture(t, { resources: true, options: { store, onEvent(event) {
+    if (event.type === 'tool_completed') live = display(subject.host)
+  } }, generate(_input, subject) {
+    return subject.state.generations === 1 ? answer('', [call('list_mcp_resources')]) : answer()
+  } })
+  const before = subject.methods.length
+  await subject.host.send('List the already captured resource metadata')
+  assert.deepEqual(subject.methods.slice(before), []); assert.equal(subject.approvals.length, 0)
+  for (const snapshot of [live, display(subject.host)]) {
+    assert.equal(snapshot.status, 'succeeded'); assert.equal(snapshot.effect, 'confirmed')
+    assert(snapshot.source.reference.startsWith('cli-'))
+  }
+  const resumed = await CliHost.resume({ id: subject.host.session.id, store,
+    provider: { async generate() { assert.fail('Cold replay cannot execute a provider or MCP operation') } } })
+  t.after(() => resumed.shutdown())
+  assert.deepEqual(display(resumed), display(subject.host))
+  assert.deepEqual(subject.methods.slice(before), [])
+})
 
 for (const mode of ['manual', 'auto']) for (const approved of [true, false]) test(`${mode} MCP tools always use exact human approval (${approved ? 'allow' : 'deny'})`, async t => {
   const subject = await fixture(t, { approved })

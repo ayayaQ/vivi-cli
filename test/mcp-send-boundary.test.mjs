@@ -91,16 +91,19 @@ function lifecycle(subject, beforeSend = async () => {}, settle = async () => {}
 function notSent(result) {
   assert.equal(result.isError, true); assert.equal(body(result).requestSent, false)
   assert.equal(body(result).unknownOutcome, undefined); assert.equal(body(result).doNotRetry, undefined)
+  assert.equal(body(result).serverEffects, 'not_attempted')
 }
 function known(result, isError = false) {
   assert.equal(result.isError ?? false, isError); assert.equal(body(result).success, !isError)
   assert.equal(body(result).requestSent, true); assert.equal(body(result).confirmedOutcome, true)
   assert.equal(body(result).unknownOutcome, undefined); assert.equal(body(result).doNotRetry, true)
+  assert.equal(body(result).serverEffects, 'unknown', 'Confirmed protocol status does not prove arbitrary server effects')
 }
 function unknown(result) {
   assert.equal(result.isError, true); assert.equal(body(result).requestSent, true)
   assert.equal(body(result).unknownOutcome, true); assert.equal(body(result).doNotRetry, true)
   assert.equal(body(result).confirmedOutcome, undefined)
+  assert.equal(body(result).serverEffects, 'unknown')
   for (const value of [secret, 'WITHHOLD_INVALID', 'CONFIRMED_TOOL_RESPONSE', 'CONFIRMED_RESOURCE_RESPONSE']) assert(!result.content.includes(value))
 }
 function exactFrame(subject, kind = 'tools') {

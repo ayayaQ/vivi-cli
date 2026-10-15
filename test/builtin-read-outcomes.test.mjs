@@ -84,7 +84,7 @@ test('legacy valid builtin result bodies do not acquire execution evidence on im
   assert.equal(display(host).status, 'unknown'); assert.equal(display(host).effect, 'unreported')
   assert.deepEqual(host.conversationRecords.projection.outcomes, [])
 })
-test('cancel-before-dispatch keeps the synthetic builtin closure uncertain', async t => {
+test('cancel-before-dispatch has exact host proof of no executor attempt', async t => {
   let host
   const f = await diskHost(t, [call('calculate', { expression: '2+3' })], { onEvent(event) {
     if (event.type === 'tool_started') host.cancel()
@@ -92,10 +92,10 @@ test('cancel-before-dispatch keeps the synthetic builtin closure uncertain', asy
   host = f.host
   const result = await host.send('Calculate then cancel')
   assert.equal(result.status, 'cancelled')
-  assert.equal(display(host).status, 'unknown'); assert.equal(display(host).effect, 'unreported')
-  assert.deepEqual(host.conversationRecords.projection.outcomes, [])
+  assert.equal(display(host).status, 'cancelled'); assert.equal(display(host).effect, 'not_attempted')
+  assert.equal(host.conversationRecords.projection.outcomes.length, 1)
 })
-test('generic extensions and committed local writes do not inherit read effect certainty', async t => {
+test('extension completion and local commits have separate exact effect evidence', async t => {
   const imported = call('owned_extension', {})
   const { host } = await diskHost(t, [imported, call('note_set', { key: 'ordinary', value: 'saved', expectedRevision: 0 })], {
     enableNotes: true, approve: async () => true,
@@ -107,7 +107,8 @@ test('generic extensions and committed local writes do not inherit read effect c
   const history = host.session.history
   for (const [index, message] of history.entries()) if (message.kind === 'tool_result') {
     const snapshot = cliHistoryToolPresentation(history, index, host.session.id, host.toolPresentationEvidence)
-    assert.equal(snapshot.status, 'unknown'); assert.equal(snapshot.effect, 'unreported')
+    assert.equal(snapshot.status, 'succeeded')
+    assert.equal(snapshot.effect, message.name === 'note_set' ? 'confirmed' : 'unknown')
   }
   assert.equal(host.session.notes.ordinary, 'saved')
 })

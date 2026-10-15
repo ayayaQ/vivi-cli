@@ -14,13 +14,21 @@ import type { AgentRunProjection, AgentRunRecord } from '@ayayaq/vivi/events/str
 import { isSessionId, validateSession, MAX_HISTORY_MESSAGES } from './session.js'
 import type { CliSession } from './session.js'
 import { assertMcpJson } from '@ayayaq/vivi/extensions/mcp'
-import { mcpOutcomeMatchesCall } from './mcp-outcomes.js'
+import { cliMcpRecordOutcome, mcpOutcomeMatchesCall, mcpOutcomeResult } from './mcp-outcomes.js'
 import type { McpOutcomeRecord } from './mcp-outcomes.js'
+import { cliPublicUrlRecordOutcome, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult } from './public-url-outcomes.js'
+import type { PublicUrlOutcomeRecord } from './public-url-outcomes.js'
 import { publicUrlContainsSecret } from './public-url.js'
-import { isBuiltinReadTool } from './tools.js'
 
-/** Live host observation of a reserved read executor returning; never reconstructed from history. */
-export interface CliBuiltinReadReceipt { readonly call: ToolCall; readonly result: ToolResult }
+
+/** Exact live host observation. Result text, tool names and replay cannot create receipts. */
+export interface CliToolReceipt {
+  readonly call: ToolCall
+  readonly result: ToolResult
+  readonly status: AgentOutcomeEvidence['status']
+  readonly effect: AgentOutcomeEvidence['effect']
+  readonly sourceKind: 'builtin-read' | 'local-mutation' | 'command' | 'public-url' | 'mcp' | 'extension' | 'dispatcher'
+}
 
 /** Complete-chain shadow storage. Canonical sessions and exact MCP receipts remain authoritative. */
 export const CLI_CONVERSATION_LIMITS = Object.freeze({ bytes: 64 * 1024 * 1024,
@@ -94,19 +102,10 @@ export function cliMcpRecordEvidence(session: CliSession, rows: readonly McpOutc
     for (const call of message.toolCalls) {
       const row = rows.find(item => mcpOutcomeMatchesCall(item, call))
       if (!row) continue
+      const results = session.history.filter(item => item.kind === 'tool_result' && item.callId === call.id)
+      if (results.length !== 1 || !same(results[0], { kind: 'tool_result', callId: call.id, name: call.name, ...mcpOutcomeResult(row) })) continue
       const old = output.find(item => item.callId === call.id)
-      let status: AgentOutcomeEvidence['status'] = 'unknown', effect: AgentOutcomeEvidence['effect'] = 'unknown'
-      if (row.state === 'accepted') { status = 'cancelled'; effect = 'not_attempted' }
-      if (row.state === 'settled' && row.result) {
-        let body: Record<string, unknown> = {}
-        try { const value: unknown = JSON.parse(row.result.content); if (object(value)) body = value } catch { /* No effect inferred. */ }
-        if (body.requestSent === false && body.unknownOutcome !== true) {
-          effect = 'not_attempted'; status = body.success === true ? 'unknown' : 'denied'
-        } else if (body.unknownOutcome !== true && (body.confirmedOutcome === true ||
-          body.source === 'mcp' && typeof body.success === 'boolean' && Array.isArray(body.content))) {
-          effect = 'confirmed'; status = body.success === true && !row.result.isError ? 'succeeded' : 'failed'
-        }
-      }
+      const { status, effect } = cliMcpRecordOutcome(row)
       const evidence: AgentOutcomeEvidence = { callId: call.id, runId: row.runId, name: call.name,
         argumentsDigest: agentArgumentsDigest(call.arguments), status, effect,
         source: { reference: `cli-mcp-outcome:${row.id}`, revision: hash(row) } }
@@ -117,6 +116,20 @@ export function cliMcpRecordEvidence(session: CliSession, rows: readonly McpOutc
         output[output.indexOf(old)] = refined
       } else output.push(evidence)
     }
+  }
+  return output
+}
+
+export function cliPublicUrlRecordEvidence(session: CliSession, rows: readonly PublicUrlOutcomeRecord[],
+  previous: readonly AgentOutcomeEvidence[] = []): AgentOutcomeEvidence[] {
+  const output = [...previous]
+  for (const message of session.history) if (message.kind === 'assistant') for (const call of message.toolCalls) {
+    const row = rows.find(item => publicUrlOutcomeMatchesCall(item, call))
+    if (!row || output.some(item => item.callId === call.id)) continue
+    const results = session.history.filter(item => item.kind === 'tool_result' && item.callId === call.id && item.name === call.name)
+    if (results.length !== 1 || !same(results[0], { kind: 'tool_result', callId: call.id, name: call.name, ...publicUrlOutcomeResult(row) })) continue
+    output.push({ callId: call.id, runId: row.runId, name: call.name, argumentsDigest: agentArgumentsDigest(call.arguments),
+      ...cliPublicUrlRecordOutcome(row), source: { reference: `cli-public-url-outcome:${row.id}`, revision: hash(row) } })
   }
   return output
 }
@@ -237,7 +250,7 @@ export class CliConversationRecords {
     }
     this.document = next
   }
-  initialize(session: CliSession, rows: readonly McpOutcomeRecord[]): Promise<void> {
+  initialize(session: CliSession, rows: readonly McpOutcomeRecord[], urlRows: readonly PublicUrlOutcomeRecord[] = []): Promise<void> {
     return this.enqueue(async () => {
       if (this.document) return
       // The canonical host's session lease owns startup; no live turn is admitted yet.
@@ -271,7 +284,7 @@ export class CliConversationRecords {
             session.history.length < pending.history.length) { await this.quarantine(); return }
           const record = decodeAgentRecord({ ...this.envelope(), type: 'session_snapshot', reason: 'reconciliation',
             snapshot: { history: entries(session, pending.history), usage: session.usage,
-              outcomes: cliMcpRecordEvidence(session, rows, this.projection.outcomes) } })
+              outcomes: cliPublicUrlRecordEvidence(session, urlRows, cliMcpRecordEvidence(session, rows, this.projection.outcomes)) } })
           this.projection = applyAgentRecord(this.projection, record)
           await this.commit({ ...this.document, records: [...this.document.records, record] })
         }
@@ -279,7 +292,7 @@ export class CliConversationRecords {
       }
       const legacy = validateSession(session)
       const record = decodeAgentRecord({ ...this.envelope(), type: 'session_snapshot', reason: 'legacy_import',
-        snapshot: { history: entries(legacy), usage: legacy.usage, outcomes: cliMcpRecordEvidence(legacy, rows) } })
+        snapshot: { history: entries(legacy), usage: legacy.usage, outcomes: cliPublicUrlRecordEvidence(legacy, urlRows, cliMcpRecordEvidence(legacy, rows)) } })
       this.projection = applyAgentRecord(this.projection, record)
       await this.commit({ schemaVersion: 1, sessionId: this.sessionId, legacy, records: [record], runs: [] })
     })
@@ -356,7 +369,7 @@ export class CliConversationRecords {
     })
   }
   settle(runId: string, result: AgentResult, session: CliSession, rows: readonly McpOutcomeRecord[],
-    reads: readonly CliBuiltinReadReceipt[] = []): Promise<void> {
+    receipts: readonly CliToolReceipt[] = []): Promise<void> {
     return this.enqueue(async () => {
       if (!this.document) throw new Error('Missing conversation anchor')
       await this.assertStoredCurrent()
@@ -365,12 +378,12 @@ export class CliConversationRecords {
       assertAgentRunCurrent(run, this.projection)
       const history = entries(session, run.history)
       const outcomes = cliMcpRecordEvidence(session, rows, this.projection.outcomes)
-      for (const receipt of reads) {
+      for (const receipt of receipts) {
         const { call } = receipt
         // Both an actual owned completion and the exact accepted canonical result
         // are required. Cancellation closures, reused IDs and legacy reads supply neither.
-        if (!isBuiltinReadTool(call.name) || outcomes.some(item => item.callId === call.id) ||
-          reads.filter(item => item.call.id === call.id).length !== 1) continue
+        if (outcomes.some(item => item.callId === call.id) ||
+          receipts.filter(item => item.call.id === call.id).length !== 1) continue
         const calls = session.history.flatMap((message, index) => message.kind === 'assistant'
           ? message.toolCalls.filter(item => item.id === call.id).map(item => ({ call: item, index })) : [])
         const binding = calls[0]
@@ -380,8 +393,8 @@ export class CliConversationRecords {
         const results = session.history.filter(message => message.kind === 'tool_result' && message.callId === call.id)
         if (results.length !== 1 || !same(results[0], expected)) continue
         outcomes.push({ runId, callId: call.id, name: call.name, argumentsDigest: agentArgumentsDigest(call.arguments),
-          status: receipt.result.isError ? 'failed' : 'succeeded', effect: 'confirmed',
-          source: { reference: `cli-builtin-read:${runId}:${call.id}`, revision: hash(receipt) } })
+          status: receipt.status, effect: receipt.effect,
+          source: { reference: `cli-${receipt.sourceKind}:${runId}:${call.id}`, revision: hash(receipt) } })
       }
       const terminal = createRunSettlement({ envelope: this.envelope(), runId,
         inputHistoryLength: run.inputHistoryLength, result, history,

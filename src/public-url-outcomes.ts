@@ -4,6 +4,7 @@ import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import type { HistoryMessage, ToolCall, ToolResult } from '@ayayaq/vivi'
+import type { AgentOutcomeEvidence } from '@ayayaq/vivi/events'
 import { assertMcpJson, mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { publicUrlContainsSecret } from './public-url.js'
 
@@ -73,16 +74,42 @@ export function publicUrlOutcomeMatchesCall(record: PublicUrlOutcomeRecord, call
     record.recoveryCallDigest === exact
 }
 export function publicUrlOutcomeResult(record: PublicUrlOutcomeRecord): ToolResult {
-  return record.result ?? (record.state === 'accepted' ? unattemptedPublicUrlResult() : unresolvedPublicUrlResult())
+  if (record.result) return record.result
+  // The accepted row precedes DNS, while durable HTTP intent follows it. A
+  // recovered accepted row rules out GET dispatch, not metadata disclosure.
+  return record.state === 'accepted' ? { content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,
+    transmission: 'not_attempted', serverEffects: 'not_attempted', networkActivity: 'possible', doNotRetry: true,
+    requests: [], redirects: [], bytesRead: 0,
+    error: { code: 'cancelled', message: 'This HTTP GET was not sent. DNS/TLS metadata may have been disclosed before interruption' } }), isError: true }
+    : unresolvedPublicUrlResult()
+}
+/** The caller must first bind this owned ledger row to the exact canonical call.
+ * Retrieval completion never establishes the GET's arbitrary server effects. */
+export function cliPublicUrlRecordOutcome(record: PublicUrlOutcomeRecord): Pick<AgentOutcomeEvidence, 'status' | 'effect'> {
+  if (record.state === 'accepted') return { status: 'cancelled', effect: 'unknown' }
+  if (record.state !== 'settled' || !record.result) return { status: 'unknown', effect: 'unknown' }
+  let body: Record<string, unknown>
+  try { body = JSON.parse(record.result.content) as Record<string, unknown> }
+  catch { return { status: 'unknown', effect: 'unknown' } }
+  if (!body || typeof body !== 'object' || Array.isArray(body) || body.source !== 'public_url' || body.unknownOutcome === true ||
+    typeof body.success !== 'boolean') return { status: 'unknown', effect: 'unknown' }
+  if (body.success && !record.result.isError) return { status: 'succeeded', effect: 'unknown' }
+  const code = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+    ? (body.error as Record<string, unknown>).code : undefined
+  return { status: code === 'approval_denied' ? 'denied' : code === 'cancelled' ? 'cancelled' : 'failed',
+    effect: body.networkActivity === 'not_attempted' && body.serverEffects === 'not_attempted' &&
+      (body.transmission === 'not_attempted' || Array.isArray(body.requests) && body.requests.every(item =>
+        item && typeof item === 'object' && !Array.isArray(item) && item.transmission === 'not_attempted'))
+      ? 'not_attempted' : 'unknown' }
 }
 export function unresolvedPublicUrlResult(): ToolResult {
   return { content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,
-    unknownOutcome: true, doNotRetry: true, transmission: 'unknown', serverEffects: 'unknown',
+    unknownOutcome: true, doNotRetry: true, transmission: 'unknown', serverEffects: 'unknown', networkActivity: 'possible',
     error: { code: 'public_url_unknown_outcome', message: 'A durable public URL send intent exists, but no settled result is available. The request may have reached the server. Do not retry automatically' } }), isError: true }
 }
 export function unattemptedPublicUrlResult(code = 'cancelled'): ToolResult {
   return { content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,
-    transmission: 'not_attempted', serverEffects: 'not_attempted', requests: [], redirects: [], bytesRead: 0,
+    transmission: 'not_attempted', serverEffects: 'not_attempted', networkActivity: 'not_attempted', requests: [], redirects: [], bytesRead: 0,
     error: { code, message: 'This public URL request was not sent; approval or the current turn was unavailable' } }), isError: true }
 }
 /** Identity is established only from the owned row and matching canonical assistant call. */

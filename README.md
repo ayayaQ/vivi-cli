@@ -529,3 +529,13 @@ Bounds are 100 skills including the creator, 64 KiB per UTF-8 document/resource,
 documents, and 24 KiB catalog metadata; serialized tool reads must also fit the session
 transcript limit. Existing credential/private-state exclusions remain. Prior restricted
 assessments stay excluded; this release does not accept automatic skill saving.
+
+### Tool completion and effects
+
+Tool cards keep completion separate from effects. Reserved local reads have an observed local outcome. A workspace, note or memory write is confirmed only after its owned commit receipt; a later cancellation or durability warning cannot turn a published write into a failed save. A denied or cancelled request before its effect boundary is shown as not attempted. A failure after commit admission remains uncertain unless publication was observed.
+
+Command cards report the observed process lifecycle. A running process is not a completed command; a zero exit code confirms process completion, while arbitrary file and network effects remain unknown. MCP success confirms the protocol response, not an intended third-party change. Local MCP configuration changes can have confirmed host receipts; incomplete setup retains known effects in the details and leaves the overall effects uncertain. Public URL cards distinguish retrieval status, HTTP transmission, and possible DNS/TLS metadata disclosure. Failure before any network operation differs from a request that may have reached a server.
+
+Imported extension results confirm only that their executor returned or failed. Claims inside result JSON cannot establish effects, approval or permission. Historical result bodies alone never acquire new receipts. Exact current-run call, occurrence, arguments and canonical result binding is required for live and saved outcomes; cold replay restores saved evidence without executing tools. If evidence persistence fails, replay keeps the uncertainty visible. Disabled native skill saving is not advertised or enabled by outcome reporting.
+
+The registration coverage test inventories every enabled owned pack, conditional MCP resource tools, dynamic MCP aliases, Plan mode and disabled tools. Adding an owned tool without an explicit outcome policy fails registration instead of silently inheriting a generic success label.

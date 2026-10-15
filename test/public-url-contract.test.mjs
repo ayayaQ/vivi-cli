@@ -57,7 +57,9 @@ function failure(result, code, attempts = 0) {
   assert.deepEqual(result.error, { code, message: 'Public URL retrieval did not complete' })
   assert.equal(result.requests.length, attempts)
   assert.equal(result.serverEffects, attempts ? 'unknown' : 'not_attempted')
-  assert.equal(result.doNotRetry, attempts ? true : undefined)
+  assert(['possible', 'not_attempted'].includes(result.networkActivity))
+  if (attempts) assert.equal(result.networkActivity, 'possible')
+  assert.equal(result.doNotRetry, attempts || result.networkActivity === 'possible' ? true : undefined)
   assert.equal(result.text, undefined)
   assert.equal(result.httpStatus, undefined)
 }

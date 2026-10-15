@@ -497,7 +497,9 @@ for (const settlementFails of [false, true]) test(`actual CLI failed terminal ch
   await restored.host.send('Continue without reissuing the operation after restart')
   ;(settlementFails ? unknown : confirmed)(restored.providerInputs[0].messages)
   assert.equal(subject.frames.length, 1); assert.equal(subject.approvals.length, 1)
-  assert.equal((await subject.outcomes.load(subject.host.session.id)).length, 0)
+  const retained = await subject.outcomes.load(subject.host.session.id)
+  assert.equal(retained.length, settlementFails ? 1 : 0)
+  if (settlementFails) assert.equal(retained[0].state, 'intent', 'An unavailable exact shadow retains conservative recovery evidence')
 })
 
 test('actual CLI same-alias calls preserve exact pairing when the later call is cancelled', async t => {
@@ -656,5 +658,8 @@ for (const settlementFails of [false, true]) test(`actual CLI template failed te
   const carried = resultOf(restored.providerInputs[0].messages).body
   assert.equal(carried.unknownOutcome === true, settlementFails)
   assert.equal(carried.confirmedOutcome === true, !settlementFails)
-  assert.equal(subject.frames.length, 1); assert.equal((await subject.outcomes.load(subject.host.session.id)).length, 0)
+  assert.equal(subject.frames.length, 1)
+  const retained = await subject.outcomes.load(subject.host.session.id)
+  assert.equal(retained.length, settlementFails ? 1 : 0)
+  if (settlementFails) assert.equal(retained[0].state, 'intent', 'An unavailable exact shadow retains conservative recovery evidence')
 })

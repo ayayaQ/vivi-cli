@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 import { CliHost } from '../dist/host.js'
+import { cliHistoryToolPresentation } from '../dist/tool-presentation.js'
 import { createBuiltinToolset } from '../dist/tools.js'
 import { createMcpSetupExtension, MCP_SETUP_GUIDANCE } from '../dist/mcp-setup-tools.js'
 import { McpSetupService } from '../dist/mcp-setup.js'
@@ -551,7 +552,9 @@ for (const action of ['add', 'connect', 'login']) for (const settlementFails of 
     await restored.host.send('Continue without repeating setup after restart')
     if (settlementFails) unknown(restored.providerInputs[0].messages); else confirmed(restored.providerInputs[0].messages, action)
     assert.equal(subject.state.effects, 1); assert.equal(subject.approvals.length, 1)
-    assert.equal((await subject.outcomes.load(subject.host.session.id)).length, 0)
+    const retained = await subject.outcomes.load(subject.host.session.id)
+    assert.equal(retained.length, settlementFails ? 1 : 0)
+    if (settlementFails) assert.equal(retained[0].state, 'intent', 'Conservative evidence remains until a durable exact shadow can replace it')
   })
 
 test('known synthetic configuration receipt remains visible when service throws before final settlement', async t => {
@@ -603,6 +606,12 @@ for (const action of ['add', 'login']) test(`synthetic ${action} receipt content
   assert(!mcpContainsSecret([subject.host.session.history, value.history, subject.providerInputs,
     await subject.outcomes.load(subject.host.session.id), subject.output()], subject.secrets))
   const restored = await resume(t, subject)
+  for (const host of [subject.host, restored.host]) {
+    const index = host.session.history.findIndex(message => message.kind === 'tool_result' && message.name === 'mcp_setup')
+    const snapshot = cliHistoryToolPresentation(host.session.history, index, host.session.id, host.toolPresentationEvidence)
+    assert.equal(snapshot.status, 'succeeded')
+    assert.equal(snapshot.effect, action === 'add' ? 'confirmed' : 'unknown')
+  }
   await restored.host.send('Continue from the privacy-screened setup evidence')
   assert(!mcpContainsSecret(restored.providerInputs, subject.secrets))
   assert.equal(subject.state.effects, 1)

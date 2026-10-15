@@ -7,6 +7,7 @@ import { Duplex, PassThrough } from 'node:stream'
 import { globalAgent, request as httpsRequest } from 'node:https'
 import { createPublicUrlTransport, isPublicUrlAddress, PUBLIC_URL_REQUEST_HEADERS,
   PUBLIC_URL_TRANSPORT_LIMITS, PublicUrlTransportError } from '../dist/public-url-transport.js'
+import { fetchPublicUrl } from '../dist/public-url.js'
 
 // Every DNS answer and TLS socket is inert. Some fixtures use the real native
 // HTTP parser over a controlled in-memory duplex, never a real network socket.
@@ -76,6 +77,42 @@ function boundedFailure(code) { return error => {
   assert(error instanceof PublicUrlTransportError); assert.equal(error.code, code); assert.equal(error.message, code)
   assert.equal(error.cause, undefined); assert(!JSON.stringify(error).includes('PRIVATE_NATIVE_MARKER')); return true
 } }
+
+test('owned engine transport distinguishes pre-HTTP TLS rejection from uncertain request dispatch', async () => {
+  const fixture = rawFixture({ socketOptions: { authorized: false } })
+  const result = await fetchPublicUrl(url, { approve: async () => true,
+    resolve: async () => [address], request: fixture.transport.requestPublicUrl })
+  assert.equal(result.success, false); assert.equal(result.error.code, 'transport_failed')
+  assert.deepEqual(result.requests, [{ url, transmission: 'not_attempted' }])
+  assert.equal(result.serverEffects, 'not_attempted'); assert.equal(result.networkActivity, 'possible'); assert.equal(result.doNotRetry, true)
+  assert.equal(fixture.state.requests.length, 0); assert.deepEqual(fixture.socket.writes, [])
+  const unknown = await fetchPublicUrl(url, { approve: async () => true, resolve: async () => [address],
+    request: async () => { throw new PublicUrlTransportError('transport_failed') } })
+  assert.deepEqual(unknown.requests, [{ url, transmission: 'unknown' }]); assert.equal(unknown.serverEffects, 'unknown')
+  assert.equal(unknown.doNotRetry, true, 'An arbitrary adapter error cannot claim the owned pre-HTTP boundary')
+})
+
+test('HTTP dispatch boundary precedes locally observed transmission and never proves server effects', async () => {
+  const fixture = rawFixture(), order = [], { input } = requestInput(undefined, {
+    onDispatch() { order.push('dispatch') }, onTransmit() { order.push('local-send') } })
+  const response = await fixture.transport.requestPublicUrl(input)
+  assert.equal(await collect(response.body), 'hello'); assert.deepEqual(order, ['dispatch', 'local-send'])
+})
+
+test('an unsent redirect hop cannot erase the earlier observed HTTP request', async () => {
+  const sockets = [new ControlledTlsSocket({ reply: 'HTTP/1.1 302 Found\r\nLocation: /second\r\nContent-Length: 0\r\n\r\n' }),
+    new ControlledTlsSocket({ authorized: false })]
+  let next = 0, calls = 0
+  const transport = createPublicUrlTransport({ createResolver() { assert.fail('DNS is injected separately') },
+    connect() { const socket = sockets[next++]; queueMicrotask(() => socket.ready()); return socket },
+    request(options, callback) { calls++; return httpsRequest(options, callback) } })
+  const result = await fetchPublicUrl(url, { approve: async () => true, resolve: async () => [address],
+    request: transport.requestPublicUrl })
+  assert.equal(result.success, false); assert.equal(calls, 1)
+  assert.deepEqual(result.requests, [{ url, transmission: 'observed' },
+    { url: 'https://example.com/second', transmission: 'not_attempted' }])
+  assert.equal(result.serverEffects, 'unknown'); assert.equal(result.doNotRetry, true)
+})
 
 for (const ip of ['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111', '2001:4860:4860:0:0:0:0:8888']) {
   test(`independent address admission permits global candidate ${ip}`, () => assert.equal(isPublicUrlAddress(ip), true))
