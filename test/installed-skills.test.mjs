@@ -4,6 +4,7 @@ import { test } from 'node:test'
 import { mkdtemp, realpath, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import { parseSkillDocument } from '@ayayaq/vivi/extensions/skills'
 import { InstalledSkillStore } from '../dist/installed-skills.js'
 const signal = () => new AbortController().signal
@@ -49,6 +50,38 @@ test('Bun releases every prepared statement before save and snapshot return with
     assert(statements.length >= 2)
     for (const statement of statements) assert.throws(() => statement.get(), /finalized|closed|Invalid statement/i)
   } finally { Database.prototype.prepare = original }
+})
+
+test('Windows Bun discovers imports and saves when its current directory is inside the profile drive', { skip: process.platform !== 'win32' || !('Bun' in globalThis) }, async t => {
+  const { profile } = await fixture(t), path = join(profile, 'same-drive-fixture.mjs')
+  await writeFile(path, `
+import assert from 'node:assert/strict'
+import { lstat, realpath } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { FileSkillStore } from ${JSON.stringify(new URL('../dist/skills.js', import.meta.url).href)}
+import { InstalledSkillStore } from ${JSON.stringify(new URL('../dist/installed-skills.js', import.meta.url).href)}
+import { parseSkillDocument } from ${JSON.stringify(import.meta.resolve('@ayayaq/vivi/extensions/skills'))}
+const profile = process.cwd(), imports = new FileSkillStore(join(profile, 'agent-skills'))
+await imports.snapshot()
+const trace = []
+if (!imports.discoveryComplete) {
+  for (let path = profile; trace.length < 16; path = dirname(path)) {
+    const original = await lstat(path, { bigint: true }), canonical = await realpath(path), target = await lstat(canonical, { bigint: true })
+    const identity = value => ({ dev: String(value.dev), ino: String(value.ino), directory: value.isDirectory(), symlink: value.isSymbolicLink() })
+    trace.push({ path, canonical, original: identity(original), target: identity(target) })
+    if (dirname(path) === path) break
+  }
+}
+assert.equal(imports.discoveryComplete, true, JSON.stringify({ diagnostics: imports.diagnostics, trace }))
+const store = new InstalledSkillStore(profile), after = parseSkillDocument(${JSON.stringify(source())})
+try {
+  await store.commit({ name: after.metadata.name, before: null, expectedRevision: null, after }, { signal: new AbortController().signal })
+  assert.equal((await store.snapshot()).document(after.metadata.name).content, after.content)
+} finally { await store.drain({ close: true }); await imports.drain({ close: true }) }
+`)
+  const result = spawnSync(process.execPath, ['--no-install', path], { cwd: profile, encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024 })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
 })
 
 test('replacement rechecks stored revision after review and preserves the winning exact source', async t => {
