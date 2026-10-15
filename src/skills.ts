@@ -3,7 +3,7 @@ import { constants } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
 import { lstat, open, opendir, realpath } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { dirname, join, parse, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import {
   createSkillCatalog, parseSkillDocument, SKILL_LIMITS, skillCreatorSource,
   validateSkillName, validateSkillResourcePath
@@ -151,7 +151,13 @@ export class FileSkillStore implements CliSkillStore {
         throw new Error('Skill directory changed during the operation; files were preserved')
       }
     }
-    const canonical = await realpath(directory.path)
+    let canonical = await realpath(directory.path)
+    const root = parse(directory.path).root
+    // Bun 1.4.2 drops the separator from a Windows drive-root realpath result.
+    // Restore only that exact same-drive root; still prove its identity below.
+    if (process.platform === 'win32' && directory.path === root && /^[A-Za-z]:$/.test(canonical) &&
+      canonical.toLowerCase() === root.slice(0, -1).toLowerCase()) canonical += sep
+    if (!isAbsolute(canonical)) throw new Error('Canonical skill directory path is not absolute')
     // Windows may expand 8.3 paths and normalize letter case. Identity, not
     // byte equality (or blanket case folding on APFS), proves that this canonical
     // spelling denotes the already checked directory. Every supplied ancestor
