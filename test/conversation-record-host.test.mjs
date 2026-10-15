@@ -282,7 +282,10 @@ test('actual CLI pairs two tool turns, provider state, reported cache counts and
     cachedInputTokens: 0, cacheWriteInputTokens: 4 })
   assert.deepEqual(replay.projection.history[1].message.providerState,
     { provider: 'owned-fixture', items: [{ opaque: 'native-state-preserved' }] })
-  assert.deepEqual(replay.projection.outcomes, [], 'Calculator success cannot prove external effect evidence')
+  assert.deepEqual(replay.projection.outcomes.map(({ callId, name, status, effect }) => ({ callId, name, status, effect })), [
+    { callId: 'record-call', name: 'calculate', status: 'succeeded', effect: 'confirmed' },
+    { callId: 'second-record-call', name: 'calculate', status: 'succeeded', effect: 'confirmed' }
+  ], 'The host observed these exact pure calculator completions; generic tool success remains insufficient')
 })
 
 test('actual CLI keeps transient text progress outside accepted and settled record bodies', async t => {

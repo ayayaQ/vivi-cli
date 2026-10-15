@@ -6,17 +6,17 @@ import type { AgentOutcomeEvidence, AgentProjection } from '@ayayaq/vivi/events'
 import { decodeToolPresentation, toolPresentationView, TOOL_PRESENTATION_LIMITS } from '@ayayaq/vivi/presentation'
 import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus, ToolPresentationView } from '@ayayaq/vivi/presentation'
 import { mcpContainsSecret } from './mcp-content.js'
+import { isBuiltinReadTool } from './tools.js'
 
 /** Host-observed evidence only. A replay, result body or source string supplies no authority. */
-export interface CliToolDecision {
+export type CliToolDecision = {
   readonly requestIndex: number
   readonly callId: string
   readonly name: string
   readonly argumentsDigest: string
-  readonly status: 'denied' | 'cancelled'
-  readonly effect: 'not_attempted'
   readonly source: ToolPresentation['source']
-}
+} & ({ readonly status: 'denied' | 'cancelled'; readonly effect: 'not_attempted' }
+  | { readonly status: 'succeeded' | 'failed'; readonly effect: 'confirmed'; readonly resultDigest: string })
 export interface CliToolEvidence { readonly sessionId: string; readonly projection?: AgentProjection; readonly decisions?: readonly CliToolDecision[] }
 export interface CliToolPresentationInput {
   readonly call: ToolCall
@@ -71,6 +71,13 @@ export function cliToolOutcome(call: ToolCall, history: readonly HistoryMessage[
 export function cliToolSource(sessionId: string | undefined, historyIndex: number, message: unknown): ToolPresentation['source'] {
   return { reference: `cli-session:${sessionId ?? 'unreported'}:history:${historyIndex}`, revision: hash(message) }
 }
+/** A live read receipt also binds the exact returned canonical result, unlike a pre-effect review denial. */
+export function cliToolResultDecision(call: ToolCall, result: ToolResultMessage, requestIndex: number,
+  evidence?: CliToolEvidence): CliToolDecision | undefined {
+  return evidence?.decisions?.find(item => item.requestIndex === requestIndex && item.callId === call.id &&
+    item.name === call.name && item.argumentsDigest === agentArgumentsDigest(call.arguments) &&
+    (item.effect === 'not_attempted' || item.resultDigest === hash(result)))
+}
 export function cliHistoryToolPresentation(history: readonly HistoryMessage[], index: number, sessionId?: string,
   evidence?: CliToolEvidence, secrets: readonly string[] = []): ToolPresentation {
   const result = history[index]
@@ -85,8 +92,8 @@ export function cliHistoryToolPresentation(history: readonly HistoryMessage[], i
   const exact = evidence && evidence.sessionId === sessionId && call &&
     JSON.stringify(evidence.projection?.history[index]?.message) === JSON.stringify(result)
     ? cliToolOutcome(call, history, evidence) : undefined
-  const decision = evidence && evidence.sessionId === sessionId && call ? evidence.decisions?.find(item => item.requestIndex === requestIndex &&
-    item.callId === call.id && item.name === call.name && item.argumentsDigest === agentArgumentsDigest(call.arguments)) : undefined
+  const decision = evidence && evidence.sessionId === sessionId && call
+    ? cliToolResultDecision(call, result, requestIndex, evidence) : undefined
   return createCliToolPresentation({ call: exactCall, result, status: exact?.status ?? decision?.status ?? 'unknown', effect: exact?.effect ?? decision?.effect ?? 'unreported',
     source: exact?.source ?? decision?.source ?? cliToolSource(sessionId, index, result), secrets,
     ...(!call ? { warnings: ['Legacy tool arguments are unavailable; no approval or effect evidence was restored.'] } : {}) })
@@ -113,8 +120,7 @@ export function cliToolPresentationView(encoded: string, collapsed = false, deta
 /** Reserved host-owned reads and informational clarification have no external operation to verify. This is display
  * context supplied by the CLI, never inferred from a foreign presentation name. */
 export function isCliLocalReadTool(name: string): boolean {
-  return ['request_user_input', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'mcp_list',
-    'workspace_list', 'workspace_read', 'workspace_search', 'workspace_glob'].includes(name)
+  return isBuiltinReadTool(name)
 }
 export interface CliToolCardView {
   readonly title: string

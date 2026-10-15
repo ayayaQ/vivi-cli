@@ -211,7 +211,7 @@ test('detail key repeats/releases and stale mouse gestures cannot select or conf
   f.input.pressEnter(); expect(await answer).toBe(false)
 })
 
-test('live request/result source revisions and indices equal the actual host canonical entries', async () => {
+test('live requests retain canonical provenance and completed reads use exact host receipt provenance', async () => {
   const f = await fixture(100, 45)
   const sourceHashes: string[] = []
   let rounds = 0
@@ -221,13 +221,16 @@ test('live request/result source revisions and indices equal the actual host can
     provider: { async generate() { return ++rounds % 2 === 1 ? { content: 'Before', toolCalls: [{ id: `call-${rounds}`, name: 'current_time', arguments: {} }] }
       : { content: 'After', toolCalls: [] } } },
     onEvent(event) {
+      if (event.type === 'tool_completed') f.io.setToolEvidence(host.toolPresentationEvidence)
       f.io.event(event)
       if (event.type === 'assistant' && event.message.toolCalls.length || event.type === 'tool_completed') {
         const index = host.session.history.length - 1, message = host.session.history[index]!
-        const revision = createHash('sha256').update(JSON.stringify(message)).digest('hex')
+        const decision = event.type === 'tool_completed' ? host.toolPresentationEvidence.decisions?.at(-1) : undefined
+        const revision = decision?.source.revision ?? createHash('sha256').update(JSON.stringify(message)).digest('hex')
         if (f.body(f.headers().at(-1)!).getChildren().length === 0) f.input.pressKey('o', { ctrl: true })
         const text = contents(f.body(f.headers().at(-1)!))
-        expect(text).toContain(`cli-session:${host.session.id}:history:${index}`)
+        expect(text).toContain(decision?.source.reference ?? `cli-session:${host.session.id}:history:${index}`)
+        if (decision) { expect(text).toContain('Status: succeeded'); expect(text).toContain('Effect: confirmed') }
         expect(text).toContain(revision); sourceHashes.push(revision)
       }
     } })
@@ -236,6 +239,34 @@ test('live request/result source revisions and indices equal the actual host can
     const result = await sendChatTurn(host, f.io, 'Use the offline clock'); f.io.result(result); f.io.setSession(host.session); await f.frame()
   }
   expect(sourceHashes).toHaveLength(4); expect(new Set(sourceHashes).size).toBe(4)
+})
+
+test('completed builtin reads keep exact live evidence while the next provider round is pending', async () => {
+  const f = await fixture(110, 50)
+  let release!: () => void, enter!: () => void, generations = 0, host!: CliHost
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const entered = new Promise<void>(resolve => { enter = resolve })
+  const calls = [{ id: 'live-calculate', name: 'calculate', arguments: { expression: '2+3' } },
+    { id: 'live-time', name: 'current_time', arguments: { timezone: 'UTC' } }]
+  host = await CliHost.create({ settings: { provider: 'openai', model: 'owned-live-offline' },
+    store: { async save() {}, async load() { throw new Error('unused') } }, provider: { async generate() {
+      if (++generations === 1) return { content: '', toolCalls: calls }
+      enter(); await gate; return { content: 'Done', toolCalls: [] }
+    } }, onEvent(event) { if (event.type === 'tool_completed') f.io.setToolEvidence(host.toolPresentationEvidence); f.io.event(event) } })
+  cleanups.push(() => host.shutdown()); f.io.setSession(host.session)
+  const running = sendChatTurn(host, f.io, 'Read two builtin results')
+  try {
+    await entered; expect(host.running).toBe(true); await f.frame()
+    expect(f.headers()).toHaveLength(2)
+    for (const header of f.headers()) expect(header.plainText).not.toContain('unverified')
+    await f.expandAll()
+    const text = contents(f.transcript())
+    expect(text.match(/Status: succeeded/g)).toHaveLength(2)
+    expect(text.match(/Effect: confirmed/g)).toHaveLength(2)
+    expect(text).not.toContain('Tool outcome is unknown')
+    expect(text).not.toContain('External effects are unreported')
+    expect(text).toContain('cli-builtin-read:')
+  } finally { release(); await running }
 })
 for (const late of [false, true]) test(`encoded private tool identities and summaries are withheld ${late ? 'after registration' : 'at first render'}`, async () => {
   const f = await fixture(100, 45)
@@ -531,7 +562,7 @@ test('a live local-read expansion survives result and canonical refresh without 
     settings: { provider: 'openai', model: 'offline' }, provider: { async generate() {
       if (++rounds === 1) return { content: '', toolCalls: [{ id: 'same-live-call', name: 'current_time', arguments: {} }] }
       await held; return { content: 'Finished the time check', toolCalls: [] }
-    } }, onEvent(event) { f.io.event(event) } })
+    } }, onEvent(event) { if (event.type === 'tool_completed') f.io.setToolEvidence(host.toolPresentationEvidence); f.io.event(event) } })
   cleanups.push(async () => host.shutdown()); f.io.setSession(host.session)
   const running = sendChatTurn(host, f.io, 'Read the clock')
   for (let attempt = 0; attempt < 1000 && rounds < 2; attempt++) await f.frame()
@@ -544,14 +575,14 @@ test('a live local-read expansion survives result and canonical refresh without 
   expect(contents(f.transcript())).not.toContain('Tools requested')
   expect(contents(f.transcript())).not.toContain('Assistant')
   f.input.pressKey('o', { ctrl: true }); await f.frame()
-  expect(contents(f.body(header))).toContain('Status: unknown')
-  expect(contents(f.body(header))).toContain('Effect: unreported')
+  expect(contents(f.body(header))).toContain('Status: succeeded')
+  expect(contents(f.body(header))).toContain('Effect: confirmed')
   finish(); const result = await running
   f.io.result(result); f.io.setSession(host.session); await f.frame()
   expect(f.headers()).toHaveLength(1)
   expect(f.headers()[0]!.id).toBe(id)
   expect(f.headers()[0]!.plainText).toBe('▾ current_time')
-  expect(contents(f.body(header))).toContain(`cli-session:${host.session.id}:history:2`)
+  expect(contents(f.body(header))).toContain(host.toolPresentationEvidence.projection!.outcomes[0]!.source.reference)
   expect(contents(f.body(header))).toContain('Result:')
   expect(contents(f.transcript())).toContain('Finished the time check')
   expect(contents(f.transcript()).match(/Assistant/g)).toHaveLength(1)
