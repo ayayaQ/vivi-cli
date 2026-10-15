@@ -209,6 +209,12 @@ For Bun servers, use `--no-install` followed by an absolute installed JS/TS
 script path and its separate arguments. Inline code and package commands are unsupported.
 Windows Node servers should explicitly allow `SYSTEMROOT` (included in the minimal
 profile/temp option); an empty environment can prevent Node 26.4 from starting.
+Windows native stdio startup allows up to 45 seconds for cold helper readiness.
+Other startup and protocol/category deadlines remain 10 seconds; each metadata
+page remains bounded to 5 seconds. Cancellation requests stop immediately, with
+the existing 5-second Windows cleanup bound. If native cleanup cannot be verified,
+the connection remains an error and cannot restart until explicit cleanup succeeds.
+The startup allowance does not resolve cold-cancellation cleanup uncertainty.
 For account-independent line management, run
 `node dist/launcher.js --no-tui --prompt /mcp`; no model or provider key is needed.
 

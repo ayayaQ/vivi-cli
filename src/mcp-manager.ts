@@ -12,7 +12,7 @@ import { McpConfigCommitError, McpConfigStore, mcpDigest, mcpDisplayJson, mcpFre
 import type { McpConfiguration, McpLaunchIdentity, McpServerConfig, McpHttpServerConfig } from './mcp-config.js'
 import { assertMcpJson, collectMcpCategory, emptyMcpCategory, MCP_LIMITS } from './mcp-catalog.js'
 import type { McpCatalogEntry, McpCatalogKind, McpCatalogSnapshot } from './mcp-catalog.js'
-import { McpStdioTransport } from './mcp-transport.js'
+import { McpStdioTransport, MCP_WINDOWS_STDIO_STARTUP_MS } from './mcp-transport.js'
 import { McpHttpTransport } from './mcp-http-transport.js'
 import { assertMcpOperationResult, MCP_OPERATION_LIMITS, mcpContainsSecret, mcpFailure, projectMcpResult } from './mcp-content.js'
 
@@ -93,6 +93,11 @@ interface Connection {
 }
 const categoryMethods = { tools: 'tools/list', resources: 'resources/list', resourceTemplates: 'resources/templates/list' } as const
 const kinds: readonly McpCatalogKind[] = ['tools', 'resources', 'resourceTemplates']
+/** Host-owned native transport policy, never server metadata or persisted configuration. */
+export function mcpStartupTimeoutMs(transport: Transport): number {
+  return transport instanceof McpStdioTransport && transport.startupTimeoutMs === MCP_WINDOWS_STDIO_STARTUP_MS
+    ? MCP_WINDOWS_STDIO_STARTUP_MS : MCP_LIMITS.categoryMs
+}
 class ConfigurationLoadError extends Error {}
 export const MCP_START_WARNING = 'Starting this trusted server runs its installed code with your OS permissions, before any tool-call approval. It can access your files and network. This is not a sandbox. Ready tool metadata is advertised to the selected model; discovered resource metadata can also be listed in its context. Every tool call and resource read requires separate human approval; returned text enters the local transcript and selected provider context.'
 export function mcpStartDisclosure(launch: McpLaunchIdentity): string {
@@ -298,8 +303,9 @@ export class McpManager {
           this.assertSendCurrent(connection, pending, message)
           pending.sent = true; pending.requestId = message.id
         } }) : new McpStdioTransport(launch))
-    // Owned startup and protocol negotiation have separate, equally bounded
-    // phases. Native readiness must not consume the protocol/category budget.
+    // Cold Windows native helper readiness was measured beyond 24 seconds.
+    // Its bounded bootstrap must not consume protocol/page/category deadlines.
+    const startupTimeoutMs = mcpStartupTimeoutMs(owned)
     const deadline = new AbortController()
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined
     let deadlinePhase: 'startup' | 'handshake' = 'startup'
@@ -311,7 +317,7 @@ export class McpManager {
     const armDeadline = (phase: 'startup' | 'handshake'): void => {
       clearDeadline()
       deadlinePhase = phase
-      deadlineTimer = setTimeout(() => deadline.abort(), MCP_LIMITS.categoryMs)
+      deadlineTimer = setTimeout(() => deadline.abort(), phase === 'startup' ? startupTimeoutMs : MCP_LIMITS.categoryMs)
     }
     // Keep the guard at the actual transport boundary, including SDK async setup.
     // The SDK may attach only its fixed modern protocol envelope to our params.
