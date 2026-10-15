@@ -13,6 +13,7 @@ interface DialogOptions {
   clean(text: string): string
   ready(): boolean
   mouseReady(): boolean
+  availableHeight(): number
   status(text: string): void
   finish(response: QuestionResponse, mouse?: boolean): void
   foreground: string | import('@opentui/core').RGBA
@@ -101,6 +102,8 @@ export class QuestionDialog {
   private changed(): void {
     if (this.changing || this.disposed) return
     const raw = this.editor.plainText
+    // Loading a page can notify after `changing` resets; it is not an answer edit.
+    if (raw === this.current().text) return
     if (raw.length > MAX_ANSWER) {
       this.changing = true
       try { this.editor.setText(this.current().text); this.editor.gotoBufferEnd() } finally { this.changing = false }
@@ -205,12 +208,17 @@ export class QuestionDialog {
   resize(): void {
     if (this.disposed) return
     this.mouse.clear()
-    const height = Math.max(5, Math.min(14, this.renderer.terminalHeight - (this.renderer.terminalHeight <= 14 ? 3 : 6)))
-    const fixed = 4 + (this.choices.visible ? this.request.questions[this.page]!.options!.length + 1 : 0)
-    this.heading.height = Math.max(1, Math.min(3, height - fixed - (this.editorBox.visible ? 1 : 0)))
-    this.choices.height = this.choices.visible ? this.request.questions[this.page]!.options!.length + 1 : 0
-    this.editorBox.height = Math.max(1, Math.min(4, height - fixed - Number(this.heading.height)))
-    this.box.height = 3 + Number(this.heading.height) + Number(this.choices.height) + (this.editorBox.visible ? Number(this.editorBox.height) : 0)
+    const height = Math.max(5, Math.min(14, this.options.availableHeight()))
+    // Reserve both borders, progress and the action row. Renderable height getters
+    // still describe the previous layout until Yoga runs, so use the new sizes.
+    const choices = this.choices.visible ? this.request.questions[this.page]!.options!.length + 1 : 0
+    const fixed = 4 + choices
+    const heading = Math.max(1, Math.min(3, height - fixed - (this.editorBox.visible ? 1 : 0)))
+    const editor = this.editorBox.visible ? Math.max(1, Math.min(4, height - fixed - heading)) : 0
+    this.heading.height = heading
+    this.choices.height = choices
+    this.editorBox.height = Math.max(1, editor)
+    this.box.height = fixed + heading + editor
     this.renderActions()
   }
   handlePaste(event: PasteEvent): void {
