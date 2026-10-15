@@ -28,8 +28,9 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
-- `/settings` — change defaults for future conversations
-- `/memories` — manage this launch’s app-wide saved context
+- `/notes` — change the session-note default for new conversations
+- `/menu` — open independent actions (`/settings` remains a legacy alias)
+- `/memories` — manage this launch’s app-wide saved context and its future-launch default
 - `/commands` — inspect or disable reviewed unsandboxed command proposals
 - `/skills` — inspect instruction-only skills and prepare creator drafts
 - `/mcp` — configure and explicitly connect trusted installed stdio servers or HTTP endpoints for reviewed tools and resource reads
@@ -123,7 +124,7 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 ### Mouse controls
 
 The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Mode, Memory or Settings below the composer to open an action when the draft
+Effort, Mode, Memory or Skills below the composer to open an action when the draft
 is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
@@ -447,8 +448,8 @@ do not opt you into app-wide persistent-memory sharing.
 ## Persistent memory
 
 Memory is off by default. Use `--enable-memory` for a launch, or choose the future
-launch default in `/settings` in the full-screen UI. `--disable-memory` overrides
-an enabled saved default. `/memories` enables or disables the current launch and
+launch default in `/memories` → Future launch default in the full-screen UI.
+`--disable-memory` overrides an enabled saved default. `/memories` enables or disables the current launch and
 lets you list, add, edit and delete records. Back, Escape and Cancel never submit
 a change. Manager create, edit and delete actions show the exact proposal and
 require a fresh interactive approval: select Approve in the full-screen UI, or
@@ -461,7 +462,7 @@ session files, normally `~/.vivi/sessions`. When enabled, saved context is sent 
 the selected OpenAI or OpenRouter provider. Keep secrets out of memory. Disabling
 memory retains existing records and stops reading or using them. Memory stays
 enabled or disabled across provider/model changes, `/new` and `/resume` during
-the launch. Changing its `/settings` default affects future launches only.
+the launch. Changing its future-launch default affects future launches only.
 
 The store is shared by CLI sessions using that state directory. A custom
 `--session-dir` (or `VIVI_SESSION_DIR`) isolates its memory; desktop memory is

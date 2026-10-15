@@ -240,7 +240,7 @@ test('command completion clicks fill a draft without submitting and toolbar acti
   const pendingDraft = watch(draft)
   await f.input.typeText('Keep my draft')
   await f.frame()
-  await f.click('vivi-action-settings')
+  await f.click('vivi-action-menu')
   await pendingDraft()
   expect((f.node('vivi-composer') as TextareaRenderable).plainText).toBe('Keep my draft')
   expect(await f.frame()).toContain('Finish or clear your draft')

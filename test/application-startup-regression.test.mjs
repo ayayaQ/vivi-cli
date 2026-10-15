@@ -113,10 +113,10 @@ test('startup tools can actually read a workspace file before any model picker o
   assert.equal(io.results[0].status, 'completed')
 })
 
-test('saved startup and verified /settings then /new use the same workspace tools without changing the active host', async t => {
+test('saved startup and independent note defaults then /new retain the same workspace tools and active host', async t => {
   const context = await fixture(t), supplied = services()
   const io = fakeIO(['First', '/settings', 'Still first', '/new', 'Second', '/exit'],
-    ['openrouter', 'current', modelId, 'default', true, false])
+    ['/notes', true])
   const launches = [], turns = []
   assert.equal(await run(context, io, supplied, [], inspectTurns(launches, turns)), 0)
   assert.equal(launches.length, 2)
@@ -124,6 +124,8 @@ test('saved startup and verified /settings then /new use the same workspace tool
   assert.deepEqual(turns[0], turns[1])
   assertToolTurns(true, launches, turns)
   assert.deepEqual(turns[0], turns[2])
+  assert.deepEqual(io.choices, ['Conversation actions', 'Session notes · new-conversation default'])
+  assert.equal(supplied.calls.length, 1)
 })
 
 test('known-supported fresh OpenRouter selection hydrates without borrowing saved model capabilities', async t => {
