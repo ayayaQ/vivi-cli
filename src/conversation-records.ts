@@ -4,7 +4,7 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, opendir, rename, unlink } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
-import type { AgentAcceptedUpdate, AgentResult, HistoryMessage, ProviderResult } from '@ayayaq/vivi'
+import type { AgentAcceptedUpdate, AgentResult, HistoryMessage, ProviderResult, ToolCall, ToolResult } from '@ayayaq/vivi'
 import { AGENT_RECORD_LIMITS, agentArgumentsDigest, agentEvidenceDigest, applyAgentRecord,
   createAgentProjection, createRunSettlement, decodeAgentRecord } from '@ayayaq/vivi/events'
 import type { AgentHistoryEntry, AgentOutcomeEvidence, AgentProjection, DurableAgentRecord } from '@ayayaq/vivi/events'
@@ -17,6 +17,10 @@ import { assertMcpJson } from '@ayayaq/vivi/extensions/mcp'
 import { mcpOutcomeMatchesCall } from './mcp-outcomes.js'
 import type { McpOutcomeRecord } from './mcp-outcomes.js'
 import { publicUrlContainsSecret } from './public-url.js'
+import { isBuiltinReadTool } from './tools.js'
+
+/** Live host observation of a reserved read executor returning; never reconstructed from history. */
+export interface CliBuiltinReadReceipt { readonly call: ToolCall; readonly result: ToolResult }
 
 /** Complete-chain shadow storage. Canonical sessions and exact MCP receipts remain authoritative. */
 export const CLI_CONVERSATION_LIMITS = Object.freeze({ bytes: 64 * 1024 * 1024,
@@ -351,7 +355,8 @@ export class CliConversationRecords {
       await this.commit({ ...this.document, runs })
     })
   }
-  settle(runId: string, result: AgentResult, session: CliSession, rows: readonly McpOutcomeRecord[]): Promise<void> {
+  settle(runId: string, result: AgentResult, session: CliSession, rows: readonly McpOutcomeRecord[],
+    reads: readonly CliBuiltinReadReceipt[] = []): Promise<void> {
     return this.enqueue(async () => {
       if (!this.document) throw new Error('Missing conversation anchor')
       await this.assertStoredCurrent()
@@ -359,9 +364,28 @@ export class CliConversationRecords {
       if (!run) throw new Error('Missing run prefix')
       assertAgentRunCurrent(run, this.projection)
       const history = entries(session, run.history)
+      const outcomes = cliMcpRecordEvidence(session, rows, this.projection.outcomes)
+      for (const receipt of reads) {
+        const { call } = receipt
+        // Both an actual owned completion and the exact accepted canonical result
+        // are required. Cancellation closures, reused IDs and legacy reads supply neither.
+        if (!isBuiltinReadTool(call.name) || outcomes.some(item => item.callId === call.id) ||
+          reads.filter(item => item.call.id === call.id).length !== 1) continue
+        const calls = session.history.flatMap((message, index) => message.kind === 'assistant'
+          ? message.toolCalls.filter(item => item.id === call.id).map(item => ({ call: item, index })) : [])
+        const binding = calls[0]
+        if (calls.length !== 1 || !binding || binding.index < run.inputHistoryLength ||
+          !same(binding.call, call)) continue
+        const expected = { kind: 'tool_result', callId: call.id, name: call.name, ...receipt.result }
+        const results = session.history.filter(message => message.kind === 'tool_result' && message.callId === call.id)
+        if (results.length !== 1 || !same(results[0], expected)) continue
+        outcomes.push({ runId, callId: call.id, name: call.name, argumentsDigest: agentArgumentsDigest(call.arguments),
+          status: receipt.result.isError ? 'failed' : 'succeeded', effect: 'confirmed',
+          source: { reference: `cli-builtin-read:${runId}:${call.id}`, revision: hash(receipt) } })
+      }
       const terminal = createRunSettlement({ envelope: this.envelope(), runId,
         inputHistoryLength: run.inputHistoryLength, result, history,
-        outcomes: cliMcpRecordEvidence(session, rows, this.projection.outcomes), sessionUsage: session.usage })
+        outcomes, sessionUsage: session.usage })
       const wrapper = createAgentRunTerminal(this.runEnvelope(run), terminal)
       const next = applyAgentRunRecord(run, wrapper)
       this.projection = next.session; this.runs = this.runs.map(item => item === run ? next : item)

@@ -414,7 +414,10 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         accountRevision: () => accountRevision
       } } : {}),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
-      onEvent: (event) => io!.event(event) })
+      onEvent: (event) => {
+        if (event.type === 'tool_completed') io!.setToolEvidence?.(host!.toolPresentationEvidence)
+        io!.event(event)
+      } })
     await host.initialize()
     io.setApprovalMode?.('manual')
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)

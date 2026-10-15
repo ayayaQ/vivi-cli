@@ -12,6 +12,12 @@ import { isPlanTool, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
 export { calculate }
 
+/** Closed set of host-owned reads/informational tools. Names alone are not execution evidence. */
+export function isBuiltinReadTool(name: string): boolean {
+  return ['calculate', 'request_user_input', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'mcp_list',
+    'workspace_list', 'workspace_read', 'workspace_search', 'workspace_glob'].includes(name)
+}
+
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
 export interface ApprovalRequest {
   call: ToolCall

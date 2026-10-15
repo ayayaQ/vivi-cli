@@ -12,14 +12,14 @@ import type { CliQuestionHost } from './questions.js'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
-import { createBuiltinToolset } from './tools.js'
+import { createBuiltinToolset, isBuiltinReadTool } from './tools.js'
 import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { FileSessionStore, newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
 import { CliConversationRecords, FileCliConversationStore } from './conversation-records.js'
-import type { CliConversationStore, CliConversationView } from './conversation-records.js'
+import type { CliBuiltinReadReceipt, CliConversationStore, CliConversationView } from './conversation-records.js'
 import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES, WorkspaceError } from './workspace.js'
 import type { ReadOnlyWorkspace } from './workspace.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
@@ -1302,6 +1302,7 @@ export class CliHost {
     const pendingMcpDisplay = new Map<string, ToolCall>()
     const enteredMcpCalls = new Set<string>()
     const recordRows = new Map<string, McpOutcomeRecord>()
+    const builtinReads: CliBuiltinReadReceipt[] = []
     const captureRecordRows = (): void => { for (const row of this.safeMcpRows()) recordRows.set(row.id, row) }
     let failed = false, primaryFailure: unknown
     try {
@@ -1509,7 +1510,7 @@ export class CliHost {
               return Promise.resolve({ content: JSON.stringify({ success: false, error: 'Skill operation contains a known credential; it was blocked' }), isError: true })
             }
           }
-          const result = await toolset.executeTool(call, context.signal, {
+          let result = await toolset.executeTool(call, context.signal, {
           enableNotes,
           readNotes: () => this.notes(),
           commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
@@ -1517,7 +1518,7 @@ export class CliHost {
           approve: (request, signal) => this.approveWithPresentation(request, signal)
           })
           if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
-            return { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }
+            result = { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }
           }
           const accepted = ownedMcpNames.has(call.name) ? this.acceptedMcpRow(call) : undefined
           if (accepted?.state === 'accepted') {
@@ -1530,7 +1531,28 @@ export class CliHost {
             try { await this.persistMcpOutcomes() } catch { /* Accepted evidence still proves no send. */ }
             return safe
           }
-          return isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
+          const safeResult = isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
+          // Only advertised reserved reads are known to have no external operation.
+          // Generic extensions and all writes retain their domain-owned effect evidence.
+          if (allowedTools.has(call.name) && isBuiltinReadTool(call.name)) {
+            builtinReads.push({ call: structuredClone(call), result: structuredClone(safeResult) })
+            let requestIndex = -1
+            for (let index = this.current.history.length - 1; index >= this.presentationTurnStart; index--) {
+              const message = this.current.history[index]!
+              if (message.kind === 'assistant' && message.toolCalls.some(item => item.id === call.id && item.name === call.name &&
+                agentArgumentsDigest(item.arguments) === agentArgumentsDigest(call.arguments))) { requestIndex = index; break }
+            }
+            if (requestIndex >= 0) {
+              const canonical = { kind: 'tool_result', callId: call.id, name: call.name, ...safeResult }
+              this.presentationDecisions.push({ requestIndex, callId: call.id, name: call.name,
+                argumentsDigest: agentArgumentsDigest(call.arguments), status: safeResult.isError ? 'failed' : 'succeeded', effect: 'confirmed',
+                resultDigest: createHash('sha256').update(JSON.stringify(canonical)).digest('hex'),
+                source: { reference: `cli-builtin-read:${this.toolsetRevision}:${call.id}`,
+                  revision: createHash('sha256').update(JSON.stringify({ call, result: safeResult })).digest('hex') } })
+              if (this.presentationDecisions.length > 256) this.presentationDecisions.shift()
+            }
+          }
+          return safeResult
         },
         onAccepted: (update: AgentAcceptedUpdate) => {
           if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return
@@ -1666,7 +1688,7 @@ export class CliHost {
         }
       }
       captureRecordRows()
-      await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()])
+      await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()], builtinReads)
       await this.retireMcpOutcomes(canonicalResult.history)
       await this.retirePublicUrlOutcomes(canonicalResult.history)
       const safeFinal = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)

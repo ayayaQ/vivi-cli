@@ -58,7 +58,7 @@ test('host-observed successful local reads stay quiet without inferring authorit
 })
 
 test('the local-read whitelist is exact and excludes writes, MCP aliases and lookalike names', () => {
-  for (const name of ['current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'workspace_list',
+  for (const name of ['calculate', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'workspace_list',
     'workspace_read', 'workspace_search', 'workspace_glob']) assert.equal(isCliLocalReadTool(name), true, name)
   for (const name of ['note_set', 'fetch_url', 'command_start', 'workspace_create_text', 'workspace_edit_text',
     'mcp_owned_workspace_read', 'Workspace_read', 'workspace_read ', 'other.workspace_read', '']) assert.equal(isCliLocalReadTool(name), false, name)

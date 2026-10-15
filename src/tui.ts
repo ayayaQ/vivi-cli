@@ -30,7 +30,7 @@ import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { conversationModeLabel } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
 import { reviewNoticeSettled } from './auto-review.js'
-import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolCardView, cliToolSource, isCliLocalReadTool } from './tool-presentation.js'
+import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolCardView, cliToolSource, cliToolResultDecision, isCliLocalReadTool } from './tool-presentation.js'
 import type { CliToolEvidence } from './tool-presentation.js'
 import { mcpContainsSecret } from './mcp-content.js'
 import { WorkspaceDiffRenderable } from './tui-diff.js'
@@ -1929,9 +1929,12 @@ export class OpenTuiIO implements ChatIO {
       const source = resultIndex === undefined
         ? { ...cliToolSource(undefined, 0, event.message), reference: 'cli-live:unreported-result' }
         : cliToolSource(this.sessionId, resultIndex, event.message)
+      const decision = live && this.toolEvidence?.sessionId === this.sessionId
+        ? cliToolResultDecision(call, event.message, live.index, this.toolEvidence) : undefined
       let encoded: string
-      try { encoded = JSON.stringify(createCliToolPresentation({ call, result: event.message, status: 'unknown', effect: 'unreported',
-        source, secrets: this.secrets })) }
+      try { encoded = JSON.stringify(createCliToolPresentation({ call, result: event.message,
+        status: decision?.status ?? 'unknown', effect: decision?.effect ?? 'unreported',
+        source: decision?.source ?? source, secrets: this.secrets })) }
       catch { encoded = '' }
       const old = this.entries.find(entry => entry.tool?.key === live?.key)
       const entry: DisplayEntry = { category: 'activity', attention: !!event.message.isError,
