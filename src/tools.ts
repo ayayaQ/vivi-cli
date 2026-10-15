@@ -14,8 +14,23 @@ export { calculate }
 
 /** Closed set of host-owned reads/informational tools. Names alone are not execution evidence. */
 export function isBuiltinReadTool(name: string): boolean {
-  return ['calculate', 'request_user_input', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'mcp_list',
-    'workspace_list', 'workspace_read', 'workspace_search', 'workspace_glob'].includes(name)
+  return builtinToolOutcomePolicy(name) === 'local-read'
+}
+
+export type CliToolOutcomePolicy = 'local-read' | 'local-mutation' | 'command' | 'public-url' | 'mcp' | 'extension'
+/** Closed inventory. Adding an advertised owned tool requires an explicit evidence policy. */
+export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
+  calculate: 'local-read', current_time: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
+  list_memories: 'local-read', create_memory: 'local-mutation', edit_memory: 'local-mutation', delete_memory: 'local-mutation',
+  workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
+  workspace_create_text: 'local-mutation', workspace_edit_text: 'local-mutation',
+  list_skills: 'local-read', read_skill: 'local-read', request_user_input: 'local-read',
+  command_start: 'command', command_poll: 'command', command_stop: 'command', fetch_url: 'public-url',
+  mcp_list: 'local-read', mcp_setup: 'mcp', list_mcp_resources: 'local-read', read_mcp_resource: 'mcp', read_mcp_resource_template: 'mcp'
+} as const satisfies Record<string, CliToolOutcomePolicy>)
+export function builtinToolOutcomePolicy(name: string): CliToolOutcomePolicy | undefined {
+  return Object.hasOwn(BUILTIN_TOOL_OUTCOME_POLICIES, name)
+    ? BUILTIN_TOOL_OUTCOME_POLICIES[name as keyof typeof BUILTIN_TOOL_OUTCOME_POLICIES] : undefined
 }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
@@ -32,7 +47,7 @@ export interface ToolHost {
   commitNote(key: string, value: string, expectedRevision: number): Promise<number>
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
   /** Prepared note writes go through host-owned review/commit, never a replacement IO judge. */
-  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | undefined>
+  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | { readonly revision: number; readonly durabilityUnconfirmed: true } | undefined>
   now?(): Date
 }
 const objectSchema = (properties: Record<string, unknown>, required: string[]): ToolDefinition['parameters'] =>
@@ -57,6 +72,7 @@ function hostTools(enableNotes = false): ToolDefinition[] {
 export function createBuiltinToolset(enableNotes = false, extensions: readonly ToolExtension[] = [], memory?: ToolExtension, workspace?: ToolExtension, skills?: ToolExtension, commands?: ToolExtension, mcp?: ToolExtension, publicUrl?: ToolExtension, taskMode: TaskMode = 'execute', questions?: ToolExtension, mcpSetup?: ToolExtension): {
   tools: ToolDefinition[]
   readonly signal: AbortSignal
+  readonly outcomePolicies: ReadonlyMap<string, CliToolOutcomePolicy>
   defer(cleanup: ExtensionCleanup): void
   dispose(): Promise<void>
   executeTool(call: ToolCall, signal: AbortSignal, host: ToolHost): Promise<ToolResult>
@@ -80,9 +96,23 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
     const tools = [...registry.tools, ...hostTools(enableNotes), ...builtinRegistry.tools]
       .filter(tool => taskMode !== 'plan' || isPlanTool(tool.name))
     const allowed = new Set(tools.map(tool => tool.name))
+    const outcomePolicies = new Map<string, CliToolOutcomePolicy>()
+    const own = (name: string): void => {
+      const policy = builtinToolOutcomePolicy(name)
+      if (!policy) throw new Error(`Owned tool has no outcome policy: ${name}`)
+      outcomePolicies.set(name, policy)
+    }
+    for (const tool of calculatorExtension.tools) own(tool.definition.name)
+    for (const tool of hostTools(enableNotes)) if (allowed.has(tool.name)) own(tool.name)
+    for (const extension of [memory, workspace, skills, questions, mcpSetup, ...(taskMode === 'plan' ? [] : [commands, publicUrl])]) {
+      for (const tool of extension?.tools ?? []) if (allowed.has(tool.definition.name)) own(tool.definition.name)
+    }
+    for (const tool of mcp?.tools ?? []) if (allowed.has(tool.definition.name)) outcomePolicies.set(tool.definition.name, builtinToolOutcomePolicy(tool.definition.name) ?? 'mcp')
+    for (const tool of tools) if (!outcomePolicies.has(tool.name)) outcomePolicies.set(tool.name, 'extension')
     return {
       tools,
       signal: scope.signal,
+      outcomePolicies,
       defer: cleanup => scope.defer(cleanup),
       dispose: () => scope.dispose(),
       executeTool: async (call, signal, host) => {
@@ -155,7 +185,7 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
       if (host.reviewNote) {
         const revision = await host.reviewNote(call, before, key, value, signal)
         return revision === undefined ? error('approval_denied', 'This note change was not approved')
-          : { content: JSON.stringify({ success: true, key, revision }) }
+          : { content: JSON.stringify({ success: true, key, ...(typeof revision === 'number' ? { revision } : revision) }) }
       }
       if (!await host.approve({ call, description: `Set session note ${JSON.stringify(key)} to ${JSON.stringify(value)}`,
         currentRevision: before.revision }, signal)) return error('approval_denied', 'Human denied this note change')

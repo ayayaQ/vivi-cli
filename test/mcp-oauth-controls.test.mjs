@@ -205,7 +205,7 @@ for (const protocol of ['legacy', '2026-07-28']) test(`${protocol} signed-in tem
   assert.equal(subject.requests.find(item => item.message.method === 'resources/read').headers.get('authorization'), 'Bearer fixture-secret-access-token-1')
   assert.match(JSON.stringify(completed.history), /OWNED_OAUTH_RESOURCE/)
   assert(JSON.stringify(host.conversationRecords.projection).includes(expandedUri))
-  assert(host.conversationRecords.projection.outcomes.some(item => item.effect === 'confirmed' && item.status === 'succeeded'))
+  assert(host.conversationRecords.projection.outcomes.some(item => item.effect === 'unknown' && item.status === 'succeeded'))
   clean([signInIo.approvals, approvals, completed.history, host.conversationRecords.projection])
   assert.equal(subject.oauthRequests.filter(item => item.method === 'POST').length, 1)
 })

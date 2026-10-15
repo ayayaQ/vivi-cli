@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { FilePublicUrlOutcomeStore, validatePublicUrlOutcomes, reconcilePublicUrlOutcomes,
-  publicUrlOutcomeResult, unattemptedPublicUrlResult, MAX_PUBLIC_URL_OUTCOME_ROWS } from '../dist/public-url-outcomes.js'
+  cliPublicUrlRecordOutcome, publicUrlOutcomeResult, unattemptedPublicUrlResult, MAX_PUBLIC_URL_OUTCOME_ROWS } from '../dist/public-url-outcomes.js'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
 
 const sessionId = randomUUID(), runId = randomUUID()
@@ -19,6 +19,22 @@ async function store(t, secrets = []) {
   const root = await mkdtemp(join(tmpdir(), 'vivi-public-url-outcomes-')); t.after(() => rm(root, { recursive: true, force: true }))
   return { root, subject: new FilePublicUrlOutcomeStore(root, secrets) }
 }
+
+test('owned URL outcomes separate retrieval status, unsent HTTP and arbitrary server effects', () => {
+  assert.deepEqual(cliPublicUrlRecordOutcome(row({ state: 'accepted' })), { status: 'cancelled', effect: 'unknown' })
+  assert.deepEqual(cliPublicUrlRecordOutcome(row()), { status: 'unknown', effect: 'unknown' })
+  assert.deepEqual(cliPublicUrlRecordOutcome(row({ state: 'settled', result: unattemptedPublicUrlResult('approval_denied') })),
+    { status: 'denied', effect: 'not_attempted' })
+  const classify = body => cliPublicUrlRecordOutcome(row({ state: 'settled', result: { content: JSON.stringify({ source: 'public_url', ...body }) } }))
+  assert.deepEqual(classify({ success: true, serverEffects: 'confirmed' }), { status: 'succeeded', effect: 'unknown' })
+  assert.deepEqual(classify({ success: false, serverEffects: 'unknown', requests: [{ transmission: 'observed' }], error: { code: 'body_limit' } }),
+    { status: 'failed', effect: 'unknown' })
+  assert.deepEqual(classify({ success: false, serverEffects: 'not_attempted', networkActivity: 'possible', requests: [{ transmission: 'not_attempted' }], error: { code: 'transport_failed' } }),
+    { status: 'failed', effect: 'unknown' })
+  assert.deepEqual(classify({ success: false, serverEffects: 'not_attempted', requests: [], error: { code: 'dns_error' } }),
+    { status: 'failed', effect: 'unknown' }, 'Legacy HTTP no-send data does not prove absence of network metadata disclosure')
+  assert.deepEqual(classify({ success: false, unknownOutcome: true, serverEffects: 'not_attempted' }), { status: 'unknown', effect: 'unknown' })
+})
 test('URL outcome evidence is detached closed JSON and contains no executable receipt', () => {
   const input = [row()], checked = validatePublicUrlOutcomes(sessionId, input)
   assert.deepEqual(checked, input); input[0].state = 'accepted'; assert.equal(checked[0].state, 'intent')
@@ -50,7 +66,10 @@ test('only matching canonical occurrence can receive unknown or settled recovery
   assert.deepEqual(reconcilePublicUrlOutcomes(history(), sessionId, [settled])[1], { kind: 'tool_result', callId: call.id, name: call.name, ...settled.result })
 })
 test('accepted evidence proves no HTTP attempt; intent proves only possible transmission', () => {
-  assert.equal(JSON.parse(publicUrlOutcomeResult(row({ state: 'accepted' })).content).transmission, 'not_attempted')
+  const accepted = JSON.parse(publicUrlOutcomeResult(row({ state: 'accepted' })).content)
+  assert.equal(accepted.transmission, 'not_attempted'); assert.equal(accepted.serverEffects, 'not_attempted')
+  assert.equal(accepted.networkActivity, 'possible'); assert.equal(accepted.doNotRetry, true)
+  assert.deepEqual(cliPublicUrlRecordOutcome(row({ state: 'accepted' })), { status: 'cancelled', effect: 'unknown' })
   const unknown = JSON.parse(publicUrlOutcomeResult(row()).content)
   assert.equal(unknown.transmission, 'unknown'); assert.equal(unknown.serverEffects, 'unknown'); assert.equal(unknown.success, false)
 })

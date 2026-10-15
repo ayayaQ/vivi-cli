@@ -254,5 +254,5 @@ for (const kind of ['tools', 'resourceTemplates']) test(`HTTP host retains exact
     assert(approvals[0].description.includes(expandedUri)); assert.equal(subject.effects[0].params.uri, expandedUri)
     assert(JSON.stringify(host.conversationRecords.projection).includes(expandedUri))
   }
-  assert(host.conversationRecords.projection.outcomes.some(item => item.effect === 'confirmed' && item.status === 'succeeded'))
+  assert(host.conversationRecords.projection.outcomes.some(item => item.effect === 'unknown' && item.status === 'succeeded'))
 })

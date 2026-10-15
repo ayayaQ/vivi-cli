@@ -544,12 +544,14 @@ export class McpManager {
   }
   private withOutcome(result: ToolResult, requestSent: boolean, confirmedOutcome = false): ToolResult {
     const body = JSON.parse(result.content) as Record<string, unknown>
-    const projection = { ...body, requestSent, ...(requestSent ? { doNotRetry: true } : {}), ...(confirmedOutcome ? { confirmedOutcome: true } : {}) }
+    const projection = { ...body, requestSent, serverEffects: requestSent ? 'unknown' : 'not_attempted',
+      ...(requestSent ? { doNotRetry: true } : {}), ...(confirmedOutcome ? { confirmedOutcome: true } : {}) }
     try { assertMcpJson(projection, MCP_OPERATION_LIMITS.resultBytes) }
     catch {
       // Adding outcome evidence can exceed the otherwise valid projection budget.
       // Preserve the confirmed status without clipping JSON or changing success into failure.
       const withheld = { success: body.success === true, source: 'mcp', untrusted: true, requestSent,
+        serverEffects: requestSent ? 'unknown' : 'not_attempted',
         ...(requestSent ? { doNotRetry: true } : {}), ...(confirmedOutcome ? { confirmedOutcome: true } : {}), contentWithheld: true }
       return { content: JSON.stringify(withheld), ...(result.isError ? { isError: true } : {}) }
     }
@@ -609,6 +611,7 @@ export class McpManager {
       const evidence = JSON.parse(result.content) as Record<string, unknown>
       result = { content: JSON.stringify({ success: evidence.success === true, source: 'mcp', untrusted: true,
         requestSent: evidence.requestSent === true, ...(evidence.confirmedOutcome ? { confirmedOutcome: true } : {}),
+        serverEffects: evidence.requestSent === true ? 'unknown' : 'not_attempted',
         ...(evidence.unknownOutcome ? { unknownOutcome: true } : {}), ...(evidence.doNotRetry ? { doNotRetry: true } : {}), contentWithheld: true }),
         ...(result.isError ? { isError: true } : {}) }
     }

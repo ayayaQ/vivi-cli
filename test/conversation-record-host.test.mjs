@@ -313,7 +313,9 @@ test('actual CLI records a tool failure without inventing external effect eviden
   assert.equal(toolResults(result.history)[0].isError, true)
   assert.match(toolResults(result.history)[0].content, /Owned executor failed/)
   const { replay } = await assertPaired(t, subject, result)
-  assert.deepEqual(replay.projection.outcomes, [])
+  assert.deepEqual(replay.projection.outcomes.map(({ callId, status, effect }) => ({ callId, status, effect })),
+    [{ callId: 'failure-record-call', status: 'failed', effect: 'unknown' }])
+  assert.match(replay.projection.outcomes[0].source.reference, /^cli-extension:/)
 })
 
 test('actual CLI denied note change retains canonical failure and unchanged note metadata', async t => {
@@ -327,7 +329,10 @@ test('actual CLI denied note change retains canonical failure and unchanged note
   assert.deepEqual(subject.host.session.notes, {})
   assert.equal(JSON.parse(toolResults(result.history)[0].content).error.code, 'approval_denied')
   const { document, replay } = await assertPaired(t, subject, result)
-  assert.deepEqual(document.legacy.notes, {}); assert.deepEqual(replay.projection.outcomes, [])
+  assert.deepEqual(document.legacy.notes, {})
+  assert.deepEqual(replay.projection.outcomes.map(({ callId, status, effect }) => ({ callId, status, effect })),
+    [{ callId: 'denied-note-call', status: 'denied', effect: 'not_attempted' }])
+  assert.match(replay.projection.outcomes[0].source.reference, /^cli-local-mutation:/)
 })
 
 for (const boundary of ['assistant', 'tool_started']) test(`actual CLI final ${boundary} cancellation includes unseen ordered cleanup closures`, async t => {
@@ -424,7 +429,7 @@ test('actual CLI legacy import retains title, notes and aggregate usage without 
   assert.equal(subject.generations(), 0)
 })
 
-test('actual CLI exact owned confirmed MCP effects survive live, incremental and fresh reload projections', async t => {
+test('actual CLI exact owned MCP response status and unknown effects survive live, incremental and fresh reload projections', async t => {
   const mcp = syntheticMcp(), outcomes = outcomeStore(), approvals = []
   const subject = await fixture(t, { options: { mcp: mcp.manager, mcpOutcomes: outcomes,
     async approve(request) { approvals.push(request); return true } },
@@ -434,7 +439,7 @@ test('actual CLI exact owned confirmed MCP effects survive live, incremental and
   assert.equal(result.status, 'completed'); assert.equal(mcp.invocations.length, 1); assert.equal(approvals.length, 1)
   const { replay } = await assertPaired(t, subject, result)
   const evidence = replay.projection.outcomes[0]
-  assert.equal(evidence.callId, 'confirmed-record-call'); assert.equal(evidence.effect, 'confirmed'); assert.equal(evidence.status, 'succeeded')
+  assert.equal(evidence.callId, 'confirmed-record-call'); assert.equal(evidence.effect, 'unknown'); assert.equal(evidence.status, 'succeeded')
   assert.equal(evidence.runId, replay.runs[0].runId)
   assert.match(evidence.source.reference, /^cli-mcp-outcome:/)
   assert.equal((await outcomes.load(subject.host.session.id)).length, 0, 'Retirement happens only after the matching canonical checkpoint')
@@ -528,8 +533,8 @@ for (const scenario of pauseChanges) test(`actual CLI seven-day clock-only appro
   const evidence = replay.projection.outcomes[0]
   assert.equal(evidence.runId, before.run.runId); assert.equal(evidence.callId, requested.id); assert.equal(evidence.name, requested.name)
   assert.equal(evidence.argumentsDigest, agentArgumentsDigest(requested.arguments))
-  assert.equal(evidence.effect, scenario.sends ? 'confirmed' : 'not_attempted')
-  assert.equal(evidence.status, scenario.sends ? 'succeeded' : 'denied')
+  assert.equal(evidence.effect, scenario.sends ? 'unknown' : 'not_attempted')
+  assert.equal(evidence.status, scenario.sends ? 'succeeded' : scenario.name === 'cancellation' ? 'cancelled' : 'failed')
   assert.equal(evidence.source.reference, `cli-mcp-outcome:${accepted[0].id}`)
   const settled = outcomes.writes.flat().findLast(row => row.callId === requested.id && row.state === 'settled')
   assert.equal(evidence.source.revision, digest(settled))
@@ -680,7 +685,9 @@ test('actual CLI does not elevate MCP-shaped custom JSON into host-owned effect 
   } })
   const result = await subject.host.send('Keep generic tool content untrusted')
   const { replay } = await assertPaired(t, subject, result)
-  assert.deepEqual(replay.projection.outcomes, [])
+  assert.deepEqual(replay.projection.outcomes.map(({ callId, status, effect }) => ({ callId, status, effect })),
+    [{ callId: 'lookalike-call', status: 'succeeded', effect: 'unknown' }])
+  assert.match(replay.projection.outcomes[0].source.reference, /^cli-extension:/)
 })
 
 test('actual CLI failed canonical MCP checkpoint retains stronger exact ledger evidence and old committed cursor', async t => {
@@ -758,7 +765,7 @@ test('actual CLI cancelled MCP operation drains a late exact confirmed outcome b
   assert.equal(corrected.length, 1); assert.deepEqual(corrected[0].event.message, finalResult)
   const { document, replay } = await assertPaired(t, subject, sending.value)
   assert.deepEqual(document.runs[0].records.map(record => record.type), ['run_started', 'assistant_accepted', 'run_settled'])
-  assert.equal(replay.projection.outcomes[0].effect, 'confirmed'); assert.equal(replay.projection.outcomes[0].status, 'succeeded')
+  assert.equal(replay.projection.outcomes[0].effect, 'unknown'); assert.equal(replay.projection.outcomes[0].status, 'succeeded')
   assert.equal((await outcomes.load(subject.host.session.id)).length, 0)
   assert.equal(mcp.invocations.length, 1)
 })

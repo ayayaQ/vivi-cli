@@ -27,6 +27,9 @@ export interface PublicUrlRequest {
   method: 'GET'
   headers: Readonly<Record<string, string>>
   signal: AbortSignal
+  /** Owned transport boundary, immediately before HTTP request construction.
+   * DNS/TLS may already have disclosed network metadata before this callback. */
+  onDispatch?(): void
   onTransmit(): void
   assertCurrent(): void
 }
@@ -51,6 +54,11 @@ const nativeDependencies: PublicUrlTransportDependencies = {
   createResolver: () => new Resolver({ timeout: PUBLIC_URL_TRANSPORT_LIMITS.dnsMilliseconds, tries: 1 }),
   connect: options => tlsConnect(options),
   request: (options, callback) => httpsRequest(options, callback),
+}
+const ownedPublicUrlRequests = new WeakSet<(input: PublicUrlRequest) => Promise<PublicUrlResponse>>()
+/** A function's code-owned send boundary cannot be advertised by result JSON. */
+export function publicUrlRequestHasSendBoundary(request: (input: PublicUrlRequest) => Promise<PublicUrlResponse>): boolean {
+  return ownedPublicUrlRequests.has(request)
 }
 function fail(code: PublicUrlTransportCode): never { throw new PublicUrlTransportError(code) }
 const knownCodes: ReadonlySet<string> = new Set<PublicUrlTransportCode>(['cancelled', 'stale_owner', 'non_public_host',
@@ -313,6 +321,7 @@ export function createPublicUrlTransport(dependencies: PublicUrlTransportDepende
           // No agent, proxy environment, DNS lookup, alternate IP, retry, or TLS
           // session reuse is involved in this direct connection.
           current()
+          input.onDispatch?.()
           request = dependencies.request({ protocol: 'https:', hostname: input.hostname, port: 443,
             method: 'GET', path: `${url.pathname}${url.search}`, agent: undefined,
             createConnection: () => { current(); return socket! },
@@ -359,6 +368,7 @@ export function createPublicUrlTransport(dependencies: PublicUrlTransportDepende
       } catch (error) { stop(error) }
     })
   }
+  ownedPublicUrlRequests.add(requestPublicUrl)
   return { resolvePublicUrlHost, requestPublicUrl }
 }
 const nativeTransport = createPublicUrlTransport()

@@ -45,6 +45,7 @@ test('durable send-intent failure stops before entering transport', async () => 
   assert.equal(result.success, false); assert.equal(result.error.code, 'transport_failed')
   assert.equal(subject.state.lookups, 1); assert.equal(subject.state.requests.length, 0)
   assert.deepEqual(result.requests, []); assert.equal(result.serverEffects, 'not_attempted')
+  assert.equal(result.networkActivity, 'possible'); assert.equal(result.doNotRetry, true)
   assert(!JSON.stringify(result).includes('private.example'))
 })
 test('durable send-intent await rechecks secrets and owner before transport', async () => {

@@ -39,7 +39,7 @@ function validateSetupArguments(args: unknown): void {
     endpoint: args.endpoint, protocol: args.protocol ?? 'auto', allowLoopbackHttp: false })
 }
 
-function withheldResult(result: ToolResult, local: boolean, screeningUnavailable = false): ToolResult {
+function withheldResult(result: ToolResult, local: boolean, screeningUnavailable = false, secrets: readonly string[] = []): ToolResult {
   let body: unknown
   try { body = JSON.parse(result.content) } catch { /* Unreported effects remain uncertain. */ }
   const record = mcpRecord(body) ? body : undefined
@@ -52,9 +52,15 @@ function withheldResult(result: ToolResult, local: boolean, screeningUnavailable
       ...(!success ? { isError: true } : {}) }
   }
   const confirmed = record?.unknownOutcome !== true && record?.confirmedOutcome === true && typeof record.success === 'boolean'
+  const safeEffects = confirmed && !screeningUnavailable && !mcpContainsSecret([record?.knownEffects ?? null, record?.effectReceipt ?? null], secrets)
+    ? { ...(Array.isArray(record?.knownEffects) ? { knownEffects: record.knownEffects } : {}),
+      ...(record?.effectReceipt && typeof record.effectReceipt === 'object' ? { effectReceipt: record.effectReceipt } : {}) } : {}
   return { content: JSON.stringify({ success: confirmed ? record?.success : false, source: 'mcp-setup',
     contentWithheld: true, doNotRetry: true,
-    ...(confirmed ? { confirmedOutcome: true } : { unknownOutcome: true }),
+    ...(confirmed ? { confirmedOutcome: true, ...safeEffects,
+      ...(record?.setupIncomplete === true ? { setupIncomplete: true } : {}),
+      ...(record?.cleanupUnverified === true ? { cleanupUnverified: true } : {}),
+      ...(record?.durabilityUnverified === true ? { durabilityUnverified: true } : {}) } : { unknownOutcome: true }),
     message: screeningUnavailable ? 'MCP setup content was withheld because credential screening is unavailable. Inspect /mcp before retrying'
       : 'MCP setup content was withheld because it contains a known credential. Inspect /mcp before retrying' }),
     ...(result.isError || !confirmed || record?.success === false ? { isError: true } : {}) }
@@ -98,7 +104,7 @@ export function createMcpSetupExtension(host: McpSetupToolHost): ToolExtension {
     }
     // Do not discard a trusted confirmed outcome merely because cancellation
     // happened after its effect. The service owns effect/unknown-outcome reporting.
-    try { return mcpContainsSecret(result, secrets()) ? withheldResult(result, local) : result }
+    try { return mcpContainsSecret(result, secrets()) ? withheldResult(result, local, false, secrets()) : result }
     catch { return withheldResult(result, local, true) }
   }
   return { id: 'vivi-cli-mcp-setup', apiVersion: 1, tools: [

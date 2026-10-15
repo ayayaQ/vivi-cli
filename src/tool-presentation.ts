@@ -15,8 +15,10 @@ export type CliToolDecision = {
   readonly name: string
   readonly argumentsDigest: string
   readonly source: ToolPresentation['source']
-} & ({ readonly status: 'denied' | 'cancelled'; readonly effect: 'not_attempted' }
-  | { readonly status: 'succeeded' | 'failed'; readonly effect: 'confirmed'; readonly resultDigest: string })
+  readonly status: AgentOutcomeEvidence['status']
+  readonly effect: AgentOutcomeEvidence['effect']
+  readonly resultDigest?: string
+}
 export interface CliToolEvidence { readonly sessionId: string; readonly projection?: AgentProjection; readonly decisions?: readonly CliToolDecision[] }
 export interface CliToolPresentationInput {
   readonly call: ToolCall
@@ -76,7 +78,7 @@ export function cliToolResultDecision(call: ToolCall, result: ToolResultMessage,
   evidence?: CliToolEvidence): CliToolDecision | undefined {
   return evidence?.decisions?.find(item => item.requestIndex === requestIndex && item.callId === call.id &&
     item.name === call.name && item.argumentsDigest === agentArgumentsDigest(call.arguments) &&
-    (item.effect === 'not_attempted' || item.resultDigest === hash(result)))
+    (item.resultDigest === undefined ? item.effect === 'not_attempted' : item.resultDigest === hash(result)))
 }
 export function cliHistoryToolPresentation(history: readonly HistoryMessage[], index: number, sessionId?: string,
   evidence?: CliToolEvidence, secrets: readonly string[] = []): ToolPresentation {
@@ -90,9 +92,14 @@ export function cliHistoryToolPresentation(history: readonly HistoryMessage[], i
   }
   const exactCall = call ?? { id: result.callId, name: result.name, arguments: {} }
   const exact = evidence && evidence.sessionId === sessionId && call &&
+    evidence.projection?.sessionId === sessionId &&
+    history.filter(message => message.kind === 'tool_result' && message.callId === call.id).length === 1 &&
+    JSON.stringify(evidence.projection?.history[requestIndex]?.message) === JSON.stringify(history[requestIndex]) &&
     JSON.stringify(evidence.projection?.history[index]?.message) === JSON.stringify(result)
     ? cliToolOutcome(call, history, evidence) : undefined
-  const decision = evidence && evidence.sessionId === sessionId && call
+  const decision = evidence && evidence.sessionId === sessionId && call &&
+    history.filter(message => message.kind === 'assistant').flatMap(message => message.toolCalls).filter(item => item.id === call.id).length === 1 &&
+    history.filter(message => message.kind === 'tool_result' && message.callId === call.id).length === 1
     ? cliToolResultDecision(call, result, requestIndex, evidence) : undefined
   return createCliToolPresentation({ call: exactCall, result, status: exact?.status ?? decision?.status ?? 'unknown', effect: exact?.effect ?? decision?.effect ?? 'unreported',
     source: exact?.source ?? decision?.source ?? cliToolSource(sessionId, index, result), secrets,
@@ -163,7 +170,7 @@ export function cliToolCardView(encoded: string, collapsed = true, detailBytes =
       : snapshot.status === 'approval_required' ? 'approval required' : snapshot.status === 'succeeded' ? ''
       : snapshot.status === 'unknown' ? external ? 'unverified' : '' : snapshot.status
     if (observed.resultError && snapshot.status === 'unknown') status = external ? 'error/unverified' : 'error result'
-    if (snapshot.effect === 'unknown') status = !status || status === 'unverified' ? 'effects unknown'
+    if (snapshot.effect === 'unknown') status = snapshot.status === 'succeeded' ? 'completed/effects unknown' : !status || status === 'unverified' ? 'effects unknown'
       : `${snapshot.status === 'approval_required' ? 'approval' : status.split('/')[0]}/unknown`
     else if (external && snapshot.effect === 'unreported' && ['failed', 'cancelled', 'denied', 'succeeded'].includes(snapshot.status))
       status = status === 'cancelled' ? 'cancelled/unknown' : status ? `${status}/unverified` : 'unverified'

@@ -69,7 +69,7 @@ test('exact evidence is bound to session, occurrence, arguments and canonical re
 })
 
 function memoryStore() { let value; return { async save(session) { value = structuredClone(session) }, async load() { return structuredClone(value) } } }
-for (const failure of [false, true]) test(`actual host generic ${failure ? 'error' : 'success'} remains unreported and cold replay executes nothing`, async t => {
+for (const failure of [false, true]) test(`actual host generic ${failure ? 'error' : 'success'} confirms only executor completion and cold legacy replay executes nothing`, async t => {
   const store = memoryStore(), evidence = [], events = [], inputs = []
   let rounds = 0, executions = 0
   const host = await CliHost.create({ store, settings: { provider: 'openai', model: 'offline' },
@@ -84,8 +84,8 @@ for (const failure of [false, true]) test(`actual host generic ${failure ? 'erro
   assert.equal(result.status, 'completed'); assert.equal(executions, 1); assert.equal(evidence.length, 2)
   const index = result.history.findIndex(message => message.kind === 'tool_result')
   const snapshot = cliHistoryToolPresentation(result.history, index, host.session.id, evidence.at(-1))
-  assert.equal(snapshot.status, 'unknown'); assert.equal(snapshot.effect, 'unreported')
-  assert(snapshot.source.reference.includes(`history:${index}`))
+  assert.equal(snapshot.status, failure ? 'failed' : 'succeeded'); assert.equal(snapshot.effect, 'unknown')
+  assert(snapshot.source.reference.startsWith('cli-extension:'))
   assert(events.some(event => event.type === 'tool_completed'))
   const cold = new CliHost({ session: await store.load(), store, provider: { async generate() { assert.fail('Replay cannot call a provider') } } })
   t.after(() => cold.shutdown()); await cold.initialize()
@@ -120,7 +120,7 @@ async function mcpFixture(t, mode) {
   t.after(async () => { await host.shutdown(); await manager.close(); await rm(directory, { recursive: true, force: true }) })
   return { host, sends: () => sends, approvals: () => approvals }
 }
-for (const [mode, status, effect, sends] of [['succeeded', 'succeeded', 'confirmed', 1], ['failed', 'failed', 'confirmed', 1],
+for (const [mode, status, effect, sends] of [['succeeded', 'succeeded', 'unknown', 1], ['failed', 'failed', 'unknown', 1],
   ['denied', 'denied', 'not_attempted', 0], ['unknown', 'unknown', 'unknown', 1]]) test(`actual host exact MCP ${mode} uses outcome provenance and preserves authority`, async t => {
   const f = await mcpFixture(t, mode), result = await f.host.send('Use owned fixture')
   const index = result.history.findIndex(message => message.kind === 'tool_result')

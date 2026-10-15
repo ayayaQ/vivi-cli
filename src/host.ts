@@ -12,14 +12,14 @@ import type { CliQuestionHost } from './questions.js'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
-import { createBuiltinToolset, isBuiltinReadTool } from './tools.js'
+import { createBuiltinToolset } from './tools.js'
 import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
 import { FileSessionStore, newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
 import { CliConversationRecords, FileCliConversationStore } from './conversation-records.js'
-import type { CliBuiltinReadReceipt, CliConversationStore, CliConversationView } from './conversation-records.js'
+import type { CliToolReceipt, CliConversationStore, CliConversationView } from './conversation-records.js'
 import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES, WorkspaceError } from './workspace.js'
 import type { ReadOnlyWorkspace } from './workspace.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
@@ -39,14 +39,14 @@ import type { McpSetupService, McpSetupEffectReceipt } from './mcp-setup.js'
 import type { ChatIO } from './terminal.js'
 import { mcpContainsSecret } from './mcp-content.js'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
-import { MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOutcomeResult, reconcileMcpOutcomes, unattemptedMcpResult, unresolvedMcpResult, validateMcpOutcomes } from './mcp-outcomes.js'
+import { cliMcpRecordOutcome, MAX_MCP_OUTCOME_ROWS, FileMcpOutcomeStore, mcpOutcomeMatchesCall, mcpOutcomeResult, reconcileMcpOutcomes, unattemptedMcpResult, unresolvedMcpResult, validateMcpOutcomes } from './mcp-outcomes.js'
 import type { McpOutcomeRecord, McpOutcomeStore } from './mcp-outcomes.js'
 import type { CliToolDecision, CliToolEvidence } from './tool-presentation.js'
 import { agentArgumentsDigest } from '@ayayaq/vivi/events'
 import { fetchPublicUrl, preparePublicUrl, publicUrlContainsSecret, PUBLIC_URL_LIMITS } from './public-url.js'
 import type { PublicUrlAdapters } from './public-url.js'
 import { createPublicUrlExtension, PUBLIC_URL_GUIDANCE } from './public-url-tools.js'
-import { FilePublicUrlOutcomeStore, MAX_PUBLIC_URL_OUTCOME_ROWS, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult, reconcilePublicUrlOutcomes, unresolvedPublicUrlResult, unattemptedPublicUrlResult, validatePublicUrlOutcomes } from './public-url-outcomes.js'
+import { cliPublicUrlRecordOutcome, FilePublicUrlOutcomeStore, MAX_PUBLIC_URL_OUTCOME_ROWS, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult, reconcilePublicUrlOutcomes, unresolvedPublicUrlResult, unattemptedPublicUrlResult, validatePublicUrlOutcomes } from './public-url-outcomes.js'
 import type { PublicUrlOutcomeRecord, PublicUrlOutcomeStore } from './public-url-outcomes.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
@@ -93,12 +93,19 @@ function withholdMcpResult<T extends ToolResult>(result: T, secrets: readonly st
     record?.source === 'mcp' && typeof record.success === 'boolean' && Array.isArray(record.content) &&
     ['tools/call', 'resources/read'].includes(String(record.method)))
   const succeeded = localListing || record?.success === true
+  // Withholding unrelated text must not erase safe, observed local setup receipts.
+  const setupEffects = setupConfirmed && !mcpContainsSecret([record?.knownEffects ?? null, record?.effectReceipt ?? null], secrets)
+    ? { ...(Array.isArray(record?.knownEffects) ? { knownEffects: record.knownEffects } : {}),
+      ...(record?.effectReceipt && typeof record.effectReceipt === 'object' ? { effectReceipt: record.effectReceipt } : {}) } : {}
+  const setupFlags = setupConfirmed ? { ...(record?.setupIncomplete === true ? { setupIncomplete: true } : {}),
+    ...(record?.cleanupUnverified === true ? { cleanupUnverified: true } : {}),
+    ...(record?.durabilityUnverified === true ? { durabilityUnverified: true } : {}) } : {}
   const projection = notSent
     ? { success: false, source: 'mcp', untrusted: true, contentWithheld: true, requestSent: false,
       error: { code: 'mcp_content_withheld', message: 'MCP request was not sent; its diagnostic content was withheld because it contains a known credential' } }
     : confirmed
     ? { success: succeeded, source: setupConfirmed ? 'mcp-setup' : 'mcp', untrusted: true, contentWithheld: true, confirmedOutcome: true,
-      ...(localListing ? { localMetadataOnly: true, requestSent: false } : setupConfirmed ? { doNotRetry: true } : { requestSent: true, doNotRetry: true }),
+      ...(localListing ? { localMetadataOnly: true, requestSent: false } : setupConfirmed ? { doNotRetry: true, ...setupEffects, ...setupFlags } : { requestSent: true, doNotRetry: true }),
       message: localListing ? 'The local MCP metadata listing completed, but its content was withheld because it contains a known credential. No remote request was sent'
         : setupConfirmed ? 'MCP setup has a confirmed effect; credential-containing content was withheld. Inspect /mcp before retrying'
         : 'MCP returned a confirmed response; its content was withheld because it contains a known credential. Do not repeat the operation to recover withheld content' }
@@ -159,10 +166,13 @@ function withholdPublicUrlResult<T extends ToolResult>(result: T, secrets: reado
   let body: Record<string, unknown> = {}
   try { body = JSON.parse(result.content) as Record<string, unknown> } catch { /* Unknown remains unknown. */ }
   const notAttempted = body.serverEffects === 'not_attempted' && body.unknownOutcome !== true
-  return { ...result, isError: true, content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,
-    contentWithheld: true, transmission: notAttempted ? 'not_attempted' : 'unknown',
-    serverEffects: notAttempted ? 'not_attempted' : 'unknown', ...(notAttempted ? {} : { doNotRetry: true }),
-    error: { code: 'public_url_content_withheld', message: 'Public URL content was withheld because it contains a known credential. Do not repeat a transmitted request to recover withheld content' } }) }
+  const networkActivity = body.networkActivity === 'not_attempted' ? 'not_attempted' : 'possible'
+  const succeeded = body.source === 'public_url' && body.success === true && body.unknownOutcome !== true && !result.isError
+  return { ...result, ...(!succeeded ? { isError: true } : {}), content: JSON.stringify({ success: succeeded, source: 'public_url', untrusted: true,
+    contentWithheld: true, transmission: notAttempted ? 'not_attempted' : 'unknown', networkActivity,
+    serverEffects: notAttempted ? 'not_attempted' : 'unknown', ...(notAttempted && networkActivity === 'not_attempted' ? {} : { doNotRetry: true }),
+    ...(succeeded ? { message: 'Public URL retrieval completed; its content was withheld because it contains a known credential. Do not repeat the request to recover withheld content' }
+      : { error: { code: 'public_url_content_withheld', message: 'Public URL content was withheld because it contains a known credential. Do not repeat a transmitted request to recover withheld content' } }) }) }
 }
 function withholdPublicUrlIdentity(value: string, secrets: readonly string[], replacements: Map<string, string>, prefix = ''): string {
   const previous = replacements.get(value)
@@ -304,6 +314,33 @@ export class CliHost {
   private readonly reviews: AutoReviewController
   private selectedTaskMode: TaskMode = 'execute'
   private readonly presentationDecisions: CliToolDecision[] = []
+  private readonly toolReceipts = new Map<string, CliToolReceipt>()
+  /** Only owned execution callbacks call this seam. Text and replay cannot create evidence. */
+  private observeToolReceipt(call: ToolCall, result: ToolResult,
+    outcome: Pick<CliToolReceipt, 'status' | 'effect'>, sourceKind: CliToolReceipt['sourceKind'], ownerSignal?: AbortSignal): ToolResult {
+    if (ownerSignal && this.controller?.signal !== ownerSignal) return result
+    const receipt: CliToolReceipt = { call: structuredClone(call), result: structuredClone(result), ...outcome, sourceKind }
+    this.toolReceipts.set(reviewDigest(call), receipt)
+    let requestIndex = -1
+    for (let index = this.current.history.length - 1; index >= this.presentationTurnStart; index--) {
+      const message = this.current.history[index]!
+      if (message.kind === 'assistant' && message.toolCalls.some(item => reviewDigest(item) === reviewDigest(call))) { requestIndex = index; break }
+    }
+    if (requestIndex >= 0) {
+      const canonical = { kind: 'tool_result', callId: call.id, name: call.name, ...result }
+      for (let index = this.presentationDecisions.length - 1; index >= 0; index--) {
+        const prior = this.presentationDecisions[index]!
+        if (prior.requestIndex === requestIndex && prior.callId === call.id && prior.name === call.name &&
+          prior.argumentsDigest === agentArgumentsDigest(call.arguments)) this.presentationDecisions.splice(index, 1)
+      }
+      this.presentationDecisions.push({ requestIndex, callId: call.id, name: call.name,
+        argumentsDigest: agentArgumentsDigest(call.arguments), ...outcome,
+        resultDigest: createHash('sha256').update(JSON.stringify(canonical)).digest('hex'), source: { reference: `cli-${sourceKind}:${this.toolsetRevision}:${call.id}`,
+          revision: reviewDigest(receipt) } })
+      if (this.presentationDecisions.length > 256) this.presentationDecisions.shift()
+    }
+    return result
+  }
   private presentationTurnStart = 0
   private readonly memoryStoreRevision = randomUUID()
   private readonly sessionStoreRevision = randomUUID()
@@ -385,7 +422,7 @@ export class CliHost {
     await this.initializeRecords()
   }
   private async initializeRecords(): Promise<void> {
-    await this.records.initialize(this.current, this.safeMcpRows())
+    await this.records.initialize(this.current, this.safeMcpRows(), this.safePublicUrlRows())
     const eventId = this.records.anchorEventId
     if (eventId && !this.current.recordAnchor && this.records.view.durability === 'disk') {
       const next = validateSession({ ...this.current, schemaVersion: 2, recordAnchor: { version: 1, eventId } })
@@ -397,7 +434,21 @@ export class CliHost {
   /** Read-only exact host evidence. Rendering it cannot approve, execute or repair a tool. */
   get toolPresentationEvidence(): CliToolEvidence {
     const projection = this.conversationRecords.projection
-    return { sessionId: this.current.id, ...(projection ? { projection } : {}), decisions: structuredClone(this.presentationDecisions) }
+    const decisions = [...this.presentationDecisions]
+    const mcp = this.safeMcpRows(), urls = this.safePublicUrlRows()
+    for (const [requestIndex, message] of this.current.history.entries()) if (message.kind === 'assistant') for (const call of message.toolCalls) {
+      const row = mcp.find(row => mcpOutcomeMatchesCall(row, call)), url = urls.find(row => publicUrlOutcomeMatchesCall(row, call))
+      if (!row && !url) continue
+      const expected = row ? mcpOutcomeResult(row) : publicUrlOutcomeResult(url!)
+      const results = this.current.history.filter(item => item.kind === 'tool_result' && item.callId === call.id)
+      const canonical = { kind: 'tool_result', callId: call.id, name: call.name, ...expected }
+      if (results.length !== 1 || JSON.stringify(results[0]) !== JSON.stringify(canonical)) continue
+      decisions.push({ requestIndex, callId: call.id, name: call.name, argumentsDigest: agentArgumentsDigest(call.arguments),
+        ...(row ? cliMcpRecordOutcome(row) : cliPublicUrlRecordOutcome(url!)),
+        resultDigest: createHash('sha256').update(JSON.stringify(canonical)).digest('hex'),
+        source: { reference: row ? `cli-mcp-outcome:${row.id}` : `cli-public-url-outcome:${url!.id}`, revision: reviewDigest(row ?? url) } })
+    }
+    return { sessionId: this.current.id, ...(projection ? { projection } : {}), decisions: structuredClone(decisions) }
   }
   private async approveWithPresentation(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     const owner = this.controller, revision = this.toolsetRevision
@@ -603,6 +654,9 @@ export class CliHost {
   }
   private async executeWorkspaceMutation(call: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
     const workspace = this.options.workspace, capturedCall = structuredClone(call)
+    let commitAdmitted = false
+    const observed = (result: ToolResult, status: CliToolReceipt['status'], effect: CliToolReceipt['effect']): ToolResult =>
+      this.observeToolReceipt(capturedCall, result, { status, effect }, 'local-mutation', ownerSignal)
     try {
       signal.throwIfAborted()
       if (!workspace || this.options.enableTools === false) throw new WorkspaceError('Workspace tools are unavailable for this turn')
@@ -632,19 +686,20 @@ export class CliHost {
         isActive: () => this.controller?.signal === ownerSignal && this.options.workspace === workspace && this.options.enableTools !== false
       }, signal, assertCurrent => {
         workspace.addSecrets(this.options.secrets ?? [])
+        commitAdmitted = true
         return workspace.commitMutation(prepared, signal, () => {
           workspace.addSecrets(this.options.secrets ?? []); assertCurrent()
         })
       }, result => result.revision)
-      return result ? { content: JSON.stringify({ success: true, source: 'selected_workspace', untrusted: true, ...result }) }
-        : { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'This workspace change was not approved' } }), isError: true }
+      return result ? observed({ content: JSON.stringify({ success: true, source: 'selected_workspace', untrusted: true, ...result }) }, 'succeeded', 'confirmed')
+        : observed({ content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'This workspace change was not approved' } }), isError: true }, signal.aborted ? 'cancelled' : 'denied', 'not_attempted')
     } catch (error) {
-      if (error instanceof WorkspaceCommitError) return { content: JSON.stringify({ success: true,
+      if (error instanceof WorkspaceCommitError) return observed({ content: JSON.stringify({ success: true,
         source: 'selected_workspace', untrusted: true, ...error.result, durabilityUnconfirmed: true,
-        warning: error.message }) }
-      return { content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'workspace_change_failed',
+        warning: error.message }) }, 'succeeded', 'confirmed')
+      return observed({ content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'workspace_change_failed',
         message: error instanceof WorkspaceError ? redactSecrets(error.message, this.options.secrets ?? [])
-          : 'Workspace change could not be confirmed. Read the file before retrying; filesystem details are withheld' } }), isError: true }
+          : 'Workspace change could not be confirmed. Read the file before retrying; filesystem details are withheld' } }), isError: true }, signal.aborted ? 'cancelled' : 'failed', commitAdmitted ? 'unknown' : 'not_attempted')
     }
   }
   private async prepareMemory(request: MemoryChangeRequest, actor: MemoryActor, signal: AbortSignal): Promise<MemoryMutation> {
@@ -655,7 +710,7 @@ export class CliHost {
     if (request.kind === 'update') return this.options.memory.prepareUpdate(request.id, request.expectedRevision, request.content, actor, signal)
     return this.options.memory.prepareDelete(request.id, request.expectedRevision, signal)
   }
-  private async reviewMemory(request: MemoryChangeRequest, actor: MemoryActor, call: ToolCall, signal: AbortSignal, ownerSignal = signal): Promise<MemoryCommitResult | undefined> {
+  private async reviewMemory(request: MemoryChangeRequest, actor: MemoryActor, call: ToolCall, signal: AbortSignal, ownerSignal = signal, onCommit?: () => void): Promise<MemoryCommitResult | undefined> {
     const memory = this.options.memory
     const capturedCall = structuredClone(call)
     const mutation = await this.prepareMemory(request, actor, signal)
@@ -692,6 +747,7 @@ export class CliHost {
       assertCurrent()
       if (!this.enabledMemory || !memory || this.options.memory !== memory) throw new Error('Persistent memory capability changed')
       memory.addSecrets(this.options.secrets ?? [])
+      onCommit?.()
       return memory.commit(prepared, { signal, assertCurrent })
     }, result => result.memories.find(memory => memory.id === prepared.after?.id)?.revision)
   }
@@ -703,6 +759,9 @@ export class CliHost {
     return this.reviewMemory(request, 'user', { id: randomUUID(), name, arguments: arguments_ }, signal)
   }
   private async executeMemory(call: MemoryToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
+    let commitAdmitted = false
+    const observed = (result: ToolResult, status: CliToolReceipt['status'], effect: CliToolReceipt['effect']): ToolResult =>
+      this.observeToolReceipt(call, result, { status, effect }, 'local-mutation', ownerSignal)
     try {
       signal.throwIfAborted()
       if (!this.enabledMemory || this.options.enableTools === false) throw new Error('Memory tools are unavailable for this turn')
@@ -711,12 +770,12 @@ export class CliHost {
         ? { kind: 'create', content: arguments_.content }
         : call.name === 'edit_memory' ? { kind: 'update', id: arguments_.id, expectedRevision: arguments_.expectedRevision, content: arguments_.content }
         : { kind: 'delete', id: arguments_.id, expectedRevision: arguments_.expectedRevision }
-      const result = await this.reviewMemory(request, 'agent', call, signal, ownerSignal)
-      return result ? memoryToolResult(result, true)
-        : { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'Human denied this memory change' } }), isError: true }
+      const result = await this.reviewMemory(request, 'agent', call, signal, ownerSignal, () => { commitAdmitted = true })
+      return result ? observed(memoryToolResult(result, true), 'succeeded', 'confirmed')
+        : observed({ content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'Human denied this memory change' } }), isError: true }, signal.aborted ? 'cancelled' : 'denied', 'not_attempted')
     } catch (error) {
-      return { content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'memory_change_failed',
-        message: redactSecrets(error instanceof Error ? error.message : 'Memory change failed', this.options.secrets ?? []) } }), isError: true }
+      return observed({ content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'memory_change_failed',
+        message: redactSecrets(error instanceof Error ? error.message : 'Memory change failed', this.options.secrets ?? []) } }), isError: true }, signal.aborted ? 'cancelled' : 'failed', commitAdmitted ? 'unknown' : 'not_attempted')
     }
   }
   private acceptMcpCalls(calls: readonly ToolCall[], names: ReadonlySet<string>, catalogs: readonly McpCatalogSnapshot[]): void {
@@ -889,10 +948,14 @@ export class CliHost {
     return urlRows.length ? reconcilePublicUrlOutcomes(reconciled, this.current.id, urlRows) : reconciled
   }
   private async retireMcpOutcomes(history: readonly HistoryMessage[]): Promise<void> {
+    const view = this.conversationRecords
+    if (JSON.stringify(this.safeMcpRows()) !== JSON.stringify([...this.mcpRows.values()])) await this.persistMcpOutcomes()
+    if (view.state !== 'shadow' || view.durability !== 'disk' || view.committedSequence !== view.observedSequence) return
     const matched = new Set<string>()
     const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
     for (const row of this.safeMcpRows()) {
-      if (calls.some(call => mcpOutcomeMatchesCall(row, call)) &&
+      if (calls.some(call => mcpOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
+          outcome.callId === call.id && outcome.name === call.name && outcome.argumentsDigest === agentArgumentsDigest(call.arguments))) &&
         history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
           message.content === mcpOutcomeResult(row).content)) matched.add(row.id)
     }
@@ -1035,8 +1098,12 @@ export class CliHost {
   }
   private async retirePublicUrlOutcomes(history: readonly HistoryMessage[]): Promise<void> {
     if (!this.publicUrlOutcomes) return
+    const view = this.conversationRecords
+    if (JSON.stringify(this.safePublicUrlRows()) !== JSON.stringify([...this.publicUrlRows.values()])) await this.persistPublicUrlOutcomes()
+    if (view.state !== 'shadow' || view.durability !== 'disk' || view.committedSequence !== view.observedSequence) return
     const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
-    const matched = new Set(this.safePublicUrlRows().filter(row => calls.some(call => publicUrlOutcomeMatchesCall(row, call)) &&
+    const matched = new Set(this.safePublicUrlRows().filter(row => calls.some(call => publicUrlOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
+      outcome.callId === call.id && outcome.name === call.name && outcome.argumentsDigest === agentArgumentsDigest(call.arguments))) &&
       history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
         message.content === publicUrlOutcomeResult(row).content)).map(row => row.id))
     if (!matched.size) return
@@ -1069,9 +1136,9 @@ export class CliHost {
     let outcome: ToolResult = unattemptedPublicUrlResult()
     try {
       assertOwned()
-      if (!this.publicUrlOutcomes || this.publicUrlRows.size >= MAX_PUBLIC_URL_OUTCOME_ROWS) return unattemptedPublicUrlResult('public_url_outcome_unavailable')
+      if (!this.publicUrlOutcomes || this.publicUrlRows.size >= MAX_PUBLIC_URL_OUTCOME_ROWS) return this.observeToolReceipt(call, unattemptedPublicUrlResult('public_url_outcome_unavailable'), { status: 'failed', effect: 'not_attempted' }, 'public-url', ownerSignal)
       const prepared = preparePublicUrl(call.arguments.url, this.options.secrets ?? [])
-      if (this.publicUrlAttempted.has(reviewDigest(prepared.url))) return unattemptedPublicUrlResult('public_url_retry_blocked')
+      if (this.publicUrlAttempted.has(reviewDigest(prepared.url))) return this.observeToolReceipt(call, unattemptedPublicUrlResult('public_url_retry_blocked'), { status: 'denied', effect: 'not_attempted' }, 'public-url', ownerSignal)
       row = { id: randomUUID(), sessionId: this.current.id, runId: toolset, callId: call.id, toolName: call.name,
         callDigest: mcpDigest(call), bindingDigest: reviewDigest({ call, prepared, limits: PUBLIC_URL_LIMITS,
           policyRevision: this.publicUrlPolicyRevision }), state: 'accepted' }
@@ -1127,6 +1194,9 @@ export class CliHost {
           this.publicUrlAttempted.add(reviewDigest(exact.url))
         }
       }, { signal, secrets: () => this.options.secrets ?? [] })
+      // DNS/TLS metadata is also an attempted transmission. A model cannot ignore
+      // doNotRetry by submitting the same URL again after resolution fails.
+      if (result.networkActivity === 'possible') this.publicUrlAttempted.add(reviewDigest(prepared.url))
       outcome = withholdPublicUrlResult({ content: JSON.stringify(result), ...(!result.success ? { isError: true } : {}) }, this.options.secrets ?? [])
     } catch {
       outcome = row && this.publicUrlRows.get(row.id)?.state === 'intent' ? unresolvedPublicUrlResult()
@@ -1136,7 +1206,10 @@ export class CliHost {
       this.publicUrlRows.set(row.id, { ...row, state: 'settled', result: withholdPublicUrlResult(outcome, this.options.secrets ?? []) })
       try { await this.persistPublicUrlOutcomes() } catch { /* A prior intent survives; no automatic retry. */ }
     }
-    return withholdPublicUrlResult(outcome, this.options.secrets ?? [])
+    const safe = withholdPublicUrlResult(outcome, this.options.secrets ?? [])
+    const outcomeRow = row ? this.publicUrlRows.get(row.id) : undefined
+    return this.observeToolReceipt(call, safe, outcomeRow ? cliPublicUrlRecordOutcome(outcomeRow)
+      : { status: signal.aborted ? 'cancelled' : 'failed', effect: 'not_attempted' }, 'public-url', ownerSignal)
   }
   cancel(): void { this.controller?.abort() }
   private async deliverEvent(event: AgentEvent): Promise<void> {
@@ -1226,7 +1299,7 @@ export class CliHost {
     this.persistence = operation.then(() => undefined, () => undefined)
     return operation
   }
-  private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal, ownerSignal: AbortSignal): Promise<number | undefined> {
+  private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal, ownerSignal: AbortSignal): Promise<number | { readonly revision: number; readonly durabilityUnconfirmed: true } | undefined> {
     const capturedBefore = structuredClone(before)
     const store = this.options.store
     const resourceId = (): string => `cli-session:${this.current.id}:note:${key}`
@@ -1239,12 +1312,30 @@ export class CliHost {
       noteRevision: this.current.noteRevision, notesEnabled: this.options.enableNotes ?? false,
       toolsEnabled: this.options.enableTools !== false, toolsetRevision: this.toolsetRevision,
       beforeDigest: reviewDigest(capturedBefore), proposalDigest: reviewDigest({ key, value, expectedRevision: before.revision }) })
-    return this.reviews.execute({ approval: { call, currentRevision: before.revision,
+    let commitAdmitted = false
+    try {
+    const revision = await this.reviews.execute({ approval: { call, currentRevision: before.revision,
       description: `Set session note ${JSON.stringify(key)}.\nBefore: ${Object.hasOwn(capturedBefore.notes, key) ? JSON.stringify(capturedBefore.notes[key]) : '(new note)'}\nAfter: ${JSON.stringify(value)}` },
       eligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
       resourceRevisions: revisions(), currentResourceRevisions: revisions,
       isActive: () => this.controller?.signal === ownerSignal && (this.options.enableNotes ?? false) && this.options.enableTools !== false },
-    signal, assertCurrent => this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent), revision => revision)
+    signal, assertCurrent => { commitAdmitted = true; return this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent) }, revision => revision)
+    this.observeToolReceipt(call, revision === undefined
+      ? { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'This note change was not approved' } }), isError: true }
+      : { content: JSON.stringify({ success: true, key, revision }) },
+      { status: revision === undefined ? signal.aborted ? 'cancelled' : 'denied' : 'succeeded', effect: revision === undefined ? 'not_attempted' : 'confirmed' }, 'local-mutation', ownerSignal)
+    return revision
+    } catch (error) {
+      if (error instanceof SessionCommitError) {
+        const saved = { revision: capturedBefore.revision + 1, durabilityUnconfirmed: true as const }
+        this.observeToolReceipt(call, { content: JSON.stringify({ success: true, key, ...saved }) }, { status: 'succeeded', effect: 'confirmed' }, 'local-mutation', ownerSignal)
+        return saved
+      }
+      this.observeToolReceipt(call, { content: JSON.stringify({ success: false, error: { code: 'invalid_arguments',
+        message: error instanceof Error ? error.message : 'Tool request failed' } }), isError: true },
+        { status: signal.aborted ? 'cancelled' : 'failed', effect: commitAdmitted ? 'unknown' : 'not_attempted' }, 'local-mutation', ownerSignal)
+      throw error
+    }
   }
   async send(content: string, signal?: AbortSignal): Promise<AgentResult> {
     if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host')
@@ -1264,6 +1355,7 @@ export class CliHost {
     this.controller = controller
     this.toolsetRevision = randomUUID()
     this.publicUrlAttempted.clear()
+    this.toolReceipts.clear()
     this.presentationTurnStart = this.current.history.length
     const commandRunId = randomUUID()
     this.reviews.beginTurn(this.current.id, content)
@@ -1280,7 +1372,12 @@ export class CliHost {
     owner.defer(() => this.drainMemory())
     owner.defer(() => this.drainMcp())
     owner.defer(() => this.drainPublicUrls())
-    owner.defer(() => this.options.commandWorkspace?.endRun())
+    let commandsEnded = false
+    const endCommands = async (): Promise<void> => {
+      if (commandsEnded) return
+      await this.options.commandWorkspace?.endRun(); commandsEnded = true
+    }
+    owner.defer(endCommands)
     const abort = (): void => controller.abort()
     owner.signal.addEventListener('abort', abort, { once: true })
     owner.defer(() => owner.signal.removeEventListener('abort', abort))
@@ -1302,7 +1399,10 @@ export class CliHost {
     const pendingMcpDisplay = new Map<string, ToolCall>()
     const enteredMcpCalls = new Set<string>()
     const recordRows = new Map<string, McpOutcomeRecord>()
-    const builtinReads: CliBuiltinReadReceipt[] = []
+    const acceptedToolCalls = new Map<string, ToolCall>()
+    const enteredToolCalls = new Set<string>()
+    const completedToolCalls = new Set<string>()
+    const questionResponses = new Map<string, { readonly requestId: string; readonly status: string }>()
     const captureRecordRows = (): void => { for (const row of this.safeMcpRows()) recordRows.set(row.id, row) }
     let failed = false, primaryFailure: unknown
     try {
@@ -1314,7 +1414,8 @@ export class CliHost {
         (call, signal) => this.executeWorkspaceMutation(call, signal, controller.signal)) : undefined
       const commands = taskMode !== 'plan' && enableTools && this.commandsEnabled
         ? createCommandExtension(() => this.openCommandWorkspace(controller.signal),
-          () => this.commandContext(commandRunId, controller.signal), controller.signal) : undefined
+          () => this.commandContext(commandRunId, controller.signal), controller.signal,
+          (call, result, outcome) => { this.observeToolReceipt(call, result, outcome, 'command', controller.signal) }) : undefined
       // A metadata commit already admitted while idle must settle before this
       // turn mutates current history. Otherwise its pre-turn snapshot could
       // replace a newly accepted prompt while the initial checkpoint waits.
@@ -1386,14 +1487,18 @@ export class CliHost {
         this.toolsetRevision === questionRevision && this.options.enableTools !== false && this.options.questionHost === questionHost &&
         questionHost?.ask === questionAsk && questionHost?.isAvailable() === true && questionHost.accountRevision?.() === this.questionAccount
       const questions = enableTools && questionHost && questionIsCurrent() ? createQuestionExtension({
-        ask: (request, { signal }) => askCurrentQuestion(questionHost, request, signal, questionIsCurrent, () => this.options.secrets ?? [])
+        ask: async (request, { signal }) => {
+          const response = await askCurrentQuestion(questionHost, request, signal, questionIsCurrent, () => this.options.secrets ?? [])
+          questionResponses.set(request.callId, { requestId: response.requestId, status: response.status })
+          return response
+        }
       }) : undefined
       const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode, questions, mcpSetup)
       if (questions) prefix.push({ kind: 'message', role: 'system', content: QUESTION_GUIDANCE })
       const allowedTools = new Set(enableTools ? toolset.tools.map(tool => tool.name) : [])
       if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: PUBLIC_URL_GUIDANCE })
       owner.defer(() => toolset.dispose())
-      const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name) ?? [])
+      const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name).filter(name => name !== 'list_mcp_resources') ?? [])
       const outcomeMcpNames = new Set([...ownedMcpNames, ...(taskMode !== 'plan' && mcpSetup?.tools.some(tool => tool.definition.name === 'mcp_setup') ? ['mcp_setup'] : [])])
       if (catalog) {
         if (!this.options.skills?.writable) {
@@ -1493,21 +1598,30 @@ export class CliHost {
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: async (call, context) => {
+          enteredToolCalls.add(reviewDigest(call))
           context.signal.throwIfAborted()
-          if (taskMode === 'plan' && !allowedTools.has(call.name)) return planModeRefusal()
+          const guarded = async (result: ToolResult, status: 'denied' | 'failed' | 'cancelled' = 'denied'): Promise<ToolResult> => {
+            const row = this.acceptedMcpRow(call)
+            if (row) {
+              this.mcpRows.set(row.id, { ...row, state: 'settled', result: structuredClone(result) })
+              try { await this.persistMcpOutcomes() } catch { /* No remote send was admitted. */ }
+            }
+            return this.observeToolReceipt(call, result, { status, effect: 'not_attempted' }, 'dispatcher')
+          }
+          if (taskMode === 'plan' && !allowedTools.has(call.name)) return guarded(planModeRefusal())
           if (outcomeMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
           if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
-            return { content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
-              error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true }
+            return guarded({ content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
+              error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true })
           }
           if (call.name === QUESTION_TOOL_NAME && mcpContainsSecret(call.arguments, this.options.secrets ?? [])) {
-            return { content: JSON.stringify({ success: false, error: { code: 'question_credentials_blocked',
-              message: 'Question contains a known credential; no prompt was displayed' } }), isError: true }
+            return guarded({ content: JSON.stringify({ success: false, error: { code: 'question_credentials_blocked',
+              message: 'Question contains a known credential; no prompt was displayed' } }), isError: true })
           }
           if (skillsToolNames.has(call.name)) {
             this.options.skills?.addSecrets(this.options.secrets ?? [])
             if (memoryContextContainsSecret([skillContents, call.arguments], this.options.secrets ?? [])) {
-              return Promise.resolve({ content: JSON.stringify({ success: false, error: 'Skill operation contains a known credential; it was blocked' }), isError: true })
+              return guarded({ content: JSON.stringify({ success: false, error: 'Skill operation contains a known credential; it was blocked' }), isError: true })
             }
           }
           let result = await toolset.executeTool(call, context.signal, {
@@ -1529,35 +1643,40 @@ export class CliHost {
             }) }, this.options.secrets ?? [])
             this.mcpRows.set(accepted.id, { ...accepted, state: 'settled', result: safe })
             try { await this.persistMcpOutcomes() } catch { /* Accepted evidence still proves no send. */ }
-            return safe
+            return this.observeToolReceipt(call, safe, cliMcpRecordOutcome(this.mcpRows.get(accepted.id)!), 'mcp')
           }
           const safeResult = isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
-          // Only advertised reserved reads are known to have no external operation.
-          // Generic extensions and all writes retain their domain-owned effect evidence.
-          if (allowedTools.has(call.name) && isBuiltinReadTool(call.name)) {
-            builtinReads.push({ call: structuredClone(call), result: structuredClone(safeResult) })
-            let requestIndex = -1
-            for (let index = this.current.history.length - 1; index >= this.presentationTurnStart; index--) {
-              const message = this.current.history[index]!
-              if (message.kind === 'assistant' && message.toolCalls.some(item => item.id === call.id && item.name === call.name &&
-                agentArgumentsDigest(item.arguments) === agentArgumentsDigest(call.arguments))) { requestIndex = index; break }
-            }
-            if (requestIndex >= 0) {
-              const canonical = { kind: 'tool_result', callId: call.id, name: call.name, ...safeResult }
-              this.presentationDecisions.push({ requestIndex, callId: call.id, name: call.name,
-                argumentsDigest: agentArgumentsDigest(call.arguments), status: safeResult.isError ? 'failed' : 'succeeded', effect: 'confirmed',
-                resultDigest: createHash('sha256').update(JSON.stringify(canonical)).digest('hex'),
-                source: { reference: `cli-builtin-read:${this.toolsetRevision}:${call.id}`,
-                  revision: createHash('sha256').update(JSON.stringify({ call, result: safeResult })).digest('hex') } })
-              if (this.presentationDecisions.length > 256) this.presentationDecisions.shift()
-            }
+          const policy = toolset.outcomePolicies.get(call.name)
+          let outcome: Pick<CliToolReceipt, 'status' | 'effect'> | undefined
+          let sourceKind: CliToolReceipt['sourceKind'] = policy === 'local-read' ? 'builtin-read' : policy ?? 'dispatcher'
+          if (policy === 'local-read') {
+            const question = call.name === QUESTION_TOOL_NAME ? questionResponses.get(call.id) : undefined
+            const cancelledQuestion = question?.status === 'cancelled' && safeResult.content === JSON.stringify({ requestId: question.requestId, status: 'cancelled' })
+            outcome = { status: safeResult.isError ? 'failed' : cancelledQuestion ? 'cancelled' : 'succeeded', effect: 'confirmed' }
           }
+          else if (policy === 'local-mutation' && !this.toolReceipts.has(reviewDigest(call))) {
+            // Reserved mutation validation failed before its owned executor/commit callback.
+            outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
+          } else if (policy === 'command' && !this.toolReceipts.has(reviewDigest(call))) {
+            outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
+          } else if (policy === 'public-url') {
+            const row = this.safePublicUrlRows().find(item => publicUrlOutcomeMatchesCall(item, call))
+            if (row) outcome = cliPublicUrlRecordOutcome(row)
+          } else if (policy === 'mcp') {
+            const row = this.safeMcpRows().find(item => mcpOutcomeMatchesCall(item, call))
+            if (row) outcome = cliMcpRecordOutcome(row)
+          } else if (policy === 'extension') {
+            // A return confirms only executor completion, never claims inside its untrusted body.
+            outcome = { status: safeResult.isError ? 'failed' : 'succeeded', effect: 'unknown' }
+          }
+          if (outcome) this.observeToolReceipt(call, safeResult, outcome, sourceKind)
           return safeResult
         },
         onAccepted: (update: AgentAcceptedUpdate) => {
           if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return
           // Frozen canonical acceptance precedes legacy display/checkpoint callbacks.
           // It is an observation seam, never an MCP checkpoint acknowledgement.
+          if (update.message.kind === 'assistant') for (const call of update.message.toolCalls) acceptedToolCalls.set(reviewDigest(call), structuredClone(call))
           const message = this.reconcileMcpHistory([...this.current.history, structuredClone(update.message)]).at(-1)!
           const work = this.records.accept(this.toolsetRevision, { ...update, message } as AgentAcceptedUpdate)
           this.eventJobs.add(work)
@@ -1610,6 +1729,9 @@ export class CliHost {
               const call = withholdMcpCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements)
               if (call.id === admittedEvent.message.callId && call.name === admittedEvent.message.name) pendingMcpDisplay.delete(id)
             }
+            if (admittedEvent.type === 'tool_completed') for (const call of acceptedToolCalls.values()) {
+              if (call.id === admittedEvent.message.callId && call.name === admittedEvent.message.name) completedToolCalls.add(reviewDigest(call))
+            }
             await this.deliverEvent(admittedEvent)
           }
           // Already-entered delivery is drained, but its obsolete continuation
@@ -1617,7 +1739,9 @@ export class CliHost {
           if (controller.signal.aborted || owner.state !== 'open' || this.activeTurn?.scope !== owner) return
           const safeHistory = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
-          if (admittedEvent.type === 'tool_completed') { captureRecordRows(); await this.retireMcpOutcomes(this.current.history) }
+          if (admittedEvent.type === 'tool_completed') {
+            captureRecordRows(); await this.retireMcpOutcomes(this.current.history)
+          }
           })()
           // Core may stop awaiting any callback on abort, even ordinary chat.
           // Keep admitted checkpoints and deliveries owned until they settle.
@@ -1640,6 +1764,8 @@ export class CliHost {
       await this.drainMemory()
       await this.drainSkills()
       await this.drainPublicUrls()
+      // Stop run-owned processes before preserving any late completion receipt.
+      await endCommands()
       captureRecordRows()
       // Core abort cleanup intentionally skips callbacks. Always use its final canonical transcript.
       // The per-turn prefix is provider context only. Persisting it would revive
@@ -1649,6 +1775,22 @@ export class CliHost {
       }
       const rawHistory = structuredClone(result.history.slice(prefix.length))
       let terminalHistory = this.reconcileMcpHistory(rawHistory)
+      for (const call of acceptedToolCalls.values()) {
+        const digest = reviewDigest(call)
+        if (this.toolReceipts.has(digest) || enteredToolCalls.has(digest)) continue
+        const message = terminalHistory.find(item => item.kind === 'tool_result' && item.callId === call.id && item.name === call.name)
+        if (message?.kind === 'tool_result') this.observeToolReceipt(call, { content: message.content, ...(Object.hasOwn(message, 'isError') ? { isError: message.isError } : {}) },
+          { status: result.status === 'cancelled' ? 'cancelled' : 'denied', effect: 'not_attempted' }, 'dispatcher')
+      }
+      terminalHistory = terminalHistory.map(message => {
+        if (message.kind !== 'tool_result') return message
+        const receipts = [...this.toolReceipts.values()].filter(receipt => receipt.call.id === message.callId && receipt.call.name === message.name && acceptedToolCalls.has(reviewDigest(receipt.call)))
+        if (receipts.length !== 1) return message
+        const receipt = receipts[0]!
+        // Reads/imported code have no durable domain commit to preserve after core cancellation.
+        if (!['local-mutation', 'command', 'public-url'].includes(receipt.sourceKind)) return message
+        return { kind: 'tool_result', callId: message.callId, name: message.name, ...receipt.result }
+      })
       const canonicalCalls = new Map(terminalHistory.flatMap(message => message.kind === 'assistant'
         ? message.toolCalls.map(call => [call.id, call] as const) : []))
       // Capacity or a cancelled admission callback can prevent creating a row.
@@ -1678,8 +1820,11 @@ export class CliHost {
           const call = withholdMcpCall(original, this.options.secrets ?? [], this.mcpIdentityReplacements)
           return call.id === message.callId && call.name === message.name
         })
-        if (pending) {
-          pendingMcpDisplay.delete(pending[0])
+        const corrected = [...this.toolReceipts.values()].find(receipt => receipt.call.id === message.callId && receipt.call.name === message.name &&
+          ['local-mutation', 'command', 'public-url'].includes(receipt.sourceKind) && !completedToolCalls.has(reviewDigest(receipt.call)))
+        if (pending || corrected) {
+          if (pending) pendingMcpDisplay.delete(pending[0])
+          if (corrected) completedToolCalls.add(reviewDigest(corrected.call))
           await this.deliverEvent({ type: 'tool_completed', message: structuredClone(message) })
           // This corrected event is another credential-registration boundary.
           const safe = this.reconcileMcpHistory(this.current.history)
@@ -1688,7 +1833,7 @@ export class CliHost {
         }
       }
       captureRecordRows()
-      await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()], builtinReads)
+      await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()], [...this.toolReceipts.values()])
       await this.retireMcpOutcomes(canonicalResult.history)
       await this.retirePublicUrlOutcomes(canonicalResult.history)
       const safeFinal = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)

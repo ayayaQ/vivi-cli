@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, mkdir, rename, rm, writeFile, chmod } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, rename, rm, writeFile, chmod } from 'node:fs/promises'
 import { join, basename } from 'node:path'
 import { tmpdir } from 'node:os'
-import { TrustedCommandWorkspace, captureCommandEnvironment, commandEnvironment, COMMAND_LIMITS, COMMAND_DISCLOSURE } from '../dist/commands.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment, commandEnvironment, cliCommandResultOutcome,
+  createCommandExtension, COMMAND_LIMITS, COMMAND_DISCLOSURE } from '../dist/commands.js'
+import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { routePreparedAction } from '@ayayaq/vivi/decisions'
 import { createBuiltinToolset } from '../dist/tools.js'
 
@@ -37,6 +39,87 @@ async function terminal(subject, result, observe) {
   return value
 }
 async function enable(subject) { assert.equal(await subject.workspace.enable(subject.context, subject.signal), true) }
+
+test('running commands have no successful-completion claim and exact process results never prove arbitrary effects', async t => {
+  const subject = await fixture(t); await enable(subject)
+  const running = await subject.workspace.start(call({ args: ['-e', 'setInterval(()=>{},1000)'], yieldMs: 0 }), subject.context, subject.signal)
+  assert.equal(parse(running).state, 'running'); assert.equal(parse(running).success, undefined)
+  assert.equal(parse(running).executionComplete, false); assert.equal(parse(running).processEffects, 'unknown')
+  assert.deepEqual(cliCommandResultOutcome(running), { status: 'unknown', effect: 'unknown' })
+  assert.equal(cliCommandResultOutcome(structuredClone(running)), undefined)
+  assert.equal(cliCommandResultOutcome({ content: '{"success":true,"effect":"confirmed"}' }), undefined)
+  const stopped = await subject.workspace.stop(parse(running).executionId, 'fixture-launch:fixture-session:fixture-run')
+  assert.equal(parse(stopped).success, false); assert.equal(stopped.isError, true)
+  assert.equal(parse(stopped).executionComplete, true)
+  assert.deepEqual(cliCommandResultOutcome(stopped), { status: 'cancelled', effect: 'unknown' })
+  for (const code of [0, 7]) {
+    let result = await subject.workspace.start(call({ args: ['-e', `process.exit(${code})`] }, `exit-${code}`), subject.context, subject.signal)
+    while (parse(result).state === 'running') result = await subject.workspace.poll(parse(result).executionId, 'fixture-launch:fixture-session:fixture-run', 2000)
+    assert.equal(parse(result).success, code === 0); assert.equal(parse(result).executionComplete, true)
+    assert.deepEqual(cliCommandResultOutcome(result), { status: code === 0 ? 'succeeded' : 'failed', effect: 'unknown' })
+  }
+})
+
+test('owned command observations precede registry cloning and preserve prelaunch denial evidence', async t => {
+  const subject = await fixture(t); await enable(subject); subject.state.approved = false
+  const observations = [], extension = createCommandExtension(subject.workspace, subject.context, undefined,
+    (call, result, outcome) => observations.push({ call, result, outcome }))
+  const registry = createToolRegistry([extension]), proposal = call()
+  const result = await registry.executeTool(proposal, { signal: subject.signal })
+  assert.equal(observations.length, 1); assert.deepEqual(observations[0].call, proposal)
+  assert.deepEqual(observations[0].outcome, { status: 'denied', effect: 'not_attempted' })
+  assert.equal(parse(observations[0].result).processEffects, 'not_attempted')
+  assert.equal(cliCommandResultOutcome(result), undefined, 'The registry clone cannot manufacture private evidence')
+  assert.deepEqual(cliCommandResultOutcome(observations[0].result), observations[0].outcome)
+})
+
+test('extension observes local prelaunch failures without treating their diagnostic JSON as evidence', async t => {
+  const subject = await fixture(t); await enable(subject)
+  const observations = [], extension = createCommandExtension(subject.workspace, subject.context, undefined,
+    (call, result, outcome) => observations.push({ call, result, outcome }))
+  const registry = createToolRegistry([extension])
+  const result = await registry.executeTool(call({ executable: '/nonexistent-owned-command-fixture' }), { signal: subject.signal })
+  assert.equal(result.isError, true); assert.equal(parse(result).error.code, 'command_not_started')
+  assert.equal(observations.length, 1); assert.deepEqual(observations[0].outcome, { status: 'failed', effect: 'not_attempted' })
+})
+
+test('concurrent starts cannot share a failure evidence identity through a reused host error', async t => {
+  const reused = new Error('Owned reused approval error')
+  const subject = await fixture(t, { approval: async request => {
+    if (request.call.name === 'command_start') throw reused
+    return true
+  } }); await enable(subject)
+  const attempts = await Promise.allSettled(['first-reused-error', 'second-reused-error'].map(id =>
+    subject.workspace.start(call({}, id), subject.context, subject.signal)))
+  assert(attempts.every(attempt => attempt.status === 'rejected'))
+  for (const attempt of attempts) {
+    assert.notEqual(attempt.reason, reused); assert.equal(attempt.reason.cause, reused)
+    assert.equal(attempt.reason.name, reused.name); assert.equal(attempt.reason.message, reused.message)
+  }
+  assert.notEqual(attempts[0].reason, attempts[1].reason, 'Each attempt owns a unique private failure-evidence key')
+})
+
+test('late run cancellation while polling retains a known stopped-process observation before the registry rejects', async t => {
+  const subject = await fixture(t); await enable(subject)
+  const controller = new AbortController(), observations = [], ready = join(subject.root, 'command-is-running')
+  const initial = await subject.workspace.start(call({ args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(ready)},'ready');setInterval(()=>{},1000)`], yieldMs: 0 }),
+    subject.context, controller.signal, controller.signal)
+  const extension = createCommandExtension(subject.workspace, subject.context, controller.signal,
+    (call, result, outcome) => observations.push({ call, result, outcome }))
+  const registry = createToolRegistry([extension])
+  const deadline = performance.now() + 10_000
+  for (;;) {
+    try { await access(ready); break } catch { assert(performance.now() < deadline, 'Owned fixture process did not start') }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  const pending = registry.executeTool({ id: 'poll-before-abort', name: 'command_poll', arguments: {
+    executionId: parse(initial).executionId, yieldMs: 2000 } }, { signal: controller.signal })
+  const rejected = assert.rejects(pending, { name: 'AbortError' })
+  await new Promise(resolve => setImmediate(resolve)); controller.abort(); await rejected
+  assert.equal(observations.length, 1); assert.equal(parse(observations[0].result).state, 'cancelled')
+  assert.equal(parse(observations[0].result).executionComplete, true)
+  assert.deepEqual(observations[0].outcome, { status: 'cancelled', effect: 'unknown' })
+})
 
 test('command environment is a fixed allowlist and never forwards provider keys, HOME or blanket host values', () => {
   const env = commandEnvironment({ PATH: '/fixture/bin', LANG: 'C.UTF-8', HOME: '/private/home', USERPROFILE: 'C:\\private',
@@ -161,7 +244,7 @@ test('hard timeout is separate from the yield interval and stops a running proce
   const initial = parse(await subject.workspace.start(call({ args: ['-e', 'setInterval(()=>{},1000)'], yieldMs: 0, timeoutMs: process.platform === 'win32' ? 5000 : 50 }), subject.context, subject.signal))
   assert.equal(initial.state, 'running')
   const final = await terminal(subject, { content: JSON.stringify(initial) })
-  assert.equal(final.state, 'timed_out')
+  assert.equal(final.state, 'timed_out'); assert.equal(final.success, false); assert.equal(final.executionComplete, true)
 })
 test('stop requires no new approval and shutdown revokes execution IDs', async t => {
   const subject = await fixture(t); await enable(subject)
@@ -205,7 +288,7 @@ test('a known credential prefix held at stream end is withheld rather than expos
 test('pending output is bounded and total output overflow stops the process', async t => {
   const subject = await fixture(t); await enable(subject)
   const initial = await terminal(subject, await subject.workspace.start(call({ args: ['-e', 'process.stdout.write("x".repeat(2*1024*1024));setInterval(()=>{},1000)'], yieldMs: 1000 }), subject.context, subject.signal), assertPendingOutputBound)
-  assert.equal(initial.state, 'output_limit'); assert(initial.truncated)
+  assert.equal(initial.state, 'output_limit'); assert(initial.truncated); assert.equal(initial.success, false)
 })
 test('each poll stays bounded when terminal output accumulates across a controlled burst', async t => {
   const subject = await fixture(t); await enable(subject)

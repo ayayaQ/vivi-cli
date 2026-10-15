@@ -241,7 +241,7 @@ test('cancel during provider streaming saves user history without inventing a pa
   assert.deepEqual((await store.load(host.session.id)).history, result.history);
 });
 
-test('cancel races an atomic note commit safely and persists an unknown-outcome closed transcript', async (t) => {
+test('cancel races an atomic note commit safely and preserves its confirmed result', async (t) => {
   const { store: real } = await fixture(t); const started = deferred(); const finish = deferred();
   let saves = 0;
   const store = { load: (id) => real.load(id), save: async (session) => {
@@ -258,7 +258,8 @@ test('cancel races an atomic note commit safely and persists an unknown-outcome 
   assert.equal(saved.notes.task, 'saved');
   assert.equal(saved.noteRevision, 1);
   assert.deepEqual(saved.history, result.history);
-  assert.equal(JSON.parse(saved.history.at(-1).content).error.code, 'cancelled');
+  assert.equal(JSON.parse(saved.history.at(-1).content).success, true);
+  assert.equal(JSON.parse(saved.history.at(-1).content).revision, 1);
 });
 
 test('crash recovery closes persisted pending tools without approving or executing them', async (t) => {

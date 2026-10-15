@@ -6,7 +6,7 @@ import { mkdtemp, readFile, rm, chmod, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mcpDigest } from '@ayayaq/vivi/extensions/mcp'
-import { FileMcpOutcomeStore, MAX_MCP_OUTCOME_ROWS, reconcileMcpOutcomes, unresolvedMcpResult, unattemptedMcpResult, validateMcpOutcomes } from '../dist/mcp-outcomes.js'
+import { FileMcpOutcomeStore, MAX_MCP_OUTCOME_ROWS, cliMcpRecordOutcome, reconcileMcpOutcomes, unresolvedMcpResult, unattemptedMcpResult, validateMcpOutcomes } from '../dist/mcp-outcomes.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 
 const call = { id: 'call-exact', name: 'mcp_fixture_exact', arguments: { value: 'ordinary' } }
@@ -23,6 +23,46 @@ async function fixture(t) {
   t.after(() => rm(directory, { force: true, recursive: true }))
   return { directory, store: new FileMcpOutcomeStore(directory), sessionId: randomUUID() }
 }
+
+test('owned MCP response status never proves the server-advertised effects', () => {
+  for (const [success, status] of [[true, 'succeeded'], [false, 'failed']]) {
+    const result = { content: JSON.stringify({ source: 'mcp', success, confirmedOutcome: true, requestSent: true,
+      effect: 'confirmed', serverEffects: 'confirmed', doNotRetry: true }), ...(!success ? { isError: true } : {}) }
+    assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'settled', result })), { status, effect: 'unknown' })
+  }
+  assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'accepted' })), { status: 'cancelled', effect: 'not_attempted' })
+  assert.deepEqual(cliMcpRecordOutcome(row()), { status: 'unknown', effect: 'unknown' })
+  assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'settled', result: unattemptedMcpResult('approval_denied') })),
+    { status: 'denied', effect: 'not_attempted' })
+  assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'settled', result: unresolvedMcpResult() })),
+    { status: 'unknown', effect: 'unknown' })
+  for (const code of ['mcp_credentials_blocked', 'mcp_setup_credentials_blocked']) {
+    assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'settled', result: unattemptedMcpResult(code) })),
+      { status: 'denied', effect: 'not_attempted' })
+  }
+})
+
+test('MCP setup distinguishes completed local changes, partial receipts and successful remote setup', () => {
+  const revision = 'a'.repeat(64), local = { kind: 'configuration-saved', serverId: 'fixture', revision, affectedServerIds: [] }
+  const classify = (knownEffects, rest = {}) => cliMcpRecordOutcome(row(undefined, { state: 'settled', toolName: 'mcp_setup',
+    result: { content: JSON.stringify({ source: 'mcp-setup', success: true, confirmedOutcome: true, knownEffects, ...rest }),
+      ...(rest.success === false ? { isError: true } : {}) } }))
+  assert.deepEqual(classify([local]), { status: 'succeeded', effect: 'confirmed' })
+  assert.deepEqual(classify([local], { success: false, setupIncomplete: true }), { status: 'failed', effect: 'unknown' })
+  assert.deepEqual(classify([local], { durabilityUnverified: true }), { status: 'succeeded', effect: 'unknown' })
+  assert.deepEqual(classify([{ kind: 'connected', serverId: 'fixture', revision }]), { status: 'succeeded', effect: 'unknown' })
+  assert.deepEqual(classify([{ kind: 'authorization-granted', serverId: 'fixture', revision }]), { status: 'succeeded', effect: 'unknown' })
+  assert.deepEqual(classify([]), { status: 'succeeded', effect: 'unknown' })
+})
+
+test('historical local MCP resource-list rows retain their real local completion without a success flag', () => {
+  const result = { content: JSON.stringify({ source: 'mcp', untrusted: true, localMetadataOnly: true,
+    requestSent: false, servers: [] }) }
+  assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'settled', toolName: 'list_mcp_resources', result })),
+    { status: 'succeeded', effect: 'confirmed' })
+  assert.deepEqual(cliMcpRecordOutcome(row(undefined, { state: 'settled', toolName: 'list_mcp_resources',
+    result: unattemptedMcpResult('invalid_arguments') })), { status: 'failed', effect: 'not_attempted' })
+})
 
 test('durable standalone intent is recovered as uncertainty without any approval or request capability', async t => {
   const { directory, store, sessionId } = await fixture(t)

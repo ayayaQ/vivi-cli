@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash } from 'node:crypto'
 import { isIP } from 'node:net'
-import { isPublicUrlAddress, PublicUrlTransportError, requestPublicUrl, resolvePublicUrlHost } from './public-url-transport.js'
+import { isPublicUrlAddress, PublicUrlTransportError, publicUrlRequestHasSendBoundary, requestPublicUrl, resolvePublicUrlHost } from './public-url-transport.js'
 import type { PublicUrlRequest, PublicUrlResponse } from './public-url-transport.js'
 import { decodePublicUrlHtmlEntities, extractPublicUrlHtml, PUBLIC_URL_HTML_VERSION } from './public-url-html.js'
 
@@ -14,7 +14,7 @@ export const PUBLIC_URL_GUIDANCE = 'fetch_url retrieves one exact selected publi
 export const PUBLIC_URL_DISCLOSURE = 'Retrieve this exact public HTTPS URL with GET. The complete path and query will be transmitted; DNS reveals the hostname, and the server can observe the caller IP and request metadata. GET may have server effects. At most three redirects are allowed; a cross-origin destination needs a new decision. Limits: 15 seconds of active work (decision pauses excluded), 16 KiB headers, 1 MiB body, 64 KiB extracted text and complete result. No cookies, login, JavaScript, proxy routing, search or file downloads.'
 export interface PreparedPublicUrl { readonly url: string; readonly hostname: string; readonly origin: string }
 export interface PublicUrlRedirect { readonly from: string; readonly to: string; readonly status: number }
-export interface PublicUrlRequestEvidence { readonly url: string; readonly transmission: 'unknown' | 'observed' }
+export interface PublicUrlRequestEvidence { readonly url: string; readonly transmission: 'not_attempted' | 'unknown' | 'observed' }
 export interface PublicUrlDisclosure extends PreparedPublicUrl {
   readonly method: 'GET'
   readonly limits: Readonly<typeof PUBLIC_URL_LIMITS>
@@ -44,6 +44,8 @@ interface PublicUrlResultBase {
   readonly source: 'public_url'; readonly untrusted: true
   readonly requests: readonly PublicUrlRequestEvidence[]; readonly redirects: readonly PublicUrlRedirect[]
   readonly bytesRead: number; readonly serverEffects: 'unknown' | 'not_attempted'
+  /** Separate from HTTP dispatch: DNS/TLS can disclose network metadata first. */
+  readonly networkActivity: 'not_attempted' | 'possible'
   readonly doNotRetry?: true
 }
 export interface PublicUrlSuccess extends PublicUrlResultBase {
@@ -189,7 +191,8 @@ export async function fetchPublicUrl(input: unknown, adapters: PublicUrlAdapters
   let limits: Record<keyof typeof PUBLIC_URL_LIMITS, number> = { ...PUBLIC_URL_LIMITS }
   let timeout = false, active: PublicUrlResponse | undefined, requested: PreparedPublicUrl | undefined,
     current: PreparedPublicUrl | undefined, reads = 0, cleanupFailed = false
-  const requests: { url: string; transmission: 'unknown' | 'observed' }[] = [], redirects: PublicUrlRedirect[] = []
+  const network: { activity: PublicUrlResultBase['networkActivity'] } = { activity: 'not_attempted' }
+  const requests: { url: string; transmission: PublicUrlRequestEvidence['transmission'] }[] = [], redirects: PublicUrlRedirect[] = []
   const closeResponse = (response: PublicUrlResponse): void => {
     try {
       const closing: unknown = response.close()
@@ -255,17 +258,25 @@ export async function fetchPublicUrl(input: unknown, adapters: PublicUrlAdapters
         if (!await owned(() => adapters.approve(disclosure(), signal))) fail('approval_denied')
         resumeBudget()
       }
-      const answers = await owned(() => (adapters.resolve ?? resolvePublicUrlHost)(current!.hostname, signal, guard))
+      const answers = await owned(() => {
+        network.activity = 'possible'
+        return (adapters.resolve ?? resolvePublicUrlHost)(current!.hostname, signal, guard)
+      })
       if (!Array.isArray(answers) || !answers.length || answers.length > limits.addresses || answers.some(address => !isPublicUrlAddress(address))) fail('non_public_address')
       guard()
       if (adapters.onBeforeRequest) await owned(() => adapters.onBeforeRequest!(disclosure(), signal))
       guard()
-      const record = { url: current.url, transmission: 'unknown' as 'unknown' | 'observed' }; requests.push(record)
+      const request = adapters.request ?? requestPublicUrl
+      // Only the owned transport proves that no HTTP dispatch occurred before
+      // its callback. An arbitrary adapter failure remains an uncertain attempt.
+      const record = { url: current.url, transmission: publicUrlRequestHasSendBoundary(request)
+        ? 'not_attempted' as const : 'unknown' as PublicUrlRequestEvidence['transmission'] }; requests.push(record)
       active = await owned(async () => {
         guard()
-        const response = await (adapters.request ?? requestPublicUrl)({ ...current!, address: answers[0]!, method: 'GET', signal,
+        const response = await request({ ...current!, address: answers[0]!, method: 'GET', signal,
           headers: Object.freeze({ accept: 'text/plain, text/html, application/json', 'accept-encoding': 'identity' }),
-          assertCurrent: guard, onTransmit: () => { record.transmission = 'observed' } })
+          assertCurrent: guard, onDispatch: () => { if (record.transmission !== 'observed') record.transmission = 'unknown' },
+          onTransmit: () => { record.transmission = 'observed' } })
         // Late responses belong to their cancelled owner and must also be closed.
         try { guard() } catch (error) { closeResponse(response); throw error }
         return response
@@ -330,7 +341,7 @@ export async function fetchPublicUrl(input: unknown, adapters: PublicUrlAdapters
         bodySha256: createHash('sha256').update(body).digest('hex'),
         representation: mime === 'text/html' ? 'inert_html_text' : 'utf8_source',
         representationVersion: mime === 'text/html' ? PUBLIC_URL_HTML_VERSION : 'public-url-utf8-v1',
-        text: '', truncated: true, serverEffects: 'unknown', doNotRetry: true }
+        text: '', truncated: true, serverEffects: 'unknown', networkActivity: network.activity, doNotRetry: true }
       const envelopeBytes = bytes(JSON.stringify(result)) + 1 // false is one byte larger than true
       if (envelopeBytes > limits.resultBytes) fail('result_limit')
       const points: string[] = []
@@ -357,8 +368,10 @@ export async function fetchPublicUrl(input: unknown, adapters: PublicUrlAdapters
     // Transport errors contain only a fixed local code. Raw thrown URL, header,
     // body and TLS/DNS diagnostics are never exposed.
     const code = closedErrorCode(error)
+    const mayHaveSent = requests.some(record => record.transmission !== 'not_attempted')
     const result: PublicUrlFailure = { success: false, source: 'public_url', untrusted: true, ...evidence, bytesRead: reads,
-      serverEffects: requests.length ? 'unknown' : 'not_attempted', ...(requests.length ? { doNotRetry: true as const } : {}),
+      serverEffects: mayHaveSent ? 'unknown' : 'not_attempted', networkActivity: network.activity,
+      ...(mayHaveSent || network.activity === 'possible' ? { doNotRetry: true as const } : {}),
       ...(cleanupFailed ? { warnings: Object.freeze(['Response cleanup failed; resource closure was not verified']) } : {}),
       error: Object.freeze({ code, message: 'Public URL retrieval did not complete' }) }
     // Normally the maximum four bounded URLs fit. Shrunk test-result budgets and
