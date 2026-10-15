@@ -12,16 +12,16 @@ import { instrumentWindowsMcpArgv, phaseCollector } from '../helpers/mcp-cold-ph
 
 assert.equal(process.platform, 'win32', 'Cold native phases require actual Windows')
 const [mode, instrumentation] = process.argv.slice(2)
-assert(['cancel', 'observe'].includes(mode)); assert(['phases', 'baseline'].includes(instrumentation))
+assert(['cancel', 'observe', 'immediate'].includes(mode)); assert(['phases', 'baseline'].includes(instrumentation))
 const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-cold-phase-'))
 const startedAt = performance.now(), phases = phaseCollector(() => performance.now() - startedAt)
-let child, owned, result, startup = 'pending', readyAfterMs, stopAfterMs, helperClosed = false, fixtureCleanupFailed = false
+let child, owned, result, startup = 'pending', readyAfterMs, stopAfterMs, completedAfterMs, helperClosed = false, fixtureCleanupFailed = false
 async function bounded(promise, ms) {
   let timer
   try { return await Promise.race([promise, new Promise(resolve => { timer = setTimeout(resolve, ms) })]) }
   finally { clearTimeout(timer) }
 }
-const deadlineMs = mode === 'cancel' ? MCP_LIMITS.categoryMs : 90_000
+const deadlineMs = mode === 'immediate' ? 0 : mode === 'cancel' ? MCP_LIMITS.categoryMs : 90_000
 const systemRoot = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'systemroot')?.[1]
 assert(systemRoot)
 try {
@@ -35,12 +35,14 @@ try {
       return child
     } })
   owned.stdout.resume(); owned.stderr.resume()
-  const ready = owned.ready.then(() => { startup = 'ready'; readyAfterMs = Math.round(performance.now() - startedAt) }, () => { if (startup === 'pending') startup = 'rejected' })
-  await bounded(ready, deadlineMs)
+  const completion = owned.completed.then(value => { completedAfterMs = Math.round(performance.now() - startedAt); return value })
+  const ready = owned.ready.then(() => { if (startup === 'pending') startup = 'ready'; readyAfterMs = Math.round(performance.now() - startedAt) }, () => { if (startup === 'pending') startup = 'rejected' })
+  if (mode === 'immediate') startup = 'cancelled-before-ready'
+  else await bounded(ready, deadlineMs)
   if (startup === 'pending') startup = 'deadline'
   stopAfterMs = Math.round(performance.now() - startedAt)
   void owned.stop().catch(() => undefined)
-  result = await bounded(owned.completed, 8000)
+  result = await bounded(completion, 8000)
 } finally {
   if (child && !helperClosed) {
     child.kill('SIGKILL')
@@ -57,8 +59,10 @@ if (/^\d+\s*$/.test(pidText)) {
 }
 try { await rm(directory, { recursive: true, force: true }) } catch { fixtureCleanupFailed = true }
 const output = { event: 'owned-windows-mcp-cold-phases', node: process.version, mode, instrumentation,
-  deadlineMs, elapsedMs: Math.round(performance.now() - startedAt), startup, readyAfterMs, stopAfterMs,
+  deadlineMs, elapsedMs: Math.round(performance.now() - startedAt), startup, readyAfterMs, stopAfterMs, completedAfterMs,
+  cleanupElapsedMs: completedAfterMs === undefined ? undefined : completedAfterMs - stopAfterMs,
   phases: phases.phases, phaseOverflow: phases.overflow, helperClosed, completionObserved: result !== undefined,
+  cancelRequestedBeforeReady: readyAfterMs === undefined,
   exitCode: Number.isSafeInteger(result?.exitCode) ? result.exitCode : null,
   signal: ['SIGTERM', 'SIGKILL'].includes(result?.signal) ? result.signal : null,
   errorPresent: typeof result?.error === 'string',
@@ -67,4 +71,4 @@ const output = { event: 'owned-windows-mcp-cold-phases', node: process.version, 
   fixtureAliveAfterCompletion: fixtureAlive, fixtureCleanupFailed }
 console.log(JSON.stringify(output))
 // Unknown cleanup or incomplete startup is evidence, never a passing native gate.
-if (startup !== 'ready' || !output.nativeCleanupReported || !helperClosed || fixtureAlive || fixtureCleanupFailed || phases.overflow) process.exitCode = 1
+if ((mode === 'immediate' ? !output.cancelRequestedBeforeReady : startup !== 'ready') || !output.nativeCleanupReported || !helperClosed || fixtureAlive || fixtureCleanupFailed || phases.overflow) process.exitCode = 1

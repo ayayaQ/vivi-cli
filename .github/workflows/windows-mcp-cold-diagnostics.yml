@@ -19,17 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The original four cold samples remain in run 38724272652.
+          # This new evidence case must actually cancel before readiness.
           - node: '26'
-            mode: cancel
-            instrumentation: phases
-          - node: '26'
-            mode: observe
-            instrumentation: phases
-          - node: '26'
-            mode: observe
-            instrumentation: baseline
-          - node: '26.4.0'
-            mode: observe
+            mode: immediate
             instrumentation: phases
     steps:
       - uses: actions/checkout@v4
