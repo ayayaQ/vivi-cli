@@ -51,6 +51,8 @@ interface McpOAuthFetchOptions {
   readonly registerSecrets: (values: readonly string[]) => void
   /** Called immediately before the single approved POST reaches the injected/native fetch. */
   readonly posting?: () => void
+  /** Fixed status evidence after a complete bounded response, before SDK parsing. */
+  readonly responseStatus?: (status: number, url: URL) => void
   /** Inspect bounded raw data before SDK parsing can discard security-relevant fields. */
   readonly inspectResponse?: (record: Record<string, unknown>, url: URL, response: Response) => void
 }
@@ -101,6 +103,7 @@ export function createMcpOAuthFetch(options: McpOAuthFetchOptions): FetchLike {
     } finally { void reader?.cancel().catch(() => undefined) }
     options.assertCurrent()
     const body = Buffer.concat(chunks).toString('utf8')
+    options.responseStatus?.(response.status, url)
     let parsed: unknown
     try { parsed = JSON.parse(body) } catch { /* The SDK handles malformed metadata using fixed application errors. */ }
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {

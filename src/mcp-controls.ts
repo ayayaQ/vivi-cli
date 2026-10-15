@@ -7,6 +7,7 @@ import type { McpServerStatus } from './mcp-manager.js'
 import type { McpCatalogKind } from './mcp-catalog.js'
 import type { McpOAuthControls } from './mcp-oauth-controls.js'
 import { McpOAuthError } from './mcp-oauth-session.js'
+import { mcpOAuthRegistrationFailureMessage } from './mcp-oauth-callback.js'
 import { McpOAuthStoreError } from './mcp-oauth-store.js'
 import { McpSetupService } from './mcp-setup.js'
 
@@ -303,7 +304,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
         if (controller.signal.aborted || io.isClosed) return
         if (error instanceof McpOAuthStoreError) io.write(`${error.message}\n`)
         else if (error instanceof McpOAuthError && error.code === 'client-registration-uncertain')
-          io.write(`MCP ${serverId} registration may have been created, but its result could not be verified. Check the issuer before retrying; vivi will not automatically register again\n`)
+          io.write(`${mcpOAuthRegistrationFailureMessage(serverId, error)}\n`)
         else if (error instanceof McpOAuthError && error.code === 'client-registration-required')
           io.write(`MCP ${serverId} needs public client setup. Choose Sign in for discovery, or use Advanced for an existing registration\n`)
         else io.write(`MCP ${serverId} setup did not complete. Check the server URL and protocol or use Advanced for public client overrides. Ordinary chat remains available\n`)

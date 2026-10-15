@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { McpOAuthRegistration } from '../dist/mcp-oauth-registration.js'
 import { createMcpOAuthFetch } from '../dist/mcp-oauth-network.js'
+import { McpOAuthError, mcpOAuthRegistrationFailureMessage } from '../dist/mcp-oauth-callback.js'
+import { createMcpOAuthNativeFetch } from '../dist/mcp-oauth-native.js'
 
 const endpoint = 'https://mcp.fixture.invalid/mcp', issuer = 'https://auth.fixture.invalid'
 const metadata = { issuer, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`,
@@ -96,9 +98,10 @@ test('discovery must advertise a safe registration endpoint and compatible issue
 test('returned registration is rejected unless exact native public metadata is preserved', async t => {
   const variants = [ { client_id: '' }, { client_id: 'x'.repeat(1025) }, { client_id: 'bad\nclient' },
     { client_secret: 'fixture-secret-client' }, { client_secret: '' }, { token_endpoint_auth_method: 'client_secret_basic' },
-    { redirect_uris: ['http://127.0.0.1:41873/wrong'] }, { redirect_uris: [ 'http://127.0.0.1:41873/oauth/callback', 'https://other.invalid' ] },
+    { token_endpoint_auth_method: undefined },
+    { redirect_uris: undefined }, { redirect_uris: ['http://127.0.0.1:41873/wrong'] }, { redirect_uris: [ 'http://127.0.0.1:41873/oauth/callback', 'https://other.invalid' ] },
     { grant_types: ['authorization_code', 'refresh_token'] }, { response_types: ['token'] }, { application_type: 'web' },
-    { application_type: undefined }, { client_name: undefined }, { client_name: 'changed client' },
+    { client_name: 42 },
     { scope: undefined }, { scope: 'read write' }, { scope: 'write' }, { issuer: 'https://wrong.invalid' } ]
   for (const [index, change] of variants.entries()) await t.test(`invalid response ${index}`, async () => {
     const { registration, calls, secrets } = fixture({ response: body => ({ ...body, client_id: 'fixture-public-client', ...change }) })
@@ -108,6 +111,102 @@ test('returned registration is rejected unless exact native public metadata is p
     if (change.client_secret) assert(secrets.includes(change.client_secret))
     await assert.rejects(registration.beginRegistration(plan), safeError('invalid-plan'))
   })
+})
+
+test('optional application type and negotiated display name do not block public registration', async t => {
+  for (const change of [{ application_type: undefined }, { client_name: undefined }, { client_name: 'Issuer-approved display name' },
+    { application_type: undefined, client_name: undefined }]) await t.test(JSON.stringify(change), async () => {
+    const { registration, calls } = fixture({ response: body => ({ ...body, client_id: 'fixture-public-client', ...change }) })
+    const plan = await registration.prepareRegistration(), client = await registration.beginRegistration(plan)
+    assert.equal(client.id, 'fixture-public-client'); assert.equal(client.client_name, undefined)
+    const posts = calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1)
+    const requested = JSON.parse(posts[0].body)
+    assert.equal(requested.application_type, 'native'); assert.equal(requested.client_name, settings.clientName)
+    await assert.rejects(registration.beginRegistration(plan), safeError('invalid-plan'))
+  })
+})
+
+test('fixed HTTP diagnostics retain status without issuer bodies and consume approval once', async t => {
+  for (const status of [400, 403, 429, 500]) for (const json of [true, false]) await t.test(`${status} json=${json}`, async () => {
+    const { registration, calls, secrets } = fixture({ fetchFn: (_url, init) => init?.method === 'POST'
+      ? json ? Response.json({ error: 'invalid_client_metadata', error_description: 'provider-error fixture-secret-error',
+        client_secret: 'fixture-secret-error' }, { status }) : new Response('provider-error fixture-secret-error', { status }) : undefined })
+    const plan = await registration.prepareRegistration()
+    await assert.rejects(registration.beginRegistration(plan), error => {
+      assert.equal(error.code, 'client-registration-uncertain')
+      assert.deepEqual(error.registrationDiagnostic, { kind: 'http-rejected', status })
+      const message = mcpOAuthRegistrationFailureMessage('fixture', error)
+      assert.match(message, new RegExp(`HTTP ${status}`)); assert.match(message, /Browser sign-in did not start/)
+      assert.match(message, /will not automatically register again/)
+      assert(!/provider-error|fixture-secret/.test(message + JSON.stringify(error))); return true
+    })
+    if (json) assert(secrets.includes('fixture-secret-error'))
+    assert.equal(calls.filter(call => call.method === 'POST').length, 1)
+    await assert.rejects(registration.beginRegistration(plan), safeError('invalid-plan'))
+  })
+})
+
+test('incompatible successful registration identifies fixed field names without values', async () => {
+  const { registration, calls } = fixture({ response: body => ({ ...body, client_id: 'fixture-public-client',
+    redirect_uris: ['https://provider-error.fixture-secret.invalid/callback'], token_endpoint_auth_method: 'client_secret_basic' }) })
+  const plan = await registration.prepareRegistration()
+  await assert.rejects(registration.beginRegistration(plan), error => {
+    assert.equal(error.code, 'client-registration-uncertain')
+    assert.deepEqual(error.registrationDiagnostic, { kind: 'response-mismatch', fields: ['token_endpoint_auth_method', 'redirect_uris'] })
+    const message = mcpOAuthRegistrationFailureMessage('fixture', error)
+    assert.match(message, /token_endpoint_auth_method, redirect_uris/)
+    assert.match(message, /A client may have been created/); assert(!/provider-error|fixture-secret/.test(message + JSON.stringify(error)))
+    return true
+  })
+  assert.equal(calls.filter(call => call.method === 'POST').length, 1)
+})
+
+test('malformed successful JSON reports invalid response without printing its body', async () => {
+  const { registration } = fixture({ fetchFn: (_url, init) => init?.method === 'POST' ? new Response('{fixture-secret') : undefined })
+  const plan = await registration.prepareRegistration()
+  await assert.rejects(registration.beginRegistration(plan), error => {
+    assert.deepEqual(error.registrationDiagnostic, { kind: 'invalid-response' })
+    assert.match(mcpOAuthRegistrationFailureMessage('fixture', error), /invalid response/)
+    assert(!JSON.stringify(error).includes('fixture-secret')); return true
+  })
+})
+
+test('native DNS failures carry fixed phase evidence through registration without dispatch', async () => {
+  let requests = 0
+  const native = createMcpOAuthNativeFetch({ async resolvePublicUrlHost() { throw new Error('provider-error fixture-secret') },
+    request() { requests++; throw new Error('unexpected dispatch') } })
+  const { registration } = fixture({ fetchFn: (url, init) => init?.method === 'POST' ? native(url.href, init) : undefined })
+  const plan = await registration.prepareRegistration()
+  await assert.rejects(registration.beginRegistration(plan), error => {
+    assert.equal(error.code, 'client-registration-uncertain')
+    assert.deepEqual(error.registrationDiagnostic, { kind: 'transport-failure', phase: 'dns' })
+    const message = mcpOAuthRegistrationFailureMessage('fixture', error)
+    assert.match(message, /DNS lookup, before HTTP request transmission/)
+    assert(!/provider-error|fixture-secret/.test(message + JSON.stringify(error))); return true
+  })
+  assert.equal(requests, 0)
+})
+
+test('safe formatter never copies unknown diagnostic field names', () => {
+  const error = new McpOAuthError('client-registration-uncertain', { kind: 'response-mismatch', fields: ['fixture-secret', 'redirect_uris'] })
+  const message = mcpOAuthRegistrationFailureMessage('fixture', error)
+  assert.match(message, /redirect_uris/); assert(!message.includes('fixture-secret'))
+})
+
+test('native TLS setup failure remains pre-transmission through full registration diagnostics', async () => {
+  let requests = 0
+  const native = createMcpOAuthNativeFetch({ async resolvePublicUrlHost() { return ['8.8.8.8'] },
+    request() { requests++; throw new Error('provider-error fixture-secret') } })
+  const { registration } = fixture({ fetchFn: (url, init) => init?.method === 'POST' ? native(url.href, init) : undefined })
+  const plan = await registration.prepareRegistration()
+  await assert.rejects(registration.beginRegistration(plan), error => {
+    assert.equal(error.code, 'client-registration-uncertain')
+    assert.deepEqual(error.registrationDiagnostic, { kind: 'transport-failure', phase: 'tls' })
+    const message = mcpOAuthRegistrationFailureMessage('fixture', error)
+    assert.match(message, /TLS connection, before HTTP request transmission/)
+    assert(!/provider-error|fixture-secret/.test(message + JSON.stringify(error))); return true
+  })
+  assert.equal(requests, 1)
 })
 
 test('plans are object-bound, epoch-bound and configuration-bound', async t => {

@@ -4,10 +4,20 @@ import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { Socket } from 'node:net'
 
+/** Fixed classifications only. Never retain issuer response text or field values. */
+export type McpOAuthNetworkPhase = 'dns' | 'tls' | 'request' | 'response'
+export type McpOAuthRegistrationDiagnostic =
+  | { readonly kind: 'http-rejected'; readonly status: number }
+  | { readonly kind: 'response-mismatch'; readonly fields: readonly string[] }
+  | { readonly kind: 'invalid-response' }
+  | { readonly kind: 'transport-failure'; readonly phase: McpOAuthNetworkPhase }
+
 export class McpOAuthError extends Error {
   constructor(readonly code: 'cancelled' | 'timeout' | 'callback-unavailable' | 'authorization-denied' |
     'invalid-plan' | 'client-registration-required' | 'authorization-failed' | 'client-registration-failed' |
-    'client-registration-uncertain' | 'client-registration-cancelled') {
+    'client-registration-uncertain' | 'client-registration-cancelled',
+    readonly registrationDiagnostic?: McpOAuthRegistrationDiagnostic,
+    readonly networkPhase?: McpOAuthNetworkPhase) {
     super({ cancelled: 'MCP sign-in cancelled', timeout: 'MCP sign-in timed out',
       'callback-unavailable': 'MCP sign-in callback is unavailable', 'authorization-denied': 'MCP sign-in was declined',
       'invalid-plan': 'MCP sign-in changed; prepare it again', 'client-registration-required': 'MCP requires a registered public OAuth client',
@@ -17,6 +27,29 @@ export class McpOAuthError extends Error {
       'authorization-failed': 'MCP sign-in failed' }[code])
     this.name = 'McpOAuthError'
   }
+}
+
+/** Human-readable evidence with no issuer-provided strings or response values. */
+export function mcpOAuthRegistrationFailureMessage(serverId: string, error: McpOAuthError): string {
+  const diagnostic = error.registrationDiagnostic
+  const suffix = 'Check the issuer before retrying; vivi will not automatically register again'
+  if (diagnostic?.kind === 'http-rejected' && Number.isInteger(diagnostic.status) && diagnostic.status >= 400 && diagnostic.status <= 599)
+    return `MCP ${serverId} client registration received HTTP ${diagnostic.status} from the issuer. Browser sign-in did not start. ${suffix}`
+  if (diagnostic?.kind === 'response-mismatch') {
+    const allowed = ['client_id', 'token_endpoint_auth_method', 'client_secret', 'issuer', 'application_type', 'client_name',
+      'redirect_uris', 'grant_types', 'response_types', 'scope']
+    const fields = allowed.filter(field => diagnostic.fields.includes(field))
+    return `MCP ${serverId} client registration returned incompatible metadata${fields.length ? ` (${fields.join(', ')})` : ''}. A client may have been created; browser sign-in did not start. ${suffix}`
+  }
+  if (diagnostic?.kind === 'invalid-response')
+    return `MCP ${serverId} client registration returned an invalid response. A client may have been created; browser sign-in did not start. ${suffix}`
+  if (diagnostic?.kind === 'transport-failure') {
+    const phases: Record<McpOAuthNetworkPhase, string> = { dns: 'DNS lookup', tls: 'TLS connection', request: 'request transmission', response: 'response transfer' }
+    const phase = phases[diagnostic.phase]
+    if (phase) return `MCP ${serverId} client registration stopped during ${phase}${diagnostic.phase === 'dns' || diagnostic.phase === 'tls'
+      ? ', before HTTP request transmission' : '; its outcome could not be verified'}. Browser sign-in did not start. ${suffix}`
+  }
+  return `MCP ${serverId} registration may have been created, but its result could not be verified. ${suffix}`
 }
 export interface McpOAuthCallbackOptions {
   readonly state: string

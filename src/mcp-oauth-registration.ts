@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { discoverOAuthServerInfo, registerClient } from '@modelcontextprotocol/client'
 import type { FetchLike, OAuthClientMetadata, OAuthDiscoveryState } from '@modelcontextprotocol/client'
 import { McpOAuthError, validateMcpOAuthRedirectPath } from './mcp-oauth-callback.js'
+import type { McpOAuthRegistrationDiagnostic } from './mcp-oauth-callback.js'
 import { createMcpOAuthFetch, mcpOAuthRemoteUrl, validateMcpOAuthDiscovery } from './mcp-oauth-network.js'
 
 export interface McpOAuthRegistrationSettings {
@@ -55,10 +56,31 @@ interface RegistrationFlow {
   info?: OAuthDiscoveryState
   plan?: McpOAuthRegistrationPlan
   posted: boolean
+  diagnostic?: McpOAuthRegistrationDiagnostic
   timer?: ReturnType<typeof setTimeout>
 }
-const exactly = (actual: readonly string[] | undefined, expected: readonly string[]): boolean =>
-  !!actual && actual.length === expected.length && expected.every((value, index) => actual[index] === value)
+const exactly = (actual: unknown, expected: readonly string[]): boolean =>
+  Array.isArray(actual) && actual.length === expected.length && expected.every((value, index) => actual[index] === value)
+
+/** Field names come from this fixed list, never provider-controlled values. */
+function incompatibleFields(client: Record<string, unknown>, plan: McpOAuthRegistrationPlan): readonly string[] {
+  const fields: string[] = []
+  if (typeof client.client_id !== 'string' || !client.client_id || client.client_id.length > 1024 ||
+    /[\u0000-\u0020\u007f-\u009f]/.test(client.client_id)) fields.push('client_id')
+  if (client.token_endpoint_auth_method !== 'none') fields.push('token_endpoint_auth_method')
+  if (Object.hasOwn(client, 'client_secret')) fields.push('client_secret')
+  if (client.issuer !== undefined && client.issuer !== plan.issuer) fields.push('issuer')
+  // Servers that do not implement the OIDC application_type extension may omit
+  // it. An explicit contradictory type remains unsafe. Display names are
+  // negotiated metadata and are neither authority nor persisted by this flow.
+  if (client.application_type !== undefined && client.application_type !== 'native') fields.push('application_type')
+  if (client.client_name !== undefined && typeof client.client_name !== 'string') fields.push('client_name')
+  if (!exactly(client.redirect_uris, [plan.redirectUri])) fields.push('redirect_uris')
+  if (!exactly(client.grant_types, ['authorization_code'])) fields.push('grant_types')
+  if (!exactly(client.response_types, ['code'])) fields.push('response_types')
+  if (client.scope !== plan.clientMetadata.scope) fields.push('scope')
+  return Object.freeze(fields)
+}
 
 /** One explicitly approved compatibility DCR POST. Never signs in, starts MCP or persists a client. */
 export class McpOAuthRegistration {
@@ -90,7 +112,8 @@ export class McpOAuthRegistration {
   private clear(flow: RegistrationFlow): void { clearTimeout(flow.timer); delete flow.timer; delete flow.info; delete flow.plan }
   private safeFailure(flow: RegistrationFlow, error: unknown): McpOAuthError {
     // A sent POST cannot safely be retried when cancellation, parsing or validation obscures its outcome.
-    if (flow.posted) return new McpOAuthError('client-registration-uncertain')
+    if (flow.posted) return new McpOAuthError('client-registration-uncertain', flow.diagnostic ??
+      (error instanceof McpOAuthError && error.networkPhase ? { kind: 'transport-failure', phase: error.networkPhase } : undefined))
     return new McpOAuthError(error instanceof McpOAuthError && error.code === 'cancelled' || flow.abort.signal.aborted
       ? 'client-registration-cancelled' : 'client-registration-failed')
   }
@@ -99,9 +122,18 @@ export class McpOAuthRegistration {
       origins: [mcpOAuthRemoteUrl(this.options.endpoint).origin, mcpOAuthRemoteUrl(this.options.issuer).origin],
       assertCurrent: () => this.assertCurrent(flow), registerSecrets: this.options.registerSecrets,
       postEndpoint: () => this.state === 'registering' ? flow.plan?.registrationEndpoint : undefined,
-      posting: () => { flow.posted = true }, inspectResponse: (record, url) => {
-        if (url.href === flow.plan?.registrationEndpoint && (record.issuer !== undefined && record.issuer !== this.options.issuer ||
-          Object.hasOwn(record, 'client_secret'))) throw new McpOAuthError('client-registration-failed')
+      posting: () => { flow.posted = true }, responseStatus: (status, url) => {
+        if (url.href === flow.plan?.registrationEndpoint)
+          flow.diagnostic = status >= 400 ? { kind: 'http-rejected', status } : { kind: 'invalid-response' }
+      }, inspectResponse: (record, url, response) => {
+        if (url.href !== flow.plan?.registrationEndpoint) return
+        if (!response.ok) {
+          flow.diagnostic = { kind: 'http-rejected', status: response.status }
+          return
+        }
+        const fields = incompatibleFields(record, flow.plan)
+        flow.diagnostic = fields.length ? { kind: 'response-mismatch', fields } : { kind: 'invalid-response' }
+        if (fields.includes('issuer') || fields.includes('client_secret')) throw new McpOAuthError('client-registration-failed')
       } })
   }
   async prepareRegistration(signal?: AbortSignal): Promise<McpOAuthRegistrationPlan> {
@@ -144,11 +176,12 @@ export class McpOAuthRegistration {
       const client = await registerClient(plan.issuer, { metadata: flow.info!.authorizationServerMetadata!,
         clientMetadata: metadata, fetchFn: this.fetchFor(flow) })
       this.assertCurrent(flow)
-      if (!client.client_id || client.client_id.length > 1024 || /[\u0000-\u0020\u007f-\u009f]/.test(client.client_id) ||
-        client.token_endpoint_auth_method !== 'none' || Object.hasOwn(client, 'client_secret') ||
-        client.application_type !== 'native' || client.client_name !== plan.clientMetadata.client_name || !exactly(client.redirect_uris, [plan.redirectUri]) ||
-        !exactly(client.grant_types, ['authorization_code']) || !exactly(client.response_types, ['code']) ||
-        client.scope !== plan.clientMetadata.scope) throw new McpOAuthError('client-registration-failed')
+      const fields = incompatibleFields(client, plan)
+      if (fields.length) {
+        flow.diagnostic = { kind: 'response-mismatch', fields }
+        throw new McpOAuthError('client-registration-failed')
+      }
+      delete flow.diagnostic
       this.options.registered?.(); this.assertCurrent(flow)
       const result = Object.freeze({ id: client.client_id, issuer: plan.issuer, redirectPort: this.options.redirectPort,
         redirectPath: this.options.redirectPath, scopes: this.options.scopes })
