@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { McpConfigStore, prepareMcpLaunch, validateMcpServer } from '../dist/mcp-config.js'
+import { McpConfigStore, mcpDigest, prepareMcpLaunch, validateMcpServer } from '../dist/mcp-config.js'
 import { McpManager } from '../dist/mcp-manager.js'
 import { McpStdioTransport } from '../dist/mcp-transport.js'
 
@@ -96,4 +96,31 @@ test('Bun requires an existing installed script and preserves explicit no-instal
   assert.equal(manager.statuses()[0].snapshot.categories.tools.state, 'ready')
   const log = (await readFile(join(directory, 'log'), 'utf8')).trim().split('\n').map(JSON.parse)
   assert(log.filter(entry => entry.method).every(entry => ['initialize', 'notifications/initialized', 'tools/list'].includes(entry.method)))
+})
+
+test('HTTP protocol modes remain explicit and preserve existing saved pins without migration', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-protocol-config-')), store = new McpConfigStore(directory)
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const configured = { transport: 'http', id: 'docs', label: 'Docs', endpoint: 'https://mcp.example.test/mcp', allowLoopbackHttp: false }
+  for (const protocol of ['legacy', '2026-07-28', 'auto']) {
+    const server = validateMcpServer({ ...configured, protocol })
+    const saved = await store.save([server], (await store.load()).revision)
+    const before = await readFile(join(directory, 'mcp-servers.json'), 'utf8')
+    const loaded = await store.load()
+    assert.equal(loaded.servers[0].protocol, protocol)
+    assert.equal(loaded.revision, saved.revision); assert.equal(loaded.revision, mcpDigest([server]))
+    assert.equal(await readFile(join(directory, 'mcp-servers.json'), 'utf8'), before)
+    assert.equal(JSON.parse(before).schemaVersion, 1)
+    for (const invalid of [undefined, null, '', '2025-11-25', '2026-07-29']) {
+      assert.throws(() => validateMcpServer({ ...configured, protocol: invalid }), /Invalid MCP/)
+    }
+    const omitted = { ...server }; delete omitted.protocol
+    assert.throws(() => validateMcpServer(omitted), /Invalid MCP/)
+  }
+  const current = await store.load(), launch = await prepareMcpLaunch(current.servers[0], current.revision, {})
+  const pinned = validateMcpServer({ ...current.servers[0], protocol: '2026-07-28' })
+  const saved = await store.save([pinned], current.revision)
+  const next = await prepareMcpLaunch(pinned, saved.revision, {})
+  assert.notEqual(saved.revision, current.revision); assert.notEqual(next.digest, launch.digest)
+  await assert.rejects(store.save(current.servers, current.revision), /configuration changed/)
 })

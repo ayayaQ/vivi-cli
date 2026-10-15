@@ -279,3 +279,28 @@ test('known connected and logged-out receipts survive immediate late cancellatio
   assert.equal(response.doNotRetry, true)
   assert.equal(subject.manager.statuses()[0].state, 'disabled')
 })
+
+for (const protocol of [undefined, 'auto', '2026-07-28', 'legacy']) test(`agent add reviews and saves protocol ${protocol ?? 'auto by default'} without connecting`, async t => {
+  const subject = await fixture(t), request = call(await subject.revision())
+  if (protocol === undefined) delete request.arguments.protocol
+  else request.arguments.protocol = protocol
+  const response = body(await subject.service.executeSetup(request, signal(), subject.context))
+  assert.equal(response.success, true); assert.equal(subject.approvals.length, 1)
+  const saved = await subject.store.load()
+  assert.equal(saved.servers[0].protocol, protocol ?? 'auto')
+  assert.match(subject.approvals[0].description, new RegExp(`"protocol":"${protocol ?? 'auto'}"`))
+  assert.deepEqual(subject.approvals[0].call.arguments, request.arguments)
+  assert.equal(subject.transportState.starts, 0); assert.deepEqual(subject.methods, [])
+})
+
+test('direct HTTP setup defaults to auto and retains explicit protocol overrides', async t => {
+  const subject = await fixture(t)
+  await subject.service.addHttp({ id: 'docs', endpoint: http().endpoint })
+  assert.equal((await subject.store.load()).servers[0].protocol, 'auto')
+  for (const protocol of ['2026-07-28', 'legacy', 'auto']) {
+    await subject.service.remove('docs')
+    await subject.service.addHttp({ id: 'docs', endpoint: http().endpoint, protocol })
+    assert.equal((await subject.store.load()).servers[0].protocol, protocol)
+  }
+  assert.equal(subject.transportState.starts, 0); assert.deepEqual(subject.methods, [])
+})

@@ -21,7 +21,7 @@ export const MCP_HELP = `Usage: vivi mcp add NAME URL [options]
 
   --session-dir PATH          Private state directory (default ~/.vivi/sessions)
   --label TEXT                Display label for add (default NAME)
-  --protocol VERSION          2026-07-28 (default) or legacy, for add
+  --protocol VERSION          auto (default), 2026-07-28 or legacy, for add
   --allow-loopback-http       Allow literal 127.0.0.1 or ::1 HTTP, for add
   --session-only              Use RAM-only sign-in for login/connect
   --help                      Show this help
@@ -43,7 +43,7 @@ export interface McpCliOptions {
   readonly id?: string
   readonly endpoint?: string
   readonly label?: string
-  readonly protocol: 'legacy' | '2026-07-28'
+  readonly protocol: 'auto' | 'legacy' | '2026-07-28'
   readonly allowLoopbackHttp: boolean
   readonly sessionDirectory: string
   readonly help: boolean
@@ -67,7 +67,7 @@ export function parseMcpCliArguments(args: readonly string[], env: NodeJS.Proces
   if (!isMcpCliCommand(args) || args.length > 32) throw new Error('Use vivi mcp --help')
   let sessionDirectory = env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions')
   let label: string | undefined
-  let protocol: McpCliOptions['protocol'] = '2026-07-28'
+  let protocol: McpCliOptions['protocol'] = 'auto'
   let allowLoopbackHttp = false, help = false, sawCommand = false, sessionOnly = false
   const positional: string[] = [], flags = new Set<string>()
   for (let index = 0; index < args.length; index++) {
@@ -87,7 +87,7 @@ export function parseMcpCliArguments(args: readonly string[], env: NodeJS.Proces
       case '--label': label = value(); break
       case '--protocol': {
         const version = value()
-        if (version !== 'legacy' && version !== '2026-07-28') throw new Error('MCP protocol must be legacy or 2026-07-28')
+        if (version !== 'auto' && version !== 'legacy' && version !== '2026-07-28') throw new Error('MCP protocol must be auto, legacy or 2026-07-28')
         protocol = version; break
       }
       case '--allow-loopback-http': allowLoopbackHttp = true; break

@@ -30,13 +30,13 @@ function validateSetupArguments(args: unknown): void {
     return
   }
   if (!mcpText(args.endpoint, 4096) || Object.hasOwn(args, 'label') && !mcpText(args.label, 80) ||
-    Object.hasOwn(args, 'protocol') && !['legacy', '2026-07-28'].includes(String(args.protocol))) {
+    Object.hasOwn(args, 'protocol') && !['auto', 'legacy', '2026-07-28'].includes(String(args.protocol))) {
     throw new Error('MCP add requires a bounded HTTPS endpoint and optional label/protocol')
   }
   // Reuse the existing exact HTTP validator. The model cannot enable insecure
   // loopback, headers, credentials, queries, fragments, process execution or installation.
   validateMcpServer({ transport: 'http', id: args.id, label: args.label ?? args.id,
-    endpoint: args.endpoint, protocol: args.protocol ?? '2026-07-28', allowLoopbackHttp: false })
+    endpoint: args.endpoint, protocol: args.protocol ?? 'auto', allowLoopbackHttp: false })
 }
 
 function withheldResult(result: ToolResult, local: boolean, screeningUnavailable = false): ToolResult {
@@ -114,7 +114,7 @@ export function createMcpSetupExtension(host: McpSetupToolHost): ToolExtension {
         id: { type: 'string', pattern: '^[a-z][a-z0-9_-]{0,15}$' },
         expectedRevision: { type: 'string', pattern: '^[a-f0-9]{64}$' },
         endpoint: { type: 'string', maxLength: 4096 }, label: { type: 'string', maxLength: 80 },
-        protocol: { type: 'string', enum: ['legacy', '2026-07-28'] }
+        protocol: { type: 'string', enum: ['auto', 'legacy', '2026-07-28'], default: 'auto' }
       }, required: ['action', 'id', 'expectedRevision'], additionalProperties: false } },
       validateArguments: validateSetupArguments,
       execute: (call, { signal }) => run(call, signal, false) }

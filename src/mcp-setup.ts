@@ -63,9 +63,9 @@ function setupInput(call: ToolCall): { readonly action: SetupAction; readonly id
     return { action, id: args.id, expectedRevision: args.expectedRevision }
   }
   if (!mcpText(args.endpoint, 4096) || Object.hasOwn(args, 'label') && !mcpText(args.label, 80) ||
-    Object.hasOwn(args, 'protocol') && !['legacy', '2026-07-28'].includes(String(args.protocol))) throw new Error('Invalid MCP setup proposal')
+    Object.hasOwn(args, 'protocol') && !['auto', 'legacy', '2026-07-28'].includes(String(args.protocol))) throw new Error('Invalid MCP setup proposal')
   const server = validateMcpServer({ transport: 'http', id: args.id, label: args.label ?? args.id,
-    endpoint: args.endpoint, protocol: args.protocol ?? '2026-07-28', allowLoopbackHttp: false }) as McpHttpServerConfig
+    endpoint: args.endpoint, protocol: args.protocol ?? 'auto', allowLoopbackHttp: false }) as McpHttpServerConfig
   return { action, id: args.id, expectedRevision: args.expectedRevision, server }
 }
 function setupResult(body: Record<string, unknown>): ToolResult {
@@ -208,7 +208,7 @@ Exact proposal: ${mcpDisplayJson(proposal)}`
   }
   async addHttp(input: McpSetupHttpInput, expectedRevision?: string, lifecycle?: McpConfigurationLifecycle): Promise<void> {
     const server = validateMcpServer({ transport: 'http', id: input.id, label: input.label ?? input.id,
-      endpoint: input.endpoint, protocol: input.protocol ?? '2026-07-28', allowLoopbackHttp: input.allowLoopbackHttp ?? false })
+      endpoint: input.endpoint, protocol: input.protocol ?? 'auto', allowLoopbackHttp: input.allowLoopbackHttp ?? false })
     await this.manager.configure(server, expectedRevision, lifecycle)
   }
   async connect(id: string, io: ChatIO, signal: AbortSignal, mode?: 'session-only', lifecycle?: McpOAuthOperationLifecycle): Promise<boolean> {

@@ -178,7 +178,10 @@ Use `node dist/launcher.js --help` for all options, including `--resume UUID` an
 Use `/mcp` to add an HTTPS server URL and name, then choose Connect or Sign in.
 The same provider-independent controls are available as `vivi mcp add NAME URL`,
 `list`, `connect`, `login`, `logout`, and `remove`. Add saves a disabled entry;
-no model or API key is needed. Technical overrides are in Advanced.
+no model or API key is needed. New HTTP servers use automatic protocol
+compatibility; exact `2026-07-28` and legacy overrides are in Advanced or
+`--protocol`. Existing pins are preserved; choose Automatic in Advanced to
+explicitly change an existing HTTP pin.
 
 You can also ask the agent to add an MCP URL or start guided setup. `mcp_list`
 reads fresh local entries, status and configuration revision without starting a
