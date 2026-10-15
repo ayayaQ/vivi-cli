@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { constants } from 'node:fs'
-import type { Stats } from 'node:fs'
+import type { BigIntStats } from 'node:fs'
 import { lstat, open, opendir, realpath } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { dirname, join, parse, relative, resolve, sep } from 'node:path'
@@ -33,37 +33,38 @@ export interface CliSkillStore {
   drain(options?: { readonly close?: boolean }): Promise<void>
 }
 
-interface PathEntry { readonly path: string; readonly entry: Stats }
+interface PathEntry { readonly path: string; readonly entry: BigIntStats }
 interface Directory {
   readonly path: string
-  readonly entry: Stats
+  readonly entry: BigIntStats
   readonly ancestry: readonly PathEntry[]
   readonly handles: readonly FileHandle[]
   readonly handle: FileHandle | undefined
   readonly private: boolean
 }
-interface StoredFile { readonly entry: Stats; readonly bytes: Buffer; readonly content: string }
+interface StoredFile { readonly entry: BigIntStats; readonly bytes: Buffer; readonly content: string }
 interface SourceBinding {
   readonly root: string
-  readonly rootEntry: Stats
+  readonly rootEntry: BigIntStats
   readonly name: string
   readonly directoryName: string
-  readonly directoryEntry: Stats
+  readonly directoryEntry: BigIntStats
   readonly revision: string
   readonly readOnly: boolean
 }
 interface Candidate { readonly source: SkillSource; readonly document: SkillDocument; readonly binding?: SourceBinding }
 
 function missing(error: unknown): boolean { return error instanceof Error && 'code' in error && error.code === 'ENOENT' }
-function sameFile(left: Stats, right: Stats): boolean { return left.dev === right.dev && left.ino !== 0 && left.ino === right.ino }
-function unchanged(left: Stats, right: Stats): boolean {
-  return sameFile(left, right) && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
+// Filesystem IDs can exceed Number.MAX_SAFE_INTEGER, notably on NTFS.
+function sameFile(left: BigIntStats, right: BigIntStats): boolean { return left.dev === right.dev && left.ino !== 0n && left.ino === right.ino }
+function unchanged(left: BigIntStats, right: BigIntStats): boolean {
+  return sameFile(left, right) && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
 }
-function ownedPrivate(info: Stats): boolean {
-  return process.platform === 'win32' || ((info.mode & 0o077) === 0 && info.uid === process.getuid?.())
+function ownedPrivate(info: BigIntStats): boolean {
+  return process.platform === 'win32' || ((info.mode & 0o077n) === 0n && info.uid === BigInt(process.getuid?.() ?? -1))
 }
-function regular(info: Stats, maximum: number, privateFile: boolean): boolean {
-  return info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && info.size <= maximum && (!privateFile || ownedPrivate(info))
+function regular(info: BigIntStats, maximum: number, privateFile: boolean): boolean {
+  return info.isFile() && !info.isSymbolicLink() && info.nlink === 1n && info.size <= BigInt(maximum) && (!privateFile || ownedPrivate(info))
 }
 function safeResource(path: string): void {
   validateSkillResourcePath(path)
@@ -132,7 +133,7 @@ export class FileSkillStore implements CliSkillStore {
   }
   private async checkDirectory(directory: Directory): Promise<void> {
     for (const ancestor of directory.ancestry) {
-      const current = await lstat(ancestor.path)
+      const current = await lstat(ancestor.path, { bigint: true })
       if (!current.isDirectory() || current.isSymbolicLink() || !sameFile(current, ancestor.entry)) {
         throw new Error('Skill directory changed during the operation; files were preserved')
       }
@@ -142,11 +143,11 @@ export class FileSkillStore implements CliSkillStore {
     // byte equality (or blanket case folding on APFS), proves that this canonical
     // spelling denotes the already checked directory. Every supplied ancestor
     // remains independently checked for reparse/symlink entries and identity.
-    const canonicalEntry = await lstat(canonical)
+    const canonicalEntry = await lstat(canonical, { bigint: true })
     if (!canonicalEntry.isDirectory() || canonicalEntry.isSymbolicLink() || !sameFile(canonicalEntry, directory.entry)) {
       throw new Error('Canonical skill directory identity differs from the approved directory')
     }
-    const current = await lstat(directory.path)
+    const current = await lstat(directory.path, { bigint: true })
     if (!sameFile(current, directory.entry) || (directory.private && !ownedPrivate(current))) {
       throw new Error('Skill directory changed or is not an owned private directory')
     }
@@ -167,13 +168,13 @@ export class FileSkillStore implements CliSkillStore {
         if (component !== undefined) current = join(current, component)
         if (parent) await this.checkDirectory(parent)
         const io = parent && component !== undefined ? join(this.ioPath(parent), component) : current
-        const entry = await lstat(io)
+        const entry = await lstat(io, { bigint: true })
         if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error('Skill roots and directories must be real directories without symlinks or junctions')
         let handle: FileHandle | undefined
         if (process.platform !== 'win32') {
           handle = await open(io, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
           handles.push(handle)
-          const info = await handle.stat()
+          const info = await handle.stat({ bigint: true })
           if (!info.isDirectory() || !sameFile(info, entry)) throw new Error('Skill directory changed while opening it')
         }
         ancestry.push({ path: current, entry })
@@ -197,8 +198,8 @@ export class FileSkillStore implements CliSkillStore {
     await this.checkDirectory(parent)
     const path = join(parent.path, name)
     const io = join(this.ioPath(parent), name)
-    let entry: Stats
-    try { entry = await lstat(io) }
+    let entry: BigIntStats
+    try { entry = await lstat(io, { bigint: true }) }
     catch (error) { if (missing(error)) return undefined; throw error }
     if (!entry.isDirectory() || entry.isSymbolicLink() || (parent.private && !ownedPrivate(entry))) {
       throw new Error('Skill directory must be real, contained and private in the owned store')
@@ -207,7 +208,7 @@ export class FileSkillStore implements CliSkillStore {
     try {
       if (process.platform !== 'win32') {
         handle = await open(io, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-        const info = await handle.stat()
+        const info = await handle.stat({ bigint: true })
         if (!info.isDirectory() || !sameFile(entry, info)) throw new Error('Skill directory changed while opening it')
       }
       const directory: Directory = { path, entry, ancestry: [...parent.ancestry, { path, entry }],
@@ -219,12 +220,12 @@ export class FileSkillStore implements CliSkillStore {
   private async readFile(directory: Directory, name: string, maximum: number = SKILL_LIMITS.maximumDocumentBytes): Promise<StoredFile | undefined> {
     await this.checkDirectory(directory)
     const path = join(this.ioPath(directory), name)
-    let entry: Stats
-    try { entry = await lstat(path) } catch (error) { if (missing(error)) return undefined; throw error }
+    let entry: BigIntStats
+    try { entry = await lstat(path, { bigint: true }) } catch (error) { if (missing(error)) return undefined; throw error }
     if (!regular(entry, maximum, directory.private)) throw new Error('Skill file is read-only: expected a bounded regular file without symlinks')
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     try {
-      const info = await file.stat()
+      const info = await file.stat({ bigint: true })
       if (!regular(info, maximum, directory.private) || !unchanged(entry, info)) throw new Error('Skill file changed while opening it')
       await this.checkDirectory(directory)
       const buffer = Buffer.alloc(maximum + 1)
@@ -235,8 +236,8 @@ export class FileSkillStore implements CliSkillStore {
         offset += bytesRead
       }
       if (offset > maximum) throw new Error('Skill file exceeds the byte limit')
-      const final = await file.stat()
-      const pathEntry = await lstat(path)
+      const final = await file.stat({ bigint: true })
+      const pathEntry = await lstat(path, { bigint: true })
       await this.checkDirectory(directory)
       if (!regular(final, maximum, directory.private) || !regular(pathEntry, maximum, directory.private) ||
         !unchanged(info, final) || !unchanged(final, pathEntry)) throw new Error('Skill file changed while reading it')
