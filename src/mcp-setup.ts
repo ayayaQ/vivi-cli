@@ -26,6 +26,7 @@ export interface McpSetupLocalServer {
   readonly protocol: string
   readonly state: string
   readonly signInState?: string
+  readonly message?: string
   readonly nextAction?: 'Connect' | 'Sign in' | 'Reconnect'
 }
 export type McpSetupEffectReceipt = {
@@ -85,10 +86,13 @@ export class McpSetupService {
     return mcpFreeze({ revision: snapshot.revision, servers: snapshot.statuses.map(status => {
       const http = isMcpHttpServer(status.server)
       const signInState = http && snapshot.revision === this.manager.configurationRevision() ? this.oauth?.peekStatus(status.server.id).state : undefined
+      const message = status.message ?? (http && snapshot.revision === this.manager.configurationRevision()
+        ? this.oauth?.connectionFailure(status.server.id) : undefined)
       return { id: status.server.id, label: status.server.label, transport: http ? 'http' as const : 'stdio' as const,
         ...(http ? { endpoint: status.server.endpoint } : {}), protocol: status.server.protocol, state: status.state,
         ...(signInState ? { signInState } : {}),
-        ...(status.state === 'connected' ? {} : { nextAction: signInState && !['unconfigured', 'connected'].includes(signInState)
+        ...(message ? { message } : {}),
+        ...(status.state === 'connected' ? {} : { nextAction: !this.oauth?.hasSavedSignIn(status.server.id) && signInState && !['unconfigured', 'connected'].includes(signInState)
           ? 'Sign in' as const : status.state === 'error' ? 'Reconnect' as const : 'Connect' as const }) }
     }) })
   }
@@ -191,12 +195,15 @@ Exact proposal: ${mcpDisplayJson(proposal)}`
   list(): { readonly revision: string; readonly servers: readonly McpSetupLocalServer[] } {
     return { revision: this.manager.configurationRevision(), servers: this.manager.statuses().map(status => {
       const http = isMcpHttpServer(status.server), signInState = http ? this.oauth?.status(status.server.id).state : undefined
+      const message = status.message ?? this.oauth?.connectionFailure(status.server.id)
       const nextAction = status.state === 'connected' ? undefined
-        : signInState && !['unconfigured', 'connected'].includes(signInState) ? 'Sign in'
+        : !this.oauth?.hasSavedSignIn(status.server.id) && signInState && !['unconfigured', 'connected'].includes(signInState) ? 'Sign in'
         : status.state === 'error' ? 'Reconnect' : 'Connect'
       return { id: status.server.id, label: status.server.label, transport: http ? 'http' : 'stdio',
         ...(http ? { endpoint: status.server.endpoint } : {}), protocol: status.server.protocol, state: status.state,
-        ...(signInState ? { signInState } : {}), ...(nextAction ? { nextAction } : {}) }
+        ...(signInState ? { signInState } : {}),
+        ...(message ? { message } : {}),
+        ...(nextAction ? { nextAction } : {}) }
     }) }
   }
   async addHttp(input: McpSetupHttpInput, expectedRevision?: string, lifecycle?: McpConfigurationLifecycle): Promise<void> {

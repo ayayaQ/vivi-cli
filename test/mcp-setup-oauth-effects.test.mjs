@@ -122,6 +122,29 @@ for (const failure of ['persistence', 'observer', 'cancellation']) test(`validat
   clean([result, subject.receipts, subject.approvals])
 })
 
+test('agent setup records a saved grant after protocol failure and explicit Connect reuses it without browser replay', async t => {
+  let rejected = true
+  const subject = await fixture(t, { seed: 'client', httpFetch(message) {
+    if (rejected && message.method === 'server/discover') return Response.json({ jsonrpc: '2.0', id: message.id,
+      error: { code: -32601, message: 'fixture-private-unsupported-method' } })
+  } })
+  const failed = body(await subject.run('login'))
+  assert.equal(failed.success, false); assert.equal(failed.confirmedOutcome, true)
+  assert(kinds(failed.knownEffects).includes('authorization-granted'))
+  assert(kinds(failed.knownEffects).includes('saved-credentials-replaced'))
+  const local = await subject.service.listLocal(signal())
+  assert.equal(local.servers[0].nextAction, 'Connect')
+  assert.match(local.servers[0].message, /protocol handshake failed/)
+  rejected = false
+  const connected = body(await subject.run('connect'))
+  assert.equal(connected.success, true)
+  assert.equal(subject.browsers.length, 1)
+  assert.equal(subject.oauthRequests.filter(item => item.method === 'POST' && item.url === metadata.token_endpoint).length, 1)
+  assert.deepEqual(subject.approvals.map(item => item.call.name), ['mcp_setup', 'sign_in_mcp_server', 'mcp_setup', 'connect_saved_mcp_server'])
+  assert.equal(subject.manager.statuses()[0].state, 'connected')
+  clean([failed, connected, local])
+})
+
 for (const failure of ['client-save', 'observer', 'cancellation']) test(`validated public registration remains known after ${failure} without starting browser sign-in`, async t => {
   const abort = new AbortController()
   const subject = await fixture(t, { seed: 'none', effect(receipt) {

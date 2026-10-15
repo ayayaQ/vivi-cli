@@ -11,6 +11,7 @@ import { McpManager } from '../dist/mcp-manager.js'
 import { McpOAuthControls } from '../dist/mcp-oauth-controls.js'
 import { McpOAuthStore } from '../dist/mcp-oauth-store.js'
 import { McpSetupService } from '../dist/mcp-setup.js'
+import { manageMcp } from '../dist/mcp-controls.js'
 
 const endpoint = 'https://mcp.saved.fixture.invalid/mcp', issuer = 'https://auth.saved.fixture.invalid'
 const server = { transport: 'http', id: 'remote', label: 'Owned saved-auth fixture', endpoint,
@@ -40,8 +41,8 @@ async function availablePort() {
   await new Promise(resolve => listener.close(resolve))
   return port
 }
-function response(message, result) {
-  return Response.json({ jsonrpc: '2.0', id: message.id, result: { ...result, resultType: 'complete', ttlMs: 0, cacheScope: 'private' } })
+function response(message, result, protocol = server.protocol) {
+  return Response.json({ jsonrpc: '2.0', id: message.id, result: protocol === 'legacy' ? result : { ...result, resultType: 'complete', ttlMs: 0, cacheScope: 'private' } })
 }
 async function bounded(promise, label) {
   let timer
@@ -69,7 +70,8 @@ async function fixture(t, options = {}) {
     for (const owner of [...hosts].reverse()) await owner.close()
     await savedStore.settle(); await rm(directory, { recursive: true, force: true })
   })
-  await configurations.save([server], (await configurations.load()).revision)
+  const configured = { ...server, protocol: options.protocol ?? server.protocol }
+  await configurations.save([configured], (await configurations.load()).revision)
   async function seed(id = server.id, serverEndpoint = endpoint, client = publicClient, tokens = initial) {
     const record = await savedStore.saveClient(id, serverEndpoint, client)
     return tokens ? savedStore.saveTokens(id, serverEndpoint, record.revision, tokens) : record
@@ -113,8 +115,11 @@ async function fixture(t, options = {}) {
       const message = JSON.parse(init.body), headers = new Headers(init.headers)
       requests.push({ message, headers })
       if (options.httpFetch) { const value = await options.httpFetch(message, init); if (value) return value }
+      if (message.method === 'initialize') return response(message, { protocolVersion: '2025-11-25', capabilities: { tools: {} },
+        serverInfo: { name: 'Owned saved-auth fixture', version: '1' } }, configured.protocol)
+      if (message.method === 'notifications/initialized') return new Response(null, { status: 202 })
       if (message.method === 'server/discover') return response(message, { supportedVersions: ['2026-07-28'], capabilities: { tools: {} } })
-      if (message.method === 'tools/list') return response(message, { tools: [{ name: 'owned-saved-echo', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }] })
+      if (message.method === 'tools/list') return response(message, { tools: [{ name: 'owned-saved-echo', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }] }, configured.protocol)
       if (message.method === 'tools/call') return denial ? new Response('fixture-private-service-error', { status: denial })
         : response(message, { content: [{ type: 'text', text: 'Owned offline result' }] })
       assert.fail(`Unexpected synthetic MCP method ${message.method}`)
@@ -440,6 +445,183 @@ test('guided saved sign-in persists the approved client and grant and restores i
   await owner.close(); const restarted = subject.host()
   assert.equal(await restarted.service.connect(server.id, ioFixture([true]), signal()), true)
   assert.equal(restarted.browsers.length, 0); assert.equal(restarted.oauthRequests.length, 0)
+})
+
+test('accepted callback and saved grant survive protocol rejection; menu Connect retries without another browser grant', async t => {
+  let rejectProtocol = true
+  const subject = await fixture(t, { seed: false, httpFetch(message) {
+    if (rejectProtocol && message.method === 'server/discover') return Response.json({ jsonrpc: '2.0', id: message.id,
+      error: { code: -32601, message: 'fixture-private-protocol-rejection' } })
+  } }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  const login = ioFixture([true])
+  assert.equal(await owner.service.login(server.id, login, signal()), false)
+  assert.equal(owner.browsers.length, 1)
+  assert.equal(owner.oauthRequests.filter(item => item.method === 'POST').length, 1)
+  assert.equal((await subject.savedStore.load(server.id, endpoint)).tokens.accessToken, 'fixture-private-refreshed-access-1')
+  assert.equal(owner.oauth.authorization(server).bearerToken, undefined)
+  assert.equal(owner.manager.statuses()[0].state, 'disabled')
+  assert.deepEqual(owner.requests.map(item => item.message.method), ['server/discover'])
+  assert.match(login.output, /Browser sign-in completed, but the MCP connection failed/)
+  assert.match(login.output, /protocol handshake failed/)
+  assert.match(login.output, /Configured protocol: 2026-07-28/)
+  assert.match(login.output, /Saved sign-in was retained/)
+  assert(!login.output.includes('requires legacy'))
+  const keyCalls = subject.keyCalls.length
+  const local = await owner.service.listLocal(signal())
+  assert.equal(subject.keyCalls.length, keyCalls)
+  assert.equal(local.servers[0].nextAction, 'Connect')
+  assert.match(local.servers[0].message, /protocol handshake failed/)
+  rejectProtocol = false
+  const retry = ioFixture([true], ['server:remote', 'connect', 'back'])
+  await manageMcp(owner.manager, retry, undefined, owner.oauth)
+  assert.equal(retry.selections[1].items[1].name, 'Connect')
+  assert.deepEqual(retry.approvals.map(item => item.call.name), ['connect_saved_mcp_server'])
+  assert.equal(owner.browsers.length, 1)
+  assert.equal(owner.oauthRequests.filter(item => item.method === 'POST').length, 1)
+  assert.equal(owner.manager.statuses()[0].state, 'connected')
+  assert.equal(owner.oauth.status(server.id).state, 'connected')
+  assert.equal(owner.oauth.hasActiveAttempt(server.id), false)
+  assert.equal(owner.oauth.connectionFailure(server.id), undefined)
+  clean([login.output, retry.output, local, retry.approvals])
+})
+
+test('guided saved sign-in supports explicitly configured legacy without changing the protocol or approval', async t => {
+  const subject = await fixture(t, { seed: false, protocol: 'legacy' }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  const io = ioFixture([true])
+  assert.equal(await owner.service.login(server.id, io, signal()), true)
+  assert.match(io.approvals[0].description, /Protocol: legacy/)
+  assert.deepEqual(owner.requests.map(item => item.message.method), ['initialize', 'notifications/initialized', 'tools/list'])
+  assert.equal(owner.manager.statuses()[0].snapshot.protocolVersion, '2025-11-25')
+  assert.equal(owner.oauth.status(server.id).state, 'connected')
+  assert.equal(owner.oauth.hasActiveAttempt(server.id), false)
+  assert.equal((await subject.savedStore.load(server.id, endpoint)).tokens.accessToken, 'fixture-private-refreshed-access-1')
+})
+
+test('inert local listing never attaches an old connection failure to externally replaced configuration', async t => {
+  const subject = await fixture(t, { seed: false, httpFetch(message) {
+    return Response.json({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'fixture-private-old-failure' } })
+  } }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  assert.equal(await owner.service.login(server.id, ioFixture([true]), signal()), false)
+  assert.match((await owner.service.listLocal(signal())).servers[0].message, /protocol handshake failed/)
+  const before = await subject.configurations.load()
+  const replacement = { ...server, endpoint: 'https://replacement.saved.fixture.invalid/mcp', protocol: 'legacy' }
+  await subject.configurations.save([replacement], before.revision)
+  const keyCalls = subject.keyCalls.length, requests = owner.requests.length
+  const local = await owner.service.listLocal(signal())
+  assert.equal(local.servers[0].endpoint, replacement.endpoint)
+  assert.equal(local.servers[0].message, undefined)
+  assert.equal(local.servers[0].signInState, undefined)
+  assert.equal(local.servers[0].nextAction, 'Connect')
+  assert.equal(subject.keyCalls.length, keyCalls)
+  assert.equal(owner.requests.length, requests)
+  clean(local)
+})
+
+test('explicit Sign in again still replaces a saved grant through fresh browser approval', async t => {
+  const subject = await fixture(t), owner = subject.host()
+  assert.equal(await owner.connect(), true)
+  await owner.manager.disconnect(server.id)
+  const io = ioFixture([true], ['server:remote', 'sign-in', 'back'])
+  await manageMcp(owner.manager, io, undefined, owner.oauth)
+  assert.equal(io.selections[1].items[1].name, 'Connect')
+  assert(io.selections[1].items.some(item => item.name === 'Sign in again' && item.value === 'sign-in'))
+  assert.deepEqual(io.approvals.map(item => item.call.name), ['sign_in_mcp_server'])
+  assert.equal(owner.browsers.length, 1)
+  assert.equal(owner.oauthRequests.filter(item => item.method === 'POST').length, 1)
+  assert.equal((await subject.savedStore.load(server.id, endpoint)).tokens.accessToken, 'fixture-private-refreshed-access-1')
+})
+
+test('post-callback HTTP denial clears saved authority and still requires fresh sign-in', async t => {
+  const subject = await fixture(t, { seed: false, httpFetch() { return new Response('fixture-private-rejected', { status: 401 }) } }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  const io = ioFixture([true])
+  assert.equal(await owner.service.login(server.id, io, signal()), false)
+  assert.equal((await subject.savedStore.load(server.id, endpoint)).tokens, undefined)
+  assert.equal(owner.oauth.hasSavedSignIn(server.id), false)
+  assert.equal((await owner.service.listLocal(signal())).servers[0].nextAction, 'Sign in')
+  assert.match(io.output, /server rejected the credentials/)
+  assert(!io.output.includes('Protocol compatibility'))
+  assert(!io.output.includes('Saved sign-in was retained'))
+  assert.equal(owner.browsers.length, 1)
+  assert.equal(owner.oauthRequests.filter(item => item.method === 'POST').length, 1)
+  clean(io.output)
+})
+
+test('credentials expiring after save are not reported as a server rejection and remain eligible for approved refresh', async t => {
+  const subject = await fixture(t, { seed: false }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  const save = subject.savedStore.saveTokens.bind(subject.savedStore)
+  subject.savedStore.saveTokens = async (...args) => { const record = await save(...args); subject.tick(122000); return record }
+  const io = ioFixture([true])
+  assert.equal(await owner.service.login(server.id, io, signal()), false)
+  assert.equal(owner.requests.length, 0)
+  assert(!io.output.includes('server rejected the credentials'))
+  assert.match(io.output, /Saved sign-in was retained/)
+  assert.equal(owner.oauth.hasSavedSignIn(server.id), true)
+  assert.equal((await owner.service.listLocal(signal())).servers[0].nextAction, 'Connect')
+  const retry = ioFixture([true])
+  assert.equal(await owner.service.connect(server.id, retry, signal()), true)
+  assert.deepEqual(retry.approvals.map(item => item.call.name), ['connect_saved_mcp_server'])
+  assert.equal(owner.browsers.length, 1)
+  assert.equal(owner.oauthRequests.filter(item => item.method === 'POST').length, 2)
+  clean([io.output, retry.output])
+})
+
+for (const action of ['logout', 'forgetSaved']) test(`${action} clears old retained-sign-in failure guidance`, async t => {
+  const subject = await fixture(t, { seed: false, httpFetch(message) {
+    return Response.json({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'fixture-private-old-failure' } })
+  } }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  assert.equal(await owner.service.login(server.id, ioFixture([true]), signal()), false)
+  assert.match(owner.oauth.connectionFailure(server.id), /Saved sign-in was retained/)
+  await owner.oauth[action](server.id)
+  assert.equal(owner.oauth.connectionFailure(server.id), undefined)
+  assert.equal(owner.oauth.hasSavedSignIn(server.id), false)
+  assert.equal((await owner.service.listLocal(signal())).servers[0].message, undefined)
+})
+
+test('saved Connect approval cannot adopt a changed protocol or replay the earlier grant', async t => {
+  const subject = await fixture(t, { seed: false, httpFetch(message) {
+    return Response.json({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'fixture-private-old-failure' } })
+  } }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  assert.equal(await owner.service.login(server.id, ioFixture([true]), signal()), false)
+  const requests = owner.requests.length, oauthRequests = owner.oauthRequests.length, io = ioFixture()
+  io.approve = async request => {
+    io.approvals.push(request)
+    assert.equal(request.call.name, 'connect_saved_mcp_server')
+    const current = await subject.configurations.load()
+    await subject.configurations.save([{ ...server, protocol: 'legacy' }], current.revision)
+    return true
+  }
+  await assert.rejects(owner.service.connect(server.id, io, signal()), safeError)
+  assert.equal(owner.requests.length, requests)
+  assert.equal(owner.oauthRequests.length, oauthRequests)
+  assert.equal(owner.browsers.length, 1)
+  assert.equal((await owner.service.listLocal(signal())).servers[0].message, undefined)
+  clean(io.approvals)
+})
+
+test('a denied grant whose disk cleanup is locked is never advertised as reusable saved sign-in', async t => {
+  let mode = 'denied'
+  const subject = await fixture(t, { seed: false, httpFetch(message) {
+    if (mode === 'denied') { subject.lock(); return new Response(null, { status: 401 }) }
+    if (mode === 'protocol') return Response.json({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'fixture-private-unsupported-method' } })
+  } }), owner = subject.host()
+  await owner.oauth.configureClient(server.id, subject.publicClient)
+  assert.equal(await owner.service.login(server.id, ioFixture([true]), signal()), false)
+  assert.equal(owner.oauth.hasSavedSignIn(server.id), false)
+  assert.equal((await owner.service.listLocal(signal())).servers[0].nextAction, 'Sign in')
+  subject.unlock(); mode = 'protocol'
+  assert.equal(await owner.service.login(server.id, ioFixture([true]), signal()), false)
+  assert.equal(owner.oauth.hasSavedSignIn(server.id), true)
+  assert.equal((await owner.service.listLocal(signal())).servers[0].nextAction, 'Connect')
+  mode = 'accepted'
+  assert.equal(await owner.service.connect(server.id, ioFixture([true]), signal()), true)
+  assert.equal(owner.browsers.length, 2)
 })
 
 test('locked-store fallback requires an explicit approval and cancellation starts no sign-in or anonymous connection', async t => {

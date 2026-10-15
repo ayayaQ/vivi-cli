@@ -64,6 +64,7 @@ interface Registration {
   state: 'disconnected' | 'needs-sign-in'
   session?: McpOAuthSession
   saved?: McpOAuthSavedRecord
+  connectionFailure?: string
 }
 interface Attempt {
   active: boolean
@@ -207,6 +208,32 @@ export class McpOAuthControls {
   }
   canRegisterPublicClient(): boolean { return !this.closed && this.options.dynamicRegistration === 'explicit' }
   savesSignIn(): boolean { return Boolean(this.options.savedStore) }
+  /** Inert launch-local evidence only. Never reads or unlocks secure storage. */
+  hasSavedSignIn(serverId: string): boolean {
+    const entry = this.registrations.get(serverId)
+    return !this.closed && !this.signInRequired.has(serverId) && entry?.state !== 'needs-sign-in' &&
+      entry?.configRevision === this.manager?.configurationRevision() && Boolean(entry?.saved?.tokens)
+  }
+  connectionFailure(serverId: string): string | undefined {
+    const entry = this.registrations.get(serverId)
+    return !this.closed && entry?.configRevision === this.manager?.configurationRevision() ? entry?.connectionFailure : undefined
+  }
+  private connectionRejected(serverId: string): boolean {
+    return this.manager?.statuses().find(status => status.server.id === serverId)?.message ===
+      'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required'
+  }
+  private reportConnectionFailure(serverId: string, entry: Registration, io: ChatIO, signedIn = false): void {
+    const status = this.manager?.statuses().find(status => status.server.id === serverId)
+    const rejected = this.connectionRejected(serverId)
+    // Manager messages contain fixed host classifications, never remote error text.
+    const reason = status?.message ?? 'MCP connection was not established'
+    const recovery = rejected ? 'The server rejected the credentials; choose Sign in again'
+      : entry.saved?.tokens ? 'Saved sign-in was retained. Choose Connect to retry without browser sign-in'
+      : 'No connection is active'
+    const protocolEvidence = reason === 'MCP protocol handshake failed' ? `Configured protocol: ${status!.server.protocol}. ` : ''
+    entry.connectionFailure = `${signedIn ? 'Browser sign-in completed, but the MCP connection failed. ' : ''}${reason}. ${protocolEvidence}${recovery}`
+    io.write(`MCP ${serverId}: ${entry.connectionFailure}\n`)
+  }
   hasActiveAttempt(serverId: string): boolean { return this.attempts.has(serverId) }
   setClientMetadataUrl(serverId: string, value: string): void {
     const url = mcpOAuthRemoteUrl(value)
@@ -221,6 +248,8 @@ export class McpOAuthControls {
   private claim(serverId: string, lifecycle?: McpOAuthOperationLifecycle): Attempt {
     lifecycle?.assertCurrent()
     if (this.attempts.has(serverId) || this.cleanups.has(serverId)) throw new McpOAuthError('invalid-plan')
+    const entry = this.registrations.get(serverId)
+    if (entry) delete entry.connectionFailure
     const attempt: Attempt = { active: true, abort: new AbortController(), revision: randomUUID(), persistence: new Set(), ...(lifecycle ? { lifecycle } : {}) }
     this.attempts.set(serverId, attempt)
     return attempt
@@ -377,6 +406,8 @@ export class McpOAuthControls {
   private async logoutOwned(serverId: string, lifecycle?: McpOAuthOperationLifecycle): Promise<void> {
     lifecycle?.assertCurrent()
     const manager = this.owner()
+    const previous = this.registrations.get(serverId)
+    if (previous) delete previous.connectionFailure
     const closing = manager.disconnect(serverId)
     await closing
     await this.options.savedStore?.settle()
@@ -397,6 +428,8 @@ export class McpOAuthControls {
   private async forgetOwned(serverId: string, expectedRevision?: string, lifecycle?: McpOAuthOperationLifecycle): Promise<void> {
     lifecycle?.assertCurrent()
     const manager = this.owner()
+    const previous = this.registrations.get(serverId)
+    if (previous) delete previous.connectionFailure
     await manager.disconnect(serverId)
     await this.options.savedStore?.settle()
     if (expectedRevision !== undefined) {
@@ -500,7 +533,10 @@ export class McpOAuthControls {
         if (!current() || !generation || fresh?.state !== 'connected' || fresh.snapshot?.connectionGeneration !== generation ||
           session.authorizationSnapshot().revision !== epoch) throw new McpOAuthError('invalid-plan')
         connected = true
+        this.signInRequired.delete(serverId)
       }
+      if (!connected && (current() || this.connectionRejected(serverId)) && !signal.aborted && !io.isClosed && !this.closed && this.registrations.get(serverId) === entry &&
+        manager.configurationRevision() === entry.configRevision) this.reportConnectionFailure(serverId, entry, io)
       return connected
     } finally {
       try { if (!connected) await this.disconnectOwned(serverId, attempt) }
@@ -645,6 +681,8 @@ export class McpOAuthControls {
       entry.session = session; attempt.session = session
       const plan = await session.prepareSignIn(combined); assertCurrent()
       await session.beginSignIn(plan, combined); await manager.reload(); assertCurrent()
+      // A newly validated grant replaces the previously denied authorization epoch.
+      this.signInRequired.delete(serverId)
       // The bundled approval covers only the server/issuer/scopes above. The manager
       // still pins and rechecks a fresh token-bound launch before any MCP send.
       connected = await manager.connect(serverId, async (launch, approvalSignal) => current() &&
@@ -657,7 +695,10 @@ export class McpOAuthControls {
         const fresh = manager.statuses().find(status => status.server.id === serverId)
         if (!generation || fresh?.state !== 'connected' || fresh.snapshot?.connectionGeneration !== generation) throw new McpOAuthError('invalid-plan')
         connected = true
+        this.signInRequired.delete(serverId)
       }
+      if (!connected && (current() || this.connectionRejected(serverId)) && !signal.aborted && !io.isClosed && !this.closed && this.registrations.get(serverId) === entry &&
+        manager.configurationRevision() === entry.configRevision) this.reportConnectionFailure(serverId, entry, io, true)
       return connected
     } catch (error) {
       if (registrationSubmitted && !registrationCompleted) this.uncertainRegistrations.add(serverId)

@@ -202,7 +202,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       io.write(`MCP · ${statuses.length} configured servers · separate human approval for calls and reads · choose a server to connect or sign in\n`)
       const selected = await choose('MCP connections', [
         { name: 'Back', value: 'back' }, { name: 'Add MCP server (URL)', value: 'add-http' },
-        ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state}${oauth && isMcpHttpServer(status.server) ? ` · sign-in ${oauth.status(status.server.id).state}` : ''} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message ? ` · ${status.message}` : ''}`, value: `server:${status.server.id}` })),
+        ...statuses.map(status => ({ name: `${status.server.id} · ${mcpDisplayJson(status.server.label)}`, description: `${status.state}${oauth && isMcpHttpServer(status.server) ? ` · sign-in ${oauth.status(status.server.id).state}` : ''} · protocol ${status.snapshot?.protocolVersion ?? status.server.protocol}${status.snapshot ? ` · tools ${status.snapshot.categories.tools.state} (${status.snapshot.categories.tools.entries.length}) · resources ${status.snapshot.categories.resources.state} (${status.snapshot.categories.resources.entries.length})` : ''}${status.message || oauth?.connectionFailure(status.server.id) ? ` · ${status.message ?? oauth?.connectionFailure(status.server.id)}` : ''}`, value: `server:${status.server.id}` })),
         { name: 'Advanced · add installed server', description: 'Trusted existing executable; no package installation', value: 'add' }
       ])
       if (selected === undefined || selected === 'back') return
@@ -212,7 +212,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       if (!status) continue
       const serverId = status.server.id
       const authState = oauth && isMcpHttpServer(status.server) ? oauth.status(serverId).state : undefined
-      const next = authState && !['unconfigured', 'connected'].includes(authState) ? 'Sign in' : status.state === 'error' ? 'Reconnect' : 'Connect'
+      const next = !oauth?.hasSavedSignIn(serverId) && authState && !['unconfigured', 'connected'].includes(authState) ? 'Sign in' : status.state === 'error' ? 'Reconnect' : 'Connect'
       const action = await choose(`${status.server.id} · ${status.state}`, [
         { name: 'Back', value: 'back' },
         ...(status.state === 'connected' ? [{ name: 'Disconnect', description: 'Close this connection and clear launch credentials', value: 'disable' }]
@@ -270,7 +270,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       }
       if (action === 'sign-in' && oauth) {
         const connected = await setup.login(serverId, io, controller.signal)
-        io.write(connected ? `MCP ${serverId} signed in and connected for this launch\n` : `MCP ${serverId} sign-in stopped; no connection is active\n`)
+        io.write(connected ? `MCP ${serverId} signed in and connected for this launch\n` : `MCP ${serverId} is not connected; review the setup details above\n`)
         continue
       }
       if (action === 'session-sign-in' && oauth) {
