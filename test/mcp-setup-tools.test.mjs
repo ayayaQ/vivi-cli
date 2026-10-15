@@ -26,6 +26,8 @@ test('setup is a fixed separate two-tool pack available without connected catalo
   const subject = fixture()
   assert.equal(subject.extension.id, 'vivi-cli-mcp-setup')
   assert.deepEqual(subject.registry.tools.map(tool => tool.name), MCP_SETUP_TOOL_NAMES)
+  const protocol = subject.registry.tools.find(tool => tool.name === 'mcp_setup').parameters.properties.protocol
+  assert.deepEqual(protocol.enum, ['auto', 'legacy', '2026-07-28']); assert.equal(protocol.default, 'auto')
   for (const definition of subject.registry.tools) assert.equal(definition.parameters.additionalProperties, false)
   assert.deepEqual(JSON.parse((await subject.run('mcp_list')).content).servers, [])
   assert.deepEqual(subject.calls, ['list'])
@@ -44,8 +46,8 @@ for (const action of ['add', 'connect', 'login', 'logout', 'remove']) test(`vali
   assert.deepEqual(subject.calls[0].arguments, args)
 })
 
-test('add preserves public endpoint, display label and protocol without expanding arguments', async () => {
-  const subject = fixture(), args = setup('add', { endpoint: 'https://example.com:8443/MCP', label: 'Docs', protocol: 'legacy' })
+for (const protocol of ['auto', 'legacy', '2026-07-28']) test(`add preserves public endpoint, display label and protocol ${protocol} without expanding arguments`, async () => {
+  const subject = fixture(), args = setup('add', { endpoint: 'https://example.com:8443/MCP', label: 'Docs', protocol })
   await subject.run('mcp_setup', args)
   assert.deepEqual(subject.calls[0].arguments, args)
 })
@@ -63,7 +65,7 @@ for (const args of [
   setup('add', { expectedRevision: 'A'.repeat(64) }), setup('add', { expectedRevision: 'a'.repeat(63) }),
   setup('add', { expectedRevision: 1 }), setup('add', { id: '../docs' }), setup('add', { id: 'Docs' }),
   setup('add', { id: 'x'.repeat(17) }), setup('add', { endpoint: undefined }),
-  setup('add', { label: '' }), setup('add', { label: 'x'.repeat(81) }), setup('add', { protocol: 'auto' }),
+  setup('add', { label: '' }), setup('add', { label: 'x'.repeat(81) }), setup('add', { protocol: 'unsupported' }),
   setup('add', { endpoint: 'https://name:password@example.com/mcp' }),
   setup('add', { endpoint: 'https://example.com/mcp?token=value' }), setup('add', { endpoint: 'https://example.com/mcp#fragment' }),
   setup('add', { endpoint: 'http://127.0.0.1/mcp' }), setup('add', { endpoint: 'file:///mcp' }),

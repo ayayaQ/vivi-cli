@@ -47,12 +47,16 @@ test('MCP argument parsing is provider-independent and accepts state directory b
   assert.equal(isMcpCliCommand(['--session-dir', '/private/state', 'mcp', 'list']), true)
   for (const args of [['--prompt', 'mcp'], ['--model', 'mcp'], ['--prompt', '/mcp']]) assert.equal(isMcpCliCommand(args), false)
   for (const args of [['mcp', 'list', '--session-dir', '/private/state'], ['--session-dir', '/private/state', 'mcp', 'list']]) {
-    assert.deepEqual(parseMcpCliArguments(args, {}), { action: 'list', protocol: '2026-07-28',
+    assert.deepEqual(parseMcpCliArguments(args, {}), { action: 'list', protocol: 'auto',
       allowLoopbackHttp: false, sessionDirectory: '/private/state', help: false })
   }
   assert.equal(parseMcpCliArguments(['mcp', 'list'], { VIVI_SESSION_DIR: '/from-env' }).sessionDirectory, '/from-env')
   const added = parseMcpCliArguments(['mcp', 'add', 'docs', 'https://mcp.example.test', '--label', 'My docs', '--protocol', 'legacy'], {})
   assert.equal(added.endpoint, 'https://mcp.example.test/'); assert.equal(added.label, 'My docs'); assert.equal(added.protocol, 'legacy')
+  assert.equal(parseMcpCliArguments(['mcp', 'add', 'docs', 'https://mcp.example.test'], {}).protocol, 'auto')
+  for (const protocol of ['auto', '2026-07-28', 'legacy']) {
+    assert.equal(parseMcpCliArguments(['mcp', 'add', 'docs', 'https://mcp.example.test', '--protocol', protocol], {}).protocol, protocol)
+  }
 })
 
 test('MCP parser rejects invalid arity, IDs, insecure endpoints and unsupported options without echoing them', () => {
@@ -83,7 +87,7 @@ test('provider-free MCP add/list/logout/remove work offline and create only MCP 
   let io = ioFixture()
   assert.equal(await main(['mcp', 'add', 'docs', 'https://mcp.example.test/mcp', '--session-dir', directory], {}, dependencies(io)), 0)
   assert.match(io.output, /saved disabled/); assert.equal(io.closed, true)
-  assert.equal((await store.load()).servers[0].protocol, '2026-07-28')
+  assert.equal((await store.load()).servers[0].protocol, 'auto')
   io = ioFixture()
   assert.equal(await main(['--session-dir', directory, 'mcp', 'list'], {}, dependencies(io)), 0)
   assert.match(io.output, /"docs".*http.*disabled.*https:\/\/mcp\.example\.test\/mcp/)
@@ -106,7 +110,7 @@ test('MCP help and empty list do not initialize chat or create state', async t =
     assert.equal(await main([...args, '--session-dir', absent], {}, noChat(io, {
       mcpManagerFactory() { assert.fail('Help must not initialize MCP or credentials') }
     })), 0)
-    assert.match(io.output, /No model, provider or API key/); assert.equal(io.closed, true)
+    assert.match(io.output, /No model, provider or API key/); assert.match(io.output, /auto \(default\), 2026-07-28 or legacy/); assert.equal(io.closed, true)
   }
   const io = ioFixture()
   assert.equal(await main(['mcp', 'list', '--session-dir', absent], {}, noChat(io)), 0)

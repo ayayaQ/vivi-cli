@@ -129,7 +129,9 @@ export class McpHttpTransport implements Transport {
       await this.cancelResponse(response)
       throw new Error('MCP HTTP session header is invalid or exceeds its bounds')
     }
-    if (this.launch.server.protocol === '2026-07-28' && response.headers.has('mcp-session-id')) {
+    // Auto selects the era at connect time. Only initialize may establish a
+    // legacy session; an unsuccessful modern probe cannot establish one.
+    if (response.ok && headers.get('mcp-protocol-version') === '2026-07-28' && response.headers.has('mcp-session-id')) {
       await this.cancelResponse(response)
       throw new Error('Modern MCP HTTP does not support transport sessions')
     }

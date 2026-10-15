@@ -87,7 +87,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
       if (!allowed) return
       allowLoopbackHttp = true
     }
-    const server = validateMcpServer({ transport: 'http', id, label: id, endpoint, protocol: '2026-07-28', allowLoopbackHttp })
+    const server = validateMcpServer({ transport: 'http', id, label: id, endpoint, protocol: 'auto', allowLoopbackHttp })
     const revision = manager.configurationRevision()
     const affected = manager.statuses().filter(status => status.state !== 'disabled').map(status => status.server.id)
     const save = await choose(`Add ${server.id} at ${endpoint}?${affected.length ? ` Existing connections will disconnect: ${affected.join(', ')}` : ''}`, [
@@ -228,7 +228,7 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
             { name: 'Sign in again', description: 'Fresh reviewed browser sign-in; replaces saved credentials securely', value: 'sign-in' },
             { name: 'Session-only sign in', description: 'Explicitly keep this new sign-in in RAM for this launch', value: 'session-sign-in' }
           ] : []),
-          { name: 'Advanced', description: 'Public client, hosted client metadata, issuer, callback and scopes', value: 'advanced' },
+          { name: 'Advanced', description: 'Protocol compatibility and public OAuth client overrides', value: 'advanced' },
           ...(oauth?.hasActiveAttempt(serverId) ? [{ name: 'Cancel sign-in', value: 'cancel-sign-in' }] : [])
         ] : []),
         { name: 'Remove saved server entry', description: 'Disconnect first; no server files are deleted', value: 'remove' }
@@ -242,8 +242,8 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
             { name: 'Public client settings', description: 'Existing public registration: client ID, issuer, callback and scopes', value: 'oauth-client' },
             { name: 'Hosted client metadata document', description: 'Optional HTTPS JSON CIMD document; used only when supported', value: 'oauth-metadata' }
           ] : []),
-          ...(oauth?.canRegisterPublicClient() ? [{ name: 'Register public client manually', description: 'Technical compatibility override; normal sign-in discovers this automatically', value: 'oauth-register' }] : [])
-          , { name: 'Protocol compatibility', description: 'Exact modern revision or explicit legacy compatibility', value: 'protocol' }
+          ...(oauth?.canRegisterPublicClient() ? [{ name: 'Register public client manually', description: 'Technical compatibility override; normal sign-in discovers this automatically', value: 'oauth-register' }] : []),
+          { name: 'Protocol compatibility', description: 'Automatic negotiation (default), exact modern revision or legacy compatibility', value: 'protocol' }
         ])
         if (advanced === 'oauth-client') await configureOAuth(serverId)
         else if (advanced === 'oauth-register') await registerOAuth(serverId)
@@ -251,11 +251,12 @@ export async function manageMcp(manager: McpManager, io: McpIO, defaultCwd?: str
           const url = await text('Hosted HTTPS client metadata URL (JSON; exact registered loopback callback)')
           if (url) { oauth.setClientMetadataUrl(serverId, url); io.write(`MCP ${serverId} client metadata URL set for this launch. Choose Sign in when ready\n`) }
         }
-        else if (advanced === 'protocol') {
+        else if (advanced === 'protocol' && isMcpHttpServer(status.server)) {
           const revision = snapshotRevision
           const protocol = await choose<McpServerConfig['protocol']>('Protocol compatibility', [
             { name: 'Back', value: status.server.protocol },
-            { name: 'Pin modern 2026-07-28', value: '2026-07-28' },
+            { name: 'Automatic compatibility (default)', description: 'Negotiate a supported protocol with this server', value: 'auto' },
+            { name: 'Pin modern 2026-07-28', description: 'Require this exact revision; no fallback', value: '2026-07-28' },
             { name: 'Legacy 2025 compatibility', value: 'legacy' }
           ])
           if (protocol && protocol !== status.server.protocol) {

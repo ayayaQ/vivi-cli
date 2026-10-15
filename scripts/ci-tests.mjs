@@ -36,7 +36,7 @@ export async function ciTestGroups(directory = new URL('../test/', import.meta.u
     'windows-headless': node.filter(name => !isMcp(name) && !nativeConpty.has(name) && !linuxOnly.has(name)).map(path),
     'windows-current': node.filter(name => currentCompatibility.has(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'bun-tui': tui.map(path),
-    'bun-boundaries': node.filter(name => name.startsWith('public-url') || name === 'mcp-http.test.mjs' || isOAuth(name) || isAgentMcpSetup(name)).map(path),
+    'bun-boundaries': node.filter(name => name.startsWith('public-url') || name === 'mcp-http.test.mjs' || name === 'mcp-auto-compatibility.test.mjs' || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'windows-stock': ['./test/windows-conpty-fallback-native.test.mjs'],
     'windows-modern': ['./test/windows-conpty-packaged-native.test.mjs'],
     'linux-only': node.filter(name => linuxOnly.has(name)).map(path),

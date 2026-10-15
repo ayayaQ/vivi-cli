@@ -148,12 +148,47 @@ test('HTTP endpoint controls save a disabled credential-free endpoint without se
   const subject = await fixture(t), io = ioFixture([1, 1, 0], ['https://mcp.example.test/endpoint', 'remote'])
   await manageMcp(subject.manager, io)
   const saved = await subject.store.load()
-  assert.equal(saved.servers.length, 1); assert.equal(saved.servers[0].transport, 'http'); assert.equal(saved.servers[0].protocol, '2026-07-28')
+  assert.equal(saved.servers.length, 1); assert.equal(saved.servers[0].transport, 'http'); assert.equal(saved.servers[0].protocol, 'auto')
   assert.equal(saved.servers[0].allowLoopbackHttp, false); assert.equal(subject.starts(), 0); assert.equal(io.approvals.length, 0)
   assert.match(io.output, /remote saved disabled/)
+  assert(!io.choices.some(choice => choice.title === 'Protocol compatibility'))
 })
 test('HTTP controls require explicit literal-loopback allowance before saving HTTP', async t => {
   const subject = await fixture(t), io = ioFixture([1, 0, 0], ['http://127.0.0.1:43210/mcp', 'remote'])
   await manageMcp(subject.manager, io)
   assert.equal((await subject.store.load()).servers.length, 0); assert.equal(subject.starts(), 0)
+})
+
+for (const [initial, target] of [
+  ['legacy', 'auto'], ['2026-07-28', 'auto'], ['auto', '2026-07-28'], ['auto', 'legacy']
+]) test(`HTTP Advanced explicitly changes protocol ${initial} to ${target} without starting a connection`, async t => {
+  const subject = await fixture(t)
+  const server = { transport: 'http', id: 'docs', label: 'Docs', endpoint: 'https://mcp.example.test/mcp',
+    protocol: initial, allowLoopbackHttp: false }
+  await subject.manager.configure(server)
+  const before = await subject.store.load(), io = ioFixture()
+  const selections = ['server:docs', 'advanced', 'protocol', target, true, 'back']
+  io.choose = async (title, choices, initialIndex) => {
+    io.choices.push({ title, choices, initial: initialIndex })
+    const selection = selections.shift()
+    assert(choices.some(choice => choice.value === selection), `Missing choice ${selection}`)
+    return selection
+  }
+  await manageMcp(subject.manager, io)
+  const saved = await subject.store.load()
+  assert.equal(saved.servers[0].protocol, target); assert.notEqual(saved.revision, before.revision)
+  assert.equal(subject.starts(), 0); assert.equal(io.approvals.length, 0)
+  const protocols = io.choices.find(choice => choice.title === 'Protocol compatibility')
+  for (const protocol of ['auto', '2026-07-28', 'legacy']) assert(protocols.choices.some(choice => choice.value === protocol))
+})
+
+test('declining an Advanced auto change preserves an existing protocol pin and revision', async t => {
+  const subject = await fixture(t)
+  await subject.manager.configure({ transport: 'http', id: 'docs', label: 'Docs', endpoint: 'https://mcp.example.test/mcp',
+    protocol: 'legacy', allowLoopbackHttp: false })
+  const before = await subject.store.load(), io = ioFixture()
+  const selections = ['server:docs', 'advanced', 'protocol', 'auto', false, 'back']
+  io.choose = async (_title, choices) => { const selection = selections.shift(); assert(choices.some(choice => choice.value === selection)); return selection }
+  await manageMcp(subject.manager, io)
+  assert.deepEqual(await subject.store.load(), before); assert.equal(subject.starts(), 0)
 })

@@ -268,7 +268,7 @@ export class McpManager {
     const client = new Client({ name: 'vivi-cli-discovery', version: '0.1.0-dev.0' }, { capabilities: {},
       jsonSchemaValidator: { getValidator: <T>(schema: JsonSchemaType) => new AjvJsonSchemaValidator().getValidator<T>(schema) },
       inputRequired: { autoFulfill: false }, enforceStrictCapabilities: true,
-      versionNegotiation: { mode: server.protocol === 'legacy' ? 'legacy' : { pin: server.protocol } } })
+      versionNegotiation: { mode: server.protocol === '2026-07-28' ? { pin: server.protocol } : server.protocol } })
     const owned: Transport = this.options.transportFactory?.(launch) ?? (isMcpHttpLaunch(launch)
       ? new McpHttpTransport(launch, { ...(this.options.httpFetch ? { fetch: this.options.httpFetch } : {}),
         assertConnectCurrent: () => assertConnectBoundary(),

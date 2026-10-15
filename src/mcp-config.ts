@@ -23,7 +23,7 @@ export interface McpHttpServerConfig {
   readonly id: string
   readonly label: string
   readonly endpoint: string
-  readonly protocol: 'legacy' | '2026-07-28'
+  readonly protocol: 'auto' | 'legacy' | '2026-07-28'
   readonly allowLoopbackHttp: boolean
 }
 export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig
@@ -82,7 +82,7 @@ export function validateMcpServer(value: unknown, secrets: readonly string[] = [
   if (mcpRecord(value) && value.transport === 'http') {
     if (Object.keys(value).length !== 6 || !Object.keys(value).every(key => ['transport', 'id', 'label', 'endpoint', 'protocol', 'allowLoopbackHttp'].includes(key)) ||
       typeof value.id !== 'string' || !/^[a-z][a-z0-9_-]{0,15}$/.test(value.id) || !mcpText(value.label, 80) ||
-      typeof value.protocol !== 'string' || !['legacy', '2026-07-28'].includes(value.protocol)) fail()
+      typeof value.protocol !== 'string' || !['auto', 'legacy', '2026-07-28'].includes(value.protocol)) fail()
     const server: McpHttpServerConfig = { transport: 'http', id: value.id, label: value.label,
       endpoint: validateMcpEndpoint(value.endpoint, value.allowLoopbackHttp), protocol: value.protocol as McpHttpServerConfig['protocol'],
       allowLoopbackHttp: value.allowLoopbackHttp as boolean }
@@ -103,7 +103,7 @@ export function validateMcpServer(value: unknown, secrets: readonly string[] = [
   if (/^(?:npx|npm|pnpm|yarn|bunx|sh|ash|bash|dash|ksh|csh|tcsh|zsh|fish|cmd|powershell|pwsh)(?:\.exe|\.cmd|\.bat)?$/i.test(basename(value.executable)) ||
     /\.(?:cmd|bat|ps1)$/i.test(value.executable)) fail()
   const server: McpStdioServerConfig = { ...(value.transport === 'stdio' ? { transport: 'stdio' as const } : {}), id: value.id, label: value.label, executable: value.executable,
-    args: [...value.args], cwd: value.cwd, protocol: value.protocol as McpServerConfig['protocol'], environment: [...value.environment] }
+    args: [...value.args], cwd: value.cwd, protocol: value.protocol as McpStdioServerConfig['protocol'], environment: [...value.environment] }
   if (server.args.some(arg => /^(?:--?)(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|secret|credential|authorization)(?:=|$)/i.test(arg))) fail()
   const runtime = basename(server.executable).replace(/\.exe$/i, '').toLowerCase()
   if (/^(?:node|bun|python(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(runtime)) {
