@@ -7,6 +7,12 @@ import type { McpLaunchIdentity }  from './mcp-config.js'
 import type { WindowsMcpProcess } from './mcp-windows.js'
 import { isMcpHttpLaunch } from './mcp-config.js'
 import { verifyMcpGroupDead } from './mcp-process-group.js'
+import { MCP_LIMITS } from './mcp-catalog.js'
+
+export const MCP_WINDOWS_STDIO_STARTUP_MS = 45_000
+export function mcpStdioStartupTimeout(platform: NodeJS.Platform = process.platform): number {
+  return platform === 'win32' ? MCP_WINDOWS_STDIO_STARTUP_MS : MCP_LIMITS.categoryMs
+}
 
 const REQUESTS = new Set(['initialize', 'server/discover', 'tools/list', 'resources/list', 'resources/templates/list', 'tools/call', 'resources/read'])
 const NOTIFICATIONS = new Set(['notifications/initialized', 'notifications/cancelled'])
@@ -29,6 +35,8 @@ export class McpStdioTransport implements Transport {
   constructor(launch: McpLaunchIdentity) { if (isMcpHttpLaunch(launch)) throw new Error('MCP stdio transport requires an installed server'); this.launch = launch as import('./mcp-config.js').McpStdioLaunchIdentity }
   get stderr(): null { return null }
   get pid(): number | undefined { return this.child?.pid }
+  /** Native helper bootstrap only; protocol, page and cleanup deadlines stay separate. */
+  get startupTimeoutMs(): number { return mcpStdioStartupTimeout() }
   async start(): Promise<void> {
     if (this.started || this.closed) throw new Error('MCP transport cannot be restarted')
     this.started = true

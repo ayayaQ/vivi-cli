@@ -8,19 +8,20 @@ import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { McpConfigStore } from '../dist/mcp-config.js'
 import { MCP_LIMITS } from '../dist/mcp-catalog.js'
-import { McpManager } from '../dist/mcp-manager.js'
+import { McpManager, mcpStartupTimeoutMs } from '../dist/mcp-manager.js'
 import { manageMcp } from '../dist/mcp-controls.js'
-import { McpStdioTransport } from '../dist/mcp-transport.js'
+import { McpStdioTransport, mcpStdioStartupTimeout, MCP_WINDOWS_STDIO_STARTUP_MS } from '../dist/mcp-transport.js'
+import { McpHttpTransport } from '../dist/mcp-http-transport.js'
 
 // Replace only the owned-process startup boundary. Real start/send/receive/close/dispose run;
 // no process, Windows helper, network, model or provider is used by this fixture.
-function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart = () => {}, beforeReply) {
+function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart = () => {}, beforeReply, completionResult = { exitCode: 0 }) {
   const transport = new McpStdioTransport(launch), stdout = new PassThrough(), stderr = new PassThrough()
   const methods = []
   let complete, starts = 0, ended = false
   const completed = new Promise(resolve => { complete = resolve })
   const owned = { stdout, stderr, ready, completed, stop: async () => {
-    await stop(); ended = true; stdout.end(); stderr.end(); complete({ exitCode: 0 })
+    await stop(); ended = true; stdout.end(); stderr.end(); complete(completionResult)
   }, write: async bytes => {
     const message = JSON.parse(bytes.toString('utf8'))
     methods.push(message.method)
@@ -31,7 +32,7 @@ function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart
       : message.method === 'server/discover' ? { resultType: 'complete', supportedVersions: ['2026-07-28'],
         capabilities: { tools: {} }, ttlMs: 0, cacheScope: 'private' }
       : { resultType: 'complete', tools: [{ name: 'never-show-revoked-metadata', inputSchema: { type: 'object' } }], ttlMs: 0, cacheScope: 'private' })
-    queueMicrotask(() => stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\n'))
+    queueMicrotask(() => { if (!ended) stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\n') })
   } }
   transport.beginStart = async () => {
     starts++; transport.windows = owned
@@ -43,11 +44,12 @@ function injectedOwnedTransport(launch, stop, ready = Promise.resolve(), onStart
   return { transport, owned, methods, starts: () => starts }
 }
 
-async function managerFixture(t, { protocol = 'legacy', ready, onStart, onStop, beforeReply } = {}) {
+async function managerFixture(t, { protocol = 'legacy', ready, onStart, onStop, beforeReply, startupMs, completionResult } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-final-validation-')), store = new McpConfigStore(directory)
   const transports = []
   const manager = new McpManager({ store, env: {}, transportFactory: launch => {
-    const subject = injectedOwnedTransport(launch, async () => { onStop?.() }, ready, onStart, beforeReply)
+    const subject = injectedOwnedTransport(launch, async () => { await onStop?.() }, ready, onStart, beforeReply, completionResult)
+    if (startupMs !== undefined) Object.defineProperty(subject.transport, 'startupTimeoutMs', { value: startupMs })
     transports.push(subject); return subject.transport
   } })
   t.after(async () => {
@@ -60,18 +62,38 @@ async function managerFixture(t, { protocol = 'legacy', ready, onStart, onStop, 
   return { manager, store, transports }
 }
 
+test('only the Windows native stdio transport receives the fixed 45-second startup budget', () => {
+  assert.equal(mcpStdioStartupTimeout('win32'), 45_000)
+  for (const platform of ['linux', 'darwin', 'freebsd']) assert.equal(mcpStdioStartupTimeout(platform), 10_000)
+  const native = new McpStdioTransport({})
+  assert.equal(mcpStartupTimeoutMs(native), process.platform === 'win32' ? 45_000 : 10_000)
+  Object.defineProperty(native, 'startupTimeoutMs', { value: 45_000, configurable: true })
+  assert.equal(mcpStartupTimeoutMs(native), 45_000)
+  Object.defineProperty(native, 'startupTimeoutMs', { value: 90_000 })
+  assert.equal(mcpStartupTimeoutMs(native), 10_000)
+  assert.equal(mcpStartupTimeoutMs({ startupTimeoutMs: 45_000 }), 10_000)
+  const http = new McpHttpTransport({ server: { endpoint: 'https://fixture.invalid/mcp', allowLoopbackHttp: false } }, {
+    beforeOperation: async () => {}, operationStarted: () => {},
+    fetch: async () => { throw new Error('Policy selection must perform no request') },
+  })
+  assert.equal(mcpStartupTimeoutMs(http), 10_000)
+  assert.equal(MCP_LIMITS.categoryMs, 10_000); assert.equal(MCP_LIMITS.pageMs, 5000)
+})
+
 for (const protocol of ['legacy', '2026-07-28']) test(`owned startup readiness precedes the SDK handshake deadline (${protocol})`, async t => {
   let release, entered
   const ready = new Promise(resolve => { release = resolve }), started = new Promise(resolve => { entered = resolve })
   t.after(() => release())
   const subject = await managerFixture(t, { protocol, ready, onStart: entered, onStop: release })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
   const outcome = pending.then(value => ({ value }), error => ({ error }))
   await started
   assert.deepEqual(subject.transports[0].methods, [])
   // A cold native setup can exceed one RPC deadline within its independently
   // bounded startup phase. Each protocol/page/category limit remains unchanged.
-  await new Promise(resolve => setTimeout(resolve, MCP_LIMITS.pageMs + 100))
+  t.mock.timers.tick(MCP_LIMITS.pageMs + 100)
+  await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(subject.transports[0].methods, [])
   release()
   const result = await outcome
@@ -87,15 +109,18 @@ for (const protocol of ['legacy', '2026-07-28']) test(`bounded startup does not 
   const reply = new Promise(resolve => { releaseReply = resolve })
   const page = new Promise(resolve => { enteredPage = resolve })
   t.after(() => { releaseReady(); releaseReply() })
-  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart,
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart, startupMs: MCP_WINDOWS_STDIO_STARTUP_MS,
     beforeReply: async method => { if (method === 'tools/list') { enteredPage(); await reply } } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
   await started
   // Deliberate simulated work, not a readiness guess: release both owned gates.
-  await new Promise(resolve => setTimeout(resolve, 6000))
+  t.mock.timers.tick(24_330)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(subject.transports[0].methods, [])
   releaseReady()
   await page
-  await new Promise(resolve => setTimeout(resolve, 4500))
+  t.mock.timers.tick(4500)
   releaseReply()
   assert.equal(await pending, true)
   const status = subject.manager.statuses()[0]
@@ -105,20 +130,104 @@ for (const protocol of ['legacy', '2026-07-28']) test(`bounded startup does not 
   assert.equal(MCP_LIMITS.categoryMs, 10_000); assert.equal(MCP_LIMITS.pageMs, 5000)
 })
 
-for (const protocol of ['legacy', '2026-07-28']) test(`owned startup remains bounded and drains cancellation before returning (${protocol})`, async t => {
+for (const protocol of ['legacy', '2026-07-28']) for (const startupMs of [10_000, 45_000]) test(`owned startup expires exactly at ${startupMs}ms and awaits cleanup (${protocol})`, async t => {
+  let releaseReady, enteredStart, releaseCleanup, enteredStop, stops = 0, settled = false
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  const cleanup = new Promise(resolve => { releaseCleanup = resolve })
+  const stopping = new Promise(resolve => { enteredStop = resolve })
+  t.after(() => { releaseReady(); releaseCleanup() })
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart, startupMs,
+    onStop: async () => { stops++; enteredStop(); await cleanup; releaseReady() } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  void pending.then(() => { settled = true })
+  await started
+  t.mock.timers.tick(startupMs - 1)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(stops, 0); assert.equal(settled, false)
+  t.mock.timers.tick(1)
+  await stopping
+  assert.equal(stops, 1); assert.equal(settled, false)
+  assert.deepEqual(subject.transports[0].methods, [])
+  releaseCleanup()
+  assert.equal(await pending, false)
+  assert.equal(stops, 1); assert.equal(subject.transports[0].starts(), 1)
+  assert.deepEqual(subject.transports[0].methods, [])
+  assert.equal(subject.manager.statuses()[0].state, 'error')
+  assert.match(subject.manager.statuses()[0].message, /server startup timed out/)
+})
+
+for (const protocol of ['legacy', '2026-07-28']) for (const action of ['cancel', 'disable']) test(`Windows startup ${action} requests stop immediately and blocks late readiness (${protocol})`, async t => {
+  let releaseReady, enteredStart, releaseCleanup, enteredStop, stops = 0
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  const cleanup = new Promise(resolve => { releaseCleanup = resolve })
+  const stopping = new Promise(resolve => { enteredStop = resolve })
+  t.after(() => { releaseReady(); releaseCleanup() })
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart, startupMs: 45_000,
+    onStop: async () => { stops++; enteredStop(); await cleanup } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const controller = new AbortController()
+  const pending = subject.manager.connect('docs', async () => true, controller.signal)
+  await started
+  const disabling = action === 'disable' ? subject.manager.disconnect('docs') : (controller.abort(), Promise.resolve())
+  await stopping
+  assert.equal(Date.now(), 0); assert.equal(stops, 1)
+  releaseReady()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(subject.transports[0].methods, [])
+  t.mock.timers.tick(90_000)
+  releaseCleanup()
+  assert.equal(await pending, false); await disabling
+  assert.equal(stops, 1); assert.equal(subject.transports[0].starts(), 1)
+  assert.deepEqual(subject.transports[0].methods, [])
+  assert.notEqual(subject.manager.statuses()[0].state, 'connected')
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`pre-ready cancellation preserves unknown native cleanup without dispatch or restart (${protocol})`, async t => {
   let releaseReady, enteredStart, stops = 0
   const ready = new Promise(resolve => { releaseReady = resolve })
   const started = new Promise(resolve => { enteredStart = resolve })
   t.after(releaseReady)
-  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart,
-    onStop: () => { stops++; releaseReady() } })
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart, startupMs: 45_000,
+    onStop: () => { stops++; releaseReady() }, completionResult: { exitCode: 1, error: new Error('Owned cold cancellation cleanup is unknown') } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const controller = new AbortController()
+  const pending = subject.manager.connect('docs', async () => true, controller.signal)
+  await started
+  controller.abort()
+  await assert.rejects(pending, /cleanup could not be verified/)
+  assert.equal(Date.now(), 0)
+  assert.equal(subject.transports[0].starts(), 1); assert.deepEqual(subject.transports[0].methods, [])
+  await assert.rejects(subject.manager.connect('docs', async () => true, new AbortController().signal), /Disable/)
+  assert.equal(subject.transports[0].starts(), 1)
+  assert.equal(subject.manager.statuses()[0].state, 'error'); assert.equal(subject.manager.statuses()[0].snapshot, undefined)
+  assert.ok(stops >= 1)
+  // Fixture-only teardown permits later disposal; it does not rewrite the rejected outcome.
+  subject.transports[0].owned.completed = Promise.resolve({ exitCode: 0 })
+})
+
+for (const protocol of ['legacy', '2026-07-28']) test(`Windows readiness after 24 seconds starts a fresh five-second handshake RPC (${protocol})`, async t => {
+  let releaseReady, enteredStart, releaseReply, enteredReply, stops = 0
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  const reply = new Promise(resolve => { releaseReply = resolve })
+  const held = new Promise(resolve => { enteredReply = resolve })
+  t.after(() => { releaseReady(); releaseReply() })
+  const subject = await managerFixture(t, { protocol, ready, onStart: enteredStart, startupMs: 45_000,
+    beforeReply: async () => { enteredReply(); await reply }, onStop: () => { stops++; releaseReply() } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
   await started
+  t.mock.timers.tick(24_330); releaseReady(); await held
+  t.mock.timers.tick(4999)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(stops, 0)
+  t.mock.timers.tick(1)
   assert.equal(await pending, false)
-  assert.equal(stops, 1)
-  assert.deepEqual(subject.transports[0].methods, [])
-  assert.equal(subject.manager.statuses()[0].state, 'error')
-  assert.match(subject.manager.statuses()[0].message, /server startup timed out/)
+  assert.equal(stops, 1); assert.equal(subject.transports[0].starts(), 1)
+  assert.deepEqual(subject.transports[0].methods, [protocol === 'legacy' ? 'initialize' : 'server/discover'])
 })
 
 for (const protocol of ['legacy', '2026-07-28']) test(`cancellation at owned readiness cannot send a handshake (${protocol})`, async t => {
@@ -169,38 +278,61 @@ for (const protocol of ['legacy', '2026-07-28']) test(`handshake RPC retains its
 })
 
 test('legacy handshake remains bounded while its final notification write is held', async t => {
-  let releaseReply, entered, stops = 0
+  let releaseReply, entered, releaseReady, enteredStart, stops = 0
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
   const reply = new Promise(resolve => { releaseReply = resolve })
   const held = new Promise(resolve => { entered = resolve })
-  t.after(releaseReply)
-  const subject = await managerFixture(t, { beforeReply: async method => {
+  t.after(() => { releaseReady(); releaseReply() })
+  const subject = await managerFixture(t, { ready, onStart: enteredStart, startupMs: 45_000, beforeReply: async method => {
     if (method === 'notifications/initialized') { entered(); await reply }
   }, onStop: () => { stops++; releaseReply() } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
-  await held
+  await started
+  t.mock.timers.tick(24_330); releaseReady(); await held
+  t.mock.timers.tick(9999)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(stops, 0)
+  t.mock.timers.tick(1)
   assert.equal(await pending, false)
   assert.equal(stops, 1)
   assert.deepEqual(subject.transports[0].methods, ['initialize', 'notifications/initialized'])
   assert.match(subject.manager.statuses()[0].message, /protocol handshake timed out/)
 })
 
-test('initial metadata retains its own ten-second category deadline and quarantines incomplete pages', async t => {
-  let page = 0, releaseReply, replyTimer
-  const subject = await managerFixture(t, { beforeReply: async method => {
+test('Windows cold startup leaves a fresh exact ten-second metadata category and quarantines incomplete pages', async t => {
+  let page = 0, releaseReady, enteredStart, settled = false
+  const ready = new Promise(resolve => { releaseReady = resolve })
+  const started = new Promise(resolve => { enteredStart = resolve })
+  const releases = [], enteredPages = []
+  const pages = Array.from({ length: 3 }, (_, index) => new Promise(resolve => { enteredPages[index] = resolve }))
+  const releasePages = () => { for (const release of releases) release?.() }
+  const subject = await managerFixture(t, { ready, onStart: enteredStart, startupMs: 45_000, beforeReply: async method => {
     if (method !== 'tools/list') return
-    page++
-    await new Promise(resolve => { releaseReply = resolve; replyTimer = setTimeout(resolve, 4200) })
-    return { resultType: 'complete', tools: [], nextCursor: `page-${page}`, ttlMs: 0, cacheScope: 'private' }
-  }, onStop: () => { clearTimeout(replyTimer); releaseReply?.() } })
-  t.after(() => { clearTimeout(replyTimer); releaseReply?.() })
-  assert.equal(await subject.manager.connect('docs', async () => true, new AbortController().signal), true)
+    const index = page++
+    await new Promise(resolve => { releases[index] = resolve; enteredPages[index]?.() })
+    return { resultType: 'complete', tools: [], nextCursor: `page-${index + 1}`, ttlMs: 0, cacheScope: 'private' }
+  }, onStop: releasePages })
+  t.after(() => { releaseReady(); releasePages() })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  t.mock.method(performance, 'now', () => Date.now())
+  const pending = subject.manager.connect('docs', async () => true, new AbortController().signal)
+  void pending.then(() => { settled = true })
+  await started
+  t.mock.timers.tick(24_330); releaseReady(); await pages[0]
+  t.mock.timers.tick(4200); releases[0](); await pages[1]
+  t.mock.timers.tick(4200); releases[1](); await pages[2]
+  t.mock.timers.tick(1599)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(settled, false)
+  t.mock.timers.tick(1)
+  assert.equal(await pending, true)
   const status = subject.manager.statuses()[0]
   assert.equal(status.state, 'connected')
   assert.equal(status.snapshot.categories.tools.state, 'error')
   assert.deepEqual(status.snapshot.categories.tools.entries, [])
-  assert.equal(page, 3)
-  // The final page uses the remaining category budget. Its timer can fire
-  // just before the category AbortSignal; both existing reasons quarantine it.
+  assert.equal(page, 3); assert.equal(subject.transports[0].starts(), 1)
   assert.ok(['Metadata discovery cancelled or timed out',
     'Metadata discovery failed, changed or exceeded its bounds'].includes(status.snapshot.categories.tools.reason))
 })
