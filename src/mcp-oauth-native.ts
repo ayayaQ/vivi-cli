@@ -8,6 +8,7 @@ import { checkServerIdentity } from 'node:tls'
 import type { PeerCertificate, TLSSocket } from 'node:tls'
 import type { FetchLike } from '@modelcontextprotocol/client'
 import { McpOAuthError } from './mcp-oauth-callback.js'
+import type { McpOAuthNetworkPhase } from './mcp-oauth-callback.js'
 import { mcpOAuthAbortable, mcpOAuthRemoteUrl } from './mcp-oauth-network.js'
 import { isPublicUrlAddress, resolvePublicUrlHost } from './public-url-transport.js'
 
@@ -121,6 +122,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
     const headers = requestHeaders(init, url, body)
     const deadline = new AbortController(), signal = AbortSignal.any([deadline.signal, ...(init?.signal ? [init.signal] : [])])
     let expired = false
+    let phase: McpOAuthNetworkPhase = 'dns'
     const timer = setTimeout(() => { expired = true; deadline.abort() }, deadlineMs)
     const guard = (): void => { if (signal.aborted) throw new McpOAuthError(expired ? 'timeout' : 'cancelled') }
     try {
@@ -131,6 +133,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
         addresses.some(address => !isPublicUrlAddress(address))) fail()
       const address = addresses[0]!
       if (isIP(hostname) && !sameAddress(hostname, address)) fail()
+      phase = 'tls'
       return await new Promise<Response>((resolve, reject) => {
         let request: ClientRequest | undefined, socket: TLSSocket | undefined, incoming: IncomingMessage | undefined
         let settled = false, sent = false, cleanupFailed = false
@@ -155,6 +158,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
           incoming = response
           try {
             current(); if (!sent) fail()
+            phase = 'response'
             const metadata = readHeaders(response), chunks: Buffer[] = []; let bytes = 0
             response.on('aborted', stop)
             response.on('close', () => { if (!response.complete) stop() })
@@ -184,7 +188,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
               verifyIdentity(hostname, socket.getPeerCertificate()) !== undefined) fail()
             // No HTTP headers or POST bytes are queued before TLS authorization
             // and the pinned peer-IP check. No retries or alternate IP fallback.
-            current(); sent = true; request!.end(body)
+            current(); sent = true; phase = 'request'; request!.end(body)
           } catch { stop() }
         }
         const onSocket = (connected: TLSSocket): void => {
@@ -218,7 +222,7 @@ export function createMcpOAuthNativeFetch(dependencies: McpOAuthNativeDependenci
         } catch { stop(); close() }
       })
     } catch {
-      throw new McpOAuthError(signal.aborted ? expired ? 'timeout' : 'cancelled' : 'authorization-failed')
+      throw new McpOAuthError(signal.aborted ? expired ? 'timeout' : 'cancelled' : 'authorization-failed', undefined, phase)
     } finally { clearTimeout(timer); deadline.abort() }
   }
 }

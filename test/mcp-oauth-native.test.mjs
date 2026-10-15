@@ -89,6 +89,21 @@ test('native OAuth GET resolves each invocation and fails closed when DNS later 
   assert.equal(options.headers.host, 'example.com'); assert.equal(options.headers.connection, 'close')
   assert.equal(options.headers['accept-encoding'], 'identity'); assert.equal(options.method, 'GET')
 })
+
+test('native failures identify fixed DNS, TLS, request and response phases without native error text', async t => {
+  for (const phase of ['dns', 'tls', 'request', 'response']) await t.test(phase, async () => {
+    const f = fixture(phase === 'dns' ? { resolveHost() { throw new Error('PRIVATE_NATIVE_MARKER') } }
+      : phase === 'tls' ? { socketOptions: { authorized: false } }
+      : phase === 'request' ? { reply: false } : { rawHeaders: ['Content-Length', '65537'] })
+    const pending = f.fetchFn(url, { method: 'POST', body: '{}' })
+    if (phase === 'request') { await tick(); f.request.emit('error', new Error('PRIVATE_NATIVE_MARKER')) }
+    await assert.rejects(pending, error => {
+      assert.equal(error.networkPhase, phase); return safeFailure()(error)
+    })
+    assert.equal(f.state.ends.length, phase === 'dns' || phase === 'tls' ? 0 : 1)
+    assert.equal(f.state.requests.length, phase === 'dns' ? 0 : 1)
+  })
+})
 test('POST HTTP bytes wait for strict TLS and peer-IP checks; SDK form bodies are bounded strings', async () => {
   const f = fixture({ secure: false }), pending = f.fetchFn(url, { method: 'POST', credentials: 'omit', redirect: 'manual',
     headers: new Headers({ 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }),
