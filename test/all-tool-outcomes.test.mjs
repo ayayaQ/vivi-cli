@@ -50,7 +50,12 @@ async function fixture(t, { initial, setup, ...options } = {}) {
   host = await CliHost.create({ store, workspace, settings, approve: async () => true, ...setupOptions,
     ...(options.enableMemory ? { memory } : {}),
     ...options, onEvent(event) {
-      if (event.type === 'tool_completed') observations.push(presentation(host, event.message.name))
+      if (event.type === 'tool_completed') {
+        const history = host.session.history
+        const index = history.findLastIndex(message => message.kind === 'tool_result' &&
+          message.callId === event.message.callId && message.name === event.message.name)
+        observations.push(cliHistoryToolPresentation(history, index, host.session.id, host.toolPresentationEvidence))
+      }
       return onEvent?.(event, host)
     } })
   t.after(async () => {
@@ -335,13 +340,33 @@ for (const cancelled of [false, true]) test(`owned clarification ${cancelled ? '
 })
 
 test('owned command exit completion has exact live and cold receipts without claiming arbitrary effects', async t => {
+  let round = 0
   const f = await fixture(t, {
     setup: async ({ root }) => ({ commandWorkspace: await TrustedCommandWorkspace.open(root, captureCommandEnvironment(process.env)) }),
     commandApproval: { isAvailable: () => true, accountRevision: () => 'offline-command-account' },
-    provider: oneCallProvider(call('command_start', { executable: process.execPath, args: ['--version'], yieldMs: 2000 }))
+    maxRounds: 25,
+    provider: { async generate({ messages }) {
+      if (++round === 1) return answer([call('command_start', { executable: process.execPath, args: ['--version'], yieldMs: 0 })])
+      const previous = JSON.parse(messages.findLast(message => message.kind === 'tool_result').content)
+      // Native Windows process setup and exit are asynchronous. Observe an actual
+      // terminal result instead of assuming the first bounded wait completes it.
+      return previous.state === 'running'
+        ? answer([call('command_poll', { executionId: previous.executionId, yieldMs: 2000 }, `exit-poll-${round}`)]) : answer()
+    } }
   })
   await f.host.send('Run the owned local version fixture')
-  for (const snapshot of [f.observations[0], presentation(f.host), presentation(await f.coldResume())]) assertEvidence(snapshot, 'succeeded', 'unknown')
+  const entries = resultEntries(f.host), restored = await f.coldResume()
+  const terminal = JSON.parse(entries.at(-1).message.content)
+  assert.equal(terminal.state, 'exited'); assert.equal(terminal.exitCode, 0)
+  assert.equal(f.observations.length, entries.length)
+  for (const [position, { message, index }] of entries.entries()) {
+    const status = JSON.parse(message.content).state === 'running' ? 'unknown' : 'succeeded'
+    for (const snapshot of [f.observations[position],
+      cliHistoryToolPresentation(f.host.session.history, index, f.host.session.id, f.host.toolPresentationEvidence),
+      cliHistoryToolPresentation(restored.session.history, index, restored.session.id, restored.toolPresentationEvidence)]) {
+      assertEvidence(snapshot, status, 'unknown')
+    }
+  }
 })
 test('owned command start, poll and stop preserve observed process states through cold replay', async t => {
   let round = 0

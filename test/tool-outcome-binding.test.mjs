@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CliHost } from '../dist/host.js'
 import { FileSessionStore } from '../dist/session.js'
-import { TrustedCommandWorkspace } from '../dist/commands.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment } from '../dist/commands.js'
 import { cliHistoryToolPresentation } from '../dist/tool-presentation.js'
 const settings = { provider: 'openai', model: 'offline-tool-binding-fixture' }
 const signalTurn = () => new Promise(resolve => setImmediate(resolve))
@@ -53,7 +53,7 @@ test('cancelling inside an already delivered completion preserves the commit and
 })
 test('late cancelled command preparation cannot mutate settled or replacement-turn evidence', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-late-command-binding-'))
-  const workspace = await TrustedCommandWorkspace.open(directory, {})
+  const workspace = await TrustedCommandWorkspace.open(directory, captureCommandEnvironment(process.env))
   let release, entered
   const gate = new Promise(resolve => { release = resolve }), started = new Promise(resolve => { entered = resolve })
   const prepare = workspace.prepare.bind(workspace)
