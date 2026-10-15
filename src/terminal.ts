@@ -200,7 +200,7 @@ export async function runModeControl(host: CliHost, io: ChatIO, line: string, ch
     default: io.write('Use /mode by itself for a fresh Manual / Auto review / Plan choice, /mode plan, /mode manual, or /mode cycle\n')
   }
 }
-export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Automatic skill saving is disabled on every platform; creator drafts are saved manually; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
+export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Creator drafts can be saved to the app-owned SQLite installed store after exact-content human review, including in Auto mode; changes are available next turn. Plan and noninteractive launches cannot save. Legacy folders and bundled skills remain read-only; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
 /memories edit ID REVISION TEXT · review an edit to the displayed revision
@@ -271,14 +271,14 @@ export async function runMemoryCommand(host: CliHost, io: ChatIO, line: string):
   } else io.write(MEMORY_COMMAND_HELP)
   return true
 }
-const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · ask the agent for a standard skill draft to save manually\n/skills on · enable for this launch; /skills off · disable without deleting\n'
+const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · draft a standard skill and request human-reviewed saving\n/skills on · enable for this launch; /skills off · disable without deleting\n'
 export function displaySkills(io: Pick<ChatIO, 'write'>, catalog: Awaited<ReturnType<CliHost['listSkills']>>, diagnostics: readonly string[] = []): void {
   io.write(`Skills (${catalog.skills.length}):\n`)
   for (const skill of catalog.skills) io.write(`${JSON.stringify(skill.name)} · ${skill.readOnly ? 'read only' : 'owned store'} · revision ${skill.revision}\n${JSON.stringify(skill.description)}\n`)
   for (const diagnostic of diagnostics) io.write(`Skill diagnostic: ${diagnostic}\n`)
 }
 export function skillCreationPrompt(description: string): string {
-  return `Use the bundled skill-creator to draft an ordinary instruction-only SKILL.md for this request: ${description}\nShow the exact draft, keep it limited to available tools, propose honest example checks, and show the draft for me to save manually. Automatic skill saving is disabled on every platform. Do not create scripts/resources, run commands, install dependencies or claim unrun evaluations.`
+  return `Use the bundled skill-creator to draft an ordinary instruction-only SKILL.md for this request: ${description}\nShow the exact draft, keep it limited to available tools, propose honest example checks, and request save_skill for explicit human review if available. Never claim it is saved before the successful save result; the skill becomes available next turn. Do not create scripts/resources, run commands, install dependencies or claim unrun evaluations.`
 }
 export async function runSkillsCommand(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
   if (!/^\/skills(?:\s|$)/.test(line.trim())) return false

@@ -24,7 +24,7 @@ export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
   list_memories: 'local-read', create_memory: 'local-mutation', edit_memory: 'local-mutation', delete_memory: 'local-mutation',
   workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
   workspace_create_text: 'local-mutation', workspace_edit_text: 'local-mutation',
-  list_skills: 'local-read', read_skill: 'local-read', request_user_input: 'local-read',
+  list_skills: 'local-read', read_skill: 'local-read', save_skill: 'local-mutation', request_user_input: 'local-read',
   command_start: 'command', command_poll: 'command', command_stop: 'command', fetch_url: 'public-url',
   mcp_list: 'local-read', mcp_setup: 'mcp', list_mcp_resources: 'local-read', read_mcp_resource: 'mcp', read_mcp_resource_template: 'mcp'
 } as const satisfies Record<string, CliToolOutcomePolicy>)
@@ -84,7 +84,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.
-  const builtins = createExtensionScope({ reservedNames: ['save_skill'] })
+  const builtins = createExtensionScope()
   scope.defer(() => builtins.dispose())
   try {
     scope.register(calculatorExtension)

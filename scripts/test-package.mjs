@@ -95,6 +95,7 @@ try {
     'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
     'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/skills.ts', 'dist/skills.js', 'dist/skills.d.ts',
+    'src/installed-skills.ts', 'dist/installed-skills.js', 'dist/installed-skills.d.ts',
     'src/workspace.ts', 'dist/workspace.js', 'dist/workspace.d.ts',
     'src/workspace-glob.ts', 'dist/workspace-glob.js', 'dist/workspace-glob.d.ts',
     'src/conversation-records.ts', 'dist/conversation-records.js', 'dist/conversation-records.d.ts',
@@ -219,11 +220,11 @@ try {
   await writeFile(join(installed, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extensions/questions'
@@ -304,7 +305,7 @@ for (const name of ['packed_fixture', 'current_time', 'note_read']) {
   await assert.rejects(scopedTools.executeTool({ id: 'packed-closed', name, arguments: {} },
     new AbortController().signal, scopedHost), { name: 'AbortError' })
 }
-const directory = await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-'))
+const directory = await realpath(await mkdtemp(join(tmpdir(), 'vivi-cli-packed-runtime-')))
 // Installed ESM and CJS consumers must use the published question entrypoint.
 const cjsQuestions = createRequire(import.meta.url)('@ayayaq/vivi/extensions/questions')
 const questionArguments = { questions: [
@@ -511,6 +512,13 @@ try {
   assert.equal(typeof skills.commit, 'undefined')
   assert(!skillsResult.history.some(message => message.name === 'save_skill'))
   await skills.drain({ close: true })
+  const installedSkills = new InstalledSkillStore(directory)
+  const installedText = '---\\nname: packed-guide\\ndescription: Installed package fixture.\\n---\\nUse supplied facts.\\n'
+  const installedDocument = parseSkillDocument(installedText)
+  const installedReceipt = await installedSkills.commit({ name: 'packed-guide', before: null, expectedRevision: null, after: installedDocument }, { signal: new AbortController().signal })
+  assert.equal(installedReceipt.revision, installedDocument.revision)
+  assert.equal((await new InstalledSkillStore(directory).snapshot()).document('packed-guide').content, installedText)
+  await installedSkills.drain({ close: true })
   const project = join(directory, 'project')
   await mkdir(project)
   await writeFile(join(project, 'readme.txt'), 'Packed workspace works')
@@ -621,13 +629,13 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession, type CliQuestionHost,
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type SkillSaveReceipt, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession, type CliQuestionHost,
   type SessionPersistence, type ApprovalRequest, type TaskMode, type ConversationMode, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
 import { createQuestionExtension, QUESTION_LIMITS, type Question, type QuestionOption, type QuestionRequest, type QuestionHost, type QuestionResponse, type QuestionAnswer, type QuestionAnswerEntry } from '@ayayaq/vivi/extensions/questions'
-import type { SkillCatalog } from '@ayayaq/vivi/extensions/skills'
+import { parseSkillDocument, type SkillCatalog } from '@ayayaq/vivi/extensions/skills'
 import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabilities, type Capability } from '@ayayaq/vivi/providers/models'
 const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
 const selection: Capability = reasoningSelectionSupport(capabilities, { mode: 'disabled' })
@@ -642,8 +650,13 @@ void conversationStore; void conversationView
 const memory: CliMemoryStore = new FileMemoryStore('/tmp/fake-types-only')
 const skills: CliSkillStore = new FileSkillStore('/tmp/fake-types-only/agent-skills', { readOnlyRoots: [], secrets: [] })
 const catalog: Promise<SkillCatalog> = skills.snapshot()
-const writable: false = skills.writable
-void catalog; void writable
+const writable: boolean = skills.writable
+const legacyWritable: false = new FileSkillStore('/tmp/fake-types-only/agent-skills').writable
+const installedSkills = new InstalledSkillStore('/tmp/fake-types-only')
+const installedWritable: true = installedSkills.writable
+const typedDocument = parseSkillDocument('---\\nname: types-only\\ndescription: Type fixture\\n---\\nType fixture')
+const installedCommit: Promise<SkillSaveReceipt> = installedSkills.commit({ name: 'types-only', before: null, expectedRevision: null, after: typedDocument }, { signal: new AbortController().signal })
+void catalog; void writable; void legacyWritable; void installedWritable; void installedCommit
 const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
 const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')

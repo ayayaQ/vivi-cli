@@ -287,13 +287,28 @@ authorized operations.
 
 ## Agent Skills adoption checks
 
-Skills use the pinned vivi 0.9.0 extension without changes to its shared agent loop.
-Run ordinary skills store, host, manager, native headless UI, package, and standalone checks
-with the current main checks. Automatic saving is disabled on every platform. Confirm
-only list/read tools are exposed, creator drafts describe manual saving, and all sources
-remain read-only. Prior restricted assessments stay unconditionally skipped; passing
-ordinary checks does not complete that stopped review or accept automatic skill saves.
-Actual Windows and macOS behavior is verified only when the relevant platform ran.
+Skills use the pinned published vivi 0.13.0 extension without runtime, types or package-byte
+changes. Its generic save callbacks already support the host implementation. A separately
+reviewed core comment clarification describes storage-neutral SKILL.md transactions and
+explicit unknown outcomes; it creates no new runtime-version or npm-publication gate.
+
+Run ordinary legacy store/host/manager checks, the new installed SQLite store and human-save
+host tests, native Save skill review tests, package checks, the full native TUI suite and
+standalone checks. New installed-store/host cases belong to Node/Linux, Node/Windows and
+Bun boundary groups. Compile and run the installed-skills standalone fixture on Linux and
+Windows. Verify exact source and atomic receipt recovery, stale-revision refusal, next-turn
+catalog activation, immutable built-ins/imports, collision diagnostics, incomplete-import
+fail-closed behavior, known-secret screening and denial/cancellation/account changes.
+
+Only interactive Execute mode advertises saving. Auto mode still requires exact-content
+human review and never calls the model reviewer for skill saves. Plan, headless and no-tools
+paths omit the save capability. No scripts/resources or general file-writing authority are
+added. Legacy sources stay read-only; no migration or shadowing occurs.
+
+The seven historical restricted filesystem assessment tests remain unchanged, excluded and
+unrun. New SQLite functional and transaction tests do not complete or reconstruct that
+stopped assessment. Actual Windows and macOS behavior is verified only when the relevant
+platform ran; current automated platform workflows cover Linux and Windows.
 
 ## Trusted command checks
 

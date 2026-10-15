@@ -13,7 +13,7 @@ import { createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '
 import type { DecisionProvider } from '@ayayaq/vivi/decisions'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
-import { FileSkillStore } from './skills.js'
+import { InstalledSkillStore } from './installed-skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
@@ -356,7 +356,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
-    const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
+    const skills = new InstalledSkillStore(options.sessionDirectory, { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
     secretTargets = values => {
       memory.addSecrets(values); skills.addSecrets(values); workspace?.addSecrets(values); host?.refreshSecretFilters()
     }
@@ -398,6 +398,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const commandEnv = captureCommandEnvironment(env)
     host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
+      skillSaveApproval: { isAvailable: () => options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,
         isAvailable: () => io?.canAutoReview === true && !io.isClosed } } : {}),

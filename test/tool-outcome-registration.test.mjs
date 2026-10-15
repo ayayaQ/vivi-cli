@@ -13,7 +13,7 @@ import { collectMcpCategory } from '../dist/mcp-catalog.js'
 import { createPublicUrlExtension } from '../dist/public-url-tools.js'
 const inert = () => { assert.fail('Inventory must never execute a tool') }
 const signal = () => new AbortController().signal
-async function packs() {
+async function packs(save = false) {
   const categories = Object.fromEntries(await Promise.all([
     ['tools', { tools: [{ name: 'arbitrary_tool', inputSchema: { type: 'object' } }] }],
     ['resources', { resources: [{ name: 'Document', uri: 'fixture:///document' }] }],
@@ -24,7 +24,7 @@ async function packs() {
   return {
     memory: createMemoryExtension({ listMemories: inert, executeMutation: inert }),
     workspace: createWorkspaceExtension({}, [], inert),
-    skills: createSkillsExtension({ catalog: createSkillCatalog([]), authorizeRead: inert }),
+    skills: createSkillsExtension({ catalog: createSkillCatalog([]), authorizeRead: inert, ...(save ? { save: { authorize: inert, commit: inert } } : {}) }),
     commands: createCommandExtension(inert, inert),
     mcp: createMcpExtension({ captureCatalogs: inert, prepareOperation: inert }, [snapshot], inert),
     publicUrl: createPublicUrlExtension(inert),
@@ -33,11 +33,12 @@ async function packs() {
   }
 }
 test('every actual registered owned tool has an explicit outcome policy, including conditional MCP resources', async () => {
-  const p = await packs()
+  for (const save of [true, false]) {
+  const p = await packs(save)
   for (const taskMode of ['execute', 'plan']) for (const notes of [true, false]) {
     const set = createBuiltinToolset(notes, [], p.memory, p.workspace, p.skills, p.commands, p.mcp, p.publicUrl, taskMode, p.questions, p.setup)
     try {
-      assert(!set.tools.some(tool => tool.name === 'save_skill'), 'Disabled native skill saving is not advertised')
+      assert.equal(set.tools.some(tool => tool.name === 'save_skill'), save && taskMode === 'execute', 'Skill saving requires an enabled owned capability and Execute mode')
       assert.equal(set.outcomePolicies.size, set.tools.length)
       const mcp = new Set(p.mcp.tools.map(tool => tool.definition.name))
       for (const tool of set.tools) {
@@ -47,11 +48,12 @@ test('every actual registered owned tool has an explicit outcome policy, includi
       }
       if (taskMode === 'execute' && notes) {
         const staticNames = set.tools.map(tool => tool.name).filter(name => !mcp.has(name)).sort()
-        assert.deepEqual(staticNames, Object.keys(BUILTIN_TOOL_OUTCOME_POLICIES).filter(name => !mcp.has(name)).sort())
+        assert.deepEqual(staticNames, Object.keys(BUILTIN_TOOL_OUTCOME_POLICIES).filter(name => !mcp.has(name) && (save || name !== 'save_skill')).sort())
         assert(['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template'].every(name => mcp.has(name)))
         assert([...mcp].some(name => !Object.hasOwn(BUILTIN_TOOL_OUTCOME_POLICIES, name)), 'Dynamic remote aliases are covered by owned provenance')
       }
     } finally { await set.dispose() }
+  }
   }
 })
 test('a newly registered owned name fails closed instead of inheriting generic success evidence', async () => {

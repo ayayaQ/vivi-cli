@@ -9,7 +9,7 @@ import {
   validateSkillName, validateSkillResourcePath
 } from '@ayayaq/vivi/extensions/skills'
 import type {
-  SkillCatalog, SkillDocument, SkillReadRequest, SkillSource
+  SkillCatalog, SkillDocument, SkillReadRequest, SkillSource, SkillSaveProposal
 } from '@ayayaq/vivi/extensions/skills'
 
 const LOCK = '.skills.lock'
@@ -25,12 +25,20 @@ export interface SkillStoreOptions {
 export interface SkillDiagnostic { readonly message: string; readonly name?: string }
 export interface CliSkillStore {
   readonly directory: string
-  /** All skill sources are read-only in this release. */
-  readonly writable: false
+  readonly writable: boolean
   readonly diagnostics: readonly string[]
   snapshot(signal?: AbortSignal): Promise<SkillCatalog>
   addSecrets(secrets: readonly string[]): void
+  /** Optional SKILL.md-only installed-store capability. Human approval belongs to the host. */
+  commit?(proposal: SkillSaveProposal, context: { readonly signal: AbortSignal; readonly assertCurrent?: () => void }): Promise<SkillSaveReceipt>
   drain(options?: { readonly close?: boolean }): Promise<void>
+}
+export interface SkillSaveReceipt {
+  readonly id: string
+  readonly name: string
+  readonly beforeRevision: string | null
+  readonly revision: string
+  readonly available: 'next_turn'
 }
 
 interface PathEntry { readonly path: string; readonly entry: BigIntStats }
@@ -83,6 +91,8 @@ export class FileSkillStore implements CliSkillStore {
   private readonly jobs = new Set<Promise<unknown>>()
   private closed = false
   private latestDiagnostics: readonly SkillDiagnostic[] = Object.freeze([])
+  private latestDiscoveredNames: readonly string[] = Object.freeze([])
+  private latestDiscoveryComplete = true
 
   constructor(directory: string, options: SkillStoreOptions = {}) {
     this.directory = resolve(directory)
@@ -92,6 +102,9 @@ export class FileSkillStore implements CliSkillStore {
   }
 
   get writable(): false { return false }
+  /** Includes valid sources excluded for a collision, so another store cannot shadow them. */
+  get discoveredNames(): readonly string[] { return this.latestDiscoveredNames }
+  get discoveryComplete(): boolean { return this.latestDiscoveryComplete }
 
   addSecrets(secrets: readonly string[]): void {
     for (const secret of secrets) if (typeof secret === 'string' && secret) this.secrets.add(secret)
@@ -323,6 +336,8 @@ export class FileSkillStore implements CliSkillStore {
   snapshot(signal?: AbortSignal): Promise<SkillCatalog> {
     return this.admit(signal, async (owned, ownedError) => {
       const diagnostics: SkillDiagnostic[] = []
+      const reservedNames = new Set<string>(['skill-creator'])
+      let discoveryComplete = !ownedError
       const candidates: Candidate[] = [{ source: skillCreatorSource, document: parseSkillDocument(skillCreatorSource.content) }]
       let considered = 1
       let entries = 0
@@ -348,10 +363,10 @@ export class FileSkillStore implements CliSkillStore {
           try {
             for await (const entry of iterator) {
               signal?.throwIfAborted()
-              if (++entries > MAXIMUM_SCAN_ENTRIES) { diagnose('Skill scan entry limit reached; remaining entries were excluded'); break }
+              if (++entries > MAXIMUM_SCAN_ENTRIES) { discoveryComplete = false; diagnose('Skill scan entry limit reached; remaining entries were excluded'); break }
               if (entry.name === LOCK || entry.name.startsWith('.skills.')) continue
               if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
-              if (++considered > SKILL_LIMITS.maximumSkills) { diagnose('Skill count limit reached; remaining entries were excluded'); break }
+              if (++considered > SKILL_LIMITS.maximumSkills) { discoveryComplete = false; diagnose('Skill count limit reached; remaining entries were excluded'); break }
               names.push(entry.name)
             }
           } finally { await iterator.close().catch(() => undefined) }
@@ -361,6 +376,7 @@ export class FileSkillStore implements CliSkillStore {
             let skill: Directory | undefined
             try {
               validateSkillName(name)
+              reservedNames.add(name.trim().normalize('NFKC'))
               validateSkillResourcePath(name)
               validateSkillResourcePath(name.trim().normalize('NFKC'))
               skill = await this.childDirectory(root, name)
@@ -382,11 +398,13 @@ export class FileSkillStore implements CliSkillStore {
               diagnose(this.safeError(error).message, name)
             } finally { if (skill) await this.closeDirectory(skill) }
           }
-        } catch (error) { signal?.throwIfAborted(); diagnose(`Root ${JSON.stringify(this.safeError(new Error(rootPath)).message)}: ${this.safeError(error).message}`) }
+        } catch (error) { signal?.throwIfAborted(); discoveryComplete = false; diagnose(`Root ${JSON.stringify(this.safeError(new Error(rootPath)).message)}: ${this.safeError(error).message}`) }
         finally { if (root && root !== owned) await this.closeDirectory(root) }
       }
       const counts = new Map<string, number>()
       for (const candidate of candidates) counts.set(candidate.document.metadata.name, (counts.get(candidate.document.metadata.name) ?? 0) + 1)
+      this.latestDiscoveredNames = Object.freeze([...reservedNames])
+      this.latestDiscoveryComplete = discoveryComplete
       const sources: SkillSource[] = []
       let summaryBytes = 2
       for (const candidate of candidates) {
