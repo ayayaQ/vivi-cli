@@ -510,32 +510,53 @@ keep missing metrics unreported; no cache policy, price or savings is inferred.
 
 ## Instruction-only Agent Skills
 
-`/skills` lists and inspects standard `<name>/SKILL.md` folders, prepares creator requests
-in the composer, and enables or disables skills for this launch. The app-wide folder is
-`<session-dir>/agent-skills`; `--skills-dir PATH` adds up to eight explicit read-only roots.
-No workspace, home, ancestor, or community discovery is performed. `--no-skills` disables
-skills. Metadata goes to the selected provider; instructions and UTF-8 text resources load
-progressively through `list_skills` and `read_skill`, without running scripts.
+`/skills` lists and inspects standard SKILL.md documents, prepares creator requests
+in the composer, and enables or disables skills for this launch. Existing
+`<session-dir>/agent-skills/<name>/SKILL.md` folders and up to eight explicit
+`--skills-dir PATH` roots remain read-only. No workspace, home, ancestor, or community
+discovery is performed. `--no-skills` disables skills. Metadata goes to the selected
+provider; instructions and imported UTF-8 text resources load progressively through
+`list_skills` and `read_skill`, without running scripts.
 
-The bundled read-only `skill-creator` drafts SKILL.md content in chat. Save the draft
-manually as `<name>/SKILL.md`, then refresh or start a new turn. Automatic skill saving is
-disabled on Windows, macOS, and Linux. There is no skill writer, save tool, or save approval.
-All skills are read-only to the agent. Existing workspace tools cannot target the owned
-private state profile. Skill hints grant no tools, permissions, or Auto eligibility.
+The bundled read-only `skill-creator` can draft an instruction-only skill, then propose
+`save_skill`. Interactive Execute mode shows the exact before/after SKILL.md source,
+canonical name and SHA-256 revisions for a deny-default human review. Auto mode still
+requires that same human review; the automatic reviewer cannot approve skill saves.
+Plan, noninteractive launches and models without tools cannot save. A successful save
+becomes discoverable on the next turn; the current turn keeps its fixed catalog.
+
+Reviewed creation and replacement store exact standard SKILL.md source in
+`<session-dir>/installed-skills/skills.sqlite`, using Node/Bun's built-in SQLite driver.
+The database holds instruction text, canonical names, exact-source revisions and immutable
+commit receipts. No scripts, resources or binary assets are installed. Legacy folders,
+explicit imports and the bundled creator are never migrated or overwritten. Name collisions
+are excluded with diagnostics instead of silently shadowing a source. Incomplete import-name
+discovery withholds installed skills and blocks new saves until refreshed.
+
+Approval holds no database lock. A short transaction rechecks the stored revision after
+review, then atomically commits source and receipt. A stale proposal must be reviewed again.
+Native commit errors are reconciled against the durable receipt through a fresh connection;
+an unresolved outcome is explicitly unknown with a receipt correlation and must not be
+retried blindly. SQLite storage is capped at 8 MiB. The store requires a stable private
+app-owned local profile; it does not claim isolation from hostile filesystem replacement.
+Existing workspace tools cannot target that private state profile. Skill hints grant no
+tools, permissions or automatic approval eligibility.
 
 Discovery uses canonical filesystem identity for ordinary Windows path aliases, preserves
-original files, and reports unavailable roots, invalid formats, and duplicate names.
+original files, and reports unavailable roots, invalid formats and duplicate names.
 Bounds are 100 skills including the creator, 64 KiB per UTF-8 document/resource, 2 MiB total
 documents, and 24 KiB catalog metadata; serialized tool reads must also fit the session
-transcript limit. Existing credential/private-state exclusions remain. Prior restricted
-assessments stay excluded; this release does not accept automatic skill saving.
+transcript limit. Exact human approval displays are bounded too; oversized proposals are
+denied rather than truncated. Existing credential/private-state exclusions remain. Prior
+restricted filesystem assessments stay excluded and unrun; new tests cover only the new
+installed-store functionality and ordinary SQLite transactions.
 
 ### Tool completion and effects
 
-Tool cards keep completion separate from effects. Reserved local reads have an observed local outcome. A workspace, note or memory write is confirmed only after its owned commit receipt; a later cancellation or durability warning cannot turn a published write into a failed save. A denied or cancelled request before its effect boundary is shown as not attempted. A failure after commit admission remains uncertain unless publication was observed.
+Tool cards keep completion separate from effects. Reserved local reads have an observed local outcome. A workspace, note, memory or installed-skill write is confirmed only after its owned commit receipt; a later cancellation or durability warning cannot turn a published write into a failed save. A denied or cancelled request before its effect boundary is shown as not attempted. A failure after commit admission remains uncertain unless publication was observed.
 
 Command cards report the observed process lifecycle. A running process is not a completed command; a zero exit code confirms process completion, while arbitrary file and network effects remain unknown. MCP success confirms the protocol response, not an intended third-party change. Local MCP configuration changes can have confirmed host receipts; incomplete setup retains known effects in the details and leaves the overall effects uncertain. Public URL cards distinguish retrieval status, HTTP transmission, and possible DNS/TLS metadata disclosure. Failure before any network operation differs from a request that may have reached a server.
 
-Imported extension results confirm only that their executor returned or failed. Claims inside result JSON cannot establish effects, approval or permission. Historical result bodies alone never acquire new receipts. Exact current-run call, occurrence, arguments and canonical result binding is required for live and saved outcomes; cold replay restores saved evidence without executing tools. If evidence persistence fails, replay keeps the uncertainty visible. Disabled native skill saving is not advertised or enabled by outcome reporting.
+Imported extension results confirm only that their executor returned or failed. Claims inside result JSON cannot establish effects, approval or permission. Historical result bodies alone never acquire new receipts. Exact current-run call, occurrence, arguments and canonical result binding is required for live and saved outcomes; cold replay restores saved evidence without executing tools. If evidence persistence fails, replay keeps the uncertainty visible. Skill saving receives a local-mutation policy only when its separate human-reviewed capability is enabled; outcome reporting grants no save authority.
 
 The registration coverage test inventories every enabled owned pack, conditional MCP resource tools, dynamic MCP aliases, Plan mode and disabled tools. Adding an owned tool without an explicit outcome policy fails registration instead of silently inheriting a generic success label.

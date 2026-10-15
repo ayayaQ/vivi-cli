@@ -1334,6 +1334,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || signal.aborted) return false
     const enrollment = request.call.name === 'enroll_auto_review'
     const publicUrl = request.call.name === 'fetch_url'
+    const skillSave = request.call.name === 'save_skill'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
     this.showTool(request.call.id, 'approval_required', 'not_attempted', 'Exact action needs human review')
     const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
@@ -1344,9 +1345,10 @@ export class OpenTuiIO implements ChatIO {
       ...(['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
         ? { workspaceDiff: request.workspaceDiff } : {}) })
     const title = enrollment ? 'Enable Auto review? (default: cancel)' : publicUrl
-      ? 'Review this public URL request (default: deny)' : 'Review this change (default: deny)'
+      ? 'Review this public URL request (default: deny)' : skillSave ? 'Save skill? (default: deny)' : 'Review this change (default: deny)'
     this.updateStatus(enrollment ? 'Enable Auto review? · Cancel is the default' : `Approval required · ${scope} · denial is the default`)
-    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Auto' } : undefined)
+    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Auto' }
+      : skillSave ? { deny: 'Deny', allow: 'Save skill' } : undefined)
     this.pickerBox.title = title
     this.pickerBox.height = 3
     this.pickerBox.visible = true

@@ -6,8 +6,7 @@ import type { CliOptions } from './main.js'
 import { decisionProviderForSession, deferredDecisionProvider } from './main.js'
 import { CliHost } from './host.js'
 import { FileMemoryStore } from './memory.js'
-import { FileSkillStore } from './skills.js'
-import { join } from 'node:path'
+import { InstalledSkillStore } from './installed-skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
@@ -91,7 +90,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 /mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
 Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
-/skills lists and inspects standard skills and prepares creator drafts for manual saving.
+/skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
 /menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
@@ -147,7 +146,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
   const decisions = new FileDecisionLedger(options.sessionDirectory, secrets)
-  const skills = new FileSkillStore(join(options.sessionDirectory, 'agent-skills'), { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io.write(`${message}\n`) })
+  const skills = new InstalledSkillStore(options.sessionDirectory, { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io.write(`${message}\n`) })
   let activeSkills = options.enableSkills
   let activeCommands = options.enableCommands
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
@@ -493,7 +492,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         { name: activeSkills ? 'Disable for this launch' : 'Enable for this launch', description: SKILLS_DISCLOSURE, value: 'toggle' },
         ...(activeSkills ? [{ name: 'Refresh skills', description: 'Reload metadata and diagnostics', value: 'refresh' },
           ...(snapshot?.skills.length ? [{ name: 'Inspect SKILL.md', description: 'View exact source as inert text', value: 'inspect' }] : []),
-          { name: 'Create with agent', description: 'Put a manual-save draft request in the composer', value: 'create' }] : [])
+          { name: 'Create with agent', description: 'Put a reviewed-save skill request in the composer', value: 'create' }] : [])
       ])
       if (action === undefined || action === 'back') return
       if (action === 'toggle') { activeSkills = !activeSkills; host?.setSkillsEnabled(activeSkills); continue }
@@ -567,6 +566,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) { await discardCandidate(); return false }
       nextHost = new CliHost({ provider, store, session, secrets, mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        skillSaveApproval: { isAvailable: () => io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
           isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),

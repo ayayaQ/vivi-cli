@@ -51,3 +51,23 @@ test('40-column footer retains compact hints rather than clipping fixed action b
   io.close(); expect(await reading).toBeUndefined();
 });
 
+
+
+test('native Save skill review shows exact text, defaults to deny and requires an explicit save click', async () => {
+  const f = await fixture()
+  const request = { call: { id: 'native-save-skill', name: 'save_skill', arguments: { name: 'brief-summary', content: 'Exact reviewed SKILL.md', expectedRevision: null } },
+    currentRevision: 'new installed skill', description: 'After exact source: "Exact reviewed SKILL.md"\nAvailable next turn' }
+  const denied = f.io.approve(request, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2))
+  const first = await f.frame()
+  expect(first).toContain('Save skill?')
+  expect(first).toContain('Exact reviewed SKILL.md')
+  f.setup.mockInput.pressEnter()
+  expect(await denied).toBe(false)
+  const saving = f.io.approve({ ...request, call: { ...request.call, id: 'native-save-skill-2' } }, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 2))
+  await f.frame()
+  const save = f.setup.renderer.root.findDescendantById('vivi-approve')!
+  await f.setup.mockMouse.click(save.x + 1, save.y)
+  expect(await saving).toBe(true)
+})
