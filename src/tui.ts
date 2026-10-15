@@ -634,8 +634,8 @@ export class OpenTuiIO implements ChatIO {
     this.footerRows = stacked ? 2 : 1
     this.footer.height = this.footerRows
     this.footer.visible = this.workspaceStatus || this.actionBar.visible
-    this.hintLine.visible = !this.actionBar.visible && !(this.workspaceStatus && this.renderer.terminalHeight < 10) && !(this.pending?.kind === 'question' && this.renderer.terminalHeight <= 14)
-    if (this.pending?.kind === 'question' && this.renderer.terminalHeight <= 14) this.footer.visible = false
+    this.hintLine.visible = !this.actionBar.visible && !(this.workspaceStatus && this.renderer.terminalHeight < 10) && !(this.pending?.kind === 'question' && this.renderer.terminalHeight <= 15)
+    if (this.pending?.kind === 'question' && this.renderer.terminalHeight <= 15) this.footer.visible = false
     this.actionBar.width = controls
     this.workspaceLine.visible = this.workspaceStatus
     const width = stacked ? columns : Math.max(1, columns - controls)
@@ -809,7 +809,7 @@ export class OpenTuiIO implements ChatIO {
     this.tokenLine.content = fitStatusColumns(fittedUsage, tokenWidth, true)
     const mode = conversationModeLabel(this.taskMode, this.approvalMode)
     const modelWidth = columns - statusTextColumns(` · ${mode}`)
-    this.modelLine.visible = this.pending?.kind !== 'question' || this.renderer.terminalHeight > 14
+    this.modelLine.visible = this.pending?.kind !== 'question' || this.renderer.terminalHeight > 15
     this.modelLine.content = modelWidth > 0 ? `${fitStatusColumns(this.sessionModel, modelWidth, true)} · ${mode}` : fitStatusColumns(mode, columns, true)
     this.updateTerminalTitle()
   }
@@ -1430,12 +1430,16 @@ export class OpenTuiIO implements ChatIO {
       this.hideCompletions(); this.disableComposer()
       this.pickerBox.visible = false
       if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
+      this.updateActionBar(); this.updateHeader()
       try {
         this.appendEntry({ category: 'activity', label: 'Questions · answers do not authorize actions', markdown: false,
           content: this.safe(request.questions.map((question, index) => `${index + 1}. ${question.header}: ${question.question}${question.options ? '\n' + question.options.map(option => `${option.label}${option.description ? ' · ' + option.description : ''}`).join('\n') : ''}`).join('\n\n')) })
         this.questionDialog = new QuestionDialog(this.renderer, request, {
           safe: (text, limit) => this.safe(text, limit), clean: stripControls, ready: () => this.pending === pending && this.ready(pending),
           mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
+          // Keep one transcript row, status, and every visible shell footer.
+          availableHeight: () => this.renderer.terminalHeight - this.headerRows - 2 - Number(this.modelLine.visible)
+            - (this.footer.visible ? this.footerRows : 0) - Number(this.hintLine.visible),
           status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
           accent: TUI_THEME.lavender, background: TUI_THEME.background })
         this.shell.insertBefore(this.questionDialog.box, this.modelLine)
@@ -1793,6 +1797,7 @@ export class OpenTuiIO implements ChatIO {
     this.workspaceStatus = true
     this.updateApprovalLayout()
     this.updateStatus()
+    this.questionDialog?.resize()
   }
   setSession(session: CliSession): void {
     if (this.closed) return
