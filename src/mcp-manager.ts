@@ -303,6 +303,7 @@ export class McpManager {
     const deadline = new AbortController()
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined
     let deadlinePhase: 'startup' | 'handshake' = 'startup'
+    const connectionPhase: { value: 'startup' | 'handshake' | 'discovery' } = { value: 'startup' }
     const clearDeadline = (): void => {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
       deadlineTimer = undefined
@@ -322,6 +323,7 @@ export class McpManager {
       assertConnectBoundary()
       await owned.start()
       assertConnectBoundary()
+      connectionPhase.value = 'handshake'
       armDeadline('handshake')
     }, close: () => closeOwned().catch(() => undefined), send: (message, options) => {
       try { assertConnectBoundary() } catch (error) { return Promise.reject(error) }
@@ -402,6 +404,7 @@ export class McpManager {
       connection.snapshot = mcpFreeze({ serverId: id, configRevision: revision, connectionGeneration: connection.generation,
         protocolVersion: client.getNegotiatedProtocolVersion() ?? 'unknown', catalogGeneration: connection.catalogGeneration,
         categories: { tools: emptyMcpCategory(), resources: emptyMcpCategory(), resourceTemplates: emptyMcpCategory() } })
+      connectionPhase.value = 'discovery'
       await this.refresh(id, ['tools'], signal)
       assertConnectBoundary()
       if (this.connections.get(id) !== connection || this.configuration.revision !== revision || connection.state !== 'connected') throw new Error('MCP connection changed during initial discovery')
@@ -409,7 +412,9 @@ export class McpManager {
     } catch {
       connection.state = 'error'; connection.message = connection.authorizationRejected ? 'MCP HTTP needs sign-in; explicit sign-in and fresh connection approval are required' : signal.aborted ? 'MCP connection cancelled'
         : deadline.signal.aborted ? `MCP ${deadlinePhase === 'startup' ? 'server startup' : 'protocol handshake'} timed out; ordinary chat remains available`
-        : 'MCP connection failed or timed out; ordinary chat remains available'
+        : connectionPhase.value === 'handshake' ? 'MCP protocol handshake failed'
+        : connectionPhase.value === 'discovery' ? 'MCP initial tool discovery failed; ordinary chat remains available'
+        : 'MCP server startup failed; ordinary chat remains available'
       connection.controller.abort()
       await closeOwned()
       return false
