@@ -1,0 +1,44 @@
+name: Windows MCP cold phase diagnostics
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-mcp-cold-diagnostics.yml'
+      - 'test/helpers/mcp-cold-phases.mjs'
+      - 'test/fixtures/mcp-windows-cold-phase-probe.mjs'
+      - 'test/mcp-cold-phases.test.mjs'
+
+permissions:
+  contents: read
+
+jobs:
+  cold-phases:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: '26'
+            mode: cancel
+            instrumentation: phases
+          - node: '26'
+            mode: observe
+            instrumentation: phases
+          - node: '26'
+            mode: observe
+            instrumentation: baseline
+          - node: '26.4.0'
+            mode: observe
+            instrumentation: phases
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Observe fixed owned cold helper phases
+        run: node test/fixtures/mcp-windows-cold-phase-probe.mjs ${{ matrix.mode }} ${{ matrix.instrumentation }}
