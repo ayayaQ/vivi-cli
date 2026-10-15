@@ -36,6 +36,21 @@ test('installed storage is lazy and exact standard source plus commit receipt pu
   }
 })
 
+test('Bun releases every prepared statement before save and snapshot return without requiring garbage collection', { skip: !('Bun' in globalThis) }, async t => {
+  const { Database } = await import('bun:sqlite'), original = Database.prototype.prepare, statements = []
+  const { store } = await fixture(t)
+  Database.prototype.prepare = function (...args) { const statement = original.apply(this, args); statements.push(statement); return statement }
+  try {
+    await store.commit(proposal(source()), { signal: signal() })
+    assert(statements.length >= 4)
+    for (const statement of statements) assert.throws(() => statement.get(), /finalized|closed|Invalid statement/i)
+    statements.length = 0
+    assert.equal((await store.snapshot()).document('brief-summary').content, source())
+    assert(statements.length >= 2)
+    for (const statement of statements) assert.throws(() => statement.get(), /finalized|closed|Invalid statement/i)
+  } finally { Database.prototype.prepare = original }
+})
+
 test('replacement rechecks stored revision after review and preserves the winning exact source', async t => {
   const { profile, store } = await fixture(t), other = new InstalledSkillStore(profile)
   t.after(() => other.drain({ close: true }))

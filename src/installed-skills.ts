@@ -23,7 +23,7 @@ interface Statement {
   get(...values: (string | number | null)[]): unknown
   run(...values: (string | number | null)[]): unknown
 }
-interface Database { exec(sql: string): unknown; prepare(sql: string): Statement; close(): void }
+interface Database { exec(sql: string): unknown; prepare(sql: string): Statement; close(throwOnError?: boolean): void }
 interface Entry { readonly path: string; readonly info: BigIntStats }
 interface Row { readonly name: string; readonly content: string; readonly revision: string }
 const absent = (error: unknown): boolean => error instanceof Error && 'code' in error && error.code === 'ENOENT'
@@ -124,7 +124,10 @@ export class InstalledSkillStore implements CliSkillStore {
       if ('Bun' in globalThis) {
         const specifier = 'bun:sqlite'
         const module = await import(specifier) as { Database: new (path: string, options: { create: boolean; readwrite: boolean; readonly: boolean }) => Database }
-        database = new module.Database(path, { create: false, readwrite: create, readonly: !create })
+        const native = new module.Database(path, { create: false, readwrite: create, readonly: !create })
+        // Bun's default close defers prepare() statements and file handles until GC.
+        // Every operation owns its statements, so release them before returning.
+        database = { exec: sql => native.exec(sql), prepare: sql => native.prepare(sql), close: () => native.close(true) }
       } else {
         const { DatabaseSync } = await import('node:sqlite')
         database = new DatabaseSync(path, { readOnly: !create, allowExtension: false, timeout: 0 }) as Database
