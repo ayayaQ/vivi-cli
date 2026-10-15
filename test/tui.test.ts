@@ -48,7 +48,7 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/settings', '/memories', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
+    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
@@ -432,7 +432,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   expect(output).toContain('A heading')
   expect(output).toContain('unverified · calculate')
   expect(output).toContain('9 in / 8 out / 17 total')
-  expect(output).toContain('/new /resume /mode /memories /skills /mcp /settings /menu /help /exit')
+  expect(output).toContain('/new /resume /mode /memories /skills /mcp /menu /help /exit')
   input.pressKey('o', { ctrl: true }); await frame()
   const expanded = renderedText(setup.renderer.root.findDescendantById(bodyId)!)
   expect(expanded).toContain(`cli-session:${session.id}:history:2`)

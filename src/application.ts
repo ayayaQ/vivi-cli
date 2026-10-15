@@ -86,15 +86,15 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
 }
 const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
 /provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
-/new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /settings changes future defaults.
-/memories manages this launch’s app-wide saved context; it is plaintext locally and sent to the selected provider when enabled.
+/new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /notes changes the session-note default for new conversations.
+/memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
 Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for manual saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
-/menu opens actions; /session shows the current ID and usage; /exit quits.
+/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
@@ -382,8 +382,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       return settingsForModel(base, model)
     }
   }
-  const save = async (next: TuiPreferences, changeMemoryDefault = false): Promise<void> => {
-    const defaults = { ...next, enableMemory: changeMemoryDefault ? next.enableMemory : settings.enableMemory }
+  const save = async (next: TuiPreferences, changed: { notes?: boolean; memory?: boolean } = {}): Promise<void> => {
+    // Active model controls must preserve independently chosen future-only defaults.
+    const defaults = { ...next, enableNotes: changed.notes ? next.enableNotes : settings.enableNotes,
+      enableMemory: changed.memory ? next.enableMemory : settings.enableMemory }
     await preferences.save(defaults); settings = defaults
   }
   const configureProviderModel = async (): Promise<void> => {
@@ -398,24 +400,23 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       await save(configured); io.setDraft?.(configured.provider)
     }
   }
-  const configure = async (): Promise<boolean> => {
-    const provider = await setupProvider(settings)
-    if (!provider) return false
-    const model = await chooseModel(provider)
-    if (!model) return false
-    const effort = await chooseEffort(io, model)
-    if (!effort) return false
-    const notes = effort.enableTools ? await io.choose('Session notes', [
-      { name: 'Keep notes disabled', description: 'Other supported tools remain available', value: false },
-      { name: 'Enable session notes', description: 'Each write requires an allow/deny approval', value: true }
-    ], effort.enableNotes ? 1 : 0) : effort.enableNotes
-    if (notes === undefined) return false
+  const configureNotes = async (): Promise<void> => {
+    const enableNotes = await io.choose('Session notes · new-conversation default', [
+      { name: 'Disable session notes by default', description: 'Other supported tools remain available', value: false },
+      { name: 'Enable session notes by default', description: 'Requires model tool support; writes are reviewed', value: true }
+    ], settings.enableNotes ? 1 : 0)
+    if (enableNotes === undefined || io.isClosed) return
+    await save({ ...settings, enableNotes }, { notes: true })
+    io.write('Session-note default saved for new conversations. Use /new when ready\n')
+  }
+  const configureMemoryDefault = async (): Promise<void> => {
     const enableMemory = await io.choose('Persistent memory default · future launches', [
-      { name: 'Keep memory disabled by default', description: 'No saved memory is read or sent unless you enable it', value: false },
+      { name: 'Disable memory by default', description: 'No saved memory is read or sent unless you enable it', value: false },
       { name: 'Enable memory by default', description: MEMORY_DISCLOSURE, value: true }
     ], settings.enableMemory ? 1 : 0)
-    if (enableMemory === undefined) return false
-    await save({ ...effort, enableNotes: notes, enableMemory }, true); return true
+    if (enableMemory === undefined || io.isClosed) return
+    await save({ ...settings, enableMemory }, { memory: true })
+    io.write('Memory default saved for future launches; this launch is unchanged\n')
   }
   const selectResume = async (): Promise<string | undefined> => {
     const sessions = await listSessions(store)
@@ -438,6 +439,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       const choices = [{ name: 'Back', description: 'Return to the conversation without changing memory', value: 'back' },
         ...(activeMemory ? [{ name: 'Disable for this launch', description: 'Stop using saved context; retain existing records', value: 'off' }]
           : [{ name: 'Enable for this launch', description: MEMORY_DISCLOSURE, value: 'on' }]),
+        { name: 'Future launch default', description: `Memory ${settings.enableMemory ? 'enabled' : 'disabled'} by default; this launch is unchanged`, value: 'default' },
         ...(activeMemory && host ? [
           { name: 'Refresh memories', description: 'Reload current app-wide records', value: 'refresh' },
           ...(snapshot ? [{ name: 'Add memory', description: 'Enter content, then review the exact proposed change', value: 'add' },
@@ -446,6 +448,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         ] : [])]
       const action = await io.choose(`Persistent memories · ${activeMemory ? 'enabled' : 'disabled'} for this launch`, choices)
       if (action === undefined || action === 'back') return
+      if (action === 'default') { await configureMemoryDefault(); continue }
       if (action === 'on' || action === 'off') {
         activeMemory = action === 'on'; host?.setMemoryEnabled(activeMemory)
         io.write(activeMemory ? 'Memory enabled for this launch\n' : 'Memory disabled for this launch; existing records retained\n')
@@ -656,7 +659,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) continue
       if (line === undefined || line.trim() === '/exit') return 0
       let command = line.trim()
-      if (command === '/menu') {
+      if (command === '/menu' || command === '/settings') {
         const action = await io.choose('Conversation actions', [
           { name: 'Continue conversation', value: 'continue' }, { name: 'Set up provider', value: '/provider' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
@@ -664,7 +667,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Rename conversation', value: '/rename' },
           { name: 'Mode', description: 'Manual / Auto review / Plan', value: '/mode' },
           { name: 'Trusted commands', value: '/commands' },
-          { name: 'Future defaults', value: '/settings' }, { name: 'Persistent memories', value: '/memories' },
+          { name: 'Session notes', description: 'Default for new conversations', value: '/notes' },
+          { name: 'Persistent memories', description: 'This launch and future-launch default', value: '/memories' },
           { name: 'Skills', value: '/skills' },
           { name: 'MCP connections', description: 'Trusted installed servers; human-reviewed tools and resource reads', value: '/mcp' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
@@ -697,7 +701,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         }
         if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
-        if (command === '/settings') { if (await configure()) io.write('Defaults apply to new conversations. Use /new when ready. Memory defaults apply to future launches; use /memories for this launch\n'); continue }
+        if (command === '/notes') { await configureNotes(); continue }
         if (command === '/skills') { await manageSkills(); continue }
         if (isMcpCommand(command)) {
           await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace, oauth) })

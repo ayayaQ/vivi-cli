@@ -176,13 +176,99 @@ test('model picker reaches saved and selected IDs beyond the old 250-row cutoff 
   assert.equal(services.catalogCalls.length, 2)
   assert.equal(JSON.parse(await readFile(join(directory, 'preferences.json'))).model, '__refresh')
 })
-test('settings affect future sessions while explicit new resets transcripts and retains nonsecret setup', async t => {
-  const directory = await fixture(t), services = fakeServices([{ id: 'new-model' }])
-  await new PreferenceStore(directory).save(base)
-  const io = fakeIO(['openai', 'current', 'new-model', 'default', false], [], ['First', '/settings', 'Still first', '/new', 'Second', '/exit']), models = []
-  assert.equal(await run(directory, io, services, session => ({ generate: async () => { models.push(session.model); return answer('Done') } }), [], { OPENAI_API_KEY: 'fake-key' }), 0)
-  assert.deepEqual(models, ['saved-model', 'saved-model', 'new-model'])
+test('session-note default changes independently and applies only to new conversations', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1', enableTools: true, enableNotes: true })
+  const io = fakeIO([false], [], ['First', '/notes', 'Still first', '/new', 'Second', '/exit']), notes = []
+  assert.equal(await run(directory, io, services, (_session, options) => ({ generate: async () => {
+    notes.push(options.enableNotes); return answer('Done')
+  } })), 0)
+  assert.deepEqual(notes, [true, true, false])
+  assert.deepEqual(io.choices.map(choice => choice.title), ['Session notes · new-conversation default'])
+  assert.equal(services.catalogCalls.length, 0)
+  assert.deepEqual(await new PreferenceStore(directory).load(), { ...base, model: 'gpt-5.1', enableTools: true,
+    reasoningCapabilities: ['none', 'low', 'medium', 'high'], enableNotes: false })
 })
+test('every former settings-wizard field is independently reachable from Menu', async t => {
+  const routes = [
+    { action: '/provider', title: 'Provider' },
+    { action: '/models', title: 'Models · openai · fresh' },
+    { action: '/effort', title: 'Reasoning effort · gpt-5.1' },
+    { action: '/notes', title: 'Session notes · new-conversation default' },
+    { action: '/memories', title: 'Persistent memories · disabled for this launch',
+      rest: ['default', undefined, 'back'] }
+  ]
+  for (const route of routes) {
+    const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5.1' }])
+    await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1' })
+    const before = await readFile(join(directory, 'preferences.json'), 'utf8')
+    const io = fakeIO([route.action, ...(route.rest ?? [undefined])], [], ['/menu', '/exit'])
+    assert.equal(await run(directory, io, services, () => ({ generate: async () => { throw new Error('Navigation must not call the model') } })), 0)
+    const menu = io.choices[0]
+    assert.equal(menu.title, 'Conversation actions')
+    for (const { action } of routes) assert(menu.values.some(choice => choice.value === action))
+    assert(!menu.values.some(choice => choice.value === '/settings' || choice.name === 'Future defaults'))
+    assert.match(menu.values.find(choice => choice.value === '/notes').description, /new conversations/)
+    assert.equal(io.choices[1].title, route.title)
+    assert.deepEqual(io.choices.map(choice => choice.title), route.rest
+      ? ['Conversation actions', route.title, 'Persistent memory default · future launches', route.title]
+      : ['Conversation actions', route.title])
+    assert.equal(await readFile(join(directory, 'preferences.json'), 'utf8'), before)
+    assert.equal(services.catalogCalls.length, route.action === '/models' ? 1 : 0)
+  }
+})
+
+test('legacy /settings opens the same menu and repeated cancellation never begins a wizard or changes saved preferences', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save(base)
+  const before = await readFile(join(directory, 'preferences.json'), 'utf8')
+  const io = fakeIO([undefined, 'continue', undefined], [], ['/settings', '/settings', '/menu', '/exit'])
+  assert.equal(await run(directory, io, services), 0)
+  assert.deepEqual(io.choices.map(choice => choice.title), ['Conversation actions', 'Conversation actions', 'Conversation actions'])
+  assert.deepEqual(io.choices[0].values, io.choices[2].values)
+  assert.equal(await readFile(join(directory, 'preferences.json'), 'utf8'), before)
+  assert.equal(services.catalogCalls.length, 0)
+  assert.equal(new Set(io.sessions.map(session => session.id)).size, 1)
+})
+
+test('note and memory-default picker cancellation preserves every saved preference and the active conversation', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  await new PreferenceStore(directory).save({ ...base, stream: false, maxRounds: 7, enableNotes: false })
+  const before = await readFile(join(directory, 'preferences.json'), 'utf8')
+  const io = fakeIO([undefined, 'default', undefined, 'back'], [], ['/notes', '/memories', '/exit'])
+  assert.equal(await run(directory, io, services), 0)
+  assert.equal(await readFile(join(directory, 'preferences.json'), 'utf8'), before)
+  assert.equal(new Set(io.sessions.map(session => session.id)).size, 1)
+  assert.equal(services.catalogCalls.length, 0)
+  assert(!io.output.includes('default saved'))
+})
+
+test('session-note default survives later effort, model and provider changes without borrowing the active default', async t => {
+  const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5.1' }, { id: 'gpt-5' }])
+  await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1', enableTools: true, stream: false, maxRounds: 7 })
+  const io = fakeIO([false, 'high', 'gpt-5', 'openai', 'current', 'gpt-5.1'], [], ['/notes', '/effort', '/models', '/provider', '/exit']), seen = []
+  assert.equal(await run(directory, io, services, (session, options) => {
+    seen.push([session.model, options.enableNotes]); return defaultFactory()
+  }, [], { OPENAI_API_KEY: 'fake-key' }), 0)
+  assert.deepEqual(seen, [['gpt-5.1', true], ['gpt-5.1', false], ['gpt-5', false], ['gpt-5.1', false]])
+  const saved = await new PreferenceStore(directory).load()
+  assert.equal(saved.enableNotes, false); assert.equal(saved.enableMemory, false)
+  assert.equal(saved.stream, false); assert.equal(saved.maxRounds, 7)
+})
+
+test('session-note and memory defaults remain configurable before selecting a model', async t => {
+  const directory = await fixture(t), services = fakeServices()
+  const io = fakeIO([undefined, false, 'default', true, 'back'], [], ['/notes', '/memories', '/exit'])
+  assert.equal(await run(directory, io, services, () => { throw new Error('No model selected') }), 0)
+  const saved = await new PreferenceStore(directory).load()
+  assert.deepEqual(saved, { ...DEFAULT_PREFERENCES, enableNotes: false, enableMemory: true })
+  assert.equal(services.catalogCalls.length, 0)
+  assert.deepEqual(io.choices.map(choice => choice.title), ['Provider', 'Session notes · new-conversation default',
+    'Persistent memories · disabled for this launch', 'Persistent memory default · future launches',
+    'Persistent memories · disabled for this launch'])
+  assert.match(io.choices[3].values.find(choice => choice.value === true).description, /plaintext.*selected provider/s)
+})
+
 test('resume preserves original model, acquires lease before capability confirmation and releases after decline', async t => {
   const directory = await fixture(t), services = fakeServices(), store = new FileSessionStore(directory)
   const saved = newSession({ provider: 'openrouter', model: 'original', reasoning: 'high' }); await store.save(saved)
@@ -266,7 +352,7 @@ test('authenticated catalog refresh denial exits picker without offering the pre
   assert.equal((await new PreferenceStore(directory).load()).model, 'saved-model')
 })
 
-test('effort/model/provider pickers scope to the resumed current model while settings stay future-only', async t => {
+test('effort/model/provider pickers scope to the resumed current model', async t => {
   const directory = await fixture(t), services = fakeServices([{ id: 'gpt-5' }, { id: 'gpt-5.1' }])
   await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1' })
   const store = new FileSessionStore(directory)
@@ -453,17 +539,21 @@ test('explicit disable overrides saved default and /memories toggles only this l
   assert.match(io.output, /existing records retained/)
 })
 
-test('future memory defaults stay distinct from current launch through /settings and /new', async t => {
+test('memory-manager future defaults stay distinct from this launch through /new and the next launch', async t => {
   for (const active of [false, true]) {
     const directory = await fixture(t), services = fakeServices([{ id: 'future-selected' }])
     await new PreferenceStore(directory).save({ ...base, enableMemory: active })
     await seedMemory(directory)
-    const io = fakeIO(['openai', 'current', 'future-selected', 'default', !active], [], ['First', '/settings', 'Still first', '/new', 'Second', '/exit'])
+    const io = fakeIO(['default', !active, 'back'], [], ['First', '/memories', 'Still first', '/new', 'Second', '/exit'])
     const seen = []
     assert.equal(await run(directory, io, services, () => ({ generate: async input => { seen.push(hasMemory(input)); return answer('Done') } }), [], { OPENAI_API_KEY: 'fake-key' }), 0)
     assert.deepEqual(seen, [active, active, active])
     assert.equal((await new PreferenceStore(directory).load()).enableMemory, !active)
-    assert.match(io.output, /Memory defaults apply to future launches/)
+    assert.match(io.output, /Memory default saved for future launches; this launch is unchanged/)
+    const next = fakeIO([], [], ['Next launch', '/exit'])
+    assert.equal(await run(directory, next, services, () => ({ generate: async input => {
+      assert.equal(hasMemory(input), !active); return answer('Done')
+    } })), 0)
   }
 })
 

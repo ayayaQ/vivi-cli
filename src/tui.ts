@@ -87,7 +87,8 @@ export const SLASH_COMMANDS = [
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
   { command: '/rename', description: 'Rename the current session' },
-  { command: '/settings', description: 'Change future defaults' },
+  { command: '/notes', description: 'Change the session-note default for new conversations' },
+  { command: '/settings', description: 'Open the menu (legacy alias)' },
   { command: '/memories', description: 'Manage app-wide saved context' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
@@ -151,7 +152,7 @@ function toolHeader(card: { readonly title: string; readonly status: string }, c
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /settings /menu /help /exit'
+const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /menu /help /exit'
 type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question'
 interface PendingInput {
   kind: InputKind
@@ -420,7 +421,7 @@ export class OpenTuiIO implements ChatIO {
       this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
         flexDirection: 'row', visible: false })
       for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
-        ['Mode', '/mode'], ['Memory', '/memories'], ['Skills', '/skills'], ['Settings', '/settings']] as const) {
+        ['Mode', '/mode'], ['Memory', '/memories'], ['Skills', '/skills']] as const) {
         this.actionBar.add(this.mouseButton(`vivi-action-${command.slice(1)}`, label, () => {
           const pending = this.pending
           if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish(command)

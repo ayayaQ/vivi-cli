@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, realpath, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createTestRenderer } from '@opentui/core/testing'
-import { TextareaRenderable } from '@opentui/core'
+import { SelectRenderable, TextareaRenderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
 import type { CliProviderName, CliSession } from '../src/session.js'
 import type { Catalog, ModelEntry } from '../src/models.js'
@@ -721,3 +721,133 @@ test('native CLI keeps the canonical launch workspace visible through new conver
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('native Menu and direct controls replace the settings wizard with independent cancellable defaults', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-navigation-'))
+  const setup = await createTestRenderer({ width: 110, height: 36, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  type ChoicePhase = { title: string; names: string[]; values: unknown[]; initial: number; descriptions: (string | undefined)[] }
+  const phases: ChoicePhase[] = []
+  let wake: ((phase: ChoicePhase) => void) | undefined
+  const nextChoice = (): Promise<ChoicePhase> => phases.length ? Promise.resolve(phases.shift()!) : new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { wake = undefined; reject(new Error('Navigation choice did not open')) }, 5000)
+    wake = phase => { clearTimeout(timer); resolve(phase) }
+  })
+  const originalChoose = io.choose.bind(io)
+  io.choose = (title, choices, initial = 0) => {
+    const response = originalChoose(title, choices, initial)
+    const phase = { title, names: choices.map(choice => choice.name), values: choices.map(choice => choice.value),
+      descriptions: choices.map(choice => choice.description), initial }
+    if (wake) { const finish = wake; wake = undefined; finish(phase) } else phases.push(phase)
+    return response
+  }
+  const frame = async (): Promise<string> => { await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
+  const click = async (id: string): Promise<void> => {
+    await frame()
+    const node = setup.renderer.root.findDescendantById(id)
+    if (!node) throw new Error(`Missing navigation control ${id}`)
+    await setup.mockMouse.click(node.x + 1, node.y)
+  }
+  const keyboardChoice = async (phase: ChoicePhase, value: unknown): Promise<void> => {
+    const index = phase.values.indexOf(value); expect(index).toBeGreaterThanOrEqual(0)
+    await frame()
+    for (let offset = phase.initial; offset !== index; offset += index > phase.initial ? 1 : -1) {
+      setup.mockInput.pressArrow(index > phase.initial ? 'down' : 'up')
+    }
+    setup.mockInput.pressEnter()
+  }
+  const mouseChoice = async (index: number): Promise<void> => {
+    await frame()
+    const node = setup.renderer.root.findDescendantById('vivi-picker') as SelectRenderable
+    const row = index * (node.showDescription ? 2 : 1)
+    expect(row).toBeLessThan(node.height)
+    await setup.mockMouse.click(node.x + 3, node.y + row)
+  }
+  const saved = { schemaVersion: 1 as const, provider: 'openai' as const, model: 'gpt-5.1', reasoning: 'default',
+    reasoningCapabilities: [] as TuiPreferences['reasoningCapabilities'], stream: false, enableTools: true,
+    enableNotes: true, enableMemory: false, maxRounds: 7 }
+  const launches: { notes: boolean; memory: boolean }[] = [], ids: string[] = []
+  let running: Promise<number> | undefined
+  try {
+    await new PreferenceStore(directory).save(saved)
+    running = main(['--no-workspace'], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
+      credentials: { status: async () => ({ available: false, label: 'Offline vault' }),
+        load: async () => undefined, save: async () => { throw new Error('Navigation cannot save a key') } },
+      catalog: { list: async () => { throw new Error('Unrelated defaults cannot load models') } },
+      providerFactory: (session, options) => {
+        launches.push({ notes: options.enableNotes, memory: options.enableMemory }); ids.push(session.id)
+        return { generate: async () => { throw new Error('Navigation cannot call the model') } }
+      } })
+    await ready(state => state.kind === 'composer')
+    await frame()
+    expect(setup.renderer.root.findDescendantById('vivi-action-settings')).toBeUndefined()
+    for (const action of ['menu', 'models', 'effort', 'mode', 'memories', 'skills']) {
+      expect(setup.renderer.root.findDescendantById(`vivi-action-${action}`)?.visible).toBe(true)
+    }
+
+    // The legacy command opens Menu and repeated Escape returns to this same composer.
+    for (let count = 0; count < 2; count++) {
+      await setup.mockInput.typeText('/settings'); setup.mockInput.pressEnter()
+      const menu = await nextChoice()
+      expect(menu.title).toBe('Conversation actions')
+      expect(menu.values).not.toContain('/settings')
+      expect(menu.names).not.toContain('Future defaults')
+      const afterCancel = ready.nextComposer(); setup.mockInput.pressEscape(); await afterCancel
+    }
+    expect((await new PreferenceStore(directory).load())?.enableNotes).toBe(true)
+
+    // Mouse Menu → keyboard Session notes is one independent picker; Back saves nothing.
+    await click('vivi-action-menu')
+    const menu = await nextChoice()
+    expect(menu.values).toContain('/provider'); expect(menu.values).toContain('/models'); expect(menu.values).toContain('/effort')
+    await keyboardChoice(menu, '/notes')
+    const notes = await nextChoice()
+    expect(notes.title).toBe('Session notes · new-conversation default')
+    const afterNotesCancel = ready.nextComposer(); await click('vivi-back'); await afterNotesCancel
+    expect((await new PreferenceStore(directory).load())?.enableNotes).toBe(true)
+
+    // Keyboard completion reaches the same picker directly and affects only future sessions.
+    await setup.mockInput.typeText('/not'); setup.mockInput.pressTab()
+    expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('/notes')
+    setup.mockInput.pressEnter()
+    const directNotes = await nextChoice()
+    expect(directNotes.title).toBe(notes.title)
+    const afterNotes = ready.nextComposer(); await keyboardChoice(directNotes, false); await afterNotes
+    expect((await new PreferenceStore(directory).load())?.enableNotes).toBe(false)
+    expect(launches).toEqual([{ notes: true, memory: false }])
+
+    // Memory owns its future-launch default. Cancelling and revisiting never toggles this launch.
+    await click('vivi-action-memories')
+    const memories = await nextChoice()
+    expect(memories.title).toBe('Persistent memories · disabled for this launch')
+    const defaultIndex = memories.values.indexOf('default')
+    await mouseChoice(defaultIndex)
+    const cancelledDefault = await nextChoice()
+    expect(cancelledDefault.title).toBe('Persistent memory default · future launches')
+    expect(cancelledDefault.descriptions[1]).toContain('plaintext')
+    setup.mockInput.pressEscape()
+    const unchanged = await nextChoice()
+    expect(unchanged.title).toBe(memories.title)
+    expect((await new PreferenceStore(directory).load())?.enableMemory).toBe(false)
+    await mouseChoice(defaultIndex)
+    const memoryDefault = await nextChoice()
+    await keyboardChoice(memoryDefault, true)
+    const updated = await nextChoice()
+    expect(updated.title).toBe(memories.title)
+    expect(updated.descriptions[defaultIndex]).toContain('enabled by default')
+    const afterMemory = ready.nextComposer(); await mouseChoice(0); await afterMemory
+    expect((await new PreferenceStore(directory).load())?.enableMemory).toBe(true)
+    expect(launches).toHaveLength(1)
+    expect(phases).toEqual([])
+
+    const afterNew = ready.nextComposer()
+    await setup.mockInput.typeText('/new'); setup.mockInput.pressEnter(); await afterNew
+    expect(launches).toEqual([{ notes: true, memory: false }, { notes: false, memory: false }])
+    expect(ids[1]).not.toBe(ids[0])
+    const defaults = await new PreferenceStore(directory).load()
+    expect(defaults?.stream).toBe(false); expect(defaults?.maxRounds).toBe(7)
+    await setup.mockInput.typeText('/exit'); setup.mockInput.pressEnter()
+    expect(await running).toBe(0)
+  } finally { io.close(); await running; setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
+}, 15000)
