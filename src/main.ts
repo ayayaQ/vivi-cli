@@ -22,7 +22,7 @@ import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMod
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
 import type { Catalog, ModelEntry } from './models.js'
-import { ModelCatalog, hydrateModelCapabilities, modelAccessDenied, modelToolsEnabled, unknownModel } from './models.js'
+import { ModelCatalog, hydrateModelCapabilities, modelAccessDenied, modelToolsEnabled, unknownModel, contextLimitsForModel } from './models.js'
 import type { CredentialStore } from './credentials.js'
 import type { ApprovalMode } from './auto-review.js'
 import { assertReviewTransportCurrent } from './auto-review.js'
@@ -396,7 +396,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, store, session, secrets, mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+    host = new CliHost({ provider, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       skillSaveApproval: { isAvailable: () => options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),

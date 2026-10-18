@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import { normalizeModelCapabilities } from '@ayayaq/vivi/providers/models'
-import type { ModelCapabilities } from '@ayayaq/vivi/providers/models'
+import type { CapabilitySource, ModelCapabilities } from '@ayayaq/vivi/providers/models'
 import type { CliProviderName } from './session.js'
 import { createHash } from 'node:crypto'
 
@@ -16,8 +16,14 @@ export interface ModelEntry {
   reasoning: Capability
   reasoningMandatory: boolean
   source: string
+  /** Request capacity is separate from cumulative provider usage. Missing stays unknown. */
+  contextWindow?: number
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  contextLimitsSource?: CapabilitySource
+  contextMetadata?: { state: 'fresh' | 'cached' | 'stale'; fetchedAt: string }
 }
-export interface CatalogResult { models: ModelEntry[]; state: 'fresh' | 'cached' | 'stale'; warning?: string }
+export interface CatalogResult { models: ModelEntry[]; state: 'fresh' | 'cached' | 'stale'; fetchedAt?: string; warning?: string }
 export interface Catalog {
   list(provider: CliProviderName, apiKey?: string, signal?: AbortSignal, refresh?: boolean): Promise<CatalogResult>
 }
@@ -113,6 +119,10 @@ export function modelToolsEnabled(model: ModelEntry | undefined, policy: {
   return model?.tools === 'supported' ? policy.enabled !== false : policy.declared === true
 }
 function applyCapabilities(model: ModelEntry, shared: ModelCapabilities): void {
+  if (shared.contextWindow !== undefined) model.contextWindow = shared.contextWindow
+  if (shared.maxInputTokens !== undefined) model.maxInputTokens = shared.maxInputTokens
+  if (shared.maxOutputTokens !== undefined) model.maxOutputTokens = shared.maxOutputTokens
+  if (shared.contextLimitsSource !== undefined) model.contextLimitsSource = structuredClone(shared.contextLimitsSource)
   if (shared.tools !== 'unknown') model.tools = shared.tools
   if (shared.chat !== 'unknown') model.conversation = shared.chat
   if (shared.stream !== 'unknown') model.streaming = shared.stream
@@ -176,13 +186,19 @@ export function parseModelCatalog(provider: CliProviderName, input: unknown): Mo
 export class ModelCatalog implements Catalog {
   private readonly cache = new Map<CliProviderName, { result: ModelEntry[]; at: number; fingerprint: string }>()
   constructor(private readonly fetcher: typeof fetch = fetch, private readonly now: () => number = Date.now) {}
+  private result(models: readonly ModelEntry[], state: CatalogResult['state'], at: number, warning?: string): CatalogResult {
+    const fetchedAt = new Date(at).toISOString()
+    return { models: structuredClone(models).map(model => ({ ...model,
+      ...(model.contextLimitsSource?.kind === 'provider-catalog' ? { contextMetadata: { state, fetchedAt } } : {}) })),
+      state, fetchedAt, ...(warning ? { warning } : {}) }
+  }
   async list(provider: CliProviderName, apiKey?: string, signal?: AbortSignal, refresh = false): Promise<CatalogResult> {
     if (signal?.aborted) throw new ModelCatalogError('Model loading cancelled')
     const fingerprint = createHash('sha256').update(apiKey ?? '').digest('hex')
     const cached = this.cache.get(provider)
     // OpenAI visibility is account-specific; never reuse another key's catalog.
     const usable = cached?.fingerprint === fingerprint ? cached : undefined
-    if (!refresh && usable && this.now() - usable.at < 15 * 60 * 1000) return { models: structuredClone(usable.result), state: 'cached' }
+    if (!refresh && usable && this.now() - usable.at < 15 * 60 * 1000) return this.result(usable.result, 'cached', usable.at)
     if (provider === 'openai' && !apiKey) throw new ModelCatalogError('Set up OpenAI with /provider before loading its models')
     const controller = new AbortController()
     const abort = (): void => controller.abort()
@@ -217,15 +233,28 @@ export class ModelCatalog implements Catalog {
       try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) }
       catch { throw new ModelCatalogError('Model catalog did not return valid JSON') }
       const models = parseModelCatalog(provider, parsed)
-      this.cache.set(provider, { result: models, at: this.now(), fingerprint })
-      return { models: structuredClone(models), state: 'fresh' }
+      const at = this.now()
+      this.cache.set(provider, { result: models, at, fingerprint })
+      return this.result(models, 'fresh', at)
     } catch (error) {
       if (signal?.aborted) throw new ModelCatalogError('Model loading cancelled')
       // Never echo response bodies or fetch errors (which may include request headers).
       const warning = error instanceof ModelCatalogError
         ? error.message : 'Model catalog could not be loaded; check your connection and try again'
-      if (usable && !accessDenied) return { models: structuredClone(usable.result), state: 'stale', warning }
+      if (usable && !accessDenied) return this.result(usable.result, 'stale', usable.at, warning)
       throw new ModelCatalogError(warning)
     } finally { clearTimeout(timeout); signal?.removeEventListener('abort', abort) }
+  }
+}
+
+/** Trusted catalog/documentation facts only. Unknown values stay omitted. */
+export function contextLimitsForModel(model?: ModelEntry, now = Date.now()): import('@ayayaq/vivi').ContextLimits | undefined {
+  if (!model || model.contextWindow === undefined && model.maxInputTokens === undefined && model.maxOutputTokens === undefined) return
+  return {
+    ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+    ...(model.maxInputTokens === undefined ? {} : { maxInputTokens: model.maxInputTokens }),
+    ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
+    ...(model.contextLimitsSource ? { source: { ...model.contextLimitsSource,
+      ...(model.contextMetadata ? { fetchedAt: model.contextMetadata.fetchedAt, freshness: now - Date.parse(model.contextMetadata.fetchedAt) > 15 * 60 * 1000 ? 'stale' : model.contextMetadata.state } : {}) } } : {})
   }
 }

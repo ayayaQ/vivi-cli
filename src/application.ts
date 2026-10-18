@@ -13,12 +13,13 @@ import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions } from './preferences.js'
 import type { TuiPreferences } from './preferences.js'
-import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied, hydrateModelCapabilities, modelToolsEnabled } from './models.js'
+import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied, hydrateModelCapabilities, modelToolsEnabled, contextLimitsForModel } from './models.js'
 import type { Catalog, ModelEntry } from './models.js'
 import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
@@ -93,7 +94,7 @@ Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves 
 /skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
-/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
+/context shows effective-request tokens, capacity and output reserve; /compact summarizes older provider context while keeping the full local transcript.\n/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
 Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
@@ -314,6 +315,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         io.setApprovalMode?.('manual')
         accountGeneration = randomUUID()
         for (const id of knownModels.keys()) if (id.startsWith(`${provider}:`)) knownModels.delete(id)
+        host?.invalidateContext(); io.setContext?.(undefined, false)
       }
       env[envName(provider)] = key
     }
@@ -340,6 +342,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       return keep ? settingsForModel(base, unknownModel(base.model)) : undefined
     }
     const remember = (): void => {
+      for (const key of knownModels.keys()) if (key.startsWith(`${base.provider}:`)) knownModels.delete(key)
+      host?.invalidateContext(); io.setContext?.(undefined, false)
       for (const model of result!.models) knownModels.set(modelKey(base.provider, model.id), model)
     }
     remember()
@@ -449,7 +453,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (action === undefined || action === 'back') return
       if (action === 'default') { await configureMemoryDefault(); continue }
       if (action === 'on' || action === 'off') {
-        activeMemory = action === 'on'; host?.setMemoryEnabled(activeMemory)
+        activeMemory = action === 'on'; host?.setMemoryEnabled(activeMemory); io.setContext?.(undefined, host?.canCompact ?? false)
         io.write(activeMemory ? 'Memory enabled for this launch\n' : 'Memory disabled for this launch; existing records retained\n')
         continue
       }
@@ -495,7 +499,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Create with agent', description: 'Put a reviewed-save skill request in the composer', value: 'create' }] : [])
       ])
       if (action === undefined || action === 'back') return
-      if (action === 'toggle') { activeSkills = !activeSkills; host?.setSkillsEnabled(activeSkills); continue }
+      if (action === 'toggle') { activeSkills = !activeSkills; host?.setSkillsEnabled(activeSkills); io.setContext?.(undefined, host?.canCompact ?? false); continue }
       if (action === 'inspect' && snapshot) {
         const name = await io.choose('Inspect a skill', [{ name: 'Back', value: '' },
           ...snapshot.skills.map(skill => ({ name: skill.name, description: `${skill.readOnly ? 'read only · ' : ''}${skill.description}`, value: skill.name }))])
@@ -539,8 +543,19 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       const session = selection.resume ? await store.load(selection.resume) : fresh!
       const sameModel = session.provider === settings.provider && session.model === settings.model
       const explicitResume = session.id === options.resume
-      const metadata = knownModels.get(modelKey(session.provider, session.model)) ??
+      let metadata = knownModels.get(modelKey(session.provider, session.model)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)
+      if (!metadata && selection.resume) {
+        const key = await loadKey(session.provider), controller = new AbortController()
+        const dispose = io.onCancel(() => controller.abort())
+        try {
+          const hydrated = await hydrateModelCapabilities(catalog, session.provider, session.model, key, controller.signal)
+          metadata = hydrated.model
+          knownModels.set(modelKey(session.provider, session.model), metadata)
+        } catch (error) { if (modelAccessDenied(error)) throw error; if (!controller.signal.aborted) report(error) }
+        finally { dispose() }
+        if (controller.signal.aborted || io.isClosed) { await discardCandidate(); return false }
+      }
       if (metadata?.conversation === 'unsupported') throw new Error('This model is incompatible with vivi’s text-conversation endpoint. Choose a supported model with /models')
       let capabilities = explicitResume && args.includes('--reasoning-capabilities') ? options.reasoningCapabilities
         : metadata?.reasoning === 'supported' ? metadata.efforts : sameModel ? settings.reasoningCapabilities : []
@@ -564,7 +579,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) { await discardCandidate(); return false }
       const provider = providerFactory(session, effective, env)
       if (io.isClosed) { await discardCandidate(); return false }
-      nextHost = new CliHost({ provider, store, session, secrets, mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
+      nextHost = new CliHost({ provider, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model)) ??
+        (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)), mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         skillSaveApproval: { isAvailable: () => io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
@@ -598,8 +614,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
     activeSettings = nextSettings; candidate = undefined
     await previousRelease?.().catch(report)
+    await refreshChatContext(host, io)
     io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setSession(host.session)
+    io.setContext?.(host.contextUsage, host.canCompact)
     io.setTaskMode?.(host.taskMode)
     io.setApprovalMode?.('manual')
     io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; Auto review enrollment revoked\n' : 'Approval mode: Manual\n')
@@ -646,6 +664,12 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
+        if (options.prompt.trim() === '/compact') { return await compactChatContext(host, io) === 'cancelled' ? 130 : 0 }
+        if (options.prompt.trim() === '/context') {
+          await refreshChatContext(host, io)
+          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model)))}\n`)
+          return 0
+        }
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
         try {
@@ -665,6 +689,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
+          ...(host ? [{ name: 'Context details', description: 'Request occupancy, capacity and output reserve', value: '/context' }] : []),
+          ...(host?.canCompact ? [{ name: 'Compact context', description: 'Summarize older provider context; retain the full transcript', value: '/compact' }] : []),
           { name: 'Mode', description: 'Manual / Auto review / Plan', value: '/mode' },
           { name: 'Trusted commands', value: '/commands' },
           { name: 'Session notes', description: 'Default for new conversations', value: '/notes' },
@@ -702,12 +728,19 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/notes') { await configureNotes(); continue }
-        if (command === '/skills') { await manageSkills(); continue }
-        if (isMcpCommand(command)) {
-          await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace, oauth) })
+        if (command === '/skills') {
+          try { await manageSkills() } finally { host?.invalidateContext(); io.setContext?.(undefined, false) }
           continue
         }
-        if (command === '/memories') { await manageMemories(); continue }
+        if (isMcpCommand(command)) {
+          try { await runMcpCommand(io, command, { mcp: () => manageMcp(mcp, io, options.workspace, oauth) }) }
+          finally { host?.invalidateContext(); io.setContext?.(undefined, false) }
+          continue
+        }
+        if (command === '/memories') {
+          try { await manageMemories() } finally { host?.invalidateContext(); io.setContext?.(undefined, false) }
+          continue
+        }
         if (/^\/commands(?:\s|$)/.test(command)) {
           if (!host && /^\/commands\s+off$/.test(command)) {
             activeCommands = false
@@ -716,6 +749,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           }
           if (!host) { io.write('Choose a provider and model before enabling trusted commands\n'); continue }
           await runCommandControl(host, io, command)
+          io.setContext?.(undefined, host.canCompact)
           if (/^\/commands\s+off$/.test(command)) activeCommands = false
           else if (/^\/commands\s+on$/.test(command) && host.commandsEnabled) activeCommands = true
           continue
@@ -729,12 +763,24 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
             continue
           }
           await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+          io.setContext?.(undefined, host.canCompact)
+          continue
+        }
+        if (command === '/compact') {
+          if (!host) { io.write('Choose a provider and model before compacting context\n'); continue }
+          await compactChatContext(host, io)
+          continue
+        }
+        if (command === '/context') {
+          if (!host) { io.write('Choose a model before measuring context\n'); continue }
+          await refreshChatContext(host, io)
+          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model)))}\n`)
           continue
         }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n${formatContextSummaryUsage(session)}${formatContextDetails(host!.contextUsage, knownModels.get(modelKey(session.provider, session.model)))}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
           io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           continue

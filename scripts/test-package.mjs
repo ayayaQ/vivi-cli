@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.13.0'
-const coreIntegrity = 'sha512-OsOmJP+cJTAVJadkzRMmmCmmWaWLEVNEK5+QLbSnbP7PhZ6Ltb388/+UISLO/SgWl4RhXtxFnqKg8yscMU+WWA=='
+const coreVersion = '0.14.0'
+const coreIntegrity = 'sha512-OOGqb3Qeue58C5u/eGPRHJ5qLDsCLB6LXQgNTk0mY99uT1y2GRuqvFiXSxlDigYjjWanayP/8kxfiMZvrw7Rzw=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.13.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.14.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -90,6 +90,7 @@ try {
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts',
     'src/usage.ts', 'dist/usage.js', 'dist/usage.d.ts',
+    'src/context-status.ts', 'dist/context-status.js', 'dist/context-status.d.ts',
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
     'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
@@ -731,11 +732,12 @@ try {
   session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
   session.history = [{ kind: 'assistant', content: '## Packed heading' + String.fromCharCode(10, 10) + 'Packed Markdown works', toolCalls: [] }]
   io.setSession(session)
+  io.setContext({ inputTokens: 63000, estimated: true, contextWindow: 128000, outputReserveTokens: 4096 })
   const reading = io.readLine('Message')
   await setup.renderOnce()
   assert(setup.captureCharFrame().includes('packed-headless-model'))
-  assert(setup.captureCharFrame().includes('Session tokens: 3 in / 2 out / 7 total'))
-  assert(setup.captureCharFrame().includes('Cache input: read 0 / write unreported'))
+  assert(setup.captureCharFrame().includes('Context ~63k/128k'))
+  assert(!setup.captureCharFrame().includes('7 total'))
   const codeNodes = node => [...(node instanceof CodeRenderable ? [node] : []), ...node.getChildren().flatMap(codeNodes)]
   const blocks = codeNodes(setup.renderer.root)
   assert(blocks.length > 0)

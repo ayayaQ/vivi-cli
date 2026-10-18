@@ -625,3 +625,119 @@ test('verified unsupported tool metadata overrides an explicit launch declaratio
   }, ['--tools']), 0)
   assert.deepEqual(seen, [true, false])
 })
+
+test('context menu/commands stay out of user history, compact only eligible history and retain discoverable usage', async t => {
+  const directory = await fixture(t)
+  await new PreferenceStore(directory).save(base)
+  const lines = [0, 1, 2, 3, 4].map(i => `User request ${i}: ${'historical source '.repeat(100)}`)
+  const io = fakeIO(['/compact', 'continue'], [], [...lines, '/menu', '/context', '/session', '/menu', '/exit'])
+  io.contexts = []; io.setContext = (usage, canCompact) => io.contexts.push({ usage, canCompact })
+  let generations = 0, summaries = 0
+  await run(directory, io, fakeServices(), () => ({ async generate(input, _signal, options) {
+    if (options?.purpose === 'context-summary') { summaries++; assert.deepEqual(input.tools, []); return answer('Historical user goals and constraints') }
+    generations++; return answer('Response '.repeat(100))
+  } }))
+  assert.equal(generations, 5); assert.equal(summaries, 1)
+  const menus = io.choices.filter(choice => choice.title === 'Conversation actions')
+  assert(menus[0].values.some(choice => choice.value === '/compact'))
+  assert(!menus[1].values.some(choice => choice.value === '/compact'))
+  assert(menus.every(menu => menu.values.some(choice => choice.value === '/context')))
+  assert.match(io.output, /Output reserve: 4096 tokens/); assert.match(io.output, /Session tokens:/)
+  assert.match(io.output, /Context-summary tokens \(reported separately\): unreported/)
+  assert(io.contexts.some(context => context.canCompact)); assert.equal(io.contexts.at(-1).canCompact, false)
+  const latest = (await new FileSessionStore(directory).load(io.sessions.at(-1).id))
+  assert.equal(latest.history.filter(message => message.kind === 'message').length, 5)
+  assert(!latest.history.some(message => message.content === '/compact' || message.content === '/context'))
+})
+
+test('one-shot context details are local-only and do not become a model prompt', async t => {
+  const directory = await fixture(t), io = fakeIO()
+  let calls = 0
+  const code = await run(directory, io, fakeServices(), () => ({ async generate() { calls++; return answer('Unexpected') } }), ['--model', 'fake-model', '--prompt', '/context'])
+  assert.equal(code, 0); assert.equal(calls, 0); assert.match(io.output, /Capacity: unknown/)
+  assert.equal(io.sessions.at(-1).history.length, 0)
+})
+
+for (const [initial, refreshed] of [[8000, 16000], [16000, 8000]]) test(`cancelled catalog picker updates the active model capacity ${initial} to ${refreshed}`, async t => {
+  const directory = await fixture(t), io = fakeIO([undefined], [], ['/context', '/models', '/context', '/exit'])
+  const services = fakeServices(); let lists = 0
+  services.catalog.list = async () => ({ state: 'fresh', models: parseModelCatalog('openrouter', { data: [{ id: 'vendor/model',
+    architecture: { input_modalities: ['text'], output_modalities: ['text'] }, context_length: ++lists === 1 ? initial : refreshed }] }) })
+  const code = await run(directory, io, services, defaultFactory, ['--provider', 'openrouter', '--model', 'vendor/model'], { OPENROUTER_API_KEY: 'offline-key' })
+  assert.equal(code, 0)
+  const capacities = [...io.output.matchAll(/Capacity: (\d+)/g)].map(match => Number(match[1]))
+  assert.deepEqual(capacities, [initial, refreshed])
+})
+
+test('cold resume never falls back to generation after catalog authentication denial', async t => {
+  const { ModelCatalog } = await import('../dist/models.js')
+  const directory = await fixture(t), session = newSession({ provider: 'openrouter', model: 'vendor/model' })
+  await new FileSessionStore(directory).save(session)
+  const io = fakeIO([], [], ['Hello', '/exit']), services = fakeServices()
+  services.catalog = new ModelCatalog(async () => new Response('{}', { status: 401 }))
+  let factories = 0, calls = 0
+  await run(directory, io, services, () => { factories++; return { async generate() { calls++; return answer('Unexpected') } } },
+    ['--resume', session.id], { OPENROUTER_API_KEY: 'offline-key' })
+  assert.equal(factories, 0); assert.equal(calls, 0); assert.match(io.output, /Model access was denied/)
+})
+
+test('accessible one-shot context details use documented model capacity without a provider call', async t => {
+  const directory = await fixture(t), io = fakeIO(); let calls = 0
+  const code = await main(['--no-tui', '--no-workspace', '--no-skills', '--model', 'gpt-4.1', '--prompt', '/context'],
+    { VIVI_SESSION_DIR: directory }, { io, providerFactory: () => ({ async generate() { calls++; throw new Error('Unexpected') } }) })
+  assert.equal(code, 0); assert.equal(calls, 0); assert.match(io.output, /Capacity: 1047576/)
+})
+
+test('accessible small-model limits block an oversized current prompt before generation', async t => {
+  const directory = await fixture(t), io = fakeIO(); let calls = 0
+  const catalog = { async list() { return { state: 'fresh', models: parseModelCatalog('openrouter', { data: [{ id: 'vendor/small', context_length: 100 }] }) } } }
+  const code = await main(['--no-tui', '--no-workspace', '--no-skills', '--provider', 'openrouter', '--model', 'vendor/small', '--prompt', 'Current prompt '.repeat(100)],
+    { VIVI_SESSION_DIR: directory, OPENROUTER_API_KEY: 'offline-key' }, { io, catalog,
+      providerFactory: () => ({ async generate() { calls++; return answer('Unexpected') } }) })
+  assert.equal(code, 1); assert.equal(calls, 0); assert.equal(io.results[0].error.code, 'context_cannot_fit')
+})
+
+test('returning from idle skill and memory management clears stale request details', async t => {
+  const directory = await fixture(t); await new PreferenceStore(directory).save(base)
+  const io = fakeIO(['back', 'back'], [], ['/context', '/skills', '/session', '/memories', '/session', '/exit'])
+  const contexts = []; io.setContext = usage => contexts.push(usage)
+  await run(directory, io, fakeServices())
+  assert.equal([...io.output.matchAll(/Input: not measured yet/g)].length, 2)
+  assert.equal(contexts.at(-1), undefined)
+})
+
+test('actual accessible one-shot context still measures after ordinary stdin EOF', async t => {
+  const { PassThrough } = await import('node:stream'), { TerminalIO } = await import('../dist/terminal.js')
+  const directory = await fixture(t), input = new PassThrough(), output = new PassThrough(); let text = ''
+  output.on('data', chunk => { text += chunk })
+  const io = new TerminalIO({ input, output, tui: false }); input.end(); await new Promise(resolve => setImmediate(resolve))
+  assert.equal(io.isClosed, true); assert.equal(io.isDisposed, false)
+  const code = await main(['--no-tui', '--no-workspace', '--no-skills', '--model', 'gpt-4.1', '--prompt', '/context'],
+    { VIVI_SESSION_DIR: directory }, { io, providerFactory: () => ({ async generate() { throw new Error('No provider expected') } }) })
+  assert.equal(code, 0); assert.match(text, /Capacity: 1047576/)
+})
+
+for (const cancel of [false, true]) test(`actual accessible one-shot compact after EOF ${cancel ? 'cancels with status130' : 'persists its checkpoint'}`, async t => {
+  const { PassThrough } = await import('node:stream'), { TerminalIO } = await import('../dist/terminal.js')
+  const directory = await fixture(t), session = newSession({ provider: 'openai', model: 'offline-context-model' })
+  session.history = Array.from({ length: 12 }, (_, i) => i % 2 ? { kind: 'assistant', content: 'Historical answer '.repeat(100), toolCalls: [] }
+    : { kind: 'message', role: 'user', content: `Historical request ${i} ${'source '.repeat(100)}` })
+  const store = new FileSessionStore(directory); await store.save(session)
+  const input = new PassThrough(), output = new PassThrough(); let text = '', calls = 0, release
+  output.on('data', chunk => { text += chunk })
+  const io = new TerminalIO({ input, output, tui: false }); input.end(); await new Promise(resolve => setImmediate(resolve))
+  const code = await main(['--no-tui', '--no-workspace', '--no-skills', '--resume', session.id, '--prompt', '/compact'],
+    { VIVI_SESSION_DIR: directory }, { io, providerFactory: () => ({ async generate(input_, _signal, options) {
+      calls++; assert.equal(options.purpose, 'context-summary'); assert.deepEqual(input_.tools, [])
+      if (cancel) { queueMicrotask(() => input.emit('keypress', '', { name: 'escape' })); return new Promise(resolve => { release = resolve }) }
+      return answer('Historical goals and observations')
+    } }) })
+  assert.equal(code, cancel ? 130 : 0); assert.equal(calls, 1)
+  const saved = await store.load(session.id)
+  assert.deepEqual(saved.history, session.history)
+  if (cancel) {
+    assert.equal(saved.contextCheckpoint, undefined); assert.equal(saved.contextSummaryUnreported, true)
+    release(answer('Late summary')); await new Promise(resolve => setImmediate(resolve))
+    assert.match(text, /compaction cancelled/)
+  } else { assert(saved.contextCheckpoint); assert.match(text, /Context compacted/) }
+})

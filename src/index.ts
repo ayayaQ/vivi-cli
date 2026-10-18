@@ -55,3 +55,6 @@ export { CliConversationRecords, CliConversationCommitError, FileCliConversation
 export type { CliConversationStore, CliConversationView, CliConversationDocument, CliConversationStored, CliConversationQuarantine } from './conversation-records.js'
 export { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView } from './tool-presentation.js'
 export type { CliToolDecision, CliToolEvidence, CliToolPresentationInput } from './tool-presentation.js'
+
+export { formatContextStatus, formatContextDetails } from './context-status.js'
+export { compactChatContext, refreshChatContext } from './terminal.js'

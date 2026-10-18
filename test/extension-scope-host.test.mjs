@@ -164,7 +164,7 @@ for (const boundary of ['checkpoint', 'display callback']) {
         }
       })
       const { host } = await fixture(t, { store, async onEvent(event) {
-        displayed.push(structuredClone(event))
+        if (event.type !== 'context_usage') displayed.push(structuredClone(event))
         if (boundary === 'display callback' && event.type === 'assistant') { blocked.enter(); await blocked.wait }
       } })
       const sending = observe(host.send('Owned generic event', caller.signal))
@@ -205,7 +205,7 @@ test('actual CLI shutdown makes retained provider callbacks inert without waitin
     await progress({ type: 'text_delta', text: 'admitted progress' })
     providerHeld.enter(); await providerHeld.wait
     return answer('OBSOLETE_PROVIDER_SUCCESS')
-  } }, onEvent: event => displayed.push(structuredClone(event)) })
+  } }, onEvent: event => { if (event.type !== 'context_usage') displayed.push(structuredClone(event)) } })
   const sending = observe(host.send('Owned blocked provider', caller.signal))
   await providerHeld.entered
   await promptly(host.shutdown(), 'CLI shutdown with an uncooperative provider')
@@ -442,7 +442,7 @@ test('actual CLI drains detached progress rejection after provider failure while
     await held.entered
     throw providerFailure
   } }, async onEvent(event) {
-    displayed.push(structuredClone(event))
+    if (event.type !== 'context_usage') displayed.push(structuredClone(event))
     if (event.type === 'text_delta') { held.enter(); await held.wait; throw displayFailure }
   } })
   const sending = observe(host.send(prompt, caller.signal))

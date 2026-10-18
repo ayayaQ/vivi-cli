@@ -3,7 +3,7 @@ import { createInterface, emitKeypressEvents } from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
-import type { AgentEvent, AgentResult } from '@ayayaq/vivi'
+import type { AgentEvent, AgentResult, ContextUsage } from '@ayayaq/vivi'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import type { CliHost } from './host.js'
 import type { MemoryChangeRequest } from './host.js'
@@ -11,6 +11,7 @@ import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
 import type { RunOutcome } from './run-status.js'
+import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { autoReviewSharingScope } from './auto-review.js'
@@ -24,6 +25,7 @@ export interface ChatIO {
   addSecrets?(secrets: readonly string[]): void
   /** Display-only host evidence, re-screened by the consumer before rendering. */
   setToolEvidence?(evidence: CliToolEvidence): void
+  setContext?(usage: ContextUsage | undefined, canCompact?: boolean): void
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
@@ -59,7 +61,32 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
     outcome = result.status
     return result
   } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
-  finally { io.runFinished?.(outcome) }
+  finally {
+    await refreshChatContext(host, io)
+    io.runFinished?.(outcome)
+  }
+}
+/** Refresh uses only local snapshots and a pure estimator; it never calls a provider. */
+export async function refreshChatContext(host: CliHost, io: ChatIO): Promise<void> {
+  if ((io instanceof TerminalIO ? io.isDisposed : io.isClosed) || host.running) return
+  try { await host.refreshContext?.(); io.setContext?.(host.contextUsage, host.canCompact) }
+  catch { io.setContext?.(undefined, false) }
+}
+export async function compactChatContext(host: CliHost, io: ChatIO): Promise<RunOutcome> {
+  await refreshChatContext(host, io)
+  if (!host.canCompact) { io.write('No older complete conversation to compact yet\n'); return 'completed' }
+  const controller = new AbortController(), dispose = io.onCancel(() => { controller.abort(); host.cancel() })
+  let outcome: RunOutcome = 'error'
+  try {
+    io.runStarted?.()
+    await host.compact(controller.signal)
+    outcome = 'completed'
+    io.write('Context compacted; full transcript retained\n')
+  } catch (error) {
+    if (controller.signal.aborted) { outcome = 'cancelled'; io.write('Context compaction cancelled; full transcript retained\n') }
+    else throw error
+  } finally { dispose(); await refreshChatContext(host, io); io.runFinished?.(outcome) }
+  return outcome
 }
 export interface TerminalOptions {
   input?: Readable
@@ -481,6 +508,10 @@ export class TerminalIO implements ChatIO {
       this.write(`[tool ${event.call.name}]\n`)
     } else if (event.type === 'tool_completed') {
       this.write(`[tool ${event.message.name}: ${event.message.isError ? 'error' : 'done'}] ${event.message.content}\n`)
+    } else if (event.type === 'compaction_started') {
+      this.write('Compacting context…\n')
+    } else if (event.type === 'compaction_failed') {
+      this.write('Context compaction failed; full transcript retained\n')
     } else if (event.type === 'round_completed') {
       this.status = `Round tokens: ${formatUsage(aggregateUsage([event.usage]))}`
       this.render()
@@ -541,6 +572,13 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
   if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (prompt !== undefined) {
+    if (prompt.trim() === '/compact') {
+      const status = await compactChatContext(host, io)
+      return { status, history: host.session.history, content: '', rounds: 0, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
+    }
+    if (prompt.trim() === '/context') {
+      await refreshChatContext(host, io); io.write(`${formatContextDetails(host.contextUsage)}\n`); return
+    }
     if (await runMcpCommand(io, prompt, controls)) return
     const dispose = io.onCancel(() => host.cancel())
     try {
@@ -549,29 +587,42 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
+    if (line.trim() === '/compact') {
+      try { await compactChatContext(host, io) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Context compaction failed'}\n`) }
+      continue
+    }
+    if (line.trim() === '/context') {
+      await refreshChatContext(host, io)
+      io.write(`${formatContextDetails(host.contextUsage)}\n`)
+      continue
+    }
     if (line.trim() === '/session') {
       const session = host.session
-      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host.taskMode, host.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n`)
+      io.write(`Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host.taskMode, host.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n${formatContextSummaryUsage(session)}${formatContextDetails(host.contextUsage)}\n`)
       continue
     }
     if (!line.trim()) continue
     if (isMcpCommand(line)) {
       try { await runMcpCommand(io, line, controls) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'MCP connection management failed'}\n`) }
+      finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
     if (/^\/commands(?:\s|$)/.test(line.trim())) {
       try { await runCommandControl(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Trusted command setup failed'}\n`) }
+      finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
     if (/^\/mode(?:\s|$)/.test(line.trim())) {
       try { await runModeControl(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
+      finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
     if (/^\/rename(?:\s|$)/.test(line.trim())) {
@@ -584,11 +635,13 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
     if (/^\/skills(?:\s|$)/.test(line.trim())) {
       try { await runSkillsCommand(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Skill management failed'}\n`) }
+      finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
     if (/^\/memories(?:\s|$)/.test(line.trim())) {
       try { await runMemoryCommand(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Memory management failed'}\n`) }
+      finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
     const dispose = io.onCancel(() => host.cancel())

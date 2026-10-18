@@ -4,7 +4,7 @@ import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import type { HistoryMessage, Usage } from '@ayayaq/vivi'
-import { closeInterruptedHistory } from '@ayayaq/vivi'
+import { closeInterruptedHistory, validateContextCheckpoint } from '@ayayaq/vivi'
 import { validSessionTitle } from './session-display.js'
 import { FileMcpOutcomeStore, reconcileMcpOutcomes } from './mcp-outcomes.js'
 import { FilePublicUrlOutcomeStore, reconcilePublicUrlOutcomes } from './public-url-outcomes.js'
@@ -26,6 +26,11 @@ export interface CliSession {
   title?: string
   titleRevision?: number
   history: HistoryMessage[]
+  /** Durable derived provider view, bound to retained raw history; grants no authority. */
+  contextCheckpoint?: import('@ayayaq/vivi').ContextCheckpoint
+  /** Reported summary charges are separate from accepted response-round usage. */
+  contextSummaryUsage?: Usage
+  contextSummaryUnreported?: boolean
   /** Cache subsets are optional complete-session totals; omission means unreported. */
   usage: Usage
   noteRevision: number
@@ -86,7 +91,7 @@ export function validateSession(value: unknown): CliSession {
   json(value)
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
-    'history', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
+    'history', 'contextCheckpoint', 'contextSummaryUsage', 'contextSummaryUnreported', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
   check(value.schemaVersion === 1 || value.schemaVersion === 2, 'unsupported schema version')
   if (value.schemaVersion === 1) check(!('recordAnchor' in value), 'schema-1 must not contain a record anchor')
   else {
@@ -94,6 +99,7 @@ export function validateSession(value: unknown): CliSession {
     keys(value.recordAnchor, ['version', 'eventId'])
     check(value.recordAnchor.version === 1 && identifier(value.recordAnchor.eventId), 'invalid record anchor')
   }
+  if ('contextCheckpoint' in value) validateContextCheckpoint(value.contextCheckpoint)
   check(isSessionId(value.id), 'invalid id')
   check(value.provider === 'openai' || value.provider === 'openrouter', 'unsupported provider')
   check(identifier(value.model), 'invalid model')
@@ -106,13 +112,17 @@ export function validateSession(value: unknown): CliSession {
     check(text(value[field], 40) && /^\d{4}-\d\d-\d\dT/.test(value[field]) &&
       Number.isFinite(Date.parse(value[field])), 'invalid timestamp')
   }
-  check(object(value.usage), 'invalid usage')
-  const usage = value.usage
-  keys(usage, ['inputTokens', 'outputTokens', 'totalTokens', 'cachedInputTokens', 'cacheWriteInputTokens'])
-  for (const field of ['inputTokens', 'outputTokens', 'totalTokens',
-    ...['cachedInputTokens', 'cacheWriteInputTokens'].filter((field) => field in usage)]) {
-    check(Number.isSafeInteger(usage[field]) && Number(usage[field]) >= 0, 'invalid usage')
+  for (const [name, optional] of [['usage', false], ['contextSummaryUsage', true]] as const) {
+    if (optional && !Object.hasOwn(value, name)) continue
+    check(object(value[name]), 'invalid usage')
+    const usage = value[name] as Record<string, unknown>
+    keys(usage, ['inputTokens', 'outputTokens', 'totalTokens', 'cachedInputTokens', 'cacheWriteInputTokens'])
+    for (const field of ['inputTokens', 'outputTokens', 'totalTokens',
+      ...['cachedInputTokens', 'cacheWriteInputTokens'].filter((field) => field in usage)]) {
+      check(Number.isSafeInteger(usage[field]) && Number(usage[field]) >= 0, 'invalid usage')
+    }
   }
+  if ('contextSummaryUnreported' in value) check(typeof value.contextSummaryUnreported === 'boolean', 'invalid context summary telemetry')
   check(Number.isSafeInteger(value.noteRevision) && Number(value.noteRevision) >= 0, 'invalid note revision')
   check(object(value.notes) && Object.keys(value.notes).length <= 64, 'invalid notes')
   for (const [key, note] of Object.entries(value.notes)) {

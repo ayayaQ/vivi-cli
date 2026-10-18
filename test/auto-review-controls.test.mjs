@@ -44,7 +44,7 @@ function fakeIO({ lines = [], approvals = [], choices = [], interactive } = {}) 
 function hostStub() {
   let mode = 'manual'
   return { session: newSession({ provider: 'openai', model: 'offline-chat' }), memoryEnabled: false,
-    get approvalMode() { return mode }, setApprovalMode(value) { mode = value } }
+    get approvalMode() { return mode }, setApprovalMode(value) { mode = value }, invalidateContext() {} }
 }
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-auto-controls-'))

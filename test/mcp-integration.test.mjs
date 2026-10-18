@@ -77,7 +77,7 @@ async function run(subject, mode, io, args = [], providerFactory = () => ({ gene
 
 test('private /mcp routing consumes one-shot and composer commands without sending them to the host', async () => {
   let sends = 0, opens = 0
-  const host = { skillsEnabled: false, memoryEnabled: false,
+  const host = { skillsEnabled: false, memoryEnabled: false, invalidateContext() {},
     send: async () => { sends++; throw new Error('MCP commands must never be host turns') } }
   for (const prompt of ['/mcp', ' /mcp ', '/mcp enable docs', '/mcp\nconnect']) {
     const io = fakeIO()
