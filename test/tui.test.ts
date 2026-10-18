@@ -48,7 +48,7 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
+    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
@@ -431,7 +431,8 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   expect(output).toContain('Assistant')
   expect(output).toContain('A heading')
   expect(output).toContain('unverified · calculate')
-  expect(output).toContain('9 in / 8 out / 17 total')
+  expect(output).toContain('Context unknown')
+  expect(output).not.toContain('17 total')
   expect(output).toContain('/new /resume /mode /memories /skills /mcp /menu /help /exit')
   input.pressKey('o', { ctrl: true }); await frame()
   const expanded = renderedText(setup.renderer.root.findDescendantById(bodyId)!)
@@ -440,41 +441,58 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   expect(expanded).toContain('Result:\n{"result":2}')
 })
 
-test('native status labels round, turn and session cache telemetry without inventing zero', async () => {
-  const { io, frame } = await fixture({ width: 160, height: 24 })
+test('native header shows one effective-request occupancy and ignores cumulative round/turn/session usage', async () => {
+  const { io, setup, frame } = await fixture({ width: 160, height: 24 })
   const session = newSession({ provider: 'openai', model: 'fake-cache-model' })
-  session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
+  session.usage = { inputTokens: 300000, outputTokens: 200000, totalTokens: 500000, cachedInputTokens: 0 }
   io.setSession(session)
-  expect(await frame()).toContain('Session tokens: 3 in / 2 out / 7 total')
-  expect(await frame()).toContain('Cache input: read 0 / write unreported')
-  io.event({ type: 'round_completed', usage: {
-    inputTokens: 1, outputTokens: 2, totalTokens: 5, cacheWriteInputTokens: 0
-  } })
-  expect(await frame()).toContain('Round tokens: 1 in / 2 out / 5 total')
-  expect(await frame()).toContain('Cache input: read unreported / write 0')
-  io.event({ type: 'round_completed' })
-  expect(await frame()).toContain('Round tokens: 0 in / 0 out / 0 total')
-  expect(await frame()).toContain('Cache input: read unreported / write unreported')
-  io.result({ ...result('Accepted'), usage: {
-    inputTokens: 4, outputTokens: 4, totalTokens: 12, cachedInputTokens: 0, cacheWriteInputTokens: 0
-  } })
-  expect(await frame()).toContain('Turn tokens: 4 in / 4 out / 12 total')
-  expect(await frame()).toContain('Cache input: read 0 / write 0')
-  io.setSession(session)
-  expect(await frame()).toContain('Session tokens: 3 in / 2 out / 7 total')
-  expect(await frame()).toContain('Cache input: read 0 / write unreported')
+  io.setContext({ inputTokens: 63000, estimated: true, contextWindow: 128000, outputReserveTokens: 4096 }, true)
+  expect(await frame()).toContain('Context ~63k/128k')
+  expect(await frame()).not.toContain('500000')
+  io.event({ type: 'round_completed', usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } })
+  expect(await frame()).toContain('Context ~63k/128k')
+  io.result({ ...result('Accepted'), usage: { inputTokens: 4, outputTokens: 4, totalTokens: 8 } })
+  expect(await frame()).toContain('Context ~63k/128k')
+  const node = setup.renderer.root.findDescendantById('vivi-tokens') as TextRenderable
+  expect(node.plainText.split('\n')).toHaveLength(1)
+  expect(node.textAlign).toBe('right')
+  expect(node.x + node.width).toBe(160)
 })
 
-test('compact native cache telemetry remains visible and fresh chats clear the prior counts', async () => {
+test('unknown capacity and new-model/reset state never borrow the prior context window', async () => {
   const { io, frame } = await fixture({ width: 40, height: 20 })
-  const session = newSession({ provider: 'openai', model: 'compact-cache' })
-  session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
+  const session = newSession({ provider: 'openai', model: 'compact-context' })
   io.setSession(session)
-  expect(await frame()).toContain('Session I/O/T 3/2/7 · cache R/W 0/0')
+  io.setContext({ inputTokens: 1600, estimated: true, outputReserveTokens: 4096 }, false)
+  expect(await frame()).toContain('Context ~1.6k/?')
   io.setDraft('openrouter')
-  const output = await frame()
-  expect(output).toContain('Session I/O/T 0/0/0 · cache R/W ?/?')
-  expect(output).not.toContain('cache R/W 0/0')
+  expect(await frame()).toContain('Context unknown')
+  io.setSession(newSession({ provider: 'openrouter', model: 'smaller-context' }))
+  io.setContext({ inputTokens: 500, estimated: true, contextWindow: 8000, outputReserveTokens: 800 }, false)
+  expect(await frame()).toContain('Context ~500/8k')
+  expect(await frame()).not.toContain('128k')
+})
+
+test('compact autocomplete follows current eligibility, and compaction status is cancellable and settles', async () => {
+  const { io, setup, input, frame } = await fixture({ width: 100, height: 30 })
+  const reading = io.readLine('Message')
+  await input.typeText('/c'); expect(await frame()).not.toContain('› /compact')
+  io.setContext({ inputTokens: 9000, estimated: true, outputReserveTokens: 4096 }, true)
+  expect(await frame()).toContain('› /compact')
+  input.pressEscape(); io.close(); await reading
+  const other = await fixture()
+  other.io.runStarted(); other.io.event({ type: 'compaction_started', reason: 'manual' })
+  expect(await other.frame()).toContain('Compacting context')
+  let cancelled = false
+  const dispose = other.io.onCancel(() => { cancelled = true })
+  other.input.pressEscape(); expect(cancelled).toBe(true)
+  other.io.runFinished('cancelled'); dispose()
+  expect(await other.frame()).toContain('Cancelled')
+  other.io.runStarted(); other.io.event({ type: 'compaction_started', reason: 'manual' })
+  other.io.event({ type: 'compaction_failed', reason: 'manual', code: 'summary_failed' })
+  other.io.runFinished('error')
+  expect(await other.frame()).toContain('Error')
+  expect(await other.frame()).not.toContain('Compacting context')
 })
 
 test('Enter submits; Shift and Alt Enter compose multiline with preserved draft', async () => {
@@ -1751,20 +1769,21 @@ test('user borders wrap Unicode and long text without changing native scrolling,
 })
 
 
-test('extremely narrow telemetry preserves the complete total before clipping labels or title space', async () => {
+test('extremely narrow context labels never display a clipped number as a complete occupancy', async () => {
   const { io, setup, frame } = await fixture({ width: 20, height: 30 })
   const session = newSession({ provider: 'openai', model: 'fixture' })
   const tokens = () => setup.renderer.root.findDescendantById('vivi-tokens') as TextRenderable
-  for (const total of [2523, Number.MAX_SAFE_INTEGER]) {
-    session.usage = { inputTokens: 2197, outputTokens: 326, totalTokens: total }
-    io.setSession(session)
-    for (const [width, height] of [[20, 30], [30, 8], [20, 8]] as const) {
-      setup.resize(width, height); await frame()
-      expect(tokens().plainText).toContain(String(total))
-      expect(tokens().plainText).not.toContain('…')
-      expect(tokens().x + tokens().width).toBeLessThanOrEqual(width)
-    }
+  io.setSession(session)
+  for (const [width, height] of [[20, 30], [30, 8], [20, 8]] as const) {
+    setup.resize(width, height)
+    io.setContext({ inputTokens: 63000, estimated: true, contextWindow: 128000, outputReserveTokens: 4096 })
+    await frame()
+    expect(tokens().plainText).toBe('Context ~63k/128k')
+    expect(tokens().x + tokens().width).toBeLessThanOrEqual(width)
   }
+  io.setContext({ inputTokens: Number.MAX_SAFE_INTEGER, estimated: true, outputReserveTokens: 4096 })
+  setup.resize(20, 8); await frame()
+  expect(tokens().plainText).toBe('Context ?')
   setup.resize(4, 8); await frame()
   expect(tokens().plainText).toBe('…')
 })

@@ -75,7 +75,7 @@ test('CLI displays provider progress but only complete assistant output enters p
     },
   } });
   await host.send('Hi');
-  assert.equal(events[0].type, 'text_delta');
+  assert.equal(events.find(event => event.type !== 'context_usage').type, 'text_delta');
   const saved = await store.load(host.session.id);
   assert.equal(saved.history.at(-1).content, 'Accepted canonical output');
   assert.ok(!JSON.stringify(saved).includes('provisional'));
@@ -112,7 +112,7 @@ for (const [providerName, factory] of [['openai', createOpenAIProvider], ['openr
     });
     const result = await host.send('Try a late note');
     assert.equal(approvals, 0);
-    assert.deepEqual(events, ['text_delta']);
+    assert.deepEqual(events.filter(type => type !== 'context_usage'), ['text_delta']);
     assert.equal(result.status, 'error');
     assert.equal(result.error.code, 'provider_error');
     assert.match(result.error.message, /timed out/);

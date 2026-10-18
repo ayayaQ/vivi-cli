@@ -324,6 +324,7 @@ try {
   session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0 }
   session.history = [{ kind: 'assistant', content: '# Embedded renderer\n\nNative Markdown works\n\n```ts\nconst embedded = true\n```', toolCalls: [] }]
   io.setSession(session)
+  io.setContext({ inputTokens: 63000, estimated: true, contextWindow: 128000, outputReserveTokens: 4096 })
   const reading = io.readLine('Message')
   await setup.waitForFrame(frame => frame.includes('Native Markdown works') && frame.includes('const embedded = true'))
   const codeNodes = (node: Renderable): CodeRenderable[] => [
@@ -333,8 +334,8 @@ try {
   assert(blocks.length > 0, 'Markdown parser blocks were not created')
   await Promise.all(blocks.map(block => block.highlightingDone))
   await setup.renderOnce()
-  assert(setup.captureCharFrame().includes('Session tokens: 3 in / 2 out / 7 total'))
-  assert(setup.captureCharFrame().includes('Cache input: read 0 / write unreported'))
+  assert(setup.captureCharFrame().includes('Context ~63k/128k'))
+  assert(!setup.captureCharFrame().includes('7 total'))
   assert(!setup.captureCharFrame().includes('# Embedded renderer'), 'Embedded Markdown grammar did not conceal markup')
   await setup.mockInput.typeText('Embedded input works')
   const windowsInput = new WindowsInputDecoder()

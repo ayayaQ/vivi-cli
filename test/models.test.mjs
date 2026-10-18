@@ -8,6 +8,7 @@ import { ModelCatalog, parseModelCatalog, documentedOpenAIModel } from '../dist/
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/model-capabilities.json', import.meta.url), 'utf8'))
 const model = (raw, provider = 'openrouter') => parseModelCatalog(provider, { data: [{ id: 'vendor/model:free', ...raw }] })[0]
 const response = data => new Response(JSON.stringify({ data }), { headers: { 'Content-Type': 'application/json' } })
+const withoutContext = ({ contextWindow, maxInputTokens, maxOutputTokens, contextLimitsSource, contextMetadata, ...model }) => model
 const cliSummary = entry => ({ selected: true, conversation: entry.conversation, tools: entry.tools,
   streaming: entry.streaming, reasoning: entry.reasoning, reasoningMandatory: entry.reasoningMandatory, efforts: entry.efforts })
 test('shared normalization fixture preserves endpoint scope and separate reasoning capabilities', () => {
@@ -52,7 +53,7 @@ test('all 52 host OpenAI facts and 72 exclusions survive shared seed enrichment'
       assert.match(correction.url, /^https:\/\/developers\.openai\.com\/api\/docs\/models\//)
       expected[correction.field] = correction.to
     }
-    assert.deepEqual(documentedOpenAIModel(before.id), expected, before.id)
+    assert.deepEqual(withoutContext(documentedOpenAIModel(before.id)), expected, before.id)
   }
   const entries = parseModelCatalog('openai', { data: [...ids, ...excluded].map(id => ({ id })) })
   assert.deepEqual(entries.map(entry => entry.id), [...ids].sort((a, b) => a.localeCompare(b)))
@@ -216,4 +217,29 @@ test('an already-aborted request rejects even when the catalog cache is fresh', 
   const abort = new AbortController(); abort.abort()
   await assert.rejects(catalog.list('openrouter', undefined, abort.signal), /cancelled/)
   assert.equal(calls, 1)
+})
+
+
+test('context limits stay endpoint-scoped, validated and attached to explicit catalog freshness', async () => {
+  const entry = model({ context_length: 128000, top_provider: { context_length: 96000, max_completion_tokens: 8000 } })
+  assert.equal(entry.contextWindow, 128000)
+  assert.equal(entry.maxOutputTokens, 8000)
+  assert.equal(entry.contextLimitsSource.kind, 'provider-catalog')
+  assert.equal(documentedOpenAIModel('future-context-model').contextWindow, undefined)
+  for (const value of [null, '128000', -1, 0, 1.5, Infinity]) {
+    assert.equal(model({ context_length: value }).contextWindow, undefined)
+  }
+  let now = 0, fail = false
+  const catalog = new ModelCatalog(async () => {
+    if (fail) throw new Error('Offline catalog')
+    return response([{ id: 'vendor/model', context_length: 128000, top_provider: { max_completion_tokens: 8000 } }])
+  }, () => now)
+  const fresh = await catalog.list('openrouter')
+  assert.deepEqual(fresh.models[0].contextMetadata, { state: 'fresh', fetchedAt: new Date(0).toISOString() })
+  const cached = await catalog.list('openrouter')
+  assert.equal(cached.models[0].contextMetadata.state, 'cached')
+  now += 16 * 60 * 1000; fail = true
+  const stale = await catalog.list('openrouter')
+  assert.equal(stale.models[0].contextMetadata.state, 'stale')
+  assert.equal(stale.models[0].contextMetadata.fetchedAt, new Date(0).toISOString())
 })

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { runAgent } from '@ayayaq/vivi'
+import { compactContext, measureContext, runAgent } from '@ayayaq/vivi'
+import type { ContextCheckpoint, ContextLimits, ContextOptions, ContextUsage } from '@ayayaq/vivi'
 import { PLAN_MODE_GUIDANCE, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
@@ -294,6 +295,9 @@ export interface CliHostOptions {
   enableTools?: boolean
   secrets?: readonly string[]
   maxRounds?: number
+  /** Trusted selected-model metadata; never read from model text or session totals. */
+  contextLimits?: ContextLimits
+  getContextLimits?(): ContextLimits | undefined
   approve?(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
   /** Genuine, interactive clarification; unrelated to execution review. */
   questionHost?: CliQuestionHost
@@ -312,6 +316,22 @@ export type MemoryChangeRequest =
 /** Thin application host: the shared core is the only provider/tool conversation loop. */
 export class CliHost {
   private current: CliSession
+  private measuredContext: ContextUsage | undefined
+  private compactEligible = false
+  get contextUsage(): ContextUsage | undefined { return this.measuredContext ? structuredClone(this.measuredContext) : undefined }
+  invalidateContext(): void { this.measuredContext = undefined; this.compactEligible = false }
+  private discardUnsafeContextCheckpoint(session: CliSession): void {
+    if (session.contextCheckpoint && mcpContainsSecret(session.contextCheckpoint, this.options.secrets ?? [])) {
+      delete session.contextCheckpoint
+      this.invalidateContext()
+    }
+  }
+  get canCompact(): boolean { return !this.running && this.compactEligible }
+  async refreshContext(signal?: AbortSignal): Promise<void> {
+    this.invalidateContext()
+    await this.run('', signal, 'measure')
+  }
+  async compact(signal?: AbortSignal): Promise<void> { await this.run('', signal, 'compact') }
   private readonly records: CliConversationRecords
   private controller: AbortController | undefined
   private persistence: Promise<void> = Promise.resolve()
@@ -393,6 +413,7 @@ export class CliHost {
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
+    this.discardUnsafeContextCheckpoint(this.current)
     this.records = new CliConversationRecords(this.current.id, options.conversationStore ??
       (options.store instanceof FileSessionStore ? new FileCliConversationStore(options.store.directory) : undefined),
       () => this.options.secrets ?? [], options.onConversationNotice)
@@ -498,6 +519,7 @@ export class CliHost {
     // authority or dispatch a queued proposal; only a new explicit turn can act.
     if (mode === 'plan') this.reviews.setMode('manual')
     this.selectedTaskMode = mode
+    this.invalidateContext()
   }
   /** Revision-checked atomic metadata change; a failed write leaves the current session intact. */
   async renameSession(input: string, expectedRevision: number): Promise<void> {
@@ -557,6 +579,7 @@ export class CliHost {
         throw new Error('Command setup is no longer active; try again while idle')
       }
       this.commandProposalsEnabled = true
+      this.invalidateContext()
       return this.commandsEnabled
     } finally { this.commandRestorePending = false }
   }
@@ -586,10 +609,13 @@ export class CliHost {
     if (this.running) throw new Error('Cancel the current turn before disabling trusted commands')
     this.commandSetupEpoch++; this.commandOpening = undefined
     this.commandProposalsEnabled = false
+    this.invalidateContext()
     await this.options.commandWorkspace?.disable()
   }
   /** Refresh copied privacy sinks after the application updates its shared live secret array. */
   refreshSecretFilters(): void {
+    this.discardUnsafeContextCheckpoint(this.current)
+    this.invalidateContext()
     const secrets = this.options.secrets ?? []
     this.mcpOutcomes?.addSecrets?.(secrets); this.publicUrlOutcomes?.addSecrets?.(secrets)
     this.options.memory?.addSecrets(secrets); this.options.skills?.addSecrets(secrets)
@@ -622,6 +648,7 @@ export class CliHost {
     if (this.running) throw new Error('Wait for the current turn before changing skills')
     if (enabled && !this.options.skills) throw new Error('Skills require a host-owned skill store')
     this.enabledSkills = enabled
+    this.invalidateContext()
   }
   async listSkills(signal?: AbortSignal): Promise<SkillCatalog> {
     if (!this.enabledSkills || !this.options.skills) throw new Error('Skills are disabled; enable them with /skills')
@@ -649,6 +676,7 @@ export class CliHost {
     if (this.running) throw new Error('Wait for the current turn before changing persistent memory')
     if (enabled && !this.options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.enabledMemory = enabled
+    this.invalidateContext()
     this.reportMemoryCapability()
   }
   async listMemories(signal?: AbortSignal): Promise<MemoryListResult> {
@@ -848,7 +876,8 @@ export class CliHost {
     if (this.running) throw new Error('Wait for the current turn before managing persistent memory')
     const name = request.kind === 'create' ? 'create_memory' : request.kind === 'update' ? 'edit_memory' : 'delete_memory'
     const { kind: _kind, ...arguments_ } = request
-    return this.reviewMemory(request, 'user', { id: randomUUID(), name, arguments: arguments_ }, signal)
+    try { return await this.reviewMemory(request, 'user', { id: randomUUID(), name, arguments: arguments_ }, signal) }
+    finally { this.invalidateContext() }
   }
   private async executeMemory(call: MemoryToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
     let commitAdmitted = false
@@ -1303,6 +1332,29 @@ export class CliHost {
     return this.observeToolReceipt(call, safe, outcomeRow ? cliPublicUrlRecordOutcome(outcomeRow)
       : { status: signal.aborted ? 'cancelled' : 'failed', effect: 'not_attempted' }, 'public-url', ownerSignal)
   }
+  private async recordContextSummaryUsage(usage?: Usage, previouslyUnreported?: boolean): Promise<void> {
+    if (usage) this.current.contextSummaryUsage = aggregateUsage([
+      ...(this.current.contextSummaryUsage ? [this.current.contextSummaryUsage] : []), usage])
+    else this.current.contextSummaryUnreported = true
+    if (usage && previouslyUnreported === false) delete this.current.contextSummaryUnreported
+    await this.save()
+  }
+  private async saveContextCheckpoint(checkpoint: ContextCheckpoint, controller: AbortController, owner: ExtensionScope): Promise<void> {
+    const assertCurrent = (): void => {
+      controller.signal.throwIfAborted()
+      if (this.shutdownStarted || this.controller !== controller || owner.state !== 'open') throw new Error('Context operation is no longer current')
+      if (mcpContainsSecret(checkpoint, this.options.secrets ?? [])) throw new Error('Context summary contains a known credential; checkpoint was blocked')
+    }
+    const job = this.persistence.then(async () => {
+      assertCurrent()
+      const next = validateSession({ ...this.current, contextCheckpoint: checkpoint, updatedAt: new Date().toISOString() })
+      try { await this.checkpoint(next, { signal: controller.signal, assertCurrent }) }
+      catch (error) { if (error instanceof SessionCommitError) this.current = next; throw error }
+      this.current = next
+    })
+    this.persistence = job.catch(() => undefined)
+    await job
+  }
   cancel(): void { this.controller?.abort() }
   private async deliverEvent(event: AgentEvent): Promise<void> {
     const delivery = { active: true }
@@ -1316,8 +1368,13 @@ export class CliHost {
   }
   /** Repeat privacy checks at the durable store's last admission guard as well as queue entry. */
   private async checkpoint(snapshot: CliSession, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<void> {
+    this.discardUnsafeContextCheckpoint(snapshot)
     if (!historyUsesMcp(snapshot.history) && !historyUsesPublicUrl(snapshot.history)) {
-      if (options) await this.options.store.save(snapshot, options)
+      if (snapshot.contextCheckpoint) await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
+        options?.assertCurrent?.()
+        if (mcpContainsSecret(snapshot.contextCheckpoint, this.options.secrets ?? [])) throw new Error('Context summary contains a known credential; session checkpoint was blocked')
+      } })
+      else if (options) await this.options.store.save(snapshot, options)
       else await this.options.store.save(snapshot)
       return
     }
@@ -1334,6 +1391,7 @@ export class CliHost {
         assertIdentitiesSafe()
         await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
           options?.assertCurrent?.()
+          if (snapshot.contextCheckpoint && mcpContainsSecret(snapshot.contextCheckpoint, this.options.secrets ?? [])) throw new Error('Context summary contains a known credential; checkpoint was blocked')
           assertIdentitiesSafe()
           if (historyUsesPublicUrl(snapshot.history) && snapshot.title && publicUrlContainsSecret(snapshot.title, this.options.secrets ?? [])) {
             throw new Error('Public URL title contains a newly known credential; checkpoint was blocked')
@@ -1360,6 +1418,7 @@ export class CliHost {
     }
   }
   private async save(): Promise<void> {
+    this.discardUnsafeContextCheckpoint(this.current)
     this.current.updatedAt = new Date().toISOString()
     this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
     this.withholdPublicUrlTitle(this.current)
@@ -1367,7 +1426,7 @@ export class CliHost {
     const operation = this.persistence.then(() => this.checkpoint(snapshot))
     this.persistence = operation.catch(() => undefined)
     try { await operation }
-    finally { this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements); this.withholdPublicUrlTitle(this.current) }
+    finally { this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements); this.withholdPublicUrlTitle(this.current); this.discardUnsafeContextCheckpoint(this.current) }
   }
   private notes(): NoteSnapshot {
     return { revision: this.current.noteRevision, notes: structuredClone(this.current.notes) }
@@ -1429,10 +1488,12 @@ export class CliHost {
       throw error
     }
   }
-  async send(content: string, signal?: AbortSignal): Promise<AgentResult> {
+  async send(content: string, signal?: AbortSignal): Promise<AgentResult> { return this.run(content, signal, 'send') }
+  private async run(content: string, signal: AbortSignal | undefined, operation: 'send' | 'compact' | 'measure'): Promise<AgentResult> {
     if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host')
     if (this.running) throw new Error('A CLI turn is already running')
-    if (!content.trim() || content.length > 64 * 1024) throw new Error('Message must contain 1..65536 characters')
+    this.discardUnsafeContextCheckpoint(this.current)
+    if (operation === 'send' && (!content.trim() || content.length > 64 * 1024)) throw new Error('Message must contain 1..65536 characters')
     const secrets = this.options.secrets ?? []
     if (secrets.some((secret) => secret.length > 0 && content.includes(secret))) {
       throw new Error('Message contains an environment credential; remove it before sending')
@@ -1450,7 +1511,7 @@ export class CliHost {
     this.toolReceipts.clear()
     this.presentationTurnStart = this.current.history.length
     const commandRunId = randomUUID()
-    this.reviews.beginTurn(this.current.id, content)
+    if (operation === 'send') this.reviews.beginTurn(this.current.id, content)
     const eventFailures: unknown[] = []
     let acknowledgedEventError = false
     let coreFailure: AgentResult['error']
@@ -1462,6 +1523,7 @@ export class CliHost {
     // Every admitted domain effect outlives core cancellation until its drain settles.
     owner.defer(() => this.drainSkills())
     owner.defer(() => this.drainMemory())
+    owner.defer(() => this.persistence)
     owner.defer(() => this.drainMcp())
     owner.defer(() => this.drainPublicUrls())
     let commandsEnded = false
@@ -1484,6 +1546,7 @@ export class CliHost {
       Object.hasOwn(baseUsage, 'cachedInputTokens') || Object.hasOwn(baseUsage, 'cacheWriteInputTokens')
       ? [baseUsage] : []
     const roundUsage: (Usage | undefined)[] = []
+    let summaryUsagePriorUnknown: boolean | undefined
     let prefix: HistoryMessage[] = []
     let memoryContents: readonly string[] = []
     let skillContents: readonly unknown[] = []
@@ -1622,24 +1685,16 @@ export class CliHost {
       if (mcpSetup) prefix.push({ kind: 'message', role: 'system', content: MCP_SETUP_GUIDANCE })
       if (commands) prefix.push({ kind: 'message', role: 'system', content: COMMAND_GUIDANCE })
       if (taskMode === 'plan') prefix.push({ kind: 'message', role: 'system', content: PLAN_MODE_GUIDANCE })
-      // Accept the prompt and its title in one successful checkpoint. A failed
-      // initial write must not leave an unsaved prompt/title in memory for a retry.
-      const previous = structuredClone(this.current)
-      const firstPrompt = !this.current.history.some(message => message.kind === 'message' && message.role === 'user')
-      this.current.history.push({ kind: 'message', role: 'user', content })
-      if (firstPrompt && this.current.title === undefined) {
-        const title = sessionTitleFromPrompt(content)
-        if (title !== undefined) { this.current.title = title; this.current.titleRevision = 1 }
-      }
-      try { await this.save() }
-      catch (error) { if (!(error instanceof SessionCommitError)) this.current = previous; throw error }
-      await this.records.begin(this.toolsetRevision, this.current)
       const generate = this.options.provider.generate.bind(this.options.provider)
-      const result = await runAgent({
-        provider: { generate: async (input, signal, options) => {
+      const guardedProvider: ModelProvider = {
+        ...(this.options.provider.estimateContext ? { estimateContext: this.options.provider.estimateContext.bind(this.options.provider) } : {}),
+        generate: async (input, signal, options) => {
           // A checkpoint, approval or prior round may register a new credential
           // after the turn snapshot loaded. Reject it immediately before every
           // provider request, without silently rewriting approved context.
+          if (mcpContainsSecret(input, this.options.secrets ?? [])) {
+            throw new Error('Provider context contains a known credential; request was blocked before admission')
+          }
           const memoryToolContext: unknown[] = []
           const mcpToolContext: unknown[] = []
           let mcpSeen = false
@@ -1673,7 +1728,44 @@ export class CliHost {
           if (mcpContainsSecret([mcpContents, toolset.tools.filter(tool => isMcpTool(tool.name)), mcpToolContext], this.options.secrets ?? [])) {
             throw new Error('MCP context contains a known credential; provider request was blocked')
           }
-          const output = await generate(input, signal, options)
+          let output: Awaited<ReturnType<typeof generate>>
+          if (options?.purpose === 'context-summary') {
+            const assertDispatch = (): void => {
+              signal.throwIfAborted()
+              if (this.shutdownStarted || this.controller !== controller || owner.state !== 'open') throw new Error('Context summary dispatch is no longer current')
+              if (mcpContainsSecret(input, this.options.secrets ?? [])) throw new Error('Context summary contains a newly known credential; dispatch was blocked')
+            }
+            // Persist a temporary incomplete flag before dispatch. Admission is
+            // owned, but the arbitrary provider promise is deliberately detached
+            // from persistence so cancellation never waits for a late provider.
+            const admission = this.persistence.then(async () => {
+              assertDispatch()
+              const previous = this.current.contextSummaryUnreported
+              summaryUsagePriorUnknown = previous === true
+              const restore = async (): Promise<void> => {
+                const rollback = structuredClone(this.current)
+                if (previous === undefined) delete rollback.contextSummaryUnreported
+                else rollback.contextSummaryUnreported = previous
+                try { await this.checkpoint(rollback) } finally { this.current = rollback }
+              }
+              const next = validateSession({ ...this.current, contextSummaryUnreported: true, updatedAt: new Date().toISOString() })
+              try { await this.checkpoint(next, { signal, assertCurrent: assertDispatch }) }
+              catch (error) {
+                if (error instanceof SessionCommitError) await restore()
+                throw error
+              }
+              this.current = next
+              try { assertDispatch() } catch (error) { await restore(); throw error }
+              let response: ReturnType<typeof generate>
+              try { response = Promise.resolve(generate(input, signal, options)) }
+              catch (error) { response = Promise.reject(error) }
+              void response.catch(() => undefined)
+              return { response }
+            })
+            this.persistence = admission.then(() => undefined, () => undefined)
+            const { response } = await admission
+            output = await response
+          } else output = await generate(input, signal, options)
           if ((historyUsesMcp(input.messages) || output.toolCalls.some(call => isMcpTool(call.name))) && mcpContainsSecret([
             output.toolCalls.filter(call => isMcpTool(call.name)), output.content, output.providerState ?? null
           ], this.options.secrets ?? [])) {
@@ -1690,10 +1782,62 @@ export class CliHost {
             throw new Error('Question provider response contains a known credential; the assistant request was blocked before admission')
           }
           // Reject session-wide overflow before this response enters canonical history.
-          aggregateUsage([...priorUsage, ...roundUsage, output.usage])
-          this.records.assertOutput(output, input.messages.slice(prefix.length))
+          if (options?.purpose !== 'context-summary') {
+            aggregateUsage([...priorUsage, ...roundUsage, output.usage])
+            if (operation === 'send') this.records.assertOutput(output, this.current.history)
+          }
           return output
-        } }, messages: [...prefix, ...this.current.history],
+        }
+      }
+      const limits = this.options.getContextLimits?.() ?? this.options.contextLimits
+      const context: ContextOptions = {
+        sourceId: this.current.id,
+        ...(this.current.contextCheckpoint ? { checkpoint: this.current.contextCheckpoint } : {}),
+        ...(limits ? { limits } : {}),
+        prefixMessages: prefix,
+        onCheckpoint: checkpoint => this.saveContextCheckpoint(checkpoint, controller, owner)
+      }
+      if (operation !== 'send') {
+        const input = { provider: guardedProvider, messages: this.current.history,
+          tools: enableTools ? toolset.tools : [], signal: controller.signal,
+          context: { ...context, autoCompact: false }, onEvent: (event: AgentEvent) => {
+            if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return
+            const work = (async (): Promise<void> => {
+              if (event.type === 'compaction_usage') {
+                await this.recordContextSummaryUsage(event.usage, summaryUsagePriorUnknown); summaryUsagePriorUnknown = undefined
+              }
+              if (event.type === 'context_usage') this.measuredContext = { ...event.usage }
+              if (operation === 'compact' && !controller.signal.aborted && owner.state === 'open') await this.deliverEvent(event)
+            })()
+            // A cancelled summary detaches the core await, but cannot release an
+            // already-admitted host callback or swallow its eventual rejection.
+            this.eventJobs.add(work)
+            void work.then(() => this.eventJobs.delete(work), error => { eventFailures.push(error); this.eventJobs.delete(work) })
+            return work
+          } }
+        let prepared
+        try { prepared = operation === 'compact' ? await compactContext(input) : measureContext(input) }
+        catch (error) { acknowledgedEventError = eventFailures[0] === error; throw error }
+        this.measuredContext = { ...prepared.usage }
+        this.compactEligible = prepared.canCompact
+        return { status: 'completed', history: structuredClone(this.current.history), content: '', rounds: 0,
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, contextUsage: prepared.usage,
+          ...(prepared.checkpoint ? { checkpoint: prepared.checkpoint } : {}) }
+      }
+      // Accept the prompt and its title in one successful checkpoint. A failed
+      // initial write must not leave an unsaved prompt/title in memory for a retry.
+      const previous = structuredClone(this.current)
+      const firstPrompt = !this.current.history.some(message => message.kind === 'message' && message.role === 'user')
+      this.current.history.push({ kind: 'message', role: 'user', content })
+      if (firstPrompt && this.current.title === undefined) {
+        const title = sessionTitleFromPrompt(content)
+        if (title !== undefined) { this.current.title = title; this.current.titleRevision = 1 }
+      }
+      try { await this.save() }
+      catch (error) { if (!(error instanceof SessionCommitError)) this.current = previous; throw error }
+      await this.records.begin(this.toolsetRevision, this.current)
+      const result = await runAgent({
+        provider: guardedProvider, messages: this.current.history, context,
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: async (call, context) => {
@@ -1795,6 +1939,10 @@ export class CliHost {
           } else if (event.type === 'tool_started' && isMcpTool(event.call.name) && mcpContainsSecret(event.call, this.options.secrets ?? [])) {
             admittedEvent = { ...event, call: withholdMcpCall(event.call, this.options.secrets ?? [], this.mcpIdentityReplacements) }
           }
+          if (admittedEvent.type === 'compaction_usage') {
+            await this.recordContextSummaryUsage(admittedEvent.usage, summaryUsagePriorUnknown); summaryUsagePriorUnknown = undefined
+          }
+          if (admittedEvent.type === 'context_usage') this.measuredContext = { ...admittedEvent.usage }
           if (admittedEvent.type === 'assistant') {
             // Register all owned calls before any tool_started callback can abort,
             // including later calls the core never enters in a cancelled batch.
@@ -1867,12 +2015,9 @@ export class CliHost {
       await endCommands()
       captureRecordRows()
       // Core abort cleanup intentionally skips callbacks. Always use its final canonical transcript.
-      // The per-turn prefix is provider context only. Persisting it would revive
-      // deleted preferences on resume and accumulate stale snapshots each turn.
-      if (prefix.some((message, index) => JSON.stringify(result.history[index]) !== JSON.stringify(message))) {
-        throw new Error('Agent returned an unexpected ephemeral context prefix')
-      }
-      const rawHistory = structuredClone(result.history.slice(prefix.length))
+      // Context projections and summaries never replace the canonical transcript.
+      const rawHistory = structuredClone(result.history)
+      if (result.contextUsage) this.measuredContext = { ...result.contextUsage }
       let terminalHistory = this.reconcileMcpHistory(rawHistory)
       for (const call of acceptedToolCalls.values()) {
         const digest = reviewDigest(call)

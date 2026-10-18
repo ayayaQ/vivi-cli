@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.13.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.14.0`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,12 +12,12 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.13.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.14.0` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
-The verified registry tarball is 339,711 bytes (367 files), SHA-256
-`f21eb617997a1da955bbc3af0d7c3cec20339723b3aacd6d9a331830bb406701`.
+The verified registry tarball is 374,097 bytes (377 files), SHA-256
+`8cf42b526b33ec0eed000df91bbc84e695c838a5f9fa036d9538d4ec664b6670`.
 The shared MCP catalog, preparation and result projection helpers are consumed
 from the registry. Its exact `yaml@2.9.1` dependency and unchanged
 reviewed integrity are bundled transitively and checked alongside the core.
@@ -287,8 +287,8 @@ authorized operations.
 
 ## Agent Skills adoption checks
 
-Skills use the pinned published vivi 0.13.0 extension without runtime, types or package-byte
-changes. Its generic save callbacks already support the host implementation. A separately
+Skills use the pinned published vivi 0.14.0 extension. Its generic save callbacks
+support the host implementation. A separately
 reviewed core comment clarification describes storage-neutral SKILL.md transactions and
 explicit unknown outcomes; it creates no new runtime-version or npm-publication gate.
 

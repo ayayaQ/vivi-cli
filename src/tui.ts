@@ -9,7 +9,7 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable } from '@opentui/core'
-import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, Usage } from '@ayayaq/vivi'
+import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, ContextUsage } from '@ayayaq/vivi'
 import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
@@ -21,7 +21,7 @@ import type { WindowsInputBridge } from './windows-input.js'
 import { inputProbe } from './input-diagnostic.js'
 import type { InputDiagnosticReport, InputProbe } from './input-diagnostic.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
-import { aggregateUsage, formatUsage } from './usage.js'
+import { formatContextStatus } from './context-status.js'
 import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
 import { RunStatus } from './run-status.js'
 import type { RunClock, RunOutcome } from './run-status.js'
@@ -90,6 +90,8 @@ export const SLASH_COMMANDS = [
   { command: '/notes', description: 'Change the session-note default for new conversations' },
   { command: '/settings', description: 'Open the menu (legacy alias)' },
   { command: '/memories', description: 'Manage app-wide saved context' },
+  { command: '/compact', description: 'Compact the provider context; retain the full transcript' },
+  { command: '/context', description: 'Show context capacity and output reserve' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
   { command: '/mcp', description: 'Manage trusted server metadata connections' },
@@ -101,8 +103,8 @@ export const SLASH_COMMANDS = [
 export type SlashCommand = typeof SLASH_COMMANDS[number]
 
 /** Complete only the whole, first slash token. Ordinary text and arguments are untouched. */
-export function getSlashCommandCompletions(input: string): readonly SlashCommand[] {
-  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input)) : []
+export function getSlashCommandCompletions(input: string, canCompact = true): readonly SlashCommand[] {
+  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact)) : []
 }
 
 const MAX_INPUT = 65536
@@ -299,8 +301,8 @@ export class OpenTuiIO implements ChatIO {
   private sessionId: string | undefined
   private approvalMode: ApprovalMode = 'manual'
   private taskMode: TaskMode = 'execute'
-  private usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
-  private usageScope: 'Session' | 'Round' | 'Turn' = 'Session'
+  private contextUsage: ContextUsage | undefined
+  private canCompact = false
   private streamed = ''
   private streamOverflow = false
   private windowsInput: WindowsInputBridge | undefined
@@ -781,14 +783,13 @@ export class OpenTuiIO implements ChatIO {
   private updateHeader(): void {
     if (this.closed || !this.headerBox) return
     const columns = Math.max(1, this.renderer.terminalWidth)
-    const usage = `${this.usageScope} tokens: ${formatUsage(this.usage).replace('\n', ' · ')}`
-    // Roomy terminals share one row. Smaller ones give the title its own row;
-    // very short terminals keep one row to leave room for native modal input.
-    const usageColumns = statusTextColumns(usage)
-    const shared = columns >= usageColumns + 25 || this.renderer.terminalHeight < 14
-    const total = String(this.usage.totalTokens)
-    const tokenBudget = Math.min(usageColumns, Math.max(1, columns - 13, Math.min(columns, total.length + 6)))
-    const titleWidth = shared ? Math.max(0, columns - tokenBudget - 1) : columns
+    const context = formatContextStatus(this.contextUsage)
+    const contextColumns = statusTextColumns(context)
+    // Keep the request occupancy in the top-right corner. Narrow terminals put
+    // it on its own row rather than clipping a number or hiding unknown capacity.
+    const shared = columns >= contextColumns + 20 || this.renderer.terminalHeight < 14
+    const tokenWidth = Math.min(columns, contextColumns)
+    const titleWidth = shared ? Math.max(0, columns - tokenWidth - 1) : columns
     const gap = shared && titleWidth > 0 ? 1 : 0
     this.headerBox.flexDirection = shared ? 'row' : 'column'
     this.headerRows = shared ? 1 : 2
@@ -797,17 +798,9 @@ export class OpenTuiIO implements ChatIO {
     this.header.visible = titleWidth > 0
     this.header.width = titleWidth
     this.header.content = fitStatusColumns(this.sessionTitle, titleWidth, true)
-    const tokenWidth = shared ? Math.max(1, columns - titleWidth - gap) : columns
-    this.tokenLine.width = tokenWidth
-    // Compact labels keep input/output/total and cache read/write distinct. An
-    // unreported cache count is '?', never zero. /session retains full labels.
-    const compactUsage = `${this.usageScope} I/O/T ${this.usage.inputTokens}/${this.usage.outputTokens}/${this.usage.totalTokens} · cache R/W ${this.usage.cachedInputTokens ?? '?'}/${this.usage.cacheWriteInputTokens ?? '?'}`
-    // Never show a clipped number as though it were the total. Give the whole
-    // count priority over its label, then over title space in very short terminals.
-    const totalLabel = `Total ${total}`
-    const priorityUsage = totalLabel.length <= tokenWidth ? totalLabel : total.length <= tokenWidth ? total : '…'
-    const fittedUsage = usageColumns <= tokenWidth ? usage : statusTextColumns(compactUsage) <= tokenWidth ? compactUsage : priorityUsage
-    this.tokenLine.content = fitStatusColumns(fittedUsage, tokenWidth, true)
+    const contextWidth = shared ? Math.max(1, columns - titleWidth - gap) : columns
+    this.tokenLine.width = contextWidth
+    this.tokenLine.content = contextColumns <= contextWidth ? context : contextWidth >= 9 ? 'Context ?' : '…'
     const mode = conversationModeLabel(this.taskMode, this.approvalMode)
     const modelWidth = columns - statusTextColumns(` · ${mode}`)
     this.modelLine.visible = this.pending?.kind !== 'question' || this.renderer.terminalHeight > 15
@@ -905,7 +898,7 @@ export class OpenTuiIO implements ChatIO {
     if (input !== this.acceptedCompletion) this.acceptedCompletion = undefined
     if (this.pending?.kind !== 'chat' || !this.pending.armed || this.cancelCallbacks.size ||
       input === this.acceptedCompletion) { this.hideCompletions(); return }
-    this.completions = getSlashCommandCompletions(input)
+    this.completions = getSlashCommandCompletions(input, this.canCompact)
     if (!this.completions.length) { this.hideCompletions(); return }
     if (input !== this.completionInput) this.completionIndex = 0
     this.completionInput = input
@@ -1776,6 +1769,8 @@ export class OpenTuiIO implements ChatIO {
     this.invalidateDialogs()
     this.runStatus.reset()
     this.sessionId = undefined
+    this.contextUsage = undefined
+    this.canCompact = false
     this.sessionTitle = 'Untitled conversation'
     this.sessionModel = `vivi · ${provider} · choose a model with /models`
     this.updateHeader()
@@ -1788,8 +1783,8 @@ export class OpenTuiIO implements ChatIO {
     this.liveToolCalls.clear()
     this.historyLength = 0
     this.turnHistoryStart = 0
-    this.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
-    this.usageScope = 'Session'
+    this.contextUsage = undefined
+    this.canCompact = false
     this.rebuild()
     this.updateStatus('Ready')
   }
@@ -1802,9 +1797,20 @@ export class OpenTuiIO implements ChatIO {
     this.updateStatus()
     this.questionDialog?.resize()
   }
+  setContext(usage: ContextUsage | undefined, canCompact = false): void {
+    if (this.closed) return
+    this.contextUsage = usage ? { ...usage } : undefined
+    this.canCompact = canCompact
+    this.updateHeader()
+    this.updateCompletions()
+  }
   setSession(session: CliSession): void {
     if (this.closed) return
-    if (this.sessionId !== session.id) this.invalidateDialogs()
+    if (this.sessionId !== session.id) {
+      this.invalidateDialogs()
+      this.contextUsage = undefined
+      this.canCompact = false
+    }
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
       this.runStatus.reset()
       this.resultNotices = []
@@ -1819,8 +1825,7 @@ export class OpenTuiIO implements ChatIO {
     this.sessionTitle = this.safe(sessionDisplayTitle(session), 4096)
     this.sessionModel = this.safe(`${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}`, 4096)
     this.updateHeader()
-    this.usage = { ...session.usage }
-    this.usageScope = 'Session'
+
     this.historyLength = session.history.length
     this.entries = [...this.transcriptEntries(session.history), ...this.resultNotices]
     this.rebuild()
@@ -1950,9 +1955,19 @@ export class OpenTuiIO implements ChatIO {
       this.liveToolCalls.delete(event.message.callId)
       if (resultIndex !== undefined) this.liveHistoryIndex = Math.max(this.liveHistoryIndex, resultIndex + 1)
       this.rebuild()
+    } else if (event.type === 'context_usage') {
+      this.contextUsage = { ...event.usage }
+      this.updateHeader()
+    } else if (event.type === 'compaction_started') {
+      this.runStatus.setPhase('compacting')
+      this.updateStatus('Compacting context')
+    } else if (event.type === 'compaction_completed') {
+      this.runStatus.setPhase('working')
+      this.updateStatus('Context compacted')
+    } else if (event.type === 'compaction_failed') {
+      this.runStatus.setPhase('working')
+      this.updateStatus('Context compaction failed; original transcript retained')
     } else if (event.type === 'round_completed') {
-      this.usage = aggregateUsage([event.usage])
-      this.usageScope = 'Round'
       this.updateStatus('Round completed')
     }
   }
@@ -1969,8 +1984,7 @@ export class OpenTuiIO implements ChatIO {
     if (result.error) this.resultNotices.push({ category: 'activity', attention: true, label: 'Error', content: this.safe(result.error.message), markdown: false })
     this.entries.push(...this.resultNotices)
     this.rebuild()
-    this.usage = { ...result.usage }
-    this.usageScope = 'Turn'
+    if (result.contextUsage && !this.contextUsage) this.contextUsage = { ...result.contextUsage }
     this.updateStatus(result.status === 'completed' ? 'Completed' : result.status === 'cancelled' ? 'Cancelled' : 'Error')
   }
   private dispose(destroyRenderer: boolean): void {

@@ -34,6 +34,8 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/commands` — inspect or disable reviewed unsandboxed command proposals
 - `/skills` — inspect instruction-only skills and prepare creator drafts
 - `/mcp` — configure and explicitly connect trusted installed stdio servers or HTTP endpoints for reviewed tools and resource reads
+- `/context` — show effective-request occupancy, model capacity, source freshness and output reserve
+- `/compact` — summarize eligible older provider context, retaining the full local transcript
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -507,8 +509,18 @@ MCP connections stay launch-owned. Trusted imports grant no extra permissions.
 
 ## Usage counts
 
-Round and turn displays show provider-reported token counts. `/session` shows the
-saved session aggregate. Cache read/write counts are input-token subsets already
+The top-right `Context ~63k/128k` measures the effective provider request, including
+fresh guidance, enabled memory/skills, tools and provider-native state. `~` marks an
+estimate; `?` means capacity is unknown. `/context` shows the output reserve and
+trusted model-limit source/freshness. Near a known limit, the shared core summarizes
+older complete tool groups; `/compact` requests this explicitly. Cancellation or a
+failed summary retains the prior view. Source-bound checkpoints survive resume;
+full raw history, approvals and exact tool evidence remain authoritative and retained.
+The 2 MiB/2000-message transcript and 384 KiB active record limits still apply;
+compaction does not bypass local storage caps.
+
+`/session` shows cumulative accepted response-round usage, with reported summary
+request usage listed separately. Cache read/write counts are input-token subsets already
 included in input and total counts. A missing cache count is shown as `unreported`,
 while an explicitly reported zero is shown as `0`. Each session cache count is
 complete only if every accepted provider round reported that field. Old sessions
