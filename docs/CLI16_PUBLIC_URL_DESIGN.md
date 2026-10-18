@@ -17,9 +17,11 @@ is historical offline evidence, not production proof.
 - Three redirects maximum, every target revalidated and freshly resolved; a
   changed origin requires a distinct exact-destination host admission
 - 15 seconds cumulative active work, excluding decision pauses; 16 KiB headers,
-  1 MiB body and at most 64 KiB UTF-8 extracted text **and complete JSON result**
-- Identity encoding only; compressed responses and unsupported MIME/charsets
-  fail closed. Supported types are UTF-8 plain text, JSON and inert HTML text
+  1 MiB wire body, 1 MiB decoded body and at most 64 KiB UTF-8 extracted text **and complete JSON result**
+- Fixed Accept-Encoding permits identity, gzip, Brotli and RFC deflate
+  (zlib-wrapped); unsupported/multiple codings, raw deflate, trailing data,
+  invalid/truncated compression and unsupported MIME/charsets fail closed.
+  Supported types are UTF-8 plain text, JSON and inert HTML text
 
 Approval discloses the complete transmitted URL, method, destination, redirect
 scope and limits. Paths and queries may reveal private data; DNS receives the
@@ -56,6 +58,17 @@ Complete metadata/source/extracted content is screened before output clipping;
 new credentials invalidate pending admission and withhold canonical content.
 Detection is conservative and incomplete, not a guarantee of finding all secrets.
 
+Content-Length and `bytesRead` measure the compressed wire representation. Both
+wire and decoded buffers independently use the same 1 MiB product ceiling (and
+both honor tightened offline-fixture body limits). Wire framing is verified before
+native decompression. Decoders use fixed 16 KiB chunks with stream backpressure,
+not convenience APIs that first allocate the entire expanded result. Cancellation,
+owner loss, the active deadline or decoded expansion beyond the ceiling destroys
+and drains the owned source/decoder pipeline before returning. A bounded native
+working chunk may be produced before an over-limit representation is rejected.
+There is no alternate-codec retry or request replay. The decoded source still
+passes fatal UTF-8 decoding, complete credential screening and inert extraction.
+
 ## Text, provenance and outcomes
 
 HTML uses a linear inert tokenizer, not browser rendering or a full HTML5 DOM.
@@ -67,7 +80,13 @@ this subset. Fixed work quanta yield and recheck cancellation/deadline. The enti
 bounded extraction is screened before its transcript-sized prefix is returned.
 
 Success records requested/final URL, redirects, HTTP status, MIME, timestamp,
-bytes read, body SHA-256, representation/version and truncation. Source text,
+wire bytes read, body SHA-256, representation/version and truncation. The digest
+identifies decoded source bytes before extraction/clipping. Compressed successes
+also record `contentEncoding` and `decodedBytes`; identity successes retain their
+existing fields. Failure results add a fixed local `failureStage` and, only after
+valid response admission, numeric `httpStatus`. These diagnostics do not contain
+reason phrases, response headers/bodies or native error details. A new redirected
+hop clears the preceding status. Source text,
 headers, links and approval-shaped payloads remain untrusted data, never authority.
 Transmission evidence is separate from retrieval success and unknown server
 side effects. A local completed write is `observed`, not proof of remote effects.

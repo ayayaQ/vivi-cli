@@ -7,6 +7,7 @@ import { Duplex, PassThrough } from 'node:stream'
 import { globalAgent, request as httpsRequest } from 'node:https'
 import { createPublicUrlTransport, isPublicUrlAddress, PUBLIC_URL_REQUEST_HEADERS,
   PUBLIC_URL_TRANSPORT_LIMITS, PublicUrlTransportError } from '../dist/public-url-transport.js'
+import { gzipSync, brotliCompressSync, deflateSync } from 'node:zlib'
 import { fetchPublicUrl } from '../dist/public-url.js'
 
 // Every DNS answer and TLS socket is inert. Some fixtures use the real native
@@ -196,7 +197,7 @@ test('real native HTTPS parser consumes inert TLS bytes with exact IP pinning an
   const wire = Buffer.concat(fixture.socket.writes).toString()
   assert.match(wire, /^GET \/selected\?ordinary=one HTTP\/1\.1\r\n/)
   assert.match(wire, /accept: text\/plain, text\/html, application\/json\r\n/i)
-  assert.match(wire, /accept-encoding: identity\r\n/i); assert.match(wire, /host: example.com\r\n/i)
+  assert.match(wire, /accept-encoding: gzip, br, deflate\r\n/i); assert.match(wire, /host: example.com\r\n/i)
   assert.match(wire, /connection: close\r\n/i)
   assert(!/authorization|cookie|proxy|user-agent|content-length|transfer-encoding/i.test(wire))
 })
@@ -460,3 +461,19 @@ for (const [name, peer] of [
   await assert.rejects(fixture.transport.requestPublicUrl(input), boundedFailure('transport_failed'))
   assert.equal(fixture.state.requests.length, 0); assert.deepEqual(evidence, []); assert.equal(fixture.socket.destroyCalls, 1)
 })
+
+for (const [encoding, compress] of [['gzip', gzipSync], ['br', brotliCompressSync], ['deflate', deflateSync]]) {
+  test(`native HTTP parser preserves ${encoding} wire framing before bounded engine decompression`, async () => {
+    const source = Buffer.from('<p>Offline compressed HTML</p><script>untrusted_code()</script>')
+    const wire = compress(source)
+    const reply = Buffer.concat([Buffer.from(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Encoding: ${encoding}\r\nContent-Length: ${wire.length}\r\n\r\n`), wire])
+    const fixture = rawFixture({ reply })
+    const result = await fetchPublicUrl(url, { approve: async () => true, resolve: async () => [address],
+      request: fixture.transport.requestPublicUrl })
+    assert.equal(result.success, true); assert.equal(result.text, 'Offline compressed HTML')
+    assert.equal(result.bytesRead, wire.length); assert.equal(result.decodedBytes, source.length)
+    assert.equal(result.contentEncoding, encoding); assert.equal(fixture.socket.destroyed, true)
+    assert.equal(fixture.state.requests.length, 1)
+    assert.match(Buffer.concat(fixture.socket.writes).toString(), /accept-encoding: gzip, br, deflate\r\n/i)
+  })
+}

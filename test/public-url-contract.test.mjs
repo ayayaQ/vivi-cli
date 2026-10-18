@@ -61,7 +61,8 @@ function failure(result, code, attempts = 0) {
   if (attempts) assert.equal(result.networkActivity, 'possible')
   assert.equal(result.doNotRetry, attempts || result.networkActivity === 'possible' ? true : undefined)
   assert.equal(result.text, undefined)
-  assert.equal(result.httpStatus, undefined)
+  assert(['admission', 'approval', 'dns', 'send_intent', 'request', 'response', 'body', 'decompression', 'decoding', 'extraction', 'result'].includes(result.failureStage))
+  if (result.httpStatus !== undefined) assert(Number.isInteger(result.httpStatus) && result.httpStatus >= 200 && result.httpStatus <= 599)
 }
 function preparedFailure(input, code, secrets = []) {
   assert.throws(() => preparePublicUrl(input, secrets), error => error.code === code)
@@ -218,7 +219,7 @@ test('approval discloses exact canonical destination and fixed method before loo
   assert.equal(request.url, url); assert.equal(request.origin, 'https://example.com')
   assert.equal(request.hostname, 'example.com'); assert.equal(request.address, publicAddress)
   assert.equal(request.method, 'GET'); assert.equal(request.signal, signal)
-  assert.deepEqual(request.headers, { accept: 'text/plain, text/html, application/json', 'accept-encoding': 'identity' })
+  assert.deepEqual(request.headers, { accept: 'text/plain, text/html, application/json', 'accept-encoding': 'gzip, br, deflate' })
   assert.equal(subject.state.requests.length, 1); assert.equal(subject.state.lookups.length, 1)
   assert.equal(subject.state.responses[0].state.closes, 1)
   assert.deepEqual(result.requests, [{ url, transmission: 'observed' }])
@@ -568,8 +569,8 @@ const rejectedResponses = [
   [{ headers: { 'content-type': 'text/plain; charset=utf-16' } }, 'unsupported_charset'],
   [{ headers: { 'content-type': 'text/plain; charset=iso-8859-1; charset=utf-8' } }, 'unsupported_charset'],
   [{ headers: { 'content-type': 'text/plain; charset=utf-8; charset=iso-8859-1' } }, 'unsupported_charset'],
-  [{ headers: { 'content-type': 'text/plain', 'content-encoding': 'gzip' } }, 'compressed_response'],
-  [{ headers: { 'content-type': 'text/plain', 'content-encoding': 'br' } }, 'compressed_response'],
+  [{ headers: { 'content-type': 'text/plain', 'content-encoding': 'zstd' } }, 'compressed_response'],
+  [{ headers: { 'content-type': 'text/plain', 'content-encoding': 'gzip, br' } }, 'compressed_response'],
   [{ headers: { 'content-type': 'text/plain', 'content-encoding': 'identity, gzip' } }, 'compressed_response'],
   [{ headers: { 'content-type': 'text/plain', 'content-disposition': 'attachment; filename=report.txt' } }, 'download_response'],
   [{ headers: { 'content-type': 'text/plain', 'content-disposition': 'form-data' } }, 'download_response'],
