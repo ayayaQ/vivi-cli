@@ -1,6 +1,6 @@
 # vivi CLI
 
-Chat with OpenAI or OpenRouter from your terminal.
+Chat with OpenAI, OpenRouter or DeepSeek from your terminal.
 
 ## Run from source
 
@@ -21,7 +21,9 @@ Each launch starts a fresh conversation. An unconfigured interactive launch open
 the existing provider/key and model pickers automatically. Escape cancels; use
 `/provider` to retry. Configured launches use saved defaults without repeating setup.
 
-- `/provider` — choose OpenAI or OpenRouter and enter a key
+- `/provider` — choose the chat provider (OpenAI, OpenRouter or DeepSeek) and key
+- `/web` — independently choose Direct, DeepSeek or Disabled web access
+- `/reviewer` — explicitly choose this conversation’s OpenAI/OpenRouter Auto reviewer
 - `/models` — search and select a model
 - `/effort` — choose a supported reasoning effort
 - `/mode` — choose Manual or enroll optional Auto review for the current conversation
@@ -40,7 +42,7 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/help` — show commands and shortcuts
 - `/exit` — quit
 
-Changing provider, model or effort starts a new conversation and keeps the old
+Changing chat provider, model or effort starts a new conversation and keeps the old
 transcript available through `/resume`.
 
 Sessions get a readable name from the first accepted message, without an extra
@@ -166,7 +168,7 @@ There is no plaintext key-storage fallback. Conversations are stored locally in
 ## Line mode
 
 Node.js 26.4+ supports line mode without Bun. Set `OPENAI_API_KEY` or
-`OPENROUTER_API_KEY` in your environment, then supply a model ID:
+`OPENROUTER_API_KEY` or `DEEPSEEK_API_KEY` in your environment, then supply a model ID:
 
 ```sh
 node dist/launcher.js --no-tui --provider openai --model YOUR_MODEL
@@ -295,9 +297,42 @@ text is untrusted; uncertain sends are recorded and never automatically replayed
 Failures include a fixed local stage and a validated HTTP status when available,
 without returning native diagnostics or error bodies.
 
+## Independent web providers
+
+Direct is the keyless default and provides only `fetch_url`. It never executes
+JavaScript and never falls back to a paid provider. `/web` independently selects
+Direct, DeepSeek or Disabled; chat setup does not enable web access.
+
+DeepSeek web adds `web_search` and routes `fetch_url` through its fixed paid API.
+It uses a separate `deepseek-web` OS credential slot or launch-only key. Reusing a
+DeepSeek chat key requires an explicit choice. In line mode use
+`--web-provider deepseek` and `DEEPSEEK_WEB_API_KEY`; `/web direct|deepseek|disabled`
+changes this launch’s selection. No key is accepted in command arguments or saved
+in plaintext preferences.
+
+The exact query/count/content choice or full URL/path/query goes to DeepSeek,
+and bounded results enter the local transcript and selected chat provider’s
+context. The CLI adds no original question or localization IP. The documented
+estimate is US$0.00075 per successful nonempty request, not an enforceable billing
+cap or receipt; DeepSeek controls pricing and actual charges. Each call has one
+API dispatch and no automatic retry or fallback. Manual reviews every call;
+freshly enrolled Auto can review exact current-request search/fetch proposals,
+with visible human fallback on uncertainty. Changing web provider/key revokes
+Auto enrollment. Plan continues to omit remote web requests.
+
+Results are untrusted, provider-reported content with source URLs and explicit
+local truncation. A successful API response does not verify original website
+facts, HTTP status, final redirect URL or completeness. DeepSeek’s remote
+JavaScript/redirect behavior is not independently verified. Local public-target
+checks do not attest to DeepSeek’s remote DNS or redirects.
+
 ## Optional Auto review
 
-Manual is always the default. `/mode` opens the current conversation’s mode
+Manual is always the default. OpenAI/OpenRouter chat keeps its same-provider
+reviewer by default. DeepSeek chat starts without a reviewer; `/reviewer` or Auto
+setup explicitly selects an OpenAI/OpenRouter account for this conversation.
+DeepSeek is not a decision backend. A reviewer/account change revokes enrollment,
+and every new recipient needs fresh disclosure and confirmation. `/mode` opens the current conversation’s mode
 choice. The full-screen picker defaults to Manual; choosing Auto review then
 requires a separate fresh, deny-default human confirmation of the disclosure.
 Line mode shows the same disclosure and requires fresh typed `allow` to enroll;
@@ -582,3 +617,9 @@ Command cards report the observed process lifecycle. A running process is not a 
 Imported extension results confirm only that their executor returned or failed. Claims inside result JSON cannot establish effects, approval or permission. Historical result bodies alone never acquire new receipts. Exact current-run call, occurrence, arguments and canonical result binding is required for live and saved outcomes; cold replay restores saved evidence without executing tools. If evidence persistence fails, replay keeps the uncertainty visible. Skill saving receives a local-mutation policy only when its separate human-reviewed capability is enabled; outcome reporting grants no save authority.
 
 The registration coverage test inventories every enabled owned pack, conditional MCP resource tools, dynamic MCP aliases, Plan mode and disabled tools. Adding an owned tool without an explicit outcome policy fails registration instead of silently inheriting a generic success label.
+
+DeepSeek chat uses the native adapter, live catalog context/effort metadata, native
+reasoning history and reported usage. Unknown limits remain unknown. Unsupported
+imported or inconsistent reasoning/tool history fails before HTTP with `/new`
+guidance; it is never silently rewritten or retried. Context compaction uses only
+core-validated provider views and retains the original local transcript.

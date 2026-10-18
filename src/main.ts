@@ -5,6 +5,10 @@ import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { createDeepSeekProvider } from '@ayayaq/vivi/providers/deepseek'
+import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
+import type { CliWebConfiguration, CliWebProviderName } from './web-tools.js'
+import { providerEnvironmentName, isReviewProvider } from './provider-selection.js'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers/openrouter'
@@ -40,6 +44,8 @@ export interface CliOptions {
   /** Launch-only request to open enrollment; never a saved approval. */
   approvalMode: ApprovalMode
   provider?: CliProviderName
+  webProvider?: CliWebProviderName
+  reviewer?: 'openai' | 'openrouter' | 'none'
   model?: string
   reasoning?: string
   reasoningCapabilities: ReasoningEffort[]
@@ -62,12 +68,14 @@ export interface CliOptions {
 }
 export const HELP = `vivi - a shared-agent terminal application
 
-Usage: vivi --provider openai|openrouter --model MODEL [options]
+Usage: vivi --provider openai|openrouter|deepseek --model MODEL [options]
        vivi --resume SESSION_ID [options]
        vivi mcp add|list|login|connect|logout|remove   Provider-independent MCP setup
        vivi                       Interactive setup and saved defaults (Bun)
 
-  --provider NAME             openai (default) or openrouter
+  --provider NAME             openai (default), openrouter or deepseek
+  --web-provider NAME         direct (keyless default), deepseek (explicit paid opt-in), disabled
+  --reviewer NAME             Explicit Auto reviewer: openai, openrouter or none (conversation only)
   --model MODEL               Required for a new session
   --reasoning LEVEL           default, disabled/none, minimal, low, medium, high, xhigh, max
   --reasoning-capabilities CSV Host-declared supported efforts; needed for nondefault reasoning
@@ -135,9 +143,20 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--help': case '-h': options.help = true; break
       case '--provider': {
         const name = value()
-        if (name !== 'openai' && name !== 'openrouter') throw new Error('Provider must be openai or openrouter')
+        if (name !== 'openai' && name !== 'openrouter' && name !== 'deepseek') throw new Error('Provider must be openai, openrouter or deepseek')
         options.provider = name
         break
+      }
+      case '--web-provider': {
+        const name = value()
+        if (!['direct', 'deepseek', 'disabled'].includes(name)) throw new Error('Web provider must be direct, deepseek or disabled')
+        options.webProvider = name as CliWebProviderName
+        break
+      }
+      case '--reviewer': {
+        const name = value()
+        if (name !== 'none' && !isReviewProvider(name)) throw new Error('Reviewer must be openai, openrouter or none')
+        options.reviewer = name; break
       }
       case '--model': options.model = value(); break
       case '--reasoning': {
@@ -231,17 +250,24 @@ export function supportsBunTui(version: string | undefined = process.versions.bu
 }
 
 export function providerForSession(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider {
-  const apiKey = session.provider === 'openai' ? env.OPENAI_API_KEY : env.OPENROUTER_API_KEY
-  if (!apiKey) throw new Error(session.provider === 'openai' ? 'Set OPENAI_API_KEY in your environment' : 'Set OPENROUTER_API_KEY in your environment')
+  const name = providerEnvironmentName(session.provider)
+  const apiKey = env[name]
+  if (!apiKey) throw new Error(`Set ${name} in your environment`)
   const common = { model: session.model, apiKey, reasoning: reasoningPolicy(session.reasoning),
     supportedReasoningEfforts: options.reasoningCapabilities, stream: options.stream }
-  return session.provider === 'openai' ? createOpenAIProvider(common) : createOpenRouterProvider({ ...common,
-    requireSupportedParameters: options.enableTools || (session.reasoning !== undefined && session.reasoning !== 'default') })
+  switch (session.provider) {
+    case 'openai': return createOpenAIProvider(common)
+    case 'deepseek': return createDeepSeekProvider(common)
+    case 'openrouter': return createOpenRouterProvider({ ...common,
+      requireSupportedParameters: options.enableTools || (session.reasoning !== undefined && session.reasoning !== 'default') })
+    default: throw new Error('Unsupported chat provider')
+  }
 }
 
 /** Dedicated fixed-model review on the selected existing account; never discover or copy credentials. */
 export function decisionProviderForSession(session: CliSession, env: NodeJS.ProcessEnv, beforeRequest?: () => void): DecisionProvider {
-  const name = session.provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
+  if (!isReviewProvider(session.provider)) throw new Error('DeepSeek is not an Auto reviewer. Choose OpenAI or OpenRouter explicitly with /reviewer')
+  const name = providerEnvironmentName(session.provider)
   const apiKey = (): string => {
     beforeRequest?.()
     const key = env[name]
@@ -256,12 +282,14 @@ export function decisionProviderForSession(session: CliSession, env: NodeJS.Proc
 /** Construct only when an enrolled eligible action actually requests review. */
 export function deferredDecisionProvider(session: CliSession, env: NodeJS.ProcessEnv,
   factory: typeof decisionProviderForSession): DecisionProvider {
-  const model = session.provider === 'openai' ? 'gpt-6-luna' : 'typesafe/jev-1.13'
-  return { id: session.provider, model,
+  if (!isReviewProvider(session.provider)) throw new Error('Choose an OpenAI or OpenRouter reviewer explicitly with /reviewer')
+  const reviewProvider = session.provider
+  const model = reviewProvider === 'openai' ? 'gpt-6-luna' : 'typesafe/jev-1.13'
+  return { id: reviewProvider, model,
     evaluate: (request, signal) => {
       // A new request-bound closure cannot be confused with a later review after timeout.
       const provider = factory(session, env, () => assertReviewTransportCurrent(request))
-      if (provider.id !== session.provider || provider.model !== model) throw new Error('Decision provider does not match the selected account and fixed review model')
+      if (provider.id !== reviewProvider || provider.model !== model) throw new Error('Decision provider does not match the selected account and fixed review model')
       return provider.evaluate(request, signal)
     } }
 }
@@ -371,8 +399,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const dispose = io.onCancel(() => controller.abort())
     const surfaceClosed = (): boolean => io instanceof TerminalIO ? io.isDisposed : io?.isClosed === true
     try {
-      if (session.provider === 'openrouter') io.write('Loading openrouter model capabilities…\n')
-      const key = session.provider === 'openai' ? env.OPENAI_API_KEY : env.OPENROUTER_API_KEY
+      if (session.provider !== 'openai') io.write(`Loading ${session.provider} model capabilities…\n`)
+      const key = env[providerEnvironmentName(session.provider)]
       const hydrated = await hydrateModelCapabilities(dependencies.catalog ?? new ModelCatalog(),
         session.provider, session.model, key, controller.signal)
       if (surfaceClosed() || controller.signal.aborted) return 130
@@ -395,8 +423,15 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       stream: metadata.streaming === 'unsupported' ? false : options.stream }
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
+    const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
+    const webKey = env.DEEPSEEK_WEB_API_KEY
+    const web: CliWebConfiguration = options.webProvider === 'deepseek' ? { provider: 'deepseek', revision: randomUUID(), apiKey: () => {
+      if (!webKey) throw new Error('Set DEEPSEEK_WEB_API_KEY for the separately selected web provider')
+      return webKey
+    } } : { provider: options.webProvider ?? 'direct' }
+    if (web.provider === 'deepseek') io.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+    host = new CliHost({ provider, web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       skillSaveApproval: { isAvailable: () => options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
@@ -404,8 +439,9 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         isAvailable: () => io?.canAutoReview === true && !io.isClosed } } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
       onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
-      ...(io.canAutoReview === true ? { decisionReview: {
-        provider: deferredDecisionProvider(session, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
+      ...(io.canAutoReview === true && selectedReviewer ? { decisionReview: {
+        provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
+        ...(options.reviewer ? { explicitReviewer: true as const } : {}),
         ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
         accountRevision: () => accountRevision, isAvailable: () => io?.canAutoReview === true && !io.isClosed
       } } : {}),
@@ -424,7 +460,29 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
+    const configureReviewer = async (line = ''): Promise<boolean> => {
+      const name = line.trim().replace(/^\/reviewer\s*/, '')
+      if (name === 'none') { host!.setDecisionReview(undefined); io!.setApprovalMode?.('manual'); io!.write('Auto reviewer: none\n'); return false }
+      if (!isReviewProvider(name)) { io!.write(`Auto reviewer: ${host!.reviewProvider ?? 'none'}. Use /reviewer openai|openrouter|none; selection is for this conversation only.\n`); return false }
+      if (!env[providerEnvironmentName(name)]) { io!.write(`Set ${providerEnvironmentName(name)} before explicitly selecting that reviewer\n`); return false }
+      const revision = randomUUID()
+      host!.setDecisionReview({ provider: deferredDecisionProvider({ ...session, provider: name }, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
+        explicitReviewer: true, ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: io!.canAutoReview === true,
+        accountRevision: () => revision, isAvailable: () => io?.canAutoReview === true && !io.isClosed })
+      io!.setApprovalMode?.('manual'); io!.write(`Auto reviewer: ${name}. Use /mode for fresh enrollment.\n`); return true
+    }
+    const configureWeb = async (line: string): Promise<void> => {
+      const name = line.trim().replace(/^\/web\s*/, '')
+      if (!['direct', 'deepseek', 'disabled'].includes(name)) { io!.write(`Web provider: ${host!.webProvider}. Use /web direct|deepseek|disabled; DeepSeek uses only DEEPSEEK_WEB_API_KEY and is paid.\n`); return }
+      if (name === 'deepseek') {
+        io!.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
+        if (!webKey) { io!.write('Set DEEPSEEK_WEB_API_KEY before selecting DeepSeek web; chat credentials are never reused automatically\n'); return }
+        host!.setWebConfiguration({ provider: 'deepseek', revision: randomUUID(), apiKey: () => webKey })
+      } else host!.setWebConfiguration({ provider: name as 'direct' | 'disabled' })
+      io!.setApprovalMode?.('manual'); io!.write(`Web provider: ${name}. Auto enrollment revoked.\n`)
+    }
     const result = await runChatLoop(host, io, options.prompt, {
+      web: configureWeb, reviewer: async line => { await configureReviewer(line) },
       mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0

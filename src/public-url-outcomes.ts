@@ -20,6 +20,7 @@ export interface PublicUrlOutcomeRecord {
   readonly callDigest: string
   /** Original exact-call hash bridges interrupted privacy-only identity rewrites. */
   readonly recoveryCallDigest?: string
+  readonly webProvider?: 'deepseek'
   readonly bindingDigest: string
   readonly state: 'accepted' | 'intent' | 'settled'
   readonly result?: ToolResult
@@ -47,10 +48,12 @@ export function validatePublicUrlOutcomes(sessionId: string, value: unknown): Pu
   const ids = new Set<string>(), calls = new Set<string>(), digests = new Map<string, string>()
   for (const record of value as PublicUrlOutcomeRecord[]) {
     check(record && !Array.isArray(record) && typeof record === 'object')
-    check(Object.keys(record).every(key => ['id', 'sessionId', 'runId', 'callId', 'toolName', 'callDigest', 'recoveryCallDigest', 'bindingDigest', 'state', 'result'].includes(key)))
+    check(Object.keys(record).every(key => ['id', 'sessionId', 'runId', 'callId', 'toolName', 'callDigest', 'recoveryCallDigest', 'webProvider', 'bindingDigest', 'state', 'result'].includes(key)))
     check(uuid(record.id) && record.sessionId === sessionId && uuid(record.runId))
     check(typeof record.callId === 'string' && record.callId.length > 0 && record.callId.length <= 200)
-    check(typeof record.toolName === 'string' && (record.toolName === 'fetch_url' || /^public_url_withheld_[a-z0-9]+$/.test(record.toolName)))
+    check(typeof record.toolName === 'string' && (record.toolName === 'fetch_url' || record.toolName === 'web_search' || /^public_url_withheld_[a-z0-9]+$/.test(record.toolName)))
+    if (Object.hasOwn(record, 'webProvider')) check(record.webProvider === 'deepseek')
+    if (record.toolName === 'web_search') check(record.webProvider === 'deepseek')
     if (Object.hasOwn(record, 'recoveryCallDigest')) check(digest(record.recoveryCallDigest))
     check(digest(record.callDigest) && digest(record.bindingDigest) && (record.state === 'accepted' || record.state === 'intent' || record.state === 'settled'))
     check(!ids.has(record.id) && !calls.has(record.callId)); ids.add(record.id); calls.add(record.callId)
@@ -75,6 +78,8 @@ export function publicUrlOutcomeMatchesCall(record: PublicUrlOutcomeRecord, call
 }
 export function publicUrlOutcomeResult(record: PublicUrlOutcomeRecord): ToolResult {
   if (record.result) return record.result
+  if (record.webProvider === 'deepseek') return deepSeekWebFailure(record.state === 'intent' ? 'unknown' : 'not_started',
+    record.state === 'intent' ? 'web_unknown_outcome' : 'cancelled', undefined, 'possible')
   // The accepted row precedes DNS, while durable HTTP intent follows it. A
   // recovered accepted row rules out GET dispatch, not metadata disclosure.
   return record.state === 'accepted' ? { content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,
@@ -91,16 +96,27 @@ export function cliPublicUrlRecordOutcome(record: PublicUrlOutcomeRecord): Pick<
   let body: Record<string, unknown>
   try { body = JSON.parse(record.result.content) as Record<string, unknown> }
   catch { return { status: 'unknown', effect: 'unknown' } }
-  if (!body || typeof body !== 'object' || Array.isArray(body) || body.source !== 'public_url' || body.unknownOutcome === true ||
+  if (!body || typeof body !== 'object' || Array.isArray(body) || (body.source !== 'public_url' && body.source !== 'web_provider') || body.unknownOutcome === true ||
     typeof body.success !== 'boolean') return { status: 'unknown', effect: 'unknown' }
+  if (body.source === 'web_provider' && (body.provider !== 'deepseek' || record.webProvider !== 'deepseek')) return { status: 'unknown', effect: 'unknown' }
   if (body.success && !record.result.isError) return { status: 'succeeded', effect: 'unknown' }
   const code = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
     ? (body.error as Record<string, unknown>).code : undefined
   return { status: code === 'approval_denied' ? 'denied' : code === 'cancelled' ? 'cancelled' : 'failed',
-    effect: body.networkActivity === 'not_attempted' && body.serverEffects === 'not_attempted' &&
+    effect: body.source === 'web_provider' ? body.requestState === 'not_started' && body.networkActivity === 'not_attempted' ? 'not_attempted' : 'unknown' : body.networkActivity === 'not_attempted' && body.serverEffects === 'not_attempted' &&
       (body.transmission === 'not_attempted' || Array.isArray(body.requests) && body.requests.every(item =>
         item && typeof item === 'object' && !Array.isArray(item) && item.transmission === 'not_attempted'))
       ? 'not_attempted' : 'unknown' }
+}
+export function deepSeekWebFailure(requestState: 'not_started' | 'unknown' | 'response_received', code: string, apiStatus?: number, networkActivity: 'not_attempted' | 'possible' = 'not_attempted'): ToolResult {
+  return { isError: true, content: JSON.stringify({ success: false, source: 'web_provider', provider: 'deepseek', untrusted: true,
+    requestState, ...(requestState === 'unknown' ? { unknownOutcome: true } : {}), doNotRetry: true,
+    networkActivity: requestState === 'not_started' ? networkActivity : 'possible',
+    ...(apiStatus === undefined ? {} : { apiStatus, apiStatusSource: 'DeepSeek API, not the original website' }),
+    billing: requestState === 'not_started' ? 'not_attempted' : 'unknown',
+    error: { code, message: requestState === 'not_started' ? networkActivity === 'possible' ? 'The DeepSeek API request was not sent. DNS/network metadata may have been disclosed' : 'This DeepSeek web request was not sent'
+      : requestState === 'unknown' ? 'The DeepSeek web request may have reached the provider and incurred charges. Do not retry automatically'
+      : 'A DeepSeek API response was received, but no usable web result was confirmed. Original website facts and billing are unverified' } }) }
 }
 export function unresolvedPublicUrlResult(): ToolResult {
   return { content: JSON.stringify({ success: false, source: 'public_url', untrusted: true,

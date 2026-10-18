@@ -7,7 +7,7 @@ import { newSession } from '../dist/session.js'
 function fixture({ mode = 'manual', interactive = true, allow = false, lines = [] } = {}) {
   let taskMode = 'execute'
   const host = { session: newSession({ provider: 'openai', model: 'offline' }), invalidateContext() {},
-    get approvalMode() { return mode }, setApprovalMode(value) { mode = value },
+    get reviewProvider() { return this.session.provider }, get approvalMode() { return mode }, setApprovalMode(value) { mode = value },
     get taskMode() { return taskMode }, setTaskMode(value) { taskMode = value; if (value === 'plan') mode = 'manual' } }
   const requests = [], io = { canAutoReview: interactive, output: '', modes: [],
     async readLine() { return lines.shift() }, write(value) { this.output += value },

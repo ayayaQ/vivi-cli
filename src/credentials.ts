@@ -13,7 +13,8 @@ const MACOS_SECRET_PREFIX = 'vivi-cli-api-key-v1:'
 const LINUX_SECRET_INPUT_BYTES = 8191
 const service = 'vivi-cli'
 const MCP_KEY_SLOT_PREFIX = 'mcp-oauth-key-v1-'
-type NativeCredentialSlot = CliProviderName | `mcp-oauth-key-v1-${string}`
+export type CredentialProviderName = CliProviderName | 'deepseek-web'
+type NativeCredentialSlot = CredentialProviderName | `mcp-oauth-key-v1-${string}`
 
 // Only this fixed, nonsecret source enters PowerShell's argv/script-block logging. All request
 // parsing and secret I/O happen inside C#, never in cmdlet parameters or the PowerShell pipeline.
@@ -151,7 +152,7 @@ public static class ViviNativeCredentials {
       int second = Array.IndexOf(input, (byte)10, first + 1, length - first - 1);
       if (second < 0) return 2;
       string provider = Encoding.ASCII.GetString(input, first + 1, second - first - 1);
-      if (provider != "openai" && provider != "openrouter" &&
+      if (provider != "openai" && provider != "openrouter" && provider != "deepseek" && provider != "deepseek-web" &&
           !System.Text.RegularExpressions.Regex.IsMatch(provider, "^mcp-oauth-key-v1-[0-9a-f]{64}$")) return 2;
       string target = "vivi-cli/" + provider;
       if (operation == "load" && second + 1 == length) return Load(target);
@@ -196,8 +197,8 @@ export interface CredentialStoreStatus {
 /** Credentials belong in the OS keyring, never preferences, sessions or environment variables. */
 export interface CredentialStore {
   status(): Promise<CredentialStoreStatus>
-  load(provider: CliProviderName): Promise<string | undefined>
-  save(provider: CliProviderName, key: string): Promise<void>
+  load(provider: CredentialProviderName): Promise<string | undefined>
+  save(provider: CredentialProviderName, key: string): Promise<void>
 }
 
 /** Provider-independent syntax checks, not authentication or a provider-specific prefix check. */
@@ -355,7 +356,7 @@ export class NativeCredentialStore implements CredentialStore {
     } catch { return unavailable() }
   }
 
-  async load(provider: CliProviderName): Promise<string | undefined> {
+  async load(provider: CredentialProviderName): Promise<string | undefined> {
     checkProvider(provider)
     return this.loadSlot(provider)
   }
@@ -386,7 +387,7 @@ export class NativeCredentialStore implements CredentialStore {
     }
   }
 
-  async save(provider: CliProviderName, input: string): Promise<void> {
+  async save(provider: CredentialProviderName, input: string): Promise<void> {
     checkProvider(provider)
     return this.saveSlot(provider, input)
   }
@@ -467,8 +468,8 @@ export function createMcpWrappingKeyStore(scope: string, options: NativeCredenti
   return new NativeCredentialStore(options).mcpWrappingKey(scope)
 }
 
-function checkProvider(provider: CliProviderName): void {
-  if (provider !== 'openai' && provider !== 'openrouter') throw new Error('Unsupported credential provider')
+function checkProvider(provider: CredentialProviderName): void {
+  if (provider !== 'openai' && provider !== 'openrouter' && provider !== 'deepseek' && provider !== 'deepseek-web') throw new Error('Unsupported credential provider')
 }
 
 function decodeMacKey(stdout: string): string {

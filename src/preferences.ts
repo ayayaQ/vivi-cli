@@ -15,7 +15,8 @@ export const MAX_SESSION_LIST_ENTRIES = 1000
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 const preferenceKeys = ['schemaVersion', 'provider', 'model', 'reasoning',
   'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'enableMemory', 'maxRounds'] as const
-const legacyPreferenceKeys = preferenceKeys.filter(key => key !== 'enableMemory')
+const optionalPreferenceKeys = ['enableMemory', 'webProvider'] as const
+const allowedPreferenceKeys = [...preferenceKeys, 'webProvider'] as const
 
 /** Host preferences only. Credentials, transcripts, prompts and paths are never settings. */
 export interface TuiPreferences {
@@ -31,6 +32,8 @@ export interface TuiPreferences {
   /** Future launch default; persistent context is independent of model tool support. */
   enableMemory: boolean
   maxRounds: number
+  /** Independent web default. Absence migrates to keyless Direct. No credential here. */
+  webProvider?: 'direct' | 'deepseek' | 'disabled'
 }
 
 export interface SessionPickerEntry {
@@ -60,20 +63,18 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
   check(Object.getOwnPropertySymbols(value).length === 0, 'unexpected field')
   const descriptors = Object.getOwnPropertyDescriptors(value)
   const keys = Object.keys(descriptors)
-  const legacy = keys.length === legacyPreferenceKeys.length &&
-    keys.every(key => legacyPreferenceKeys.includes(key as typeof legacyPreferenceKeys[number]))
-  check(legacy || (keys.length === preferenceKeys.length &&
-    keys.every((key) => preferenceKeys.includes(key as typeof preferenceKeys[number]))),
+  check(keys.every(key => allowedPreferenceKeys.includes(key as typeof allowedPreferenceKeys[number])) &&
+    preferenceKeys.filter(key => !(optionalPreferenceKeys as readonly string[]).includes(key)).every(key => keys.includes(key)),
   'unexpected or missing field')
   const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>
   for (const key of preferenceKeys) {
-    if (key === 'enableMemory' && legacy) { fields[key] = false; continue }
+    if (key === 'enableMemory' && !keys.includes(key)) { fields[key] = false; continue }
     const descriptor = descriptors[key]
     check(descriptor && descriptor.enumerable && 'value' in descriptor, 'expected enumerable data fields')
     fields[key] = descriptor.value
   }
   check(fields.schemaVersion === 1, 'unsupported schema version')
-  check(fields.provider === 'openai' || fields.provider === 'openrouter', 'unsupported provider')
+  check(fields.provider === 'openai' || fields.provider === 'openrouter' || fields.provider === 'deepseek', 'unsupported provider')
   check(typeof fields.model === 'string' && fields.model.length <= 200 &&
     fields.model.trim() === fields.model && !/[\u0000-\u001f\u007f-\u009f]/.test(fields.model), 'invalid model')
   check(typeof fields.reasoning === 'string' &&
@@ -107,6 +108,12 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     reasoningCapabilities: supported, stream: fields.stream, enableTools: fields.enableTools,
     enableNotes: fields.enableNotes, enableMemory: fields.enableMemory,
     maxRounds: fields.maxRounds as number
+  }
+  if (keys.includes('webProvider')) {
+    const descriptor = descriptors.webProvider
+    check(descriptor && descriptor.enumerable && 'value' in descriptor &&
+      ['direct', 'deepseek', 'disabled'].includes(descriptor.value), 'unsupported web provider')
+    preferences.webProvider = descriptor.value
   }
   const encoded = JSON.stringify(preferences)
   check(!secretPresent(encoded, secrets), 'settings must not contain environment credentials')
