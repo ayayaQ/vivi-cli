@@ -13,7 +13,7 @@ const LOCK_RETRY_MS = 25
 const PRIMARY = 'decision-ledger.json'
 const LOCK = `${PRIMARY}.lock`
 
-export type DecisionLedgerToolName = 'note_set' | 'create_memory' | 'edit_memory' | 'delete_memory' | 'workspace_create_text' | 'workspace_edit_text' | 'fetch_url'
+export type DecisionLedgerToolName = 'note_set' | 'create_memory' | 'edit_memory' | 'delete_memory' | 'workspace_create_text' | 'workspace_edit_text' | 'fetch_url' | 'web_search'
 export type DecisionLedgerSource = 'automatic' | 'human-once' | 'human-deny'
 export type DecisionLedgerState = 'reviewed' | 'commit_started' | 'committed' | 'denied' | 'cancelled' | 'failed' | 'unknown'
 export type DecisionLedgerReasonCode = 'requirements_met' | 'provider_recommended_reject' | 'uncertain' |
@@ -78,7 +78,7 @@ export class DecisionLedgerCommitError extends DecisionLedgerError {
   }
 }
 
-const toolNames: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'workspace_create_text', 'workspace_edit_text', 'fetch_url']
+const toolNames: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'workspace_create_text', 'workspace_edit_text', 'fetch_url', 'web_search']
 const sources: readonly string[] = ['automatic', 'human-once', 'human-deny']
 const states: readonly string[] = ['reviewed', 'commit_started', 'committed', 'denied', 'cancelled', 'failed', 'unknown']
 const reasons: readonly string[] = ['requirements_met', 'provider_recommended_reject', 'uncertain', 'refusal',
@@ -141,8 +141,8 @@ export function validateDecisionLedgerRecord(value: unknown): DecisionLedgerReco
   for (const field of ['id', 'sessionId', 'runId']) check(uuid(record[field]), 'invalid opaque UUID')
   for (const field of ['callId', 'policyRevision', 'model']) check(identifier(record[field]), 'invalid bounded identifier')
   check(member(record.toolName, toolNames), 'unknown tool')
-  check(record.toolName === 'fetch_url' ? record.actionKind === 'network-admission' : !Object.hasOwn(record, 'actionKind'), 'invalid action kind')
-  check(record.toolName !== 'fetch_url' || !Object.hasOwn(record, 'resultRevision'), 'network admission has no retrieval revision')
+  check((record.toolName === 'fetch_url' || record.toolName === 'web_search') ? record.actionKind === 'network-admission' : !Object.hasOwn(record, 'actionKind'), 'invalid action kind')
+  check(!['fetch_url', 'web_search'].includes(String(record.toolName)) || !Object.hasOwn(record, 'resultRevision'), 'network admission has no retrieval revision')
   check(record.provider === 'openai' || record.provider === 'openrouter', 'unknown provider')
   check(typeof record.snapshotDigest === 'string' && /^[0-9a-f]{64}$/.test(record.snapshotDigest), 'invalid snapshot digest')
   check(member(record.source, sources), 'unknown decision source')

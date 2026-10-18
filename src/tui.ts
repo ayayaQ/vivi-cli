@@ -80,7 +80,9 @@ function guardMarkdownSelection(node: Renderable): void {
   for (const child of node.getChildren()) guardMarkdownSelection(child)
 }
 export const SLASH_COMMANDS = [
-  { command: '/provider', description: 'Choose a provider' },
+  { command: '/provider', description: 'Choose a chat provider' },
+  { command: '/web', description: 'Choose an independent web provider' },
+  { command: '/reviewer', description: 'Choose this conversation’s Auto reviewer' },
   { command: '/models', description: 'Choose a model' },
   { command: '/effort', description: 'Choose reasoning effort' },
   { command: '/mode', description: 'Choose Manual / Auto review / Plan' },

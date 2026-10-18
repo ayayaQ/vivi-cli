@@ -11,7 +11,7 @@ import { FilePublicUrlOutcomeStore, reconcilePublicUrlOutcomes } from './public-
 
 export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
-export type CliProviderName = 'openai' | 'openrouter'
+export type CliProviderName = 'openai' | 'openrouter' | 'deepseek'
 export interface CliSession {
   schemaVersion: 1 | 2
   /** Schema-2 points to an existing shadow anchor; it grants no replay/send authority. */
@@ -101,7 +101,7 @@ export function validateSession(value: unknown): CliSession {
   }
   if ('contextCheckpoint' in value) validateContextCheckpoint(value.contextCheckpoint)
   check(isSessionId(value.id), 'invalid id')
-  check(value.provider === 'openai' || value.provider === 'openrouter', 'unsupported provider')
+  check(value.provider === 'openai' || value.provider === 'openrouter' || value.provider === 'deepseek', 'unsupported provider')
   check(identifier(value.model), 'invalid model')
   if ('title' in value) check(typeof value.title === 'string' && validSessionTitle(value.title), 'invalid title')
   if ('titleRevision' in value) check('title' in value && Number.isSafeInteger(value.titleRevision) &&

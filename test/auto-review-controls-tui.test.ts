@@ -28,7 +28,7 @@ async function fixture() {
   const session = newSession({ provider: 'openai', model: 'offline-chat' })
   io.setSession(session)
   let mode: ApprovalMode = 'manual'
-  const host = { get session() { return session }, get approvalMode() { return mode },
+  const host = { get session() { return session }, get reviewProvider() { return 'openai' as const }, get approvalMode() { return mode },
     setApprovalMode(value: ApprovalMode) { mode = value } } as unknown as CliHost
   // The test renderer is deliberately headless. Only this injected test surface
   // declares interactive capability; no provider, account or key is involved.

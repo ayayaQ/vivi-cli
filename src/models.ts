@@ -34,7 +34,7 @@ const ACCESS_DENIED = 'Model access was denied; check this provider’s key with
 export function modelAccessDenied(error: unknown): boolean {
   return error instanceof ModelCatalogError && error.message === ACCESS_DENIED
 }
-const endpoints = { openai: 'https://api.openai.com/v1/models', openrouter: 'https://openrouter.ai/api/v1/models' }
+const endpoints = { openai: 'https://api.openai.com/v1/models', openrouter: 'https://openrouter.ai/api/v1/models', deepseek: 'https://api.deepseek.com/models' }
 
 // GET /v1/models has no capability metadata. These exact Responses model IDs are
 // verified against their official model pages; unknown IDs remain chat-only/default.
@@ -171,8 +171,8 @@ export function parseModelCatalog(provider: CliProviderName, input: unknown): Mo
     } else {
       // OpenRouter model metadata describes its Chat Completions gateway. Never
       // infer capabilities from model names. Unknown/future efforts are omitted.
-      applyCapabilities(model, normalizeModelCapabilities({ apiVersion: 1, provider: 'openrouter', protocol: 'chat-completions', model: raw }))
-      model.source = 'OpenRouter model catalog metadata'
+      applyCapabilities(model, normalizeModelCapabilities({ apiVersion: 1, provider, protocol: 'chat-completions', model: raw }))
+      model.source = provider === 'deepseek' ? 'DeepSeek model catalog metadata' : 'OpenRouter model catalog metadata'
     }
     if (model.conversation === 'unsupported') continue
     models.set(model.id, model)
@@ -199,7 +199,7 @@ export class ModelCatalog implements Catalog {
     // OpenAI visibility is account-specific; never reuse another key's catalog.
     const usable = cached?.fingerprint === fingerprint ? cached : undefined
     if (!refresh && usable && this.now() - usable.at < 15 * 60 * 1000) return this.result(usable.result, 'cached', usable.at)
-    if (provider === 'openai' && !apiKey) throw new ModelCatalogError('Set up OpenAI with /provider before loading its models')
+    if ((provider === 'openai' || provider === 'deepseek') && !apiKey) throw new ModelCatalogError(`Set up ${provider === 'openai' ? 'OpenAI' : 'DeepSeek'} with /provider before loading its models`)
     const controller = new AbortController()
     const abort = (): void => controller.abort()
     signal?.addEventListener('abort', abort, { once: true })

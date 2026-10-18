@@ -48,7 +48,7 @@ test('every actual registered owned tool has an explicit outcome policy, includi
       }
       if (taskMode === 'execute' && notes) {
         const staticNames = set.tools.map(tool => tool.name).filter(name => !mcp.has(name)).sort()
-        assert.deepEqual(staticNames, Object.keys(BUILTIN_TOOL_OUTCOME_POLICIES).filter(name => !mcp.has(name) && (save || name !== 'save_skill')).sort())
+        assert.deepEqual(staticNames, Object.keys(BUILTIN_TOOL_OUTCOME_POLICIES).filter(name => name !== 'web_search' && !mcp.has(name) && (save || name !== 'save_skill')).sort())
         assert(['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template'].every(name => mcp.has(name)))
         assert([...mcp].some(name => !Object.hasOwn(BUILTIN_TOOL_OUTCOME_POLICIES, name)), 'Dynamic remote aliases are covered by owned provenance')
       }

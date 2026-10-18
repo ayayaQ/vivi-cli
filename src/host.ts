@@ -5,6 +5,14 @@ import { PLAN_MODE_GUIDANCE, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentAcceptedUpdate, AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
+import { projectDeepSeekHistory, ProviderRequestError } from '@ayayaq/vivi/providers/deepseek'
+import { createDeepSeekWebProvider } from '@ayayaq/vivi/web/deepseek'
+import { WebProviderError } from '@ayayaq/vivi/web'
+import { createDeepSeekWebExtension, prepareWebSearch, DEEPSEEK_WEB_GUIDANCE, DEEPSEEK_WEB_DISCLOSURE, DEEPSEEK_WEB_LIMITS, DEEPSEEK_WEB_COST } from './web-tools.js'
+import type { CliWebConfiguration } from './web-tools.js'
+import { boundedDeepSeekWebResult } from './web-results.js'
+import { resolvePublicUrlHost, isPublicUrlAddress } from './public-url-transport.js'
+import { isReviewProvider } from './provider-selection.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createQuestionExtension } from '@ayayaq/vivi/extensions/questions'
@@ -47,14 +55,14 @@ import { agentArgumentsDigest } from '@ayayaq/vivi/events'
 import { fetchPublicUrl, preparePublicUrl, publicUrlContainsSecret, PUBLIC_URL_LIMITS } from './public-url.js'
 import type { PublicUrlAdapters } from './public-url.js'
 import { createPublicUrlExtension, PUBLIC_URL_GUIDANCE } from './public-url-tools.js'
-import { cliPublicUrlRecordOutcome, FilePublicUrlOutcomeStore, MAX_PUBLIC_URL_OUTCOME_ROWS, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult, reconcilePublicUrlOutcomes, unresolvedPublicUrlResult, unattemptedPublicUrlResult, validatePublicUrlOutcomes } from './public-url-outcomes.js'
+import { deepSeekWebFailure, cliPublicUrlRecordOutcome, FilePublicUrlOutcomeStore, MAX_PUBLIC_URL_OUTCOME_ROWS, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult, reconcilePublicUrlOutcomes, unresolvedPublicUrlResult, unattemptedPublicUrlResult, validatePublicUrlOutcomes } from './public-url-outcomes.js'
 import type { PublicUrlOutcomeRecord, PublicUrlOutcomeStore } from './public-url-outcomes.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
 const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
 const commandToolNames = new Set<string>(COMMAND_TOOL_NAMES)
 const isMcpTool = (name: string): boolean => name.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template'].includes(name)
-const isPublicUrlTool = (name: string): boolean => name === 'fetch_url' || name.startsWith('public_url_withheld_')
+const isPublicUrlTool = (name: string): boolean => name === 'fetch_url' || name === 'web_search' || name.startsWith('public_url_withheld_')
 const historyUsesPublicUrl = (history: readonly HistoryMessage[]): boolean => history.some(message =>
   message.kind === 'tool_result' && isPublicUrlTool(message.name) || message.kind === 'assistant' && message.toolCalls.some(call => isPublicUrlTool(call.name)))
 const historyUsesMcp = (history: readonly HistoryMessage[]): boolean => history.some(message =>
@@ -169,6 +177,13 @@ function withholdPublicUrlResult<T extends ToolResult>(result: T, secrets: reado
   if (!publicUrlContainsSecret(result.content, secrets)) return result
   let body: Record<string, unknown> = {}
   try { body = JSON.parse(result.content) as Record<string, unknown> } catch { /* Unknown remains unknown. */ }
+  if (body.source === 'web_provider') {
+    const success = body.success === true && body.unknownOutcome !== true && !result.isError
+    const requestState = ['not_started', 'unknown', 'response_received'].includes(String(body.requestState)) ? body.requestState : 'unknown'
+    return { ...result, ...(!success ? { isError: true } : {}), content: JSON.stringify({ success, source: 'web_provider', provider: 'deepseek',
+      untrusted: true, contentWithheld: true, requestState, ...(requestState === 'unknown' ? { unknownOutcome: true } : {}),
+      billing: 'unknown', networkActivity: body.networkActivity === 'not_attempted' ? 'not_attempted' : 'possible', doNotRetry: true, error: { code: 'known_credential', message: 'Web content was withheld because it contains a known credential' } }) }
+  }
   const notAttempted = body.serverEffects === 'not_attempted' && body.unknownOutcome !== true
   const networkActivity = body.networkActivity === 'not_attempted' ? 'not_attempted' : 'possible'
   const succeeded = body.source === 'public_url' && body.success === true && body.unknownOutcome !== true && !result.isError
@@ -285,6 +300,8 @@ export interface CliHostOptions {
   onMcpNotice?(message: string): void
   /** Public-page tools are available only with durable outcome evidence and tool support. */
   enablePublicUrl?: boolean
+  /** Fixed independently selected host web backend. Absence preserves keyless Direct. */
+  web?: CliWebConfiguration
   publicUrlOutcomes?: PublicUrlOutcomeStore
   /** Trusted host fixture dependencies, captured and bound per turn; never model arguments. */
   publicUrlTransport?: Pick<PublicUrlAdapters, 'resolve' | 'request'>
@@ -336,7 +353,9 @@ export class CliHost {
   private controller: AbortController | undefined
   private persistence: Promise<void> = Promise.resolve()
   private enabledMemory: boolean
-  private readonly reviews: AutoReviewController
+  private reviews: AutoReviewController
+  private selectedWeb: CliWebConfiguration
+  private webRevision = randomUUID()
   private selectedTaskMode: TaskMode = 'execute'
   private readonly presentationDecisions: CliToolDecision[] = []
   private readonly toolReceipts = new Map<string, CliToolReceipt>()
@@ -401,6 +420,7 @@ export class CliHost {
   private lastSkillsDiagnostics = ''
   private readonly skillSaveJobs = new Set<Promise<ToolResult>>()
   constructor(private readonly options: CliHostOptions) {
+    this.selectedWeb = options.web ?? { provider: 'direct' }
     this.publicUrlOutcomes = options.publicUrlOutcomes ?? (options.store instanceof FileSessionStore
       ? new FilePublicUrlOutcomeStore(options.store.directory, options.secrets ?? []) : undefined)
     this.mcpOutcomes = options.mcpOutcomes ?? (options.store instanceof FileSessionStore
@@ -408,6 +428,7 @@ export class CliHost {
     this.enabledMemory = options.enableMemory ?? false
     this.enabledSkills = options.enableSkills ?? false
     if (this.enabledSkills && !options.skills) throw new Error('Skills require a host-owned skill store')
+    if (options.decisionReview && this.selectedWeb.provider === 'deepseek') options.decisionReview = { ...options.decisionReview, deepSeekWeb: true }
     this.reviews = new AutoReviewController(options.decisionReview, () => this.options.secrets ?? [],
       (request, signal) => this.approveWithPresentation(request, signal), options.onReviewNotice)
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
@@ -421,7 +442,8 @@ export class CliHost {
     this.questionAccount = options.questionHost?.accountRevision?.()
     this.commandAccount = options.commandApproval?.accountRevision()
     this.commandProposalsEnabled = options.enableCommands !== false
-    if (options.decisionReview && options.decisionReview.provider.id !== this.current.provider) {
+    if (options.decisionReview && (!isReviewProvider(options.decisionReview.provider.id) ||
+      options.decisionReview.provider.id !== this.current.provider && options.decisionReview.explicitReviewer !== true)) {
       throw new Error('Decision review must use this session’s selected provider; cross-provider review is unavailable')
     }
     this.current.history = withholdRemoteHistory(closeInterruptedHistory(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
@@ -502,10 +524,33 @@ export class CliHost {
   }
   get session(): CliSession { return structuredClone(this.current) }
   get running(): boolean { return this.controller !== undefined }
+  get webProvider(): CliWebConfiguration['provider'] { return this.selectedWeb.provider }
+  get reviewProvider(): 'openai' | 'openrouter' | undefined {
+    const id = this.options.decisionReview?.provider.id
+    return id && isReviewProvider(id) ? id : undefined
+  }
+  /** Explicit host controls only; conversation-local selection never carries old enrollment. */
+  setDecisionReview(config: AutoReviewConfiguration | undefined): void {
+    if (this.running) throw new Error('Wait for the current turn before changing reviewer')
+    if (config && (!isReviewProvider(config.provider.id) || config.provider.id !== this.current.provider && config.explicitReviewer !== true)) throw new Error('Choose an explicit supported reviewer')
+    if (config) this.options.decisionReview = { ...config, ...(this.selectedWeb.provider === 'deepseek' ? { deepSeekWeb: true as const } : {}) }
+    else delete this.options.decisionReview
+    this.reviews = new AutoReviewController(this.options.decisionReview, () => this.options.secrets ?? [],
+      (request, signal) => this.approveWithPresentation(request, signal), this.options.onReviewNotice)
+  }
+  setWebConfiguration(config: CliWebConfiguration): void {
+    if (this.running) throw new Error('Wait for the current turn before changing web provider')
+    this.selectedWeb = config; this.webRevision = randomUUID(); this.invalidateContext()
+    const review = this.options.decisionReview
+    if (review) {
+      const { deepSeekWeb: _old, ...rest } = review
+      this.setDecisionReview({ ...rest, ...(config.provider === 'deepseek' ? { deepSeekWeb: true as const } : {}) })
+    } else this.reviews.setMode('manual')
+  }
   get approvalMode(): ApprovalMode { return this.reviews.mode }
   get taskMode(): TaskMode { return this.selectedTaskMode }
   get approvalEnrollmentBinding(): string {
-    return reviewDigest({ sessionId: this.current.id, provider: this.current.provider, taskMode: this.taskMode, enrollmentBinding: this.reviews.enrollmentBinding })
+    return reviewDigest({ ...(this.selectedWeb.provider === 'deepseek' ? { webRevision: this.webRevision } : {}), sessionId: this.current.id, provider: this.current.provider, taskMode: this.taskMode, enrollmentBinding: this.reviews.enrollmentBinding })
   }
   setApprovalMode(mode: ApprovalMode): void {
     if (this.running) throw new Error('Wait for the current turn before changing approval mode')
@@ -1245,7 +1290,7 @@ export class CliHost {
     let admissionGuard: (() => void) | undefined, admittedOrigin: string | undefined, approvals = 0
     let row: PublicUrlOutcomeRecord | undefined
     const owned = (): boolean => !this.shutdownStarted && this.controller?.signal === ownerSignal &&
-      this.toolsetRevision === toolset && this.options.enableTools !== false && this.options.enablePublicUrl !== false &&
+      this.toolsetRevision === toolset && this.options.enableTools !== false && this.options.enablePublicUrl !== false && this.selectedWeb.provider === 'direct' &&
       this.options.store === store && this.options.publicUrlOutcomes === explicitSink &&
       this.options.publicUrlTransport === transport && transport?.resolve === resolve && transport?.request === request &&
       reviewDigest(callReference) === callDigest
@@ -1330,6 +1375,129 @@ export class CliHost {
     const safe = withholdPublicUrlResult(outcome, this.options.secrets ?? [])
     const outcomeRow = row ? this.publicUrlRows.get(row.id) : undefined
     return this.observeToolReceipt(call, safe, outcomeRow ? cliPublicUrlRecordOutcome(outcomeRow)
+      : { status: signal.aborted ? 'cancelled' : 'failed', effect: 'not_attempted' }, 'public-url', ownerSignal)
+  }
+  private executeDeepSeekWeb(call: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
+    const job = this.performDeepSeekWeb(call, signal, ownerSignal)
+    this.publicUrlJobs.add(job)
+    void job.then(() => this.publicUrlJobs.delete(job), () => this.publicUrlJobs.delete(job))
+    return job
+  }
+  private async performDeepSeekWeb(callReference: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal): Promise<ToolResult> {
+    const call = structuredClone(callReference), callDigest = reviewDigest(call), toolset = this.toolsetRevision
+    const config = this.selectedWeb, revision = this.webRevision, sink = this.options.publicUrlOutcomes
+    const keyReference = config.provider === 'deepseek' ? config.apiKey : undefined
+    const fetchReference = config.provider === 'deepseek' ? config.fetch : undefined
+    const credentialRevision = config.provider === 'deepseek' ? config.revision : undefined
+    const transportReference = fetchReference ?? globalThis.fetch
+    let didDispatch = false, dispatchBlocked = false
+    const store = this.options.store, resolve = this.options.publicUrlTransport?.resolve ?? resolvePublicUrlHost
+    let row: PublicUrlOutcomeRecord | undefined, admissionGuard: (() => void) | undefined
+    let requestState: 'not_started' | 'unknown' | 'response_received' = 'not_started'
+    let networkActivity: 'not_attempted' | 'possible' = 'not_attempted'
+    let outcome = deepSeekWebFailure('not_started', 'web_blocked')
+    const owned = (): boolean => !this.shutdownStarted && this.controller?.signal === ownerSignal &&
+      this.toolsetRevision === toolset && this.taskMode !== 'plan' && this.options.enableTools !== false &&
+      this.options.enablePublicUrl !== false && this.selectedWeb === config && this.webRevision === revision &&
+      config.provider === 'deepseek' && config.apiKey === keyReference && config.fetch === fetchReference && config.revision === credentialRevision &&
+      this.options.publicUrlOutcomes === sink && this.options.store === store &&
+      (this.options.publicUrlTransport?.resolve ?? resolvePublicUrlHost) === resolve && reviewDigest(callReference) === callDigest
+    const assertOwned = (): void => {
+      signal.throwIfAborted(); ownerSignal.throwIfAborted()
+      if (!owned()) throw new Error('Web request became stale')
+      if (publicUrlContainsSecret(call, this.options.secrets ?? [])) throw new Error('Web request contains a known credential')
+    }
+    try {
+      assertOwned()
+      if (config.provider !== 'deepseek' || !this.publicUrlOutcomes || this.publicUrlRows.size >= MAX_PUBLIC_URL_OUTCOME_ROWS) throw new Error('Web outcome storage unavailable')
+      const operation = call.name === 'web_search' ? 'search' : 'fetch'
+      const preparedUrl = operation === 'fetch' ? preparePublicUrl(call.arguments.url, this.options.secrets ?? []) : undefined
+      if (operation === 'fetch' && (call.name !== 'fetch_url' || Object.keys(call.arguments).length !== 1)) throw new Error('Invalid web fetch')
+      const request = operation === 'search' ? prepareWebSearch(call.arguments) : { url: preparedUrl!.url }
+      const identity = reviewDigest({ provider: 'deepseek', operation, request })
+      if (this.publicUrlAttempted.has(identity)) { outcome = deepSeekWebFailure('not_started', 'web_retry_blocked'); throw new Error('Already attempted') }
+      const endpoint = `https://api.deepseek.com/v1/tools/${operation}`
+      const affectedData = { provider: 'deepseek', operation, endpoint, method: 'POST', request,
+        limits: { ...DEEPSEEK_WEB_LIMITS }, cost: DEEPSEEK_WEB_COST,
+        transmits: 'Exact query/count/includeContent or full requested URL/path/query to DeepSeek; API/network metadata; fetch DNS hostname to local resolvers',
+        originalQuestion: false, localizationIp: false, fallback: false, automaticRetry: false, maxApiCalls: 1,
+        originalWebsiteStatus: 'unverified', remoteRedirects: 'not independently verifiable' }
+      const resourceId = `cli-deepseek-web:${revision}:${identity}`
+      const action = (): PreparedActionMetadata => ({ complete: true, effects: [{ kind: 'external', resourceId,
+        scope: 'external', affectedData, review: 'model-review' }] })
+      const revisions = (): JsonObject => { assertOwned(); return { [resourceId]: identity, sessionId: this.current.id, toolsetRevision: toolset,
+        webRevision: revision, credentialRevision: config.revision, requestDigest: identity, callDigest,
+        limitsDigest: reviewDigest(DEEPSEEK_WEB_LIMITS), policyRevision: 'vivi-cli-deepseek-web-v1' } }
+      row = { id: randomUUID(), sessionId: this.current.id, runId: toolset, callId: call.id, toolName: call.name,
+        callDigest: mcpDigest(call), bindingDigest: reviewDigest({ affectedData, revisions: revisions() }), webProvider: 'deepseek', state: 'accepted' }
+      this.publicUrlCalls.set(row.id, call); this.publicUrlRows.set(row.id, row)
+      // This row prevents replay across interruption without granting permission to send.
+      await this.persistPublicUrlOutcomes(assertOwned)
+      this.publicUrlAttempted.add(identity)
+      const guardedFetch: typeof fetch = (input, init) => {
+        try {
+          init?.signal?.throwIfAborted(); assertOwned()
+          if (!admissionGuard || didDispatch || input !== endpoint || init?.method !== 'POST') throw new Error('Web transport admission is unavailable')
+          admissionGuard()
+        } catch { dispatchBlocked = true; throw new Error('Host blocked the web request before transport invocation') }
+        // No await or user callback may separate the final guard from actual dispatch.
+        didDispatch = true; networkActivity = 'possible'
+        return transportReference(input, init)
+      }
+      const web = createDeepSeekWebProvider({ apiKey: config.apiKey, fetch: guardedFetch,
+        timeoutMs: DEEPSEEK_WEB_LIMITS.milliseconds, maxResponseBytes: DEEPSEEK_WEB_LIMITS.responseBytes,
+        maxContentChars: DEEPSEEK_WEB_LIMITS.contentChars,
+        beforeRequest: async (intent, requestSignal) => {
+          requestSignal.throwIfAborted(); assertOwned()
+          if (reviewDigest(intent) !== identity) throw new Error('Web request changed')
+          const allowed = await this.reviews.execute({ approval: { call, currentRevision: identity,
+            description: `${operation === 'search' ? 'Search with DeepSeek' : 'Fetch through DeepSeek'}: ${JSON.stringify(request)}\n` +
+              `API destination: ${endpoint} (POST)\n${DEEPSEEK_WEB_DISCLOSURE}\n` +
+              'Limits: 60 seconds, 2 MiB API response, 8,000 content characters per item and 64 KiB complete tool result. Fetch checks the requested public hostname locally; remote DNS and redirects cannot be verified.' },
+            operationLabel: 'web request', eligible: true, inputData: affectedData, resourceRevisions: revisions(),
+            currentResourceRevisions: revisions, preparedAction: action(), currentPreparedAction: action, isActive: owned },
+            requestSignal, async assertCurrent => { assertCurrent(); assertOwned(); admissionGuard = assertCurrent; return true })
+          if (allowed !== true || !admissionGuard) { outcome = deepSeekWebFailure('not_started', 'approval_denied'); throw new Error('Web request not approved') }
+          requestSignal.throwIfAborted(); assertOwned(); admissionGuard()
+          if (preparedUrl) {
+            const exact = preparePublicUrl(preparedUrl.url, this.options.secrets ?? [])
+            networkActivity = 'possible'
+            const addresses = await resolve(exact.hostname, requestSignal, () => { assertOwned(); admissionGuard!() })
+            requestSignal.throwIfAborted(); assertOwned(); admissionGuard()
+            if (!addresses.length || addresses.length > PUBLIC_URL_LIMITS.addresses || addresses.some(address => !isPublicUrlAddress(address))) throw new Error('Web target is not public')
+          }
+          this.publicUrlRows.set(row!.id, { ...row!, state: 'intent' })
+          await this.persistPublicUrlOutcomes(() => { requestSignal.throwIfAborted(); assertOwned(); admissionGuard!() })
+          requestSignal.throwIfAborted(); assertOwned(); admissionGuard()
+          this.publicUrlAttempted.add(identity)
+        }
+      })
+      const response = operation === 'search' ? await web.search(prepareWebSearch(call.arguments), signal)
+        : await web.fetch({ url: preparedUrl!.url }, signal)
+      requestState = 'response_received'
+      // Screen the complete normalized response before local clipping, including URLs and metadata.
+      assertOwned()
+      if (publicUrlContainsSecret(response, this.options.secrets ?? [])) throw new Error('Web response contains a known credential')
+      outcome = { content: boundedDeepSeekWebResult(response) }
+    } catch (error) {
+      if (dispatchBlocked && !didDispatch) {
+        requestState = 'not_started'
+        outcome = deepSeekWebFailure(requestState, signal.aborted || ownerSignal.aborted ? 'cancelled' : 'web_stale_before_dispatch', undefined, networkActivity)
+      } else if (error instanceof WebProviderError) {
+        requestState = error.requestState
+        if (!outcome.content.includes('approval_denied')) outcome = deepSeekWebFailure(requestState, error.code, error.apiStatus, networkActivity)
+      } else if (!outcome.content.includes('web_retry_blocked') && !outcome.content.includes('approval_denied')) {
+        outcome = deepSeekWebFailure(requestState === 'response_received' ? requestState
+          : row && this.publicUrlRows.get(row.id)?.state === 'intent' ? 'unknown' : 'not_started',
+          signal.aborted || ownerSignal.aborted ? 'cancelled' : 'web_blocked', undefined, networkActivity)
+      }
+    }
+    const safe = withholdPublicUrlResult(outcome, this.options.secrets ?? [])
+    if (row) {
+      this.publicUrlRows.set(row.id, { ...row, state: 'settled', result: safe })
+      try { await this.persistPublicUrlOutcomes() } catch { /* Prior durable intent survives; never replay. */ }
+    }
+    return this.observeToolReceipt(call, safe, row ? cliPublicUrlRecordOutcome(this.publicUrlRows.get(row.id)!)
       : { status: signal.aborted ? 'cancelled' : 'failed', effect: 'not_attempted' }, 'public-url', ownerSignal)
   }
   private async recordContextSummaryUsage(usage?: Usage, previouslyUnreported?: boolean): Promise<void> {
@@ -1617,8 +1785,10 @@ export class CliHost {
         skills = { ...skills, tools: skills.tools.map(tool => tool.definition.name === 'save_skill'
           ? { ...tool, execute: (call, { signal }) => this.executeSkillSave(call, signal, controller.signal, catalog) } : tool) }
       }
-      const publicUrl = taskMode !== 'plan' && enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes
-        ? createPublicUrlExtension((call, signal) => this.executePublicUrl(call, signal, controller.signal)) : undefined
+      const publicUrl = taskMode !== 'plan' && enableTools && this.options.enablePublicUrl !== false && this.publicUrlOutcomes && this.selectedWeb.provider !== 'disabled'
+        ? this.selectedWeb.provider === 'deepseek'
+          ? createDeepSeekWebExtension((call, signal) => this.executeDeepSeekWeb(call, signal, controller.signal))
+          : createPublicUrlExtension((call, signal) => this.executePublicUrl(call, signal, controller.signal)) : undefined
       const setup = enableTools ? this.options.mcpSetup : undefined
       const setupService = setup?.service, setupList = setupService?.listLocal, setupExecute = setupService?.executeSetup
       const setupManager = setupService?.manager, setupIo = setup?.io, setupRemoteManager = this.options.mcp
@@ -1658,7 +1828,7 @@ export class CliHost {
       const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode, questions, mcpSetup)
       if (questions) prefix.push({ kind: 'message', role: 'system', content: QUESTION_GUIDANCE })
       const allowedTools = new Set(enableTools ? toolset.tools.map(tool => tool.name) : [])
-      if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: PUBLIC_URL_GUIDANCE })
+      if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: this.selectedWeb.provider === 'deepseek' ? DEEPSEEK_WEB_GUIDANCE : PUBLIC_URL_GUIDANCE })
       owner.defer(() => toolset.dispose())
       const ownedMcpNames = new Set(mcp?.tools.map(tool => tool.definition.name).filter(name => name !== 'list_mcp_resources') ?? [])
       const outcomeMcpNames = new Set([...ownedMcpNames, ...(taskMode !== 'plan' && mcpSetup?.tools.some(tool => tool.definition.name === 'mcp_setup') ? ['mcp_setup'] : [])])
@@ -1686,9 +1856,18 @@ export class CliHost {
       if (commands) prefix.push({ kind: 'message', role: 'system', content: COMMAND_GUIDANCE })
       if (taskMode === 'plan') prefix.push({ kind: 'message', role: 'system', content: PLAN_MODE_GUIDANCE })
       const generate = this.options.provider.generate.bind(this.options.provider)
+      let deepSeekHistoryUnsupported = false
+      const historyHelp = 'This DeepSeek conversation has unsupported imported or inconsistent native reasoning/tool history. Use /new to start fresh; the existing transcript is retained. Do not retry this request or silently drop history.'
+      const preflightDeepSeek = (input: Parameters<ModelProvider['generate']>[0]): void => {
+        if (this.current.provider !== 'deepseek') return
+        try { projectDeepSeekHistory(input.messages, this.current.model, { tools: Boolean(input.tools?.length), thinking: this.current.reasoning !== 'none' }) }
+        catch (error) { if (error instanceof ProviderRequestError && error.code === 'configuration') deepSeekHistoryUnsupported = true; throw error }
+      }
+      const estimator = this.options.provider.estimateContext?.bind(this.options.provider)
       const guardedProvider: ModelProvider = {
-        ...(this.options.provider.estimateContext ? { estimateContext: this.options.provider.estimateContext.bind(this.options.provider) } : {}),
+        ...(estimator ? { estimateContext: (input: Parameters<NonNullable<ModelProvider['estimateContext']>>[0]) => { preflightDeepSeek(input); return estimator(input) } } : {}),
         generate: async (input, signal, options) => {
+          preflightDeepSeek(input)
           // A checkpoint, approval or prior round may register a new credential
           // after the turn snapshot loaded. Reject it immediately before every
           // provider request, without silently rewriting approved context.
@@ -1817,7 +1996,7 @@ export class CliHost {
           } }
         let prepared
         try { prepared = operation === 'compact' ? await compactContext(input) : measureContext(input) }
-        catch (error) { acknowledgedEventError = eventFailures[0] === error; throw error }
+        catch (error) { acknowledgedEventError = eventFailures[0] === error; if (deepSeekHistoryUnsupported) throw new Error(historyHelp); throw error }
         this.measuredContext = { ...prepared.usage }
         this.compactEligible = prepared.canCompact
         return { status: 'completed', history: structuredClone(this.current.history), content: '', rounds: 0,
@@ -1905,6 +2084,7 @@ export class CliHost {
           } else if (policy === 'public-url') {
             const row = this.safePublicUrlRows().find(item => publicUrlOutcomeMatchesCall(item, call))
             if (row) outcome = cliPublicUrlRecordOutcome(row)
+            else if (!this.toolReceipts.has(reviewDigest(call))) outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
           } else if (policy === 'mcp') {
             const row = this.safeMcpRows().find(item => mcpOutcomeMatchesCall(item, call))
             if (row) outcome = cliMcpRecordOutcome(row)
@@ -2048,7 +2228,8 @@ export class CliHost {
           canonicalCalls.has(message.callId) && mcpDigest(call) === mcpDigest(canonicalCalls.get(message.callId)))
         return captured ? { kind: 'tool_result', callId: message.callId, name: message.name, ...unattemptedMcpResult() } : message
       })
-      const canonicalResult = { ...result, history: terminalHistory }
+      const canonicalResult = { ...result, history: terminalHistory,
+        ...(deepSeekHistoryUnsupported && result.error ? { error: { ...result.error, message: historyHelp } } : {}) }
       this.current.history = canonicalResult.history
       // Reconcile from the original baseline, never add final usage to event sums.
       // A cancelled/unaccepted response contributes no round and preserves prior metrics.

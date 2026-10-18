@@ -48,7 +48,7 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
+    '/provider', '/web', '/reviewer', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])

@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.14.0'
-const coreIntegrity = 'sha512-OOGqb3Qeue58C5u/eGPRHJ5qLDsCLB6LXQgNTk0mY99uT1y2GRuqvFiXSxlDigYjjWanayP/8kxfiMZvrw7Rzw=='
+const coreVersion = '0.15.0'
+const coreIntegrity = 'sha512-EmLEBhSxuFqw4ue98xJDGc+MAzNi/blaF3kR1B+iASF7khXYAej91aNhdazCA3rP8rVG0W35St/2Ze1e4CJF6Q=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.14.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.15.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -106,6 +106,10 @@ try {
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',
     'src/windows-input.ts', 'dist/windows-input.js', 'dist/windows-input.d.ts',
+    'src/provider-selection.ts', 'dist/provider-selection.js', 'dist/provider-selection.d.ts',
+    'src/key-controls.ts', 'dist/key-controls.js', 'dist/key-controls.d.ts',
+    'src/web-tools.ts', 'dist/web-tools.js', 'dist/web-tools.d.ts',
+    'src/web-results.ts', 'dist/web-results.js', 'dist/web-results.d.ts',
     'src/questions.ts', 'dist/questions.js', 'dist/questions.d.ts',
     'src/input-queue.ts', 'dist/input-queue.js', 'dist/input-queue.d.ts']) assert(paths.has(path), `Missing ${path}`)
   for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'http-transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes', 'templates']) {
@@ -136,7 +140,11 @@ try {
     'src/presentation.ts', 'dist/presentation.js', 'dist/presentation.d.ts', 'dist/cjs/presentation.js',
     'dist/cjs/presentation.d.ts', 'docs/TOOL_PRESENTATION.md', 'examples/tool-presentation.mjs',
     'src/index.ts', 'src/run-agent.ts', 'src/history.ts', 'src/providers/openai.ts',
-    'src/providers/openrouter.ts', 'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
+    'src/providers/openrouter.ts', 'src/providers/deepseek.ts', 'src/web.ts', 'src/web/deepseek.ts', 'docs/WEB.md', 'docs/DEEPSEEK.md',
+    'dist/providers/deepseek.js', 'dist/providers/deepseek.d.ts', 'dist/cjs/providers/deepseek.js', 'dist/cjs/providers/deepseek.d.ts',
+    'dist/web.js', 'dist/web.d.ts', 'dist/cjs/web.js', 'dist/cjs/web.d.ts',
+    'dist/web/deepseek.js', 'dist/web/deepseek.d.ts', 'dist/cjs/web/deepseek.js', 'dist/cjs/web/deepseek.d.ts',
+    'dist/index.js', 'dist/index.d.ts', 'dist/cjs/index.js']) {
     assert(paths.has(`${corePath}/${path}`), `Missing bundled shared core ${path}`)
   }
   assert.deepEqual(packed.bundled.sort(), [coreName, 'yaml'].sort(), 'Shared core and its exact transitive YAML dependency must remain bundled')
@@ -234,6 +242,9 @@ import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContex
 import { parseSkillDocument, skillCreatorSource } from '@ayayaq/vivi/extensions/skills'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
+import { createDeepSeekProvider, projectDeepSeekHistory } from '@ayayaq/vivi/providers/deepseek'
+import { WebProviderError } from '@ayayaq/vivi/web'
+import { createDeepSeekWebProvider } from '@ayayaq/vivi/web/deepseek'
 import { normalizeModelCapabilities, reasoningSelectionSupport } from '@ayayaq/vivi/providers/models'
 import { createDecisionRequest, evaluateDecision, isDecisionCurrent, createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
 import { parseModelCatalog, documentedOpenAIModel } from './dist/models.js'
@@ -629,6 +640,39 @@ try {
   })) })
   assert.equal((await openai.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenAI shared')
   assert.equal((await router.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenRouter shared')
+  const require = createRequire(import.meta.url)
+  for (const module of [{ createDeepSeekProvider, projectDeepSeekHistory }, require('@ayayaq/vivi/providers/deepseek')]) {
+    const deepseek = module.createDeepSeekProvider({ model: 'deepseek-flash', apiKey: 'packed-chat-fixture', fetch: async (input, init) => {
+      assert.equal(String(input), 'https://api.deepseek.com/chat/completions')
+      assert.equal(init.headers.Authorization, 'Bearer packed-chat-fixture')
+      return new Response(JSON.stringify({ model: 'deepseek-flash', choices: [{ finish_reason: 'stop',
+        message: { role: 'assistant', content: 'DeepSeek shared', reasoning_content: 'Packed native reasoning' } }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5, prompt_cache_hit_tokens: 1 } }))
+    } })
+    const result = await deepseek.generate({ messages: [], tools: [] }, new AbortController().signal)
+    assert.equal(result.content, 'DeepSeek shared'); assert.equal(result.providerState.provider, 'deepseek:deepseek-flash')
+    assert.equal(result.usage.cachedInputTokens, 1)
+    assert.equal(module.projectDeepSeekHistory([{ kind: 'assistant', ...result }], 'deepseek-flash', { tools: true })[0].reasoning_content, 'Packed native reasoning')
+  }
+  for (const module of [{ createDeepSeekWebProvider, WebProviderError }, { ...require('@ayayaq/vivi/web/deepseek'), ...require('@ayayaq/vivi/web') }]) {
+    const intents = [], sends = []
+    const web = module.createDeepSeekWebProvider({ apiKey: 'packed-web-fixture', beforeRequest: intent => { intents.push(intent) }, fetch: async (input, init) => {
+      sends.push({ input, request: JSON.parse(init.body) })
+      assert.equal(init.headers.Authorization, 'Bearer packed-web-fixture')
+      return new Response(JSON.stringify(String(input).endsWith('/search')
+        ? { results: [{ title: 'Packed source', url: 'https://example.com/source', snippet: 'Packed snippet', summary: 'Packed summary', content: '' }] }
+        : { title: 'Packed page', content: 'Packed untrusted content' }))
+    } })
+    const searched = await web.search({ query: 'packed public query', count: 1 })
+    const fetched = await web.fetch({ url: 'https://example.com/source' })
+    assert.equal(searched.results[0].url, 'https://example.com/source'); assert.equal(searched.provenance.untrusted, true)
+    assert.equal(fetched.requestedUrl, 'https://example.com/source'); assert.equal(fetched.contentMarkdown, 'Packed untrusted content')
+    assert.deepEqual(sends.map(row => String(row.input)), ['https://api.deepseek.com/v1/tools/search', 'https://api.deepseek.com/v1/tools/fetch'])
+    assert.equal(intents.length, 2); assert.equal(intents[0].request.query, 'packed public query'); assert(Object.isFrozen(intents[0]))
+    const error = new module.WebProviderError('deepseek', 'preflight', 'Packed veto')
+    assert.equal(error.requestState, 'not_started')
+  }
+
 } finally { await mcp.close(); await rm(directory, { recursive: true, force: true }) }
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
@@ -637,6 +681,10 @@ import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSk
   type SessionPersistence, type ApprovalRequest, type TaskMode, type ConversationMode, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
 import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
+import { createDeepSeekProvider, projectDeepSeekHistory } from '@ayayaq/vivi/providers/deepseek'
+import { createDeepSeekWebProvider } from '@ayayaq/vivi/web/deepseek'
+import { WebProviderError, type WebProvider, type WebRequestIntent } from '@ayayaq/vivi/web'
+import type { CliWebConfiguration } from '@ayayaq/vivi-cli'
 import type { ToolExtension } from '@ayayaq/vivi/extensions'
 import { createQuestionExtension, QUESTION_LIMITS, type Question, type QuestionOption, type QuestionRequest, type QuestionHost, type QuestionResponse, type QuestionAnswer, type QuestionAnswerEntry } from '@ayayaq/vivi/extensions/questions'
 import { parseSkillDocument, type SkillCatalog } from '@ayayaq/vivi/extensions/skills'
@@ -644,6 +692,13 @@ import { normalizeModelCapabilities, reasoningSelectionSupport, type ModelCapabi
 const capabilities: ModelCapabilities = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: 'gpt-5.1' } })
 const selection: Capability = reasoningSelectionSupport(capabilities, { mode: 'disabled' })
 const provider: ModelProvider = createOpenAIProvider({ model: 'fake', apiKey: 'fake' })
+const deepseekProvider: ModelProvider = createDeepSeekProvider({ model: 'deepseek-flash', apiKey: 'fake' })
+const webProvider: WebProvider = createDeepSeekWebProvider({ apiKey: 'fake', beforeRequest(intent: WebRequestIntent) { void intent } })
+const webConfiguration: CliWebConfiguration = { provider: 'deepseek', revision: 'types-only', apiKey: () => 'fake' }
+const deepseekSession: CliSession = newSession({ provider: 'deepseek', model: 'deepseek-flash' })
+const nativeProjection = projectDeepSeekHistory(deepseekSession.history, deepseekSession.model, { tools: true })
+const webError: WebProviderError = new WebProviderError('deepseek', 'preflight', 'Types only')
+void deepseekProvider; void webProvider; void webConfiguration; void nativeProjection; void webError
 const session: CliSession = newSession({ provider: 'openai', model: 'fake' })
 session.usage = { inputTokens: 3, outputTokens: 2, totalTokens: 7, cachedInputTokens: 0, cacheWriteInputTokens: 0 }
 const usageText: string = formatUsage(aggregateUsage([session.usage, undefined]))

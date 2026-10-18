@@ -25,7 +25,7 @@ export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
   workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
   workspace_create_text: 'local-mutation', workspace_edit_text: 'local-mutation',
   list_skills: 'local-read', read_skill: 'local-read', save_skill: 'local-mutation', request_user_input: 'local-read',
-  command_start: 'command', command_poll: 'command', command_stop: 'command', fetch_url: 'public-url',
+  command_start: 'command', command_poll: 'command', command_stop: 'command', fetch_url: 'public-url', web_search: 'public-url',
   mcp_list: 'local-read', mcp_setup: 'mcp', list_mcp_resources: 'local-read', read_mcp_resource: 'mcp', read_mcp_resource_template: 'mcp'
 } as const satisfies Record<string, CliToolOutcomePolicy>)
 export function builtinToolOutcomePolicy(name: string): CliToolOutcomePolicy | undefined {
@@ -80,7 +80,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
   if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
   const scope = createExtensionScope({
     reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
-      PUBLIC_URL_TOOL_NAME, QUESTION_TOOL_NAME, ...MCP_SETUP_TOOL_NAMES, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
+      PUBLIC_URL_TOOL_NAME, 'web_search', QUESTION_TOOL_NAME, ...MCP_SETUP_TOOL_NAMES, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
   // imports cannot claim a memory name, even while the feature is disabled.

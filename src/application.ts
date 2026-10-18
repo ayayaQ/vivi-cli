@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+import { chooseSecureKey } from './key-controls.js'
+import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
+import type { CliWebConfiguration } from './web-tools.js'
 import type { ModelProvider } from '@ayayaq/vivi'
 import { randomUUID } from 'node:crypto'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
+import { providerEnvironmentName, isReviewProvider } from './provider-selection.js'
 import type { CliOptions } from './main.js'
 import { decisionProviderForSession, deferredDecisionProvider } from './main.js'
 import { CliHost } from './host.js'
@@ -63,7 +67,7 @@ export interface ApplicationOptions {
 }
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
   reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
-const envName = (provider: CliProviderName): string => provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'
+const envName = providerEnvironmentName
 
 export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPreferences {
   const same = base.model === model.id
@@ -85,7 +89,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
   return selected === undefined ? undefined : { ...base, reasoning: selected }
 }
 const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
-/provider sets up an OpenAI or OpenRouter key; /models opens the model picker; /effort selects supported reasoning.
+/provider sets up an OpenAI, OpenRouter or DeepSeek chat key; /web independently selects Direct, DeepSeek or Disabled; /reviewer explicitly selects this conversation’s supported Auto reviewer; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /notes changes the session-note default for new conversations.
 /memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
@@ -189,6 +193,12 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         savedSettings.model === settings.model && !savedSettings.enableTools && !args.includes('--tools')) settings.enableTools = false
     }
   }
+  if (options.webProvider !== undefined) settings.webProvider = options.webProvider
+  let webKey = env.DEEPSEEK_WEB_API_KEY
+  let webGeneration = randomUUID()
+  let reviewerGeneration = randomUUID()
+  // Explicit reviewer credentials are launch-owned and never replace chat env state.
+  const reviewerKeys = new Map<'openai' | 'openrouter', string>()
   const declaredToolTarget = { provider: settings.provider, model: settings.model }
   let host: CliHost | undefined
   // Opaque launch-owned revisions never expose, derive from or persist credentials.
@@ -234,7 +244,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   // Hydrate it before the first fresh host, just as /models does before /new.
   // Already-selected models in this launch need no second discovery request.
   const hydrateModel = async (): Promise<string | false | undefined> => {
-    if (settings.provider !== 'openrouter' || knownModels.has(modelKey(settings.provider, settings.model))) return
+    if (settings.provider === 'openai' || knownModels.has(modelKey(settings.provider, settings.model))) return
     const key = await loadKey(settings.provider)
     const controller = new AbortController()
     const dispose = io.onCancel(() => controller.abort())
@@ -275,8 +285,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const setupProvider = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
     const provider = await io.choose('Provider', [
       { name: 'OpenAI', description: 'Responses API', value: 'openai' as const },
-      { name: 'OpenRouter', description: 'Chat Completions gateway', value: 'openrouter' as const }
-    ], base.provider === 'openrouter' ? 1 : 0)
+      { name: 'OpenRouter', description: 'Chat Completions gateway', value: 'openrouter' as const },
+      { name: 'DeepSeek', description: 'Native Chat Completions; separate from web', value: 'deepseek' as const }
+    ], ['openai', 'openrouter', 'deepseek'].indexOf(base.provider))
     if (!provider || io.isClosed) return
     const current = await loadKey(provider)
     if (io.isClosed) return
@@ -387,7 +398,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   }
   const save = async (next: TuiPreferences, changed: { notes?: boolean; memory?: boolean } = {}): Promise<void> => {
     // Active model controls must preserve independently chosen future-only defaults.
-    const defaults = { ...next, enableNotes: changed.notes ? next.enableNotes : settings.enableNotes,
+    const defaults = { ...next, ...(settings.webProvider ? { webProvider: settings.webProvider } : {}), enableNotes: changed.notes ? next.enableNotes : settings.enableNotes,
       enableMemory: changed.memory ? next.enableMemory : settings.enableMemory }
     await preferences.save(defaults); settings = defaults
   }
@@ -402,6 +413,73 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       // /models can continue setup without a wizard loop or storing credentials.
       await save(configured); io.setDraft?.(configured.provider)
     }
+  }
+  const webConfiguration = async (): Promise<CliWebConfiguration> => {
+    const provider = settings.webProvider ?? 'direct'
+    if (provider !== 'deepseek') return { provider }
+    if (!webKey) {
+      try { webKey = await credentials.load('deepseek-web'); if (webKey) register(webKey) }
+      catch (error) { report(error) }
+    }
+    const key = webKey, revision = webGeneration
+    return { provider: 'deepseek', revision, apiKey: () => {
+      if (!key) throw new Error('Configure a separate DeepSeek web key with /web')
+      return key
+    } }
+  }
+  const configureWeb = async (): Promise<void> => {
+    const provider = await io.choose('Web provider · independent of chat', [
+      { name: 'Direct', description: 'Keyless public HTTPS fetch; no search or JavaScript', value: 'direct' as const },
+      { name: 'DeepSeek', description: 'Paid search and fetch with a separate key and disclosure', value: 'deepseek' as const },
+      { name: 'Disabled', description: 'No web tools', value: 'disabled' as const }
+    ], ['direct', 'deepseek', 'disabled'].indexOf(settings.webProvider ?? 'direct'))
+    if (!provider || io.isClosed) return
+    if (provider === 'deepseek') {
+      io.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
+      // Deliberate paid-provider opt-in is separate from each Manual/Auto request approval.
+      const use = await io.choose('Enable paid DeepSeek web?', [
+        { name: 'Cancel', value: false }, { name: 'Configure DeepSeek web', description: 'Separate from chat; each request follows the selected review mode', value: true }
+      ])
+      if (!use || io.isClosed) return
+      if (!webKey) { try { webKey = await credentials.load('deepseek-web'); if (webKey) register(webKey) } catch (error) { report(error) } }
+      const key = await chooseSecureKey(io, credentials, { slot: 'deepseek-web', title: 'DeepSeek web',
+        ...(webKey ? { current: webKey } : {}),
+        ...(env.DEEPSEEK_API_KEY ? { reuse: { label: 'Reuse my DeepSeek chat key for web', key: env.DEEPSEEK_API_KEY } } : {}), register })
+      if (!key || io.isClosed) return
+      webKey = key; webGeneration = randomUUID()
+    }
+    await preferences.save({ ...settings, webProvider: provider })
+    settings = { ...settings, webProvider: provider }
+    host?.setWebConfiguration(await webConfiguration())
+    io.setApprovalMode?.('manual'); io.setContext?.(undefined, false)
+    io.write(`Web provider: ${provider}. Auto enrollment revoked; chat provider is ${host?.session.provider ?? settings.provider}.\n`)
+  }
+  const configureReviewer = async (): Promise<boolean> => {
+    if (!host) { io.write('Choose a chat model before selecting this conversation’s reviewer\n'); return false }
+    const provider = await io.choose('Auto reviewer · this conversation only', [
+      { name: 'None', description: 'Manual and Plan remain available', value: 'none' as const },
+      { name: 'OpenAI', description: 'Fixed gpt-6-luna review model; explicit account selection', value: 'openai' as const },
+      { name: 'OpenRouter', description: 'Fixed typesafe/jev-1.13 reviewer; sends data to OpenRouter and TypeSafe', value: 'openrouter' as const }
+    ], host.reviewProvider === 'openai' ? 1 : host.reviewProvider === 'openrouter' ? 2 : 0)
+    if (!provider || io.isClosed) return false
+    if (provider === 'none') { host.setDecisionReview(undefined); io.setApprovalMode?.('manual'); io.write('Auto reviewer: none\n'); return false }
+    const reviewerKey = reviewerKeys.get(provider)
+    const current = reviewerKey ?? await loadKey(provider)
+    const key = await chooseSecureKey(io, credentials, { slot: provider, title: `${provider} reviewer`,
+      ...(current ? { current, currentDescription: reviewerKey ? 'Explicit reviewer key selected during this launch' : 'Existing environment or OS provider key; explicitly choose it for review' } : {}),
+      storageDescription: 'Replaces this provider’s saved OS key and may change future chat launches; never plaintext settings', register })
+    if (!key || io.isClosed) return false
+    reviewerKeys.set(provider, key)
+    reviewerGeneration = randomUUID()
+    const generation = reviewerGeneration, selectedHost = host
+    const reviewEnv = { ...env, [envName(provider)]: key }
+    const reviewSession = { ...host.session, provider }
+    host.setDecisionReview({ provider: deferredDecisionProvider(reviewSession, reviewEnv, input.decisionProviderFactory ?? decisionProviderForSession),
+      explicitReviewer: true, ledger: decisions, canAutoReview: io.canAutoReview === true,
+      accountRevision: () => generation, isAvailable: () => io.canAutoReview === true && !io.isClosed && host === selectedHost && reviewerGeneration === generation })
+    io.setApprovalMode?.('manual')
+    io.write(`Auto reviewer: ${provider}, this conversation only. Use /mode for fresh enrollment.\n`)
+    return true
   }
   const configureNotes = async (): Promise<void> => {
     const enableNotes = await io.choose('Session notes · new-conversation default', [
@@ -577,9 +655,12 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
       if (io.isClosed) { await discardCandidate(); return false }
+      const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
+      if (options.reviewer && selectedReviewer) await loadKey(selectedReviewer)
       const provider = providerFactory(session, effective, env)
+      const web = await webConfiguration()
       if (io.isClosed) { await discardCandidate(); return false }
-      nextHost = new CliHost({ provider, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model)) ??
+      nextHost = new CliHost({ provider, web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)), mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         skillSaveApproval: { isAvailable: () => io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
@@ -588,8 +669,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),
         onMemoryNotice: message => io.write(`${message}\n`),
         onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
-        ...(io.canAutoReview === true ? { decisionReview: {
-          provider: deferredDecisionProvider(session, env, input.decisionProviderFactory ?? decisionProviderForSession),
+        ...(io.canAutoReview === true && selectedReviewer ? { decisionReview: {
+          provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, env, input.decisionProviderFactory ?? decisionProviderForSession),
+          ...(options.reviewer ? { explicitReviewer: true as const } : {}),
           ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
           isAvailable: () => io.canAutoReview === true && !io.isClosed
         } } : {}),
@@ -652,7 +734,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) continue
       if (launchModePending && host) {
         launchModePending = false
-        await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+        await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
       } else if (launchModePending && io.canAutoReview !== true) {
         launchModePending = false
         io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
@@ -685,7 +767,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       let command = line.trim()
       if (command === '/menu' || command === '/settings') {
         const action = await io.choose('Conversation actions', [
-          { name: 'Continue conversation', value: 'continue' }, { name: 'Set up provider', value: '/provider' },
+          { name: 'Continue conversation', value: 'continue' }, { name: 'Chat provider', value: '/provider' },
+          { name: 'Web provider', description: settings.webProvider ?? 'direct', value: '/web' },
+          { name: 'Auto reviewer', description: host?.reviewProvider ?? 'None selected', value: '/reviewer' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
@@ -721,6 +805,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`)
           continue
         }
+        if (command === '/web') { await configureWeb(); continue }
+        if (command === '/reviewer') { await configureReviewer(); continue }
         if (command === '/provider') {
           await configureProviderModel()
           continue
@@ -762,7 +848,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
             io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling Auto review again\n')
             continue
           }
-          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex))
+          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
           io.setContext?.(undefined, host.canCompact)
           continue
         }

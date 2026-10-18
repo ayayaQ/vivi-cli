@@ -14,6 +14,7 @@ import type { RunOutcome } from './run-status.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
+import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
 import { autoReviewSharingScope } from './auto-review.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
 import type { CliToolEvidence } from './tool-presentation.js'
@@ -119,7 +120,8 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
 }
 
 /** Disclosure is host-authored; credentials and model-generated text never identify an account. */
-export function autoReviewDisclosure(provider: 'openai' | 'openrouter'): string {
+export function autoReviewDisclosure(provider: 'openai' | 'openrouter', deepSeekWeb = false): string {
+  if (deepSeekWeb) return `Auto sends your exact current request, proposed eligible local note/memory changes and scoped workspace text edits, and paid DeepSeek web query/URL proposals, fixed API endpoint, limits and cost to ${provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'} for approval checks, including unrequested proposals. Review itself adds API charges and may share private information. Recognized sensitive data, uncertain checks and failures require visible human review. External content cannot authorize an action. ${DEEPSEEK_WEB_DISCLOSURE}`
   const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
   return `Auto sends your current request, proposed note/memory changes and workspace text creation/precise edits (paths, before and after), and public URL GET proposals (full URL including path/query, destination, method, network limits and redirect scope) to ${recipients} for approval checks, including changes you didn’t request. ` +
     'This may share private information and incur extra API charges; only actions judged to match your request can be approved automatically. ' +
@@ -143,7 +145,7 @@ function selectPlan(host: CliHost, io: ChatIO): void {
 }
 
 /** Mode choices are not authority. Auto enrollment always uses the fresh deny-default approval path. */
-export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser): Promise<void> {
+export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   const current: ConversationMode = host.taskMode === 'plan' ? 'plan' : host.approvalMode
   const selected = choose ? await choose('Mode · Manual is the default', [
@@ -163,15 +165,19 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
     io.write(`${fromPlan ? AUTO_REVIEW_UNAVAILABLE.replace('Using Manual;', 'Plan remains active;') : AUTO_REVIEW_UNAVAILABLE}\n`)
     return
   }
-  const disclosure = autoReviewDisclosure(host.session.provider)
+  if (!host.reviewProvider && setupReviewer) await setupReviewer()
+  const reviewer = host.reviewProvider
+  if (!reviewer) { io.write('Choose an OpenAI or OpenRouter reviewer explicitly with /reviewer before enrolling Auto. DeepSeek chat does not inherit another account.\n'); return }
+  const deepSeekWeb = host.webProvider === 'deepseek'
+  const disclosure = autoReviewDisclosure(reviewer, deepSeekWeb)
   const binding = host.approvalEnrollmentBinding
   io.write(fromPlan ? 'Mode: Plan · Auto review requires fresh enrollment; cancel keeps Plan\n' : 'Approval mode: Manual\n')
   const controller = new AbortController()
   const dispose = io.onCancel(() => controller.abort())
   try {
     const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
-      mode: 'auto', provider: host.session.provider, sessionId: host.session.id,
-      reviewDataSharing: autoReviewSharingScope(host.session.provider), ...(binding ? { enrollmentBinding: binding } : {})
+      mode: 'auto', provider: reviewer, sessionId: host.session.id,
+      reviewDataSharing: autoReviewSharingScope(reviewer, deepSeekWeb), ...(binding ? { enrollmentBinding: binding } : {})
     } }, currentRevision: 'fresh Auto review enrollment',
     description: disclosure }, controller.signal)
     if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
@@ -203,7 +209,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
 }
 
 /** Manual -> freshly enrolled Auto -> Plan -> Manual. No task implicitly leaves Plan. */
-export async function cycleApprovalMode(host: CliHost, io: ChatIO): Promise<void> {
+export async function cycleApprovalMode(host: CliHost, io: ChatIO, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   if (host.taskMode === 'plan') {
     selectManual(host, io)
@@ -214,16 +220,16 @@ export async function cycleApprovalMode(host: CliHost, io: ChatIO): Promise<void
     selectPlan(host, io)
     return
   }
-  await selectApprovalMode(host, io)
+  await selectApprovalMode(host, io, undefined, setupReviewer)
 }
 /** Direct Plan/Manual choices require no enrollment; Auto still uses /mode's fresh confirmation. */
-export async function runModeControl(host: CliHost, io: ChatIO, line: string, choose?: ModeChooser): Promise<void> {
+export async function runModeControl(host: CliHost, io: ChatIO, line: string, choose?: ModeChooser, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   switch (line.trim()) {
     case '/mode plan': selectPlan(host, io); return
     case '/mode manual': selectManual(host, io); io.write('Approval mode: Manual\n'); return
-    case '/mode cycle': await cycleApprovalMode(host, io); return
-    case '/mode': await selectApprovalMode(host, io, choose); return
+    case '/mode cycle': await cycleApprovalMode(host, io, setupReviewer); return
+    case '/mode': await selectApprovalMode(host, io, choose, setupReviewer); return
     default: io.write('Use /mode by itself for a fresh Manual / Auto review / Plan choice, /mode plan, /mode manual, or /mode cycle\n')
   }
 }
@@ -555,7 +561,7 @@ export class TerminalIO implements ChatIO {
 }
 
 /** These controls are supplied by the launch owner, never exposed as model tools. */
-interface UserChatControls { mcp?(): Promise<void> }
+interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void> }
 
 export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.test(line.trim()) }
 
@@ -572,6 +578,8 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
   if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (prompt !== undefined) {
+    if (/^\/web(?:\s|$)/.test(prompt.trim())) { if (controls.web) await controls.web(prompt); return }
+    if (/^\/reviewer(?:\s|$)/.test(prompt.trim())) { if (controls.reviewer) await controls.reviewer(prompt); return }
     if (prompt.trim() === '/compact') {
       const status = await compactChatContext(host, io)
       return { status, history: host.session.history, content: '', rounds: 0, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
@@ -607,6 +615,8 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       continue
     }
     if (!line.trim()) continue
+    if (/^\/web(?:\s|$)/.test(line.trim())) { if (controls.web) await controls.web(line); else io.write('Web settings unavailable in this surface\n'); continue }
+    if (/^\/reviewer(?:\s|$)/.test(line.trim())) { if (controls.reviewer) await controls.reviewer(line); else io.write('Reviewer settings unavailable in this surface\n'); continue }
     if (isMcpCommand(line)) {
       try { await runMcpCommand(io, line, controls) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'MCP connection management failed'}\n`) }

@@ -58,3 +58,5 @@ export type { CliToolDecision, CliToolEvidence, CliToolPresentationInput } from 
 
 export { formatContextStatus, formatContextDetails } from './context-status.js'
 export { compactChatContext, refreshChatContext } from './terminal.js'
+
+export type { CliWebConfiguration, CliWebProviderName } from './web-tools.js'
