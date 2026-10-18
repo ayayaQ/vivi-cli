@@ -287,9 +287,13 @@ FullLanguage for owned Job Object cleanup.
 public HTTPS URL through host review. It sends the full path/query and network
 metadata; GET may have server-side effects. Every redirect is validated, and a
 changed origin needs a fresh decision. Limits are 3 redirects, 15 seconds active
-work, 16 KiB headers, 1 MiB body and 64 KiB text/result. No login, cookies,
+work, 16 KiB headers, 1 MiB wire body, 1 MiB decoded body and 64 KiB text/result.
+Identity, gzip, Brotli and zlib-wrapped deflate responses are supported; coding
+chains, raw deflate and invalid/truncated compressed data fail closed. No login, cookies,
 JavaScript, search, downloads or private/local addresses are supported. Returned
 text is untrusted; uncertain sends are recorded and never automatically replayed.
+Failures include a fixed local stage and a validated HTTP status when available,
+without returning native diagnostics or error bodies.
 
 ## Optional Auto review
 

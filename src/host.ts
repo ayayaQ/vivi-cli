@@ -1295,7 +1295,7 @@ export class CliHost {
             description: `Fetch public page with GET: ${exact.url}\nDestination hostname: ${exact.hostname}\n` +
               'The full path and query will be sent. DNS sees the hostname; the server sees caller IP and fixed request headers. GET may have server-side effects.\n' +
               'One initial request and at most three validated redirects; changed origins require a separate decision. No login, cookies, JavaScript, linked-page crawling or downloads.\n' +
-              '15 seconds active work, 16 KiB headers, 1 MiB body, at most 64 KiB text/result. Returned text enters the local transcript and selected provider context as untrusted data.' },
+              '15 seconds active work, 16 KiB headers, 1 MiB wire body and 1 MiB decoded body, at most 64 KiB text/result. Returned text enters the local transcript and selected provider context as untrusted data.' },
             eligible: true, operationLabel: 'public URL request', inputData: affectedData,
             preparedAction: action(), currentPreparedAction: action, resourceRevisions: revisions(), currentResourceRevisions: revisions,
             isActive: owned }, reviewSignal, async assertCurrent => {

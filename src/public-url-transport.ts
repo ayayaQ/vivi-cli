@@ -11,7 +11,7 @@ import type { ConnectionOptions, PeerCertificate, TLSSocket } from 'node:tls'
 export const PUBLIC_URL_TRANSPORT_LIMITS = Object.freeze({ addresses: 16, headerBytes: 16 * 1024,
   bodyBytes: 1024 * 1024, dnsMilliseconds: 5_000, urlBytes: 4_096 })
 export const PUBLIC_URL_REQUEST_HEADERS: Readonly<Record<string, string>> = Object.freeze({
-  accept: 'text/plain, text/html, application/json', 'accept-encoding': 'identity',
+  accept: 'text/plain, text/html, application/json', 'accept-encoding': 'gzip, br, deflate',
 })
 export type PublicUrlTransportCode = 'cancelled' | 'stale_owner' | 'non_public_host' | 'non_public_address'
   | 'known_secret' | 'deadline' | 'invalid_request' | 'dns_error' | 'transport_failed' | 'invalid_response' | 'body_limit' | 'cleanup_failed'
