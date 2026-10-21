@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import { conversationHistoryDigest, matchingConversationErrors } from './conversation-errors.js'
+import type { CliConversationError, CliConversationErrors } from './conversation-errors.js'
 import {
   BoxRenderable, CliRenderEvents, CodeRenderable, createCliRenderer, decodePasteBytes, MarkdownRenderable,
   RGBA, SelectRenderable, SelectRenderableEvents, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable, TextTableRenderable,
@@ -280,6 +282,8 @@ export class OpenTuiIO implements ChatIO {
   private activeApproval: { token: object; toolKey: string | undefined } | undefined
   private displaySequence = 0
   private resultNotices: DisplayEntry[] = []
+  private conversationErrors: CliConversationErrors | undefined
+  private liveErrors: CliConversationError[] = []
   private reviewNotices: DisplayEntry[] = []
   private historyLength = 0
   private turnHistoryStart = 0
@@ -579,6 +583,9 @@ export class OpenTuiIO implements ChatIO {
       label: this.safe(entry.label, 4096), content: this.safe(entry.content) })
     this.entries = this.entries.map(redactEntry)
     this.resultNotices = this.resultNotices.map(redactEntry)
+    this.liveErrors = this.liveErrors.map(error => ({ ...error, message: this.safe(error.message) }))
+    if (this.conversationErrors) this.conversationErrors = { ...this.conversationErrors,
+      errors: this.conversationErrors.errors.map(error => ({ ...error, message: this.safe(error.message) })) }
     this.reviewNotices = this.reviewNotices.map(redactEntry)
     this.sessionTitle = this.safe(this.sessionTitle, 4096)
     this.sessionModel = this.safe(this.sessionModel, 4096)
@@ -1576,6 +1583,9 @@ export class OpenTuiIO implements ChatIO {
     this.rebuild()
   }
   setToolEvidence(evidence: CliToolEvidence): void { this.toolEvidence = evidence }
+  setConversationErrors(errors: CliConversationErrors): void {
+    this.conversationErrors = { sessionId: errors.sessionId, errors: errors.errors.map(error => ({ ...error, message: this.safe(error.message) })) }
+  }
   /** Inert display sink for shared versioned data; it contains no action handlers. */
   toolPresentation(encoded: string): void {
     this.appendEntry({ category: 'activity', label: 'Tool presentation', content: '', markdown: false,
@@ -1717,6 +1727,14 @@ export class OpenTuiIO implements ChatIO {
   private transcriptEntries(history: readonly HistoryMessage[]): DisplayEntry[] {
     const entries = this.historyEntries(history)
     const placed = new Map<number, DisplayEntry[]>()
+    const durable = this.conversationErrors && this.conversationErrors.sessionId === this.sessionId ? this.conversationErrors.errors : []
+    const errors = [...durable, ...this.liveErrors.filter(error => !durable.some(saved =>
+      saved.historyDigest === error.historyDigest && saved.message === error.message))]
+    for (const error of matchingConversationErrors(history, errors)) {
+      const group = placed.get(error.historyLength) ?? []
+      group.push({ category: 'activity', attention: true, label: 'Error', content: this.safe(error.message), markdown: false })
+      placed.set(error.historyLength, group)
+    }
     for (const entry of this.reviewNotices) {
       const start = entry.historyStart ?? this.turnHistoryStart
       if (start >= history.length) continue
@@ -1781,6 +1799,8 @@ export class OpenTuiIO implements ChatIO {
     this.resultNotices = []
     this.reviewNotices = []
     this.toolEvidence = undefined
+    this.conversationErrors = undefined
+    this.liveErrors = []
     this.expandedTools.clear()
     this.liveToolCalls.clear()
     this.historyLength = 0
@@ -1815,6 +1835,7 @@ export class OpenTuiIO implements ChatIO {
     }
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
       this.runStatus.reset()
+      this.liveErrors = []
       this.resultNotices = []
       this.reviewNotices = []
       this.turnHistoryStart = 0
@@ -1980,10 +2001,17 @@ export class OpenTuiIO implements ChatIO {
     this.clearStream()
     this.settleReviews(result.status)
     this.historyLength = result.history.length
+    if (result.error && this.sessionId !== undefined) {
+      const historyDigest = conversationHistoryDigest(result.history), message = this.safe(result.error.message)
+      if (!this.liveErrors.some(error => error.historyDigest === historyDigest && error.message === message)) {
+        this.liveErrors.push({ id: `live-error:${this.displaySequence++}`, historyLength: result.history.length, historyDigest, message })
+        this.liveErrors = this.liveErrors.slice(-MAX_ENTRIES)
+      }
+    }
     this.entries = this.transcriptEntries(result.history)
     this.resultNotices = []
     if (partial !== undefined) this.resultNotices.push({ category: 'assistant', label: 'Partial display only · response was not accepted', content: partial, markdown: true })
-    if (result.error) this.resultNotices.push({ category: 'activity', attention: true, label: 'Error', content: this.safe(result.error.message), markdown: false })
+    if (result.error && this.sessionId === undefined) this.resultNotices.push({ category: 'activity', attention: true, label: 'Error', content: this.safe(result.error.message), markdown: false })
     this.entries.push(...this.resultNotices)
     this.rebuild()
     if (result.contextUsage && !this.contextUsage) this.contextUsage = { ...result.contextUsage }

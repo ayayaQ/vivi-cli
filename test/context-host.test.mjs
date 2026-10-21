@@ -333,3 +333,21 @@ test('cancelled committed summary initiation is drained and rolls back temporary
   assert(!f.host.session.contextSummaryUnreported); assert(!f.store.latest.contextSummaryUnreported)
   assert.equal(f.host.session.contextSummaryUsage.totalTokens, counts.totalTokens)
 })
+
+test('guarded provider carries mode-aware budgets through measurement, send and resumed mode changes', async () => {
+  const s = store()
+  let session
+  for (const budget of [65536, 8192, 131072]) {
+    const p = provider(); p.defaultOutputTokens = budget
+    const options = { store: s, provider: p, enableTools: false,
+      contextLimits: { contextWindow: 1048576, maxOutputTokens: 393216 } }
+    const host = session ? await CliHost.resume({ ...options, id: session.id }) : await CliHost.create({ ...options, settings })
+    await host.refreshContext()
+    assert.equal(host.contextUsage.outputReserveTokens, budget)
+    assert.equal(host.contextUsage.availableInputTokens, 1048576 - budget)
+    assert.equal(p.estimates.at(-1).config.maxOutputTokens, budget)
+    assert.equal((await host.send('Continue with current provider settings')).status, 'completed')
+    assert.equal(p.calls.at(-1).config.maxOutputTokens, budget)
+    session = host.session
+  }
+})

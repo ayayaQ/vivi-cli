@@ -105,7 +105,8 @@ test('renderer close/destruction/error stop elapsed callbacks and settle active 
 
 test('failed persistence before a result ends the timer and shows error without awaiting another prompt', async () => {
   const { io, runClock, status } = await fixture()
-  const host = { async send() { throw new Error('Fixture checkpoint error') } } as unknown as CliHost
+  const host = { conversationErrors: { sessionId: 'fixture', errors: [] },
+    async send() { throw new Error('Fixture checkpoint error') } } as unknown as CliHost
   await expect(sendChatTurn(host, io, 'Test')).rejects.toThrow('checkpoint error')
   expect(status()).toContain('Error · 0s'); expect(runClock.timers.size).toBe(0)
 })

@@ -698,6 +698,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     await previousRelease?.().catch(report)
     await refreshChatContext(host, io)
     io.setToolEvidence?.(host.toolPresentationEvidence)
+    io.setConversationErrors?.(host.conversationErrors)
     io.setSession(host.session)
     io.setContext?.(host.contextUsage, host.canCompact)
     io.setTaskMode?.(host.taskMode)

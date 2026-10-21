@@ -19,6 +19,8 @@ import type { McpOutcomeRecord } from './mcp-outcomes.js'
 import { cliPublicUrlRecordOutcome, publicUrlOutcomeMatchesCall, publicUrlOutcomeResult } from './public-url-outcomes.js'
 import type { PublicUrlOutcomeRecord } from './public-url-outcomes.js'
 import { publicUrlContainsSecret } from './public-url.js'
+import { conversationHistoryDigest, matchingConversationErrors } from './conversation-errors.js'
+import type { CliConversationError } from './conversation-errors.js'
 
 
 /** Exact live host observation. Result text, tool names and replay cannot create receipts. */
@@ -197,6 +199,24 @@ export class CliConversationRecords {
       ...(this.state === 'shadow' && this.store && this.document ? { committedRuns: this.document.runs.map(run => ({ runId: run.runId,
         sequence: run.records.at(-1)?.sequence ?? 0, eventId: run.records.at(-1)?.eventId ?? null })) } : {}),
       ...(this.state === 'shadow' ? { projection: structuredClone(this.projection), runs: structuredClone(this.runs) } : {}) }
+  }
+  /** Reuse validated durable settlements without changing canonical/provider history. */
+  get errors(): readonly CliConversationError[] {
+    if (this.state !== 'shadow' || !this.document) return []
+    const failures = this.document.records.filter(record => record.type === 'run_settled' && record.settlement.error)
+    if (!failures.length) return []
+    // Screen before publishing, but do not clone the whole run journal merely to
+    // read diagnostics. Ordinary successful turns have no diagnostic work.
+    if (containsSecret([this.document, this.projection, this.runs], this.secrets)) {
+      this.state = 'quarantined'
+      void this.enqueue(() => this.quarantine()).catch(() => undefined)
+      return []
+    }
+    return matchingConversationErrors(this.projection.history.map(entry => entry.message as HistoryMessage),
+      failures.flatMap(record => record.type === 'run_settled' && record.settlement.error
+        ? [{ id: record.eventId, historyLength: record.snapshot.history.length,
+          historyDigest: conversationHistoryDigest(record.snapshot.history.map(entry => entry.message as HistoryMessage)),
+          message: record.settlement.error.message }] : []))
   }
   async drain(): Promise<void> { await this.tail }
   private enqueue(work: () => Promise<void>): Promise<void> {
