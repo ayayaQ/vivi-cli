@@ -29,6 +29,7 @@ import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
 import { CliConversationRecords, FileCliConversationStore } from './conversation-records.js'
 import type { CliToolReceipt, CliConversationStore, CliConversationView } from './conversation-records.js'
+import type { CliConversationErrors } from './conversation-errors.js'
 import { createWorkspaceExtension, WORKSPACE_GUIDANCE, WORKSPACE_TOOL_NAMES, WorkspaceError } from './workspace.js'
 import type { ReadOnlyWorkspace } from './workspace.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
@@ -480,6 +481,9 @@ export class CliHost {
     }
   }
   get conversationRecords(): CliConversationView { return this.records.view }
+  get conversationErrors(): CliConversationErrors {
+    return { sessionId: this.current.id, errors: this.records.errors }
+  }
   /** Read-only exact host evidence. Rendering it cannot approve, execute or repair a tool. */
   get toolPresentationEvidence(): CliToolEvidence {
     const projection = this.conversationRecords.projection
@@ -1865,7 +1869,8 @@ export class CliHost {
       }
       const estimator = this.options.provider.estimateContext?.bind(this.options.provider)
       const guardedProvider: ModelProvider = {
-        ...(estimator ? { estimateContext: (input: Parameters<NonNullable<ModelProvider['estimateContext']>>[0]) => { preflightDeepSeek(input); return estimator(input) } } : {}),
+        ...(this.options.provider.defaultOutputTokens !== undefined ? { defaultOutputTokens: this.options.provider.defaultOutputTokens } : {}),
+        ...(estimator ? { estimateContext: (input, options) => { preflightDeepSeek(input); return estimator(input, options) } } : {}),
         generate: async (input, signal, options) => {
           preflightDeepSeek(input)
           // A checkpoint, approval or prior round may register a new credential

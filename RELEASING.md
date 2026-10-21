@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.15.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.15.1`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,12 +12,12 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.15.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.15.1` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
-The verified registry tarball is 409,811 bytes (406 files), SHA-256
-`eae1355b5fc5919c7362aac2dd01db21e270c9cf45214c6fc958f560a2bebc27`.
+The verified registry tarball is 411,995 bytes (406 files), SHA-256
+`4174bb934a89330db1ddc2239d6ded80ef324ace4b30f23881fab5bd79dc0d30`.
 The installed package checks exercise the native DeepSeek chat adapter and independent
 web provider through ESM, CommonJS and strict TypeScript consumers using offline fixtures.
 Chat reasoning history and web source URLs/provenance retain their shared contracts.
@@ -290,7 +290,7 @@ authorized operations.
 
 ## Agent Skills adoption checks
 
-Skills use the pinned published vivi 0.15.0 extension. Its generic save callbacks
+Skills use the pinned published vivi 0.15.1 extension. Its generic save callbacks
 support the host implementation. A separately
 reviewed core comment clarification describes storage-neutral SKILL.md transactions and
 explicit unknown outcomes; it creates no new runtime-version or npm-publication gate.

@@ -18,6 +18,7 @@ import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
 import { autoReviewSharingScope } from './auto-review.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
 import type { CliToolEvidence } from './tool-presentation.js'
+import type { CliConversationErrors } from './conversation-errors.js'
 import { conversationModeLabel } from './task-mode.js'
 import type { ConversationMode, TaskMode } from './task-mode.js'
 
@@ -26,6 +27,8 @@ export interface ChatIO {
   addSecrets?(secrets: readonly string[]): void
   /** Display-only host evidence, re-screened by the consumer before rendering. */
   setToolEvidence?(evidence: CliToolEvidence): void
+  /** Persisted display-only host errors, not provider messages or tool outcomes. */
+  setConversationErrors?(errors: CliConversationErrors): void
   setContext?(usage: ContextUsage | undefined, canCompact?: boolean): void
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
@@ -56,9 +59,11 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
   let outcome: RunOutcome = 'error'
   try {
     io.setToolEvidence?.(host.toolPresentationEvidence)
+    io.setConversationErrors?.(host.conversationErrors)
     io.runStarted?.()
     const result = await host.send(content, signal)
     io.setToolEvidence?.(host.toolPresentationEvidence)
+    io.setConversationErrors?.(host.conversationErrors)
     outcome = result.status
     return result
   } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
