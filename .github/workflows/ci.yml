@@ -19,6 +19,7 @@ env:
 
 jobs:
   check:
+    name: Linux correctness / Node ${{ matrix.node }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,3 +34,241 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: node scripts/ci-tests.mjs linux-node
+
+  candidate:
+    name: Package/runtime / Linux candidate
+    # One Linux TUI/package/standalone gate exports validated immutable Windows inputs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs bun-tui
+      - run: npm run test:package:built
+        env:
+          VIVI_TEST_BUN: bun
+          VIVI_TEST_CANDIDATE_DIR: ${{ runner.temp }}/canonical-npm-candidate
+      - run: bun scripts/test-standalone.ts
+      - name: Verify compiled installed-skill SQLite saving
+        run: |
+          bun build --compile test/fixtures/installed-skills-standalone-probe.mjs --outfile "${{ runner.temp }}/vivi-installed-skills-fixture"
+          "${{ runner.temp }}/vivi-installed-skills-fixture"
+      - name: Verify compiled saved MCP sign-in with synthetic credentials
+        run: |
+          bun build --compile test/fixtures/mcp-saved-standalone-probe.mjs --outfile "${{ runner.temp }}/vivi-mcp-saved-fixture"
+          "${{ runner.temp }}/vivi-mcp-saved-fixture"
+      - run: bun scripts/build-standalone.ts
+      - run: ./build/vivi --help
+      # Exact private archive plus nonsecret metadata/evidence only.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canonical-private-npm-candidate
+          path: |
+            ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+            ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+            ${{ runner.temp }}/canonical-npm-candidate/package-evidence.json
+          if-no-files-found: error
+
+  mcp:
+    name: Windows compatibility / MCP / Node ${{ matrix.node }}
+    # All minimum-Node Windows MCP cases premerge; full current-Node on main/manual.
+    # Native helpers stay serial inside their isolated runner, without longer deadlines.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(github.event_name == 'pull_request' && '["26.4.0"]' || '["26.4.0", "26"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs windows-mcp
+
+  headless:
+    name: Windows compatibility / headless / Node ${{ matrix.node }}
+    # All remaining minimum-Node Windows headless cases; full current on main/manual.
+    # Packed minimum-Node behavior belongs to bun below, using the same archive.
+    needs: candidate
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(github.event_name == 'pull_request' && '["26.4.0"]' || '["26.4.0", "26"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs windows-headless
+      - uses: actions/download-artifact@v4
+        if: matrix.node == '26'
+        with:
+          name: canonical-private-npm-candidate
+          path: ${{ runner.temp }}/canonical-npm-candidate
+      - run: npm run test:package:built
+        if: matrix.node == '26'
+        env:
+          VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+          VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-current-package-evidence.json
+      - uses: actions/upload-artifact@v4
+        if: matrix.node == '26'
+        with:
+          name: windows-current-node-headless-evidence
+          path: ${{ runner.temp }}/windows-current-package-evidence.json
+          if-no-files-found: error
+
+  current-compatibility:
+    name: Windows compatibility / current Node PR boundaries
+    # Actual current Node startup, argv/env, binary I/O, cancellation and descendant cleanup.
+    # OAuth callback/lifecycle files are included automatically when present in the checkout.
+    if: github.event_name == 'pull_request'
+    needs: candidate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          architecture: x64
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          name: canonical-private-npm-candidate
+          path: ${{ runner.temp }}/canonical-npm-candidate
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs windows-current
+      - run: npm run test:package:built
+        env:
+          VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+          VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-current-package-evidence.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-current-node-headless-evidence
+          path: ${{ runner.temp }}/windows-current-package-evidence.json
+          if-no-files-found: error
+
+  bun:
+    name: Package/runtime / Windows Bun and minimum Node
+    # One pinned Windows Bun runtime, stock OS transport and packed minimum-Node gate.
+    # No physical Windows Terminal, live keys, providers or native credential store.
+    needs: candidate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+          architecture: x64
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: canonical-private-npm-candidate
+          path: ${{ runner.temp }}/canonical-npm-candidate
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/ci-tests.mjs bun-boundaries
+      - name: Verify real stock Windows fallback transport
+        run: |
+          $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
+          $env:VIVI_TEST_POWERSHELL = (Get-Command pwsh -CommandType Application).Source
+          node scripts/ci-tests.mjs windows-stock
+      - run: node scripts/ci-tests.mjs bun-tui
+      - run: npm run test:package:built
+        env:
+          VIVI_TEST_BUN: bun
+          VIVI_TEST_PACKAGE_ARCHIVE: ${{ runner.temp }}/canonical-npm-candidate/ayayaq-vivi-cli-0.1.0-dev.0.tgz
+          VIVI_TEST_PACKAGE_METADATA: ${{ runner.temp }}/canonical-npm-candidate/candidate.json
+          VIVI_TEST_ACCEPTANCE_REPORT: ${{ runner.temp }}/windows-minimum-package-evidence.json
+      - run: bun scripts/test-standalone.ts
+      - name: Verify compiled Windows installed-skill SQLite saving
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'vivi-installed-skills-fixture.exe'
+          bun build --compile test/fixtures/installed-skills-standalone-probe.mjs --outfile $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify compiled Windows saved MCP sign-in with synthetic credentials
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'vivi-mcp-saved-fixture.exe'
+          bun build --compile test/fixtures/mcp-saved-standalone-probe.mjs --outfile $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - run: bun scripts/build-standalone.ts
+      - run: .\build\vivi.exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-minimum-node-bun-headless-evidence
+          path: ${{ runner.temp }}/windows-minimum-package-evidence.json
+          if-no-files-found: error
+
+  packaged-conpty:
+    name: Package/runtime / Windows pinned ConPTY
+    # Independent hash-pinned mode1 gate. It consumes no canonical npm artifact.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+          architecture: x64
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci --ignore-scripts
+      - name: Prepare hash-pinned official Microsoft ConPTY pair
+        run: |
+          ./test/fixtures/windows-conpty/prepare-pinned-backend.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0')
+      - name: Verify real pinned mode1 transport
+        run: |
+          $env:VIVI_TEST_BUN = (Get-Command bun -CommandType Application).Source
+          $env:VIVI_TEST_POWERSHELL = (Get-Command pwsh -CommandType Application).Source
+          $env:VIVI_TEST_CONPTY_PINNED_DIRECTORY = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
+          node scripts/ci-tests.mjs windows-modern
+      - name: Remove the private Microsoft backend
+        if: always()
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'vivi-conpty-wt-1.24.12741.0'
+          if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
+
+  summary:
+    name: CI summary
+    # Evaluate even when a prerequisite fails, is cancelled, or is skipped.
+    if: ${{ always() }}
+    needs: [check, candidate, mcp, headless, current-compatibility, bun, packaged-conpty]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+      - name: Test summary policy
+        run: node --test .github/scripts/ci-summary.test.mjs
+      - name: Require all expected checks
+        run: node .github/scripts/ci-summary.mjs
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_NEEDS: ${{ toJSON(needs) }}
