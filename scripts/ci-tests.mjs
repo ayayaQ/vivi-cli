@@ -11,12 +11,28 @@ const nativeConpty = new Set([
   'windows-conpty-packaged-native.test.mjs'
 ])
 // These existing suites assert POSIX file modes/symlink behavior unconditionally.
-// They retain complete minimum/current Linux coverage, as before this change.
+// They retain complete minimum Linux coverage and full latest coverage on main/manual.
 const linuxOnly = new Set(['cli.test.mjs', 'preferences.test.mjs'])
 const currentCompatibility = new Set([
   'command-process.test.mjs', 'command-windows.test.mjs', 'command-windows-real.test.mjs',
   'mcp-windows.test.mjs', 'mcp-windows-real.test.mjs', 'mcp-windows-node-env.test.mjs',
   'platform-acceptance.test.mjs', 'windows-input.test.mjs', 'windows-conpty.test.mjs'
+])
+// Small latest-Linux smoke: actual startup/signals, subprocesses, HTTP/OAuth and SQLite.
+const linuxCurrent = new Set([
+  'launcher.test.mjs', 'command-process.test.mjs', 'mcp-http.test.mjs',
+  'mcp-lifecycle.test.mjs', 'mcp-oauth-native.test.mjs', 'mcp-oauth-store.test.mjs',
+  'installed-skills.test.mjs', 'platform-acceptance.test.mjs'
+])
+// Keep Windows-specific process paths plus disk/SQLite/credential and transport seams.
+// Pure host/control duplication remains in the full main/manual Windows matrix.
+const minimumWindows = new Set([
+  ...currentCompatibility,
+  'mcp-http.test.mjs', 'mcp-integration.test.mjs', 'mcp-invocation.test.mjs',
+  'mcp-lifecycle.test.mjs', 'mcp-transport.test.mjs', 'mcp-send-boundary.test.mjs',
+  'installed-skills.test.mjs', 'skills-store.test.mjs', 'memory-store.test.mjs',
+  'credentials.test.mjs', 'workspace.test.mjs', 'workspace-edit.test.mjs',
+  'conpty-package.test.mjs'
 ])
 const isOAuth = name => name.includes('mcp-oauth')
 const isAgentMcpSetup = name => name.startsWith('mcp-setup-')
@@ -26,12 +42,14 @@ export async function ciTestGroups(directory = new URL('../test/', import.meta.u
   const names = (await readdir(directory)).sort()
   const node = names.filter(name => name.endsWith('.test.mjs'))
   const tui = names.filter(name => name.endsWith('.test.ts'))
-  for (const name of [...nativeConpty, ...linuxOnly, ...currentCompatibility]) {
+  for (const name of [...nativeConpty, ...linuxOnly, ...currentCompatibility, ...linuxCurrent, ...minimumWindows]) {
     assert(node.includes(name), `CI coverage file is missing: ${name}`)
   }
   const path = name => `./test/${name}`
   return {
     'linux-node': node.map(path),
+    'linux-current': node.filter(name => linuxCurrent.has(name)).map(path),
+    'windows-minimum': node.filter(name => minimumWindows.has(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'windows-mcp': node.filter(isMcp).map(path),
     'windows-headless': node.filter(name => !isMcp(name) && !nativeConpty.has(name) && !linuxOnly.has(name)).map(path),
     'windows-current': node.filter(name => currentCompatibility.has(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),

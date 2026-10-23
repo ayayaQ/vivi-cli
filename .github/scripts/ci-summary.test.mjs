@@ -8,7 +8,7 @@ import { requiredJobs, requireSuccessfulChecks } from './ci-summary.mjs'
 
 const events = ['pull_request', 'push', 'workflow_dispatch']
 const successfulNeeds = event => Object.fromEntries(requiredJobs.map(job => [job, {
-  result: job === 'current-compatibility' && event !== 'pull_request' ? 'skipped' : 'success'
+  result: (event === 'pull_request' ? ['mcp', 'headless'].includes(job) : job === 'current-compatibility') ? 'skipped' : 'success'
 }]))
 
 for (const event of events) {
@@ -67,4 +67,31 @@ test('summary names every workflow job and always evaluates prerequisite outcome
   assert.deepEqual(dependencies.sort(), [...requiredJobs].sort())
   assert.match(summary, /CI_EVENT_NAME: \$\{\{ github.event_name \}\}/)
   assert.match(summary, /CI_NEEDS: \$\{\{ toJSON\(needs\) \}\}/)
+})
+
+test('workflow implements the exact PR and main/manual coverage topology', () => {
+  const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8')
+  const job = name => workflow.split(`\n  ${name}:\n`)[1].split(/\n  [a-z][a-z-]*:\n/)[0]
+  for (const name of ['mcp', 'headless']) {
+    assert.match(job(name), /if: github.event_name != 'pull_request'/)
+    assert.match(job(name), /node: \['26\.4\.0', '26'\]/)
+    assert.match(job(name), new RegExp(`run: node scripts/ci-tests.mjs windows-${name}`))
+  }
+  assert.match(job('current-compatibility'), /if: github.event_name == 'pull_request'/)
+  assert.match(job('current-compatibility'), /run: node scripts\/ci-tests.mjs windows-current/)
+  assert.match(job('check'), /node: '26\.4\.0'\s+group: linux-node/)
+  assert.match(job('check'), /group: \$\{\{ github.event_name == 'pull_request' && 'linux-current' \|\| 'linux-node' \}\}/)
+  assert.match(job('check'), /run: node scripts\/ci-tests.mjs \$\{\{ matrix.group \}\}/)
+  assert.match(job('bun'), /if: github.event_name == 'pull_request'\s+run: node scripts\/ci-tests.mjs windows-minimum/)
+  for (const name of ['bun', 'candidate', 'packaged-conpty']) assert.match(job(name), /bun-version: 1\.4\.2/)
+  for (const name of ['bun', 'candidate']) assert.match(job(name), /run: node scripts\/ci-tests.mjs bun-tui/)
+  for (const name of ['bun', 'current-compatibility', 'headless']) {
+    assert.match(job(name), /uses: actions\/download-artifact@v4/)
+    assert.match(job(name), /name: canonical-private-npm-candidate/)
+    assert.match(job(name), /run: npm run test:package:built/)
+    assert.match(job(name), /VIVI_TEST_PACKAGE_ARCHIVE:.*ayayaq-vivi-cli-0\.1\.0-dev\.0.tgz/)
+    assert.match(job(name), /VIVI_TEST_PACKAGE_METADATA:.*candidate.json/)
+  }
+  assert.match(workflow, /push:\s+branches: \[main\]/)
+  assert.match(workflow, /cancel-in-progress: \$\{\{ github.event_name == 'pull_request' \}\}/)
 })

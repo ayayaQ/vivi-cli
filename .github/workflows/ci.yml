@@ -19,12 +19,17 @@ env:
 
 jobs:
   check:
-    name: Linux correctness / Node ${{ matrix.node }}
+    name: Linux correctness / Node ${{ matrix.node }} / ${{ matrix.group }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ['26.4.0', '26']
+        include:
+          - node: '26.4.0'
+            group: linux-node
+          - node: '26'
+            # Latest Node exercises runtime boundaries on PRs, the full suite otherwise.
+            group: ${{ github.event_name == 'pull_request' && 'linux-current' || 'linux-node' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,7 +38,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run build
-      - run: node scripts/ci-tests.mjs linux-node
+      - run: node scripts/ci-tests.mjs ${{ matrix.group }}
 
   candidate:
     name: Package/runtime / Linux candidate
@@ -78,13 +83,14 @@ jobs:
 
   mcp:
     name: Windows compatibility / MCP / Node ${{ matrix.node }}
-    # All minimum-Node Windows MCP cases premerge; full current-Node on main/manual.
+    # Broad Windows coverage is retained on main/manual; PR boundaries run below.
+    if: github.event_name != 'pull_request'
     # Native helpers stay serial inside their isolated runner, without longer deadlines.
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ${{ fromJSON(github.event_name == 'pull_request' && '["26.4.0"]' || '["26.4.0", "26"]') }}
+        node: ['26.4.0', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -98,14 +104,15 @@ jobs:
 
   headless:
     name: Windows compatibility / headless / Node ${{ matrix.node }}
-    # All remaining minimum-Node Windows headless cases; full current on main/manual.
+    # Broad Windows coverage is retained on main/manual; PR boundaries run below.
+    if: github.event_name != 'pull_request'
     # Packed minimum-Node behavior belongs to bun below, using the same archive.
     needs: candidate
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ${{ fromJSON(github.event_name == 'pull_request' && '["26.4.0"]' || '["26.4.0", "26"]') }}
+        node: ['26.4.0', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -188,6 +195,9 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       - run: npm ci --ignore-scripts
       - run: npm run build
+      - name: Minimum Node Windows PR boundaries
+        if: github.event_name == 'pull_request'
+        run: node scripts/ci-tests.mjs windows-minimum
       - run: node scripts/ci-tests.mjs bun-boundaries
       - name: Verify real stock Windows fallback transport
         run: |
