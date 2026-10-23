@@ -77,3 +77,35 @@ test('CI runner rejects unknown groups and propagates failed test subprocesses',
   assert.equal(failed.status, 1)
   assert.match(failed.stderr, /Cannot find module/)
 })
+
+test('PR smoke groups preserve runtime boundaries without repeating broad suites', async () => {
+  const groups = await ciTestGroups()
+  assert.deepEqual(groups['linux-current'], [
+    'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
+    'mcp-oauth-native', 'mcp-oauth-store', 'platform-acceptance'
+  ].map(name => `./test/${name}.test.mjs`))
+  for (const file of groups['windows-current']) assert(groups['windows-minimum'].includes(file))
+  for (const name of ['mcp-http', 'mcp-integration', 'mcp-invocation', 'mcp-lifecycle',
+    'mcp-transport', 'mcp-send-boundary', 'installed-skills', 'skills-store', 'memory-store',
+    'credentials', 'workspace', 'workspace-edit', 'conpty-package']) {
+    assert(groups['windows-minimum'].includes(`./test/${name}.test.mjs`))
+  }
+  const broadWindows = [...groups['windows-mcp'], ...groups['windows-headless']]
+  for (const file of groups['windows-minimum']) assert(broadWindows.includes(file))
+  assert(groups['windows-minimum'].length < broadWindows.length / 2)
+  for (const file of broadWindows.filter(file => !groups['windows-minimum'].includes(file))) {
+    assert(groups['linux-node'].includes(file), `Deferred Windows file lost baseline Node coverage: ${file}`)
+  }
+})
+
+test('new OAuth/setup fixtures automatically retain minimum Windows PR coverage', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-ci-minimum-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const names = await readdir(new URL('./', import.meta.url))
+  const added = ['mcp-oauth-new.test.mjs', 'application-mcp-oauth-new.test.mjs', 'mcp-setup-new.test.mjs']
+  for (const name of [...names.filter(name => /\.test\.(mjs|ts)$/.test(name)), ...added]) {
+    await writeFile(join(directory, name), '')
+  }
+  const groups = await ciTestGroups(directory)
+  for (const name of added) assert(groups['windows-minimum'].includes(`./test/${name}`))
+})
