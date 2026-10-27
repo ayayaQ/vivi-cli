@@ -28,6 +28,7 @@
     "dist",
     "src",
     "scripts",
+    "docs/PROJECT_INPUTS.md",
     "tsconfig.json",
     "LICENSE",
     "NOTICE",
@@ -45,7 +46,7 @@
     "test:package:built": "node scripts/test-package.mjs"
   },
   "dependencies": {
-    "@ayayaq/vivi": "0.15.1",
+    "@ayayaq/vivi": "0.16.0",
     "@modelcontextprotocol/client": "2.3.1",
     "@opentui/core": "0.5.14",
     "ignore": "7.0.12",

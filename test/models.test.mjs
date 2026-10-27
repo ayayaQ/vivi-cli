@@ -8,7 +8,9 @@ import { ModelCatalog, parseModelCatalog, documentedOpenAIModel } from '../dist/
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/model-capabilities.json', import.meta.url), 'utf8'))
 const model = (raw, provider = 'openrouter') => parseModelCatalog(provider, { data: [{ id: 'vendor/model:free', ...raw }] })[0]
 const response = data => new Response(JSON.stringify({ data }), { headers: { 'Content-Type': 'application/json' } })
-const withoutContext = ({ contextWindow, maxInputTokens, maxOutputTokens, contextLimitsSource, contextMetadata, ...model }) => model
+// The frozen host baseline predates context/image metadata. Assert its old facts
+// independently, then verify the added exact image binding below.
+const withoutContext = ({ contextWindow, maxInputTokens, maxOutputTokens, contextLimitsSource, contextMetadata, vision, modelCapabilities, ...model }) => model
 const cliSummary = entry => ({ selected: true, conversation: entry.conversation, tools: entry.tools,
   streaming: entry.streaming, reasoning: entry.reasoning, reasoningMandatory: entry.reasoningMandatory, efforts: entry.efforts })
 test('shared normalization fixture preserves endpoint scope and separate reasoning capabilities', () => {
@@ -53,7 +55,14 @@ test('all 52 host OpenAI facts and 72 exclusions survive shared seed enrichment'
       assert.match(correction.url, /^https:\/\/developers\.openai\.com\/api\/docs\/models\//)
       expected[correction.field] = correction.to
     }
-    assert.deepEqual(withoutContext(documentedOpenAIModel(before.id)), expected, before.id)
+    const actual = documentedOpenAIModel(before.id)
+    assert.deepEqual(withoutContext(actual), expected, before.id)
+    if (!excluded.includes(before.id)) assert(actual.modelCapabilities, `Missing selectable-model image binding: ${before.id}`)
+    if (actual.modelCapabilities) {
+      const normalized = normalizeModelCapabilities({ apiVersion: 1, provider: 'openai', protocol: 'responses', model: { id: before.id } })
+      assert.deepEqual(actual.modelCapabilities, normalized, before.id)
+      assert.equal(actual.vision, normalized.vision, before.id)
+    }
   }
   const entries = parseModelCatalog('openai', { data: [...ids, ...excluded].map(id => ({ id })) })
   assert.deepEqual(entries.map(entry => entry.id), [...ids].sort((a, b) => a.localeCompare(b)))

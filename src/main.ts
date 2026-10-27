@@ -13,6 +13,8 @@ import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import type { ReasoningEffort, ReasoningSelection } from '@ayayaq/vivi/providers/openrouter'
 import type { ModelProvider } from '@ayayaq/vivi'
+import { FileImageAssets } from './image-assets.js'
+import type { CliImageAssets } from './image-assets.js'
 import { createOpenAIDecisionProvider, createOpenRouterDecisionProvider } from '@ayayaq/vivi/decisions'
 import type { DecisionProvider } from '@ayayaq/vivi/decisions'
 import { CliHost } from './host.js'
@@ -65,6 +67,10 @@ export interface CliOptions {
   maxRounds: number
   prompt?: string
   help: boolean
+  /** Ephemeral host-owned runtime capabilities, never command-line or saved preference inputs. */
+  imageAssets?: CliImageAssets
+  imageCapability?: import('./models.js').Capability
+  imageModelCapabilities?: import('@ayayaq/vivi/providers/models').ModelCapabilities
 }
 export const HELP = `vivi - a shared-agent terminal application
 
@@ -254,7 +260,9 @@ export function providerForSession(session: CliSession, options: CliOptions, env
   const apiKey = env[name]
   if (!apiKey) throw new Error(`Set ${name} in your environment`)
   const common = { model: session.model, apiKey, reasoning: reasoningPolicy(session.reasoning),
-    supportedReasoningEfforts: options.reasoningCapabilities, stream: options.stream }
+    supportedReasoningEfforts: options.reasoningCapabilities, stream: options.stream,
+    ...(options.imageAssets ? { resolveImage: (reference: import('@ayayaq/vivi').ToolImageReference) => options.imageAssets!.resolve(reference) } : {}),
+    ...(options.imageModelCapabilities ? { modelCapabilities: options.imageModelCapabilities } : {}) }
   switch (session.provider) {
     case 'openai': return createOpenAIProvider(common)
     case 'deepseek': return createDeepSeekProvider(common)
@@ -418,9 +426,13 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     if (metadata.conversation === 'unsupported') throw new Error('This model is incompatible with vivi’s text-conversation endpoint. Choose a supported model')
     const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
       declared: args.includes('--tools') })
-    const effective = { ...options, enableTools, enableNotes: options.enableNotes && enableTools,
+    const effective: CliOptions = { ...options, enableTools, enableNotes: options.enableNotes && enableTools,
       reasoningCapabilities: metadata.reasoning === 'supported' ? [...metadata.efforts] : options.reasoningCapabilities,
       stream: metadata.streaming === 'unsupported' ? false : options.stream }
+    const images = new FileImageAssets(join(options.sessionDirectory, 'images'), session.id)
+    effective.imageAssets = images
+    effective.imageCapability = metadata.vision ?? 'unknown'
+    if (metadata.modelCapabilities) effective.imageModelCapabilities = metadata.modelCapabilities
     const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
     const accountRevision = randomUUID()
     const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
@@ -431,7 +443,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     } } : { provider: options.webProvider ?? 'direct' }
     if (web.provider === 'deepseek') io.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+    host = new CliHost({ provider, images, imageCapability: metadata.vision ?? 'unknown', ...(metadata.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       skillSaveApproval: { isAvailable: () => options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),

@@ -309,6 +309,18 @@ export async function runMemoryCommand(host: CliHost, io: ChatIO, line: string):
   } else io.write(MEMORY_COMMAND_HELP)
   return true
 }
+export async function runInstructionsCommand(host: CliHost, io: Pick<ChatIO, 'write'>, line: string): Promise<boolean> {
+  if (!/^\/instructions(?:\s|$)/.test(line.trim())) return false
+  const action = line.trim().split(/\s+/).slice(1)
+  if (action.length > 1 || !['status', 'reload', 'disable'].includes(action[0] ?? 'status')) {
+    io.write('/instructions status · show loaded sources and errors\n/instructions reload · refresh active guidance now\n/instructions disable · disable for this launch (restart to re-enable)\n')
+    return true
+  }
+  if (action[0] === 'disable') host.disableInstructions()
+  else await host.reloadInstructions()
+  io.write(`${host.instructionsStatus}\n`)
+  return true
+}
 const SKILLS_COMMAND_HELP = '/skills list · names, descriptions, revisions and diagnostics\n/skills inspect NAME · exact SKILL.md\n/skills create DESCRIPTION · draft a standard skill and request human-reviewed saving\n/skills on · enable for this launch; /skills off · disable without deleting\n'
 export function displaySkills(io: Pick<ChatIO, 'write'>, catalog: Awaited<ReturnType<CliHost['listSkills']>>, diagnostics: readonly string[] = []): void {
   io.write(`Skills (${catalog.skills.length}):\n`)
@@ -600,7 +612,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /mcp manages reviewed server connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /instructions shows project guidance, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
@@ -645,6 +657,12 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       if (!name) io.write('Use /rename NAME to name this session\n')
       else try { await host.renameSession(name, host.session.titleRevision ?? 0); io.write(`Session renamed: ${sessionDisplayTitle(host.session)}\n`) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Session rename failed'}\n`) }
+      continue
+    }
+    if (/^\/instructions(?:\s|$)/.test(line.trim())) {
+      try { await runInstructionsCommand(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Instruction management failed'}\n`) }
+      finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
     if (/^\/skills(?:\s|$)/.test(line.trim())) {

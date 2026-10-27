@@ -60,3 +60,8 @@ export { formatContextStatus, formatContextDetails } from './context-status.js'
 export { compactChatContext, refreshChatContext } from './terminal.js'
 
 export type { CliWebConfiguration, CliWebProviderName } from './web-tools.js'
+
+export { ProjectInstructions, INSTRUCTION_LIMIT_BYTES } from './instructions.js'
+export type { InstructionProfile, InstructionSnapshot } from './instructions.js'
+export { FileImageAssets, IMAGE_LIMITS, imageMetadata } from './image-assets.js'
+export type { CliImageAssets } from './image-assets.js'

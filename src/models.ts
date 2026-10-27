@@ -10,6 +10,10 @@ export interface ModelEntry {
   id: string
   name: string
   tools: Capability
+  /** Image input is model-specific, independent of tool-call capability. */
+  vision?: Capability
+  /** Exact provider/protocol/model binding used by image-aware adapters. */
+  modelCapabilities?: ModelCapabilities
   conversation: Capability
   streaming: Capability
   efforts: ReasoningEffort[]
@@ -119,11 +123,13 @@ export function modelToolsEnabled(model: ModelEntry | undefined, policy: {
   return model?.tools === 'supported' ? policy.enabled !== false : policy.declared === true
 }
 function applyCapabilities(model: ModelEntry, shared: ModelCapabilities): void {
+  model.modelCapabilities = structuredClone(shared)
   if (shared.contextWindow !== undefined) model.contextWindow = shared.contextWindow
   if (shared.maxInputTokens !== undefined) model.maxInputTokens = shared.maxInputTokens
   if (shared.maxOutputTokens !== undefined) model.maxOutputTokens = shared.maxOutputTokens
   if (shared.contextLimitsSource !== undefined) model.contextLimitsSource = structuredClone(shared.contextLimitsSource)
   if (shared.tools !== 'unknown') model.tools = shared.tools
+  model.vision = shared.vision
   if (shared.chat !== 'unknown') model.conversation = shared.chat
   if (shared.stream !== 'unknown') model.streaming = shared.stream
   if (shared.reasoning.support !== 'unknown') model.reasoning = shared.reasoning.support

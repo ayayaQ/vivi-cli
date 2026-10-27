@@ -22,9 +22,12 @@ async function noStages(root) { assert(!(await fs.readdir(root)).some(name => na
 
 test('new mutation names are reserved and the extension needs an explicit host executor', async t => {
   const { workspace } = await fixture(t)
-  assert.deepEqual(createWorkspaceExtension(workspace).tools.map(tool => tool.definition.name), WORKSPACE_TOOL_NAMES)
+  const textReads = WORKSPACE_TOOL_NAMES.filter(name => name !== 'workspace_read_image')
+  assert.deepEqual(createWorkspaceExtension(workspace).tools.map(tool => tool.definition.name), textReads)
   assert.deepEqual(createWorkspaceExtension(workspace, [], async () => ({ content: '' })).tools.map(tool => tool.definition.name),
-    [...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
+    [...textReads, ...WORKSPACE_MUTATION_TOOL_NAMES])
+  assert.deepEqual(createWorkspaceExtension(workspace, [], undefined, async () => ({ content: '' })).tools.map(tool => tool.definition.name),
+    WORKSPACE_TOOL_NAMES)
   for (const name of WORKSPACE_MUTATION_TOOL_NAMES) assert.throws(() => createBuiltinToolset(false, [{ id: 'fixture', apiVersion: 1,
     tools: [{ definition: { name, description: '', parameters: {} }, validateArguments() {}, execute() {} }] }]), /collision/)
 })

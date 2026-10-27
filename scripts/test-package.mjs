@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.15.1'
-const coreIntegrity = 'sha512-pwkfWh5DDcrgrBPW+IuVl5XRbZFGh6kilmlgoe3e4/NXcpDy51RqVXxpbrVgB6t/4DjvcVp7BBtmssT9atakUQ=='
+const coreVersion = '0.16.0'
+const coreIntegrity = 'sha512-Df2VOeDwf6/20jt0MT0eiq1oSH7Jaf/wa6wmsy0X0G5vYgVRxvF8gnpyyVni5zs6o+6o+z5BxBvTRSiwPCGR3g=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.15.1 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.16.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -112,6 +112,8 @@ try {
     'src/web-results.ts', 'dist/web-results.js', 'dist/web-results.d.ts',
     'src/questions.ts', 'dist/questions.js', 'dist/questions.d.ts',
     'src/input-queue.ts', 'dist/input-queue.js', 'dist/input-queue.d.ts']) assert(paths.has(path), `Missing ${path}`)
+  for (const path of ['docs/PROJECT_INPUTS.md', 'src/instructions.ts', 'dist/instructions.js', 'dist/instructions.d.ts',
+    'src/image-assets.ts', 'dist/image-assets.js', 'dist/image-assets.d.ts']) assert(paths.has(path), `Missing project-input artifact ${path}`)
   for (const name of ['config', 'catalog', 'manager', 'controls', 'transport', 'http-transport', 'process-group', 'windows', 'tools', 'content', 'schema', 'outcomes', 'templates']) {
     for (const path of [`src/mcp-${name}.ts`, `dist/mcp-${name}.js`, `dist/mcp-${name}.d.ts`]) {
       assert(paths.has(path), `Missing ${path}`)
@@ -233,7 +235,7 @@ import { mkdtemp, realpath, mkdir, readFile, readdir, rm, writeFile } from 'node
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument } from '@ayayaq/vivi-cli'
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, calculate, builtinTools, createBuiltinToolset, aggregateUsage, formatUsage, FileCliConversationStore, replayCliConversationDocument, FileImageAssets, ProjectInstructions, newSession } from '@ayayaq/vivi-cli'
 import { validateHistory, closeInterruptedHistory } from '@ayayaq/vivi'
 import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extensions/questions'
@@ -540,6 +542,29 @@ try {
   await writeFile(join(project, '.gitignore'), '*.log')
   await writeFile(join(project, 'ignored.log'), 'Packed ignored fixture')
   const workspace = await ReadOnlyWorkspace.open(project)
+  await writeFile(join(project, 'AGENTS.md'), 'Packaged scoped project guidance')
+  const imagePixels = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64')
+  await writeFile(join(project, 'image.png'), imagePixels)
+  const imageSession = newSession({ provider: 'openai', model: 'gpt-4.1' })
+  const imageAssets = new FileImageAssets(join(directory, 'images'), imageSession.id)
+  assert.equal(typeof ProjectInstructions, 'function')
+  let imageRounds = 0
+  const imageHost = new CliHost({ session: imageSession, store: new FileSessionStore(directory), workspace,
+    images: imageAssets, imageCapability: 'supported', provider: { async generate({ messages, tools }) {
+      assert(tools.some(tool => tool.name === 'workspace_read_image'))
+      assert(messages.some(message => message.role === 'user' && message.content.includes('Packaged scoped project guidance')))
+      if (++imageRounds === 1) return { content: '', toolCalls: [{ id: 'packed-image', name: 'workspace_read_image', arguments: { path: 'image.png' } }] }
+      const observation = messages.find(message => message.kind === 'tool_result' && message.images)
+      assert.deepEqual(Buffer.from(imageAssets.resolve(observation.images[0])), imagePixels)
+      return { content: 'Packed image observed', toolCalls: [] }
+    } } })
+  assert.equal((await imageHost.send('Inspect image.png')).status, 'completed')
+  assert.equal(imageHost.session.schemaVersion, 3)
+  assert(!JSON.stringify(imageHost.session).includes(imagePixels.toString('base64')))
+  assert(!JSON.stringify(imageHost.session).includes('Packaged scoped project guidance'))
+  assert(imageHost.conversationRecords.projection.history.some(entry => entry.message.images?.length))
+  await imageHost.shutdown()
+  await rm(join(project, 'AGENTS.md')); await rm(join(project, 'image.png'))
   const workspaceRegistry = createToolRegistry([createWorkspaceExtension(workspace)])
   const listing = await workspaceRegistry.executeTool({ id: 'packed-workspace', name: 'workspace_list', arguments: {} }, { signal: new AbortController().signal })
   assert.equal(JSON.parse(listing.content).untrusted, true)
@@ -677,9 +702,9 @@ try {
 `)
   run(process.execPath, [...nodeGuard, join(installed, 'consumer.mjs')], temporary)
   await writeFile(join(installed, 'consumer.ts'), `
-import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type SkillSaveReceipt, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession, type CliQuestionHost,
+import { CliHost, FileSessionStore, FileMemoryStore, FileSkillStore, InstalledSkillStore, ReadOnlyWorkspace, TrustedCommandWorkspace, createWorkspaceExtension, WORKSPACE_LIMITS, TerminalIO, newSession, createBuiltinToolset, aggregateUsage, formatUsage, FileImageAssets, ProjectInstructions, type CliImageAssets, type InstructionSnapshot, type CommandApprovalContext, type PreparedCommand, type CliMemoryStore, type CliSkillStore, type SkillSaveReceipt, type MemoryChangeRequest, type ChatIO, type CliHostOptions, type CliSession, type CliQuestionHost,
   type SessionPersistence, type ApprovalRequest, type TaskMode, type ConversationMode, McpConfigStore, McpManager, createMcpExtension, type McpCatalogSnapshot, type McpPreparedOperation, type McpOutcomeStore, FileMcpOutcomeStore, type McpInvocationLifecycle, FileCliConversationStore, type CliConversationStore, type CliConversationView, createCliToolPresentation, cliToolPresentationView, type CliToolEvidence, type CliToolDecision } from '@ayayaq/vivi-cli'
-import type { AgentEvent, AgentResult, ModelProvider } from '@ayayaq/vivi'
+import type { AgentEvent, AgentResult, ModelProvider, ToolImageReference } from '@ayayaq/vivi'
 import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
 import { createDeepSeekProvider, projectDeepSeekHistory } from '@ayayaq/vivi/providers/deepseek'
 import { createDeepSeekWebProvider } from '@ayayaq/vivi/web/deepseek'
@@ -720,6 +745,11 @@ const change: MemoryChangeRequest = { kind: 'create', content: 'Type fixture' }
 void memory; void change
 const workspace: Promise<ReadOnlyWorkspace> = ReadOnlyWorkspace.open('/tmp/fake-types-only')
 void workspace; void createWorkspaceExtension; void WORKSPACE_LIMITS
+const imageAssets: CliImageAssets = new FileImageAssets('/tmp/fake-types-only', session.id)
+const snapshot: Promise<ToolImageReference> = imageAssets.snapshot(new Uint8Array(), new AbortController().signal)
+const instructionSource: ProjectInstructions = new ProjectInstructions()
+const instructionSnapshot: Promise<InstructionSnapshot> = instructionSource.refresh(new AbortController().signal)
+void snapshot; void instructionSnapshot
 const commandWorkspace: Promise<TrustedCommandWorkspace> = TrustedCommandWorkspace.open('/tmp/fake-types-only', {})
 const commandContext: CommandApprovalContext = { launchId: 'types', sessionId: 'types', runId: 'types', accountRevision: 'types',
   canApprove: () => false, isCurrent: () => false, approve: async () => false }

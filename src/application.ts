@@ -4,6 +4,7 @@ import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
 import type { CliWebConfiguration } from './web-tools.js'
 import type { ModelProvider } from '@ayayaq/vivi'
 import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import { providerEnvironmentName, isReviewProvider } from './provider-selection.js'
 import type { CliOptions } from './main.js'
@@ -14,10 +15,11 @@ import { InstalledSkillStore } from './installed-skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
+import { FileImageAssets } from './image-assets.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, isMcpCommand, runMcpCommand } from './terminal.js'
+import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
@@ -96,6 +98,7 @@ const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also ad
 Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
+/instructions status|reload|disable manages launch-local AGENTS.md guidance.
 /mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
 /context shows effective-request tokens, capacity and output reserve; /compact summarizes older provider context while keeping the full local transcript.\n/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
@@ -657,10 +660,14 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) { await discardCandidate(); return false }
       const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
       if (options.reviewer && selectedReviewer) await loadKey(selectedReviewer)
+      const images = new FileImageAssets(join(options.sessionDirectory, 'images'), session.id)
+      effective.imageAssets = images
+      effective.imageCapability = metadata?.vision ?? 'unknown'
+      if (metadata?.modelCapabilities) effective.imageModelCapabilities = metadata.modelCapabilities
       const provider = providerFactory(session, effective, env)
       const web = await webConfiguration()
       if (io.isClosed) { await discardCandidate(); return false }
-      nextHost = new CliHost({ provider, web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model)) ??
+      nextHost = new CliHost({ provider, images, imageCapability: metadata?.vision ?? 'unknown', ...(metadata?.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)), mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         skillSaveApproval: { isAvailable: () => io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
@@ -781,6 +788,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Session notes', description: 'Default for new conversations', value: '/notes' },
           { name: 'Persistent memories', description: 'This launch and future-launch default', value: '/memories' },
           { name: 'Skills', value: '/skills' },
+          { name: 'Project instructions', value: '/instructions' },
           { name: 'MCP connections', description: 'Trusted installed servers; human-reviewed tools and resource reads', value: '/mcp' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
         ])
@@ -815,6 +823,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/notes') { await configureNotes(); continue }
+        if (/^\/instructions(?:\s|$)/.test(command)) {
+          if (!host) { io.write('Choose a model before inspecting project instructions\n'); continue }
+          try { await runInstructionsCommand(host, io, command) } finally { host.invalidateContext(); io.setContext?.(undefined, false) }
+          continue
+        }
         if (command === '/skills') {
           try { await manageSkills() } finally { host?.invalidateContext(); io.setContext?.(undefined, false) }
           continue

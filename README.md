@@ -35,6 +35,7 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/memories` — manage this launch’s app-wide saved context and its future-launch default
 - `/commands` — inspect or disable reviewed unsandboxed command proposals
 - `/skills` — inspect instruction-only skills and prepare creator drafts
+- `/instructions` — inspect, reload or disable scoped `AGENTS.md` guidance
 - `/mcp` — configure and explicitly connect trusted installed stdio servers or HTTP endpoints for reviewed tools and resource reads
 - `/context` — show effective-request occupancy, model capacity, source freshness and output reserve
 - `/compact` — summarize eligible older provider context, retaining the full local transcript
@@ -44,6 +45,11 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 
 Changing chat provider, model or effort starts a new conversation and keeps the old
 transcript available through `/resume`.
+
+The host loads scoped `AGENTS.md` guidance fresh before each dispatch. Mention an
+image path normally; the agent can inspect PNG/JPEG pixels with
+`workspace_read_image`, subject to workspace policy and verified model support.
+There is no `/attach` command or automatic image upload.
 
 Sessions get a readable name from the first accepted message, without an extra
 model call. Rename keeps that name through later turns and resumes. The resume
@@ -454,6 +460,13 @@ canonical paths and file identities and withholds results when it detects concur
 changes. This is not an OS sandbox against hostile programs changing the tree;
 use a project folder you control. Exact policy and verification limits are in
 [RELEASING.md](RELEASING.md#read-only-workspace-policy).
+
+## Project instructions
+
+The host loads scoped `AGENTS.md` guidance from the selected workspace, never its
+parents. User instructions, permissions and required reviews still take precedence.
+Use `/instructions` for status, `reload` to refresh or `disable` for this launch.
+See [project instructions and image input](docs/PROJECT_INPUTS.md) for details.
 
 ## Reviewed commands
 

@@ -23,7 +23,7 @@ async function packs(save = false) {
     protocolVersion: '2025-11-25', catalogGeneration: 1, categories }
   return {
     memory: createMemoryExtension({ listMemories: inert, executeMutation: inert }),
-    workspace: createWorkspaceExtension({}, [], inert),
+    workspace: createWorkspaceExtension({}, [], inert, inert),
     skills: createSkillsExtension({ catalog: createSkillCatalog([]), authorizeRead: inert, ...(save ? { save: { authorize: inert, commit: inert } } : {}) }),
     commands: createCommandExtension(inert, inert),
     mcp: createMcpExtension({ captureCatalogs: inert, prepareOperation: inert }, [snapshot], inert),

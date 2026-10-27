@@ -97,6 +97,7 @@ export const SLASH_COMMANDS = [
   { command: '/compact', description: 'Compact the provider context; retain the full transcript' },
   { command: '/context', description: 'Show context capacity and output reserve' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
+  { command: '/instructions', description: 'Inspect, reload or disable project guidance' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
   { command: '/mcp', description: 'Manage trusted server metadata connections' },
   { command: '/menu', description: 'Open the menu' },
