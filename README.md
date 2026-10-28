@@ -400,10 +400,33 @@ full decision request. Larger exact evidence stays Manual without truncation;
 there is no hard prepaid USD cost guarantee. Returned review usage and any
 reported cost are recorded separately from chat/session usage.
 
-The versioned host heuristics require every check to reach at least `0.995` for
-OpenAI or `0.999` for OpenRouter; any check at or below `0.05` recommends rejection.
-These thresholds are uncalibrated and do not establish comparable behavior
-between providers. Model estimates can be wrong and do not prove authorization.
+The versioned host heuristics require **every** check to meet the selected
+reviewer's threshold: **99.5% for OpenAI** and **99.9% for OpenRouter** by default.
+`/auto-threshold` opens the full-screen threshold picker (also in `/settings`);
+in line mode it shows the current reviewer threshold and usage.
+`/auto-threshold 95` saves a 95% override for the selected reviewer;
+`/auto-threshold default` removes that reviewer's override and restores its
+conservative default without changing the other reviewer. The picker offers
+Default, 90%, 95%, 99%, and Custom. Custom values are **90–100% inclusive, in
+0.1 percentage-point steps** (for example `99.5`); a 100% cutoff requires an
+estimate of exactly 1 for every check. These nonsecret settings persist across
+launches and apply in both the full-screen and line interfaces, but never
+restore Auto enrollment. Changes require an idle interactive conversation,
+revoke existing Auto enrollment, and require fresh `/mode` consent.
+
+Lower thresholds allow more uncertain proposals. The 90% minimum is a product
+input bound, **not a validated safety floor**. These thresholds are uncalibrated
+and do not establish comparable behavior between providers. Model estimates
+can be wrong and do not prove authorization. Any check at or below `0.05`
+still recommends rejection; changing the allow threshold never changes this
+fixed rejection cutoff, host blocks, sensitive-data handling, or human-only actions.
+Review summaries show the lowest requirement estimate, the threshold actually
+used, and the coded outcome, with each requirement's estimate available in the
+details. These are estimates for individual requirements, **not an overall
+probability of approval or safety**. Local reads do not receive fabricated
+reviewer scores. Human-only and blocked actions retain their existing routing;
+missing or invalid reviewer scores are never shown as 0%. Audit metadata retains
+the effective threshold used for a decision.
 A model rejection may still be reviewed by a human when host policy allows it.
 Uncertain, malformed, failed, stale or over-budget reviews use the ordinary
 human approval path; cancelled reviews cannot commit. The UI reports review

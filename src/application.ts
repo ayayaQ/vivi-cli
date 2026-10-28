@@ -23,7 +23,10 @@ import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOS
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
-import { PreferenceStore, listSessions } from './preferences.js'
+import { PreferenceStore, listSessions, DEFAULT_PREFERENCES } from './preferences.js'
+import { chooseAutoReviewThreshold } from './auto-review-controls.js'
+import { formatAutoReviewThreshold, parseAutoReviewThresholdPercent, resolveAutoReviewThreshold } from './auto-review-settings.js'
+import { reviewDigest } from './auto-review.js'
 import type { TuiPreferences } from './preferences.js'
 import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied, hydrateModelCapabilities, modelToolsEnabled, contextLimitsForModel } from './models.js'
 import type { Catalog, ModelEntry } from './models.js'
@@ -67,8 +70,7 @@ export interface ApplicationOptions {
   /** Trusted launch/fixture browser and network hooks; no credentials or persisted OAuth settings. */
   mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>
 }
-export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
-  reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
+export { DEFAULT_PREFERENCES } from './preferences.js'
 const envName = providerEnvironmentName
 
 export function settingsForModel(base: TuiPreferences, model: ModelEntry): TuiPreferences {
@@ -117,6 +119,10 @@ interface ApplicationSecretRegistration {
   targets(values: readonly string[]): void
 }
 export async function runApplication(input: ApplicationOptions): Promise<number> {
+  if (input.options.prompt !== undefined && /^\/auto-threshold(?:\s|$)/.test(input.options.prompt.trim())) {
+    input.io.write('Auto threshold changes require an idle interactive conversation; no setting changed\n')
+    return 0
+  }
   let manager: McpManager
   const registration: ApplicationSecretRegistration = { secrets: [...input.secrets], targets: () => undefined,
     register: values => {
@@ -167,8 +173,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const register = (key: string): void => registration.register([key])
   let settings = structuredClone(DEFAULT_PREFERENCES)
   let savedSettings: TuiPreferences | undefined
+  let thresholdPreferencesAvailable = true
   try { savedSettings = await preferences.load(); settings = savedSettings ? structuredClone(savedSettings) : settings }
-  catch (error) { io.write('Saved defaults could not be loaded; use /provider or /resume\n'); report(error) }
+  catch (error) { thresholdPreferencesAvailable = false; io.write('Saved defaults could not be loaded; Auto enrollment is unavailable until /auto-threshold explicitly saves a valid setting. Use /provider or /resume\n'); report(error) }
   // App-wide consent belongs to the launch, not to a model's session settings.
   let activeMemory = args.includes('--enable-memory') || args.includes('--disable-memory')
     ? options.enableMemory : settings.enableMemory
@@ -405,6 +412,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     // Active model controls must preserve independently chosen future-only defaults.
     const defaults = { ...next, ...(settings.webProvider ? { webProvider: settings.webProvider } : {}), enableNotes: changed.notes ? next.enableNotes : settings.enableNotes,
       enableMemory: changed.memory ? next.enableMemory : settings.enableMemory }
+    if (settings.autoReviewThresholds) defaults.autoReviewThresholds = settings.autoReviewThresholds
     await preferences.save(defaults); settings = defaults
   }
   const configureProviderModel = async (): Promise<void> => {
@@ -481,10 +489,42 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     const reviewSession = { ...host.session, provider }
     host.setDecisionReview({ provider: deferredDecisionProvider(reviewSession, reviewEnv, input.decisionProviderFactory ?? decisionProviderForSession),
       explicitReviewer: true, ledger: decisions, canAutoReview: io.canAutoReview === true,
-      accountRevision: () => generation, isAvailable: () => io.canAutoReview === true && !io.isClosed && host === selectedHost && reviewerGeneration === generation })
+      autoReviewThresholds: settings.autoReviewThresholds ?? {},
+      accountRevision: () => generation, isAvailable: () => thresholdPreferencesAvailable && io.canAutoReview === true && !io.isClosed && host === selectedHost && reviewerGeneration === generation })
     io.setApprovalMode?.('manual')
     io.write(`Auto reviewer: ${provider}, this conversation only. Use /mode for fresh enrollment.\n`)
     return true
+  }
+  const configureAutoThreshold = async (line: string): Promise<void> => {
+    const selectedHost = host, provider = selectedHost?.reviewProvider
+    if (!selectedHost || !provider) { io.write('Choose this conversation’s Auto reviewer with /reviewer first\n'); return }
+    if (io.canAutoReview !== true || io.isClosed || selectedHost.running || options.prompt !== undefined) {
+      io.write('Auto threshold changes require an idle interactive conversation; no setting changed\n'); return
+    }
+    const binding = selectedHost.approvalEnrollmentBinding, previous = selectedHost.autoReviewThresholds
+    const settingsRevision = reviewDigest(settings.autoReviewThresholds ?? {})
+    const argument = line.trim().replace(/^\/auto-threshold\s*/, '')
+    let next = { ...previous }
+    if (!argument) {
+      const picked = await chooseAutoReviewThreshold(io, provider, previous)
+      if (!picked) return
+      next = picked
+    } else if (argument === 'default') delete next[provider]
+    else next[provider] = parseAutoReviewThresholdPercent(argument)
+    if (host !== selectedHost || provider !== selectedHost.reviewProvider || io.isClosed || io.canAutoReview !== true || selectedHost.running ||
+      binding !== selectedHost.approvalEnrollmentBinding || settingsRevision !== reviewDigest(settings.autoReviewThresholds ?? {})) {
+      io.write('Auto threshold context changed; reopen /auto-threshold. No setting changed\n'); return
+    }
+    // Revoke before persistence; failed settings writes cannot leave relaxed Auto authority.
+    selectedHost.setAutoReviewThresholds(next); selectedHost.setApprovalMode('manual'); io.setApprovalMode?.('manual')
+    const appliedBinding = selectedHost.approvalEnrollmentBinding
+    try { await preferences.save({ ...settings, autoReviewThresholds: next }) }
+    catch (error) {
+      if (host === selectedHost && !selectedHost.running && selectedHost.approvalEnrollmentBinding === appliedBinding) selectedHost.setAutoReviewThresholds(previous)
+      throw error
+    }
+    settings = { ...settings, autoReviewThresholds: next }; thresholdPreferencesAvailable = true
+    io.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Auto enrollment revoked; use /mode for fresh consent.\n`)
   }
   const configureNotes = async (): Promise<void> => {
     const enableNotes = await io.choose('Session notes · new-conversation default', [
@@ -682,7 +722,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, env, input.decisionProviderFactory ?? decisionProviderForSession),
           ...(options.reviewer ? { explicitReviewer: true as const } : {}),
           ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
-          isAvailable: () => io.canAutoReview === true && !io.isClosed
+          autoReviewThresholds: settings.autoReviewThresholds ?? {},
+          isAvailable: () => thresholdPreferencesAvailable && io.canAutoReview === true && !io.isClosed
         } } : {}),
         ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
           ask: (request, { signal }) => io.askQuestions!(request, signal),
@@ -780,6 +821,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Continue conversation', value: 'continue' }, { name: 'Chat provider', value: '/provider' },
           { name: 'Web provider', description: settings.webProvider ?? 'direct', value: '/web' },
           { name: 'Auto reviewer', description: host?.reviewProvider ?? 'None selected', value: '/reviewer' },
+          { name: 'Auto threshold', description: host?.reviewProvider ? formatAutoReviewThreshold(resolveAutoReviewThreshold(host.reviewProvider, host.autoReviewThresholds).allowPermille) : 'Choose a reviewer first', value: '/auto-threshold' },
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
@@ -827,6 +869,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         }
         if (command === '/web') { await configureWeb(); continue }
         if (command === '/reviewer') { await configureReviewer(); continue }
+        if (/^\/auto-threshold(?:\s|$)/.test(command)) { await configureAutoThreshold(command); continue }
         if (command === '/provider') {
           await configureProviderModel()
           continue

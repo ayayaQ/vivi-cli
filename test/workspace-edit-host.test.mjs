@@ -84,7 +84,7 @@ for (const providerId of ['openai', 'openrouter']) for (const name of WORKSPACE_
     assert.equal(effect.affectedData.afterRevision, workspaceRevision(await fs.readFile(join(subject.root, 'new.txt'))))
     if (name === 'workspace_edit_text') { assert.equal(effect.affectedData.before, 'old'); assert.equal(effect.affectedData.after, 'new') }
     else { assert.equal(effect.affectedData.before, null); assert.equal(effect.affectedData.after, 'ordinary project text\n') }
-    assert.equal(snapshot.policyRevision, `${AUTO_REVIEW_POLICY_REVISION}-${providerId}`)
+    assert.equal(snapshot.policyRevision, `${AUTO_REVIEW_POLICY_REVISION}-${providerId}-t${providerId === 'openai' ? 995 : 999}`)
     assert.equal(snapshot.userRequest.approvedScope.reviewDataSharing.revision, AUTO_REVIEW_SHARING_REVISION)
     assert.deepEqual(snapshot.userRequest.approvedScope.reviewDataSharing.recipients, providerId === 'openai' ? ['OpenAI'] : ['OpenRouter', 'TypeSafe'])
     assert.deepEqual(subject.records.map(record => record.state), ['commit_started', 'committed'])
@@ -216,7 +216,7 @@ test('expanded fresh enrollment discloses exact local and URL data, named recipi
     assert.match(disclosure, /workspace text creation\/precise edits/); assert.match(disclosure, /paths, before and after/)
     assert.match(disclosure, /private information/); assert.match(disclosure, /extra API charges/)
     for (const required of ['full URL including path/query', 'destination', 'method', 'network limits', 'redirect scope', 'hostname to DNS', 'caller IP', 'server-side effects or costs', 'sensitive data']) assert(disclosure.includes(required), required)
-    assert.equal(sharing.revision, AUTO_REVIEW_SHARING_REVISION); assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v5')
+    assert.equal(sharing.revision, AUTO_REVIEW_SHARING_REVISION); assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v6')
     assert(sharing.data.some(item => item.includes('workspace-relative')))
   }
 })

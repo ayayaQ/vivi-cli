@@ -345,14 +345,16 @@ for (const encoded of ['fixture-known-secret', 'fixture\\u002dknown\\u002dsecret
   test(`credential registered after confirmed MCP projection is withheld before canonical admission: ${encoded}`, async t => {
     let subject
     subject = await fixture(t, { toolResult: { content: [{ type: 'text', text: encoded }, { type: 'text', text: 'unrelated-invalid-percent-%' }] },
-      options: { onReviewNotice(message) {
+      options: { onReviewNotice(message, context) {
         subject.notices.push(message)
-        if (message === 'Approved by you; MCP operation returned a response') subject.secrets.push('fixture-known-secret')
+        // Display summaries may gain metadata; inject at the same owned, settled response boundary.
+        if (context?.toolName === alias && context.state === 'saved' && context.source === 'human') subject.secrets.push('fixture-known-secret')
       } } })
     const disk = await useFileSessionStore(subject)
     subject.host.setApprovalMode('auto')
     const result = await subject.host.send('Use the fixture tool')
     assert.equal(result.status, 'completed'); assert.equal(subject.invocations().length, 1)
+    assert.equal(subject.secrets.includes('fixture-known-secret'), true, 'the owned response-boundary fixture must run')
     const response = resultOf(result), body = JSON.parse(response.content)
     assert.equal(response.isError ?? false, false); assert.equal(body.success, true)
     assert.equal(body.contentWithheld, true); assert.equal(body.confirmedOutcome, true); assert.equal(body.doNotRetry, true)

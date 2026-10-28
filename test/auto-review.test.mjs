@@ -33,7 +33,7 @@ function fixture(options = {}) {
     state.records.push(structuredClone(record))
   } }
   const controller = new AutoReviewController({ provider: options.providerOverride ?? provider, ledger, canAutoReview: options.canAutoReview ?? true,
-    accountRevision: () => state.account }, options.secretsReader ?? state.secrets, async request => {
+    accountRevision: () => state.account, ...(Object.hasOwn(options, 'thresholds') ? { autoReviewThresholds: options.thresholds } : {}) }, options.secretsReader ?? state.secrets, async request => {
     state.human++; state.humanRequest = request
     await options.onHuman?.(state, request)
     return options.approved ?? false
@@ -643,7 +643,7 @@ test('the exact prepared metadata reaches the frozen shared decision request', a
   assert.equal(reviewDigest(snapshot.preparedAction), reviewDigest(subject.proposal.preparedAction))
   assert(Object.isFrozen(snapshot.preparedAction.effects[0].affectedData))
   assert(Object.hasOwn(snapshot.resourceRevisions, snapshot.preparedAction.effects[0].resourceId))
-  assert.equal(snapshot.policyRevision, `${AUTO_REVIEW_POLICY_REVISION}-openai`)
+  assert.equal(snapshot.policyRevision, `${AUTO_REVIEW_POLICY_REVISION}-openai-t995`)
 })
 
 
@@ -694,7 +694,7 @@ for (const providerId of ['openai', 'openrouter']) {
     for (const excluded of ['delete_memory', 'run_command', 'mcp_remote', 'list_mcp_resources', 'read_mcp_resource']) {
       assert(!snapshot.userRequest.approvedScope.tools.includes(excluded))
     }
-    assert.equal(snapshot.policyRevision, `${AUTO_REVIEW_POLICY_REVISION}-${providerId}`)
+    assert.equal(snapshot.policyRevision, `${AUTO_REVIEW_POLICY_REVISION}-${providerId}-t${providerId === 'openai' ? 995 : 999}`)
     assert.equal(snapshot.userRequest.approvedScope.reviewDataSharing.revision, AUTO_REVIEW_SHARING_REVISION)
     assert.equal(snapshot.inputData.url, 'https://example.com/docs?topic=color')
     assert.equal(snapshot.inputData.method, 'GET')
@@ -991,4 +991,89 @@ test('official deferred decision transport samples a replaced live secret list a
   assert.equal(await subject.execute(), undefined)
   assert.equal(fetches, 0); assert.equal(subject.state.human, 1); assert.equal(subject.state.commits, 0)
   assert.equal(subject.state.records.at(-1).reasonCode, 'privacy')
+})
+
+
+for (const providerId of ['openai', 'openrouter']) {
+  for (const [permille, probability, allowed] of [[900, 0.9, true], [950, 0.9, false], [950, 0.95, true],
+    [950, 0.94999999, false], [1000, 0.99999999, false], [1000, 1, true], [900, 0.05, false]]) {
+    test(`${providerId} configured ${permille} cutoff with ${probability} retains exact all-check admission`, async () => {
+      const subject = fixture({ providerId, thresholds: { [providerId]: permille }, probability })
+      assert.equal(await subject.execute(), allowed ? 2 : undefined)
+      assert.equal(subject.state.calls, 1); assert.equal(subject.state.commits, allowed ? 1 : 0)
+      const request = subject.state.requests[0]
+      assert(request.policy.checks.every(check => check.allowAt === permille / 1000 && check.denyAt === 0.05))
+      assert.match(request.snapshot.policyRevision, new RegExp(`-t${permille}$`))
+      assert.deepEqual(subject.state.records[0].thresholds, { allowAt: permille / 1000, denyAt: 0.05 })
+      const evidence = subject.state.reviewStates.at(-1).evaluation
+      assert.equal(evidence.kind, 'model'); assert.equal(evidence.allowAt, permille / 1000)
+      assert.equal(evidence.checks.length, 4); assert(evidence.checks.every(check => check.probability === probability))
+      assert(subject.state.notices.at(-1).includes('Lowest requirement estimate'))
+      assert(subject.state.notices.at(-1).includes('not an overall approval or safety probability'))
+      if (probability === 0.05) assert.equal(evidence.outcome, 'deny')
+    })
+  }
+}
+test('one requirement below cutoff is never averaged away and human review sees captured score and cutoff', async () => {
+  const subject = fixture({ thresholds: { openai: 950 }, probabilities: { effects_within_scope: 0.9 }, approved: true })
+  assert.equal(await subject.execute(), 2)
+  assert.equal(subject.state.human, 1)
+  assert.match(subject.state.humanRequest.description, /90%.*95%/)
+  assert.match(subject.state.humanRequest.description, /effects within scope: 90%/)
+  assert.equal(subject.state.reviewStates.at(-1).source, 'human')
+  assert.equal(subject.state.reviewStates.at(-1).evaluation.outcome, 'ask')
+})
+test('missing and malformed review scores stay unavailable without invented zero percent', async () => {
+  const subject = fixture({ thresholds: { openai: 950 }, response: { model: 'gpt-6-luna', answers: [], usage: { inputTokens: 1, outputTokens: 1 } } })
+  assert.equal(await subject.execute(), undefined)
+  const evidence = subject.state.reviewStates.at(-1).evaluation
+  assert.equal(evidence.kind, 'unavailable'); assert.deepEqual(evidence.checks, [])
+  assert.equal(evidence.reasonCode, 'invalid_response')
+  assert.match(subject.state.notices.at(-1), /estimate unavailable/)
+  assert(!subject.state.notices.at(-1).includes('Lowest requirement estimate'))
+})
+test('privacy, host manual and hard blocked routes never manufacture model estimates at a lower cutoff', async () => {
+  for (const gate of ['privacy', 'manual', 'blocked']) {
+    const subject = fixture({ thresholds: { openai: 900 }, ...(gate === 'privacy' ? { text: 'my medication' } : {}) })
+    if (gate !== 'privacy') subject.proposal.preparedAction.effects[0].review = gate
+    assert.equal(await subject.execute(), undefined)
+    assert.equal(subject.state.calls, 0); assert.equal(subject.state.commits, 0)
+    assert.equal(subject.state.human, gate === 'blocked' ? 0 : 1)
+    const evidence = subject.state.reviewStates.at(-1).evaluation
+    assert.equal(evidence.kind, 'not-reviewed'); assert.deepEqual(evidence.checks, [])
+    assert(!subject.state.notices.at(-1).includes('Lowest requirement estimate'))
+  }
+})
+test('threshold edits reject active turns without resetting budget or seen proposals, then revoke idle enrollment', async () => {
+  const subject = fixture({ thresholds: { openai: 950 } })
+  const initial = subject.controller.enrollmentBinding
+  assert.throws(() => subject.controller.setThresholdOverrides({ openai: 900 }), /current turn/)
+  assert.equal(subject.controller.enrollmentBinding, initial)
+  await subject.execute()
+  assert.throws(() => subject.controller.setThresholdOverrides({ openai: 900 }), /current turn/)
+  await assert.rejects(subject.execute(), /already been reviewed/)
+  assert.equal(subject.state.calls, 1)
+  subject.controller.endTurn(); subject.controller.setThresholdOverrides({ openai: 900 })
+  assert.equal(subject.controller.mode, 'manual'); assert.notEqual(subject.controller.enrollmentBinding, initial)
+  assert.deepEqual(subject.controller.thresholdOverrides, { openai: 900 })
+})
+test('threshold edits cannot clear a suspended audit or unknown resource outcome', async () => {
+  for (const failure of ['audit', 'unknown']) {
+    const subject = fixture(failure === 'audit' ? { onAudit() { throw new Error('offline audit') } }
+      : { onCommit() { throw new Error('unknown write outcome') } })
+    if (failure === 'audit') assert.equal(await subject.execute(), undefined)
+    else await assert.rejects(subject.execute(), /unknown write outcome/)
+    subject.controller.endTurn(); subject.controller.setThresholdOverrides({ openai: 900 })
+    assert.equal(subject.controller.mode, 'manual')
+    assert.throws(() => subject.controller.setMode('auto'), /healthy review ledger/)
+  }
+})
+test('configuration overrides are copied and invalid runtime configuration cannot silently use defaults', async () => {
+  const overrides = { openai: 950 }, subject = fixture({ thresholds: overrides, probability: 0.94 })
+  overrides.openai = 900
+  assert.equal(await subject.execute(), undefined)
+  assert.equal(subject.state.requests[0].policy.checks[0].allowAt, 0.95)
+  for (const thresholds of [null, undefined, { openai: 899 }, { openai: 950.5 }, { openai: NaN }, { extra: 900 }]) {
+    assert.throws(() => fixture({ thresholds }), /threshold/i)
+  }
 })

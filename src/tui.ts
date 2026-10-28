@@ -86,6 +86,7 @@ export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a chat provider' },
   { command: '/web', description: 'Choose an independent web provider' },
   { command: '/reviewer', description: 'Choose this conversation’s Auto reviewer' },
+  { command: '/auto-threshold', description: 'Set the reviewer’s saved requirement cutoff' },
   { command: '/models', description: 'Choose a model' },
   { command: '/effort', description: 'Choose reasoning effort' },
   { command: '/mode', description: 'Choose Manual / Auto review / Plan' },

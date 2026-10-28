@@ -94,6 +94,8 @@ try {
     'src/tui-mouse.ts', 'dist/tui-mouse.js', 'dist/tui-mouse.d.ts',
     'src/memory.ts', 'dist/memory.js', 'dist/memory.d.ts',
     'src/auto-review.ts', 'dist/auto-review.js', 'dist/auto-review.d.ts',
+    'src/auto-review-settings.ts', 'dist/auto-review-settings.js', 'dist/auto-review-settings.d.ts',
+    'src/auto-review-controls.ts', 'dist/auto-review-controls.js', 'dist/auto-review-controls.d.ts',
     'src/decision-ledger.ts', 'dist/decision-ledger.js', 'dist/decision-ledger.d.ts',
     'src/skills.ts', 'dist/skills.js', 'dist/skills.d.ts',
     'src/installed-skills.ts', 'dist/installed-skills.js', 'dist/installed-skills.d.ts',
@@ -627,13 +629,17 @@ try {
   assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed old')
   const readRevision = JSON.parse((await workspace.execute('workspace_read', { path: 'created.txt' }, new AbortController().signal)).content).revision
   let editRounds = 0, decisions = 0
+  const editNotices = [], editAudits = []
   const editHost = await CliHost.create({ store: new FileSessionStore(directory), workspace,
     approve: async () => { throw new Error('Packed eligible edit unexpectedly needed manual review') },
-    decisionReview: { canAutoReview: true, accountRevision: () => 'packed-account', ledger: { async upsert() {} },
+    onReviewNotice: (message, context) => editNotices.push({ message, context }),
+    decisionReview: { canAutoReview: true, autoReviewThresholds: { openai: 950, openrouter: 990 }, accountRevision: () => 'packed-account', ledger: { async upsert(row) { editAudits.push(row) } },
       provider: { id: 'openai', model: 'gpt-6-luna', async evaluate(request) {
         decisions++; assert.equal(request.snapshot.preparedAction.effects[0].scope, 'workspace')
+        assert(request.policy.checks.every(check => check.allowAt === 0.95 && check.denyAt === 0.05))
+        assert.match(request.snapshot.policyRevision, /-t950$/)
         assert.equal(request.snapshot.inputData.before, 'old'); assert.equal(request.snapshot.inputData.after, 'new')
-        return { model: 'gpt-6-luna', answers: request.policy.checks.map(check => ({ name: check.name, type: 'predicate', probability: 1 })),
+        return { model: 'gpt-6-luna', answers: request.policy.checks.map(check => ({ name: check.name, type: 'predicate', probability: 0.95 })),
           usage: { inputTokens: 1, outputTokens: 1 } }
       } } },
     settings: { provider: 'openai', model: 'fake' }, provider: { generate: async () => ++editRounds === 1
@@ -644,6 +650,15 @@ try {
   assert.equal((await editHost.send('Replace old with new in created.txt')).status, 'completed')
   assert.equal(decisions, 1); assert.equal(await readFile(join(project, 'created.txt'), 'utf8'), 'packed new')
   assert(!(await readdir(project)).some(name => name.startsWith('.vivi-stage-')))
+  assert.deepEqual(editAudits.at(-1).thresholds, { allowAt: 0.95, denyAt: 0.05 })
+  assert.equal(editNotices.at(-1).context.evaluation.checks.length, 4)
+  assert(editNotices.at(-1).message.includes('Lowest requirement estimate 95%'))
+  assert(editNotices.at(-1).message.includes('required 95%'))
+  editHost.setAutoReviewThresholds({ openrouter: 990 })
+  assert.equal(editHost.approvalMode, 'manual')
+  assert.deepEqual(editHost.autoReviewThresholds, { openrouter: 990 })
+  const copiedThresholds = editHost.autoReviewThresholds; copiedThresholds.openrouter = 900
+  assert.equal(editHost.autoReviewThresholds.openrouter, 990)
   let extensionRounds = 0
   const extensionHost = await CliHost.create({ store: new FileSessionStore(directory),
     settings: { provider: 'openai', model: 'fake' }, extensions: [fixture],

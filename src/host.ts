@@ -39,6 +39,7 @@ import type { InstructionProfile, InstructionSnapshot } from './instructions.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
 import { normalizeSessionTitle, sessionTitleFromPrompt, validSessionTitle } from './session-display.js'
 import { AutoReviewController, reviewDigest } from './auto-review.js'
+import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice } from './auto-review.js'
 import type { JsonObject } from '@ayayaq/vivi'
 import type { PreparedActionMetadata } from '@ayayaq/vivi/decisions'
@@ -564,14 +565,23 @@ export class CliHost {
     const id = this.options.decisionReview?.provider.id
     return id && isReviewProvider(id) ? id : undefined
   }
+  get autoReviewThresholds(): AutoReviewThresholdOverrides { return this.reviews.thresholdOverrides }
+  /** Human settings only, on the existing controller so failed-audit suspension survives. */
+  setAutoReviewThresholds(value: AutoReviewThresholdOverrides): void {
+    if (this.running) throw new Error('Wait for the current turn before changing Auto thresholds')
+    this.reviews.setThresholdOverrides(value)
+    if (this.options.decisionReview) this.options.decisionReview.autoReviewThresholds = this.reviews.thresholdOverrides
+  }
   /** Explicit host controls only; conversation-local selection never carries old enrollment. */
   setDecisionReview(config: AutoReviewConfiguration | undefined): void {
     if (this.running) throw new Error('Wait for the current turn before changing reviewer')
     if (config && (!isReviewProvider(config.provider.id) || config.provider.id !== this.current.provider && config.explicitReviewer !== true)) throw new Error('Choose an explicit supported reviewer')
-    if (config) this.options.decisionReview = { ...config, ...(this.selectedWeb.provider === 'deepseek' ? { deepSeekWeb: true as const } : {}) }
-    else delete this.options.decisionReview
-    this.reviews = new AutoReviewController(this.options.decisionReview, () => this.options.secrets ?? [],
+    const next = config ? { ...config, autoReviewThresholds: Object.hasOwn(config, 'autoReviewThresholds') ? config.autoReviewThresholds! : this.reviews.thresholdOverrides, ...(this.selectedWeb.provider === 'deepseek' ? { deepSeekWeb: true as const } : {}) } : undefined
+    const reviews = new AutoReviewController(next, () => this.options.secrets ?? [],
       (request, signal) => this.approveWithPresentation(request, signal), this.options.onReviewNotice)
+    if (next) this.options.decisionReview = next
+    else delete this.options.decisionReview
+    this.reviews = reviews
   }
   setWebConfiguration(config: CliWebConfiguration): void {
     if (this.running) throw new Error('Wait for the current turn before changing web provider')

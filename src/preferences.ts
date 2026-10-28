@@ -8,6 +8,8 @@ import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 import { isSessionId } from './session.js'
 import type { CliProviderName, FileSessionStore } from './session.js'
 import { sessionDisplayTitle } from './session-display.js'
+import { validateAutoReviewThresholdOverrides } from './auto-review-settings.js'
+import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 
 export const MAX_PREFERENCES_BYTES = 8 * 1024
 export const MAX_SESSION_PICKER_ITEMS = 100
@@ -15,8 +17,8 @@ export const MAX_SESSION_LIST_ENTRIES = 1000
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 const preferenceKeys = ['schemaVersion', 'provider', 'model', 'reasoning',
   'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'enableMemory', 'maxRounds'] as const
-const optionalPreferenceKeys = ['enableMemory', 'webProvider'] as const
-const allowedPreferenceKeys = [...preferenceKeys, 'webProvider'] as const
+const optionalPreferenceKeys = ['enableMemory', 'webProvider', 'autoReviewThresholds'] as const
+const allowedPreferenceKeys = [...preferenceKeys, 'webProvider', 'autoReviewThresholds'] as const
 
 /** Host preferences only. Credentials, transcripts, prompts and paths are never settings. */
 export interface TuiPreferences {
@@ -34,7 +36,13 @@ export interface TuiPreferences {
   maxRounds: number
   /** Independent web default. Absence migrates to keyless Direct. No credential here. */
   webProvider?: 'direct' | 'deepseek' | 'disabled'
+  /** Per-reviewer integer permille overrides only; absence retains provider defaults, never enrollment. */
+  autoReviewThresholds?: AutoReviewThresholdOverrides
 }
+
+/** Shared launch defaults. Neither saved preferences nor these defaults enroll Auto review. */
+export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
+  reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
 
 export interface SessionPickerEntry {
   id: string
@@ -114,6 +122,11 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     check(descriptor && descriptor.enumerable && 'value' in descriptor &&
       ['direct', 'deepseek', 'disabled'].includes(descriptor.value), 'unsupported web provider')
     preferences.webProvider = descriptor.value
+  }
+  if (keys.includes('autoReviewThresholds')) {
+    const descriptor = descriptors.autoReviewThresholds
+    check(descriptor && descriptor.enumerable && 'value' in descriptor, 'invalid Auto review thresholds')
+    preferences.autoReviewThresholds = validateAutoReviewThresholdOverrides(descriptor.value)
   }
   const encoded = JSON.stringify(preferences)
   check(!secretPresent(encoded, secrets), 'settings must not contain environment credentials')

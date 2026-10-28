@@ -12,6 +12,7 @@ import { OpenTuiIO } from '../src/tui.js'
 import { newSession } from '../src/session.js'
 import { FileMemoryStore } from '../src/memory.js'
 import { FileDecisionLedger } from '../src/decision-ledger.js'
+import { DEFAULT_PREFERENCES, PreferenceStore } from '../src/preferences.js'
 import type { ApprovalRequest } from '../src/tools.js'
 import type { ReviewNotice } from '../src/auto-review.js'
 
@@ -97,8 +98,9 @@ test('status fixture waits for a completed new frame before a fresh deny gesture
 
 type Phase = { kind: 'choice'; names: string[] } | { kind: 'approval'; request: ApprovalRequest }
   | { kind: 'composer' } | { kind: 'fetch'; finish(response: Response): void; body: Record<string, unknown> }
-async function application(callCount = 1, preliminaryTools = false) {
+async function application(callCount = 1, preliminaryTools = false, threshold?: number) {
   const f = await fixture(), directory = await mkdtemp(join(tmpdir(), 'vivi-review-status-'))
+  if (threshold !== undefined) await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, autoReviewThresholds: { openrouter: threshold } })
   const phases: Phase[] = []
   let wake: ((phase: Phase) => void) | undefined
   const announce = (phase: Phase): void => { if (wake) { const done = wake; wake = undefined; done(phase) } else phases.push(phase) }
@@ -266,4 +268,27 @@ test('canonical refresh, reused call IDs, late events and resumed sessions never
   f.io.reviewNotice('wrong session', { ...first, state: 'needs_review' })
   expect(f.transcript()).not.toContain('Review ·')
   expect(f.transcript()).not.toContain('wrong session')
+})
+
+
+for (const threshold of [900, 950]) test(`native review status shows captured ${threshold / 10}% cutoff and all four model estimates`, async () => {
+  const f = await application(1, false, threshold)
+  await f.send('Make a memory that on Thursdays we start with howdy.')
+  await f.response(200, 0.9)
+  if (threshold === 950) {
+    const request = await f.review('deny')
+    expect(request.description).toContain('90% is below the 95% cutoff')
+  }
+  await f.settled()
+  const text = f.transcript()
+  expect(text).toContain(`required ${threshold / 10}%`)
+  expect(text).toContain('Lowest requirement estimate 90%')
+  for (const name of ['request match: 90%', 'effects within scope: 100%', 'instruction source: 100%', 'non-sensitive content: 100%']) expect(text).toContain(name)
+  expect(text).toContain('not an overall approval or safety probability')
+  expect(text).not.toContain('Reviewing create_memory')
+  expect(text).toContain(threshold === 900 ? 'Automatically approved' : 'Denied by you')
+  expect((await new FileDecisionLedger(f.directory).list()).at(-1)?.thresholds).toEqual({ allowAt: threshold / 1000, denyAt: 0.05 })
+  f.setup.resize(40, 20); await f.frame()
+  const composer = f.setup.renderer.root.findDescendantById('vivi-composer-box')!
+  expect(composer.y + composer.height).toBeLessThanOrEqual(20)
 })
