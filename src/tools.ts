@@ -23,6 +23,7 @@ export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
   calculate: 'local-read', current_time: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
   list_memories: 'local-read', create_memory: 'local-mutation', edit_memory: 'local-mutation', delete_memory: 'local-mutation',
   workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
+  workspace_read_image: 'local-read',
   workspace_create_text: 'local-mutation', workspace_edit_text: 'local-mutation',
   list_skills: 'local-read', read_skill: 'local-read', save_skill: 'local-mutation', request_user_input: 'local-read',
   command_start: 'command', command_poll: 'command', command_stop: 'command', fetch_url: 'public-url', web_search: 'public-url',

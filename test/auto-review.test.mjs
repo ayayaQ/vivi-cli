@@ -61,6 +61,13 @@ test('Manual is default, has zero judge calls, and preserves ordinary human revi
   assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 1)
   assert.deepEqual(subject.state.records, [])
 })
+test('unseen image observations route text-only automatic review to fresh human review', async () => {
+  const subject = fixture({ approved: true })
+  subject.controller.markUnseenImageContext()
+  assert.equal(await subject.execute(), 2)
+  assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 1)
+  assert.match(subject.state.humanRequest.description, /text-only reviewer cannot inspect/)
+})
 test('interactive capability is required for enrollment', () => {
   assert.throws(() => fixture({ canAutoReview: false }), /interactive/)
 })

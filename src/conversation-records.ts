@@ -317,12 +317,12 @@ export class CliConversationRecords {
       await this.commit({ schemaVersion: 1, sessionId: this.sessionId, legacy, records: [record], runs: [] })
     })
   }
-  private envelope(): { version: 1; sessionId: string; eventId: string; sequence: number; previousEventId: string | null; source: { reference: string } } {
-    return { version: 1, sessionId: this.sessionId, eventId: randomUUID(), sequence: this.projection.sequence + 1,
+  private envelope(): { version: 2; sessionId: string; eventId: string; sequence: number; previousEventId: string | null; source: { reference: string } } {
+    return { version: 2, sessionId: this.sessionId, eventId: randomUUID(), sequence: this.projection.sequence + 1,
       previousEventId: this.projection.eventId, source: { reference: `cli-session:${this.sessionId}:records` } }
   }
-  private runEnvelope(run: AgentRunProjection): { version: 1; scope: 'run'; sessionId: string; runId: string; eventId: string; sequence: number; previousEventId: string | null; source: { reference: string } } {
-    return { version: 1, scope: 'run', sessionId: this.sessionId, runId: run.runId, eventId: randomUUID(),
+  private runEnvelope(run: AgentRunProjection): { version: 2; scope: 'run'; sessionId: string; runId: string; eventId: string; sequence: number; previousEventId: string | null; source: { reference: string } } {
+    return { version: 2, scope: 'run', sessionId: this.sessionId, runId: run.runId, eventId: randomUUID(),
       sequence: run.sequence + 1, previousEventId: run.eventId, source: { reference: `cli-run:${run.runId}` } }
   }
   private async assertStoredCurrent(): Promise<void> {

@@ -152,6 +152,7 @@ interface Turn {
   text: string
   calls: number
   seen: Set<string>
+  unseenImages?: boolean
 }
 
 /** Strict plain-JSON canonical hash; only hashes enter the metadata ledger. */
@@ -266,6 +267,8 @@ export class AutoReviewController {
   beginTurn(sessionId: string, text: string): void {
     this.turn = { sessionId, text, runId: randomUUID(), requestId: randomUUID(), calls: 0, seen: new Set() }
   }
+  /** The fixed text-only reviewer cannot approve decisions that may depend on unseen pixels. */
+  markUnseenImageContext(): void { if (this.turn) this.turn.unseenImages = true }
   endTurn(): void { this.turn = undefined }
   async drain(): Promise<void> {
     try { await this.config?.ledger.drain?.() }
@@ -387,11 +390,12 @@ export class AutoReviewController {
     // A shared route is classification only. It cannot broaden the CLI action allowlist,
     // enroll Auto, authorize data sharing, or bypass the existing resource commit guard.
     const inScope = proposal.eligible && (AUTO_REVIEW_TOOL_NAMES.includes(call.name) || this.config?.deepSeekWeb === true && call.name === 'web_search')
-    const eligible = inScope && route.route === 'model-review'
+    const eligible = inScope && route.route === 'model-review' && !turn?.unseenImages
     if (!this.config || mode !== 'auto' || !eligible || !turn) {
       let manualApproval = approval
       if (this.config && mode === 'auto') {
-        const reason = proposal.operationLabel === 'MCP operation' ? 'MCP operations always require human approval, even in Auto'
+        const reason = turn?.unseenImages ? 'This session contains image observations that the text-only reviewer cannot inspect'
+          : proposal.operationLabel === 'MCP operation' ? 'MCP operations always require human approval, even in Auto'
           : !inScope ? `This action is outside Auto review’s ${AUTO_REVIEW_SCOPE_DESCRIPTION} scope`
           : route.route !== 'model-review' ? 'Host preparation requires manual review for this action'
           : 'Auto review requires an active current user request'

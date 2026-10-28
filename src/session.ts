@@ -13,7 +13,7 @@ export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
 export type CliProviderName = 'openai' | 'openrouter' | 'deepseek'
 export interface CliSession {
-  schemaVersion: 1 | 2
+  schemaVersion: 1 | 2 | 3
   /** Schema-2 points to an existing shadow anchor; it grants no replay/send authority. */
   recordAnchor?: { version: 1; eventId: string }
   id: string
@@ -92,9 +92,9 @@ export function validateSession(value: unknown): CliSession {
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
     'history', 'contextCheckpoint', 'contextSummaryUsage', 'contextSummaryUnreported', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
-  check(value.schemaVersion === 1 || value.schemaVersion === 2, 'unsupported schema version')
+  check(value.schemaVersion === 1 || value.schemaVersion === 2 || value.schemaVersion === 3, 'unsupported schema version')
   if (value.schemaVersion === 1) check(!('recordAnchor' in value), 'schema-1 must not contain a record anchor')
-  else {
+  else if (value.schemaVersion === 2 || 'recordAnchor' in value) {
     check(object(value.recordAnchor), 'schema-2 requires a record anchor')
     keys(value.recordAnchor, ['version', 'eventId'])
     check(value.recordAnchor.version === 1 && identifier(value.recordAnchor.eventId), 'invalid record anchor')
@@ -135,10 +135,26 @@ export function validateSession(value: unknown): CliSession {
   for (const message of value.history) {
     check(object(message) && text(message.content), 'invalid history message')
     if (message.kind === 'tool_result') {
-      keys(message, ['kind', 'callId', 'name', 'content', 'isError'])
+      keys(message, ['kind', 'callId', 'name', 'content', 'isError', ...(value.schemaVersion === 3 ? ['images'] : [])])
       const next = pending.shift()
       check(next && message.callId === next.id && message.name === next.name, 'unmatched tool result')
       if ('isError' in message) check(typeof message.isError === 'boolean', 'invalid tool result')
+      if ('images' in message) {
+        check(Array.isArray(message.images) && message.images.length > 0 && message.images.length <= 4, 'invalid image references')
+        const imageIds = new Set<string>()
+        for (const image of message.images) {
+          check(object(image), 'invalid image reference')
+          keys(image, ['id', 'sha256', 'mimeType', 'width', 'height', 'byteLength'])
+          check(text(image.id, 256) && image.id.length > 0 && image.id.trim() === image.id && !/[\u0000-\u001f\u007f]/.test(image.id) &&
+            !imageIds.has(image.id) && typeof image.sha256 === 'string' && /^[a-f0-9]{64}$/.test(image.sha256) &&
+            (image.mimeType === 'image/png' || image.mimeType === 'image/jpeg'), 'invalid image identity or encoding')
+          imageIds.add(image.id as string)
+          check(Number.isSafeInteger(image.width) && Number(image.width) > 0 &&
+            Number.isSafeInteger(image.height) && Number(image.height) > 0 &&
+            Number(image.width) * Number(image.height) <= 16_000_000 && Number.isSafeInteger(image.byteLength) &&
+            Number(image.byteLength) > 0 && Number(image.byteLength) <= 5 * 1024 * 1024, 'invalid image bounds')
+        }
+      }
       continue
     }
     check(pending.length === 0, 'interleaved pending tool calls')
