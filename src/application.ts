@@ -19,7 +19,7 @@ import { FileImageAssets } from './image-assets.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
-import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
+import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
@@ -103,7 +103,9 @@ Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves 
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
 /context shows effective-request tokens, capacity and output reserve; /compact summarizes older provider context while keeping the full local transcript.\n/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
-Escape or Ctrl-C cancels a running turn. Ctrl-C while idle exits.
+Enter while working queues a message; Ctrl+Enter or Interrupt & send cancels first, then sends after cleanup. Modifier reporting varies by terminal.
+/queue shows retained input; /queue send sends it; /queue undo edits the latest; /queue clear removes pending input.
+Escape or Ctrl-C cancels a running turn and retains queued input. Ctrl-C while idle exits.
 Provider/model/effort changes start a fresh conversation; existing transcripts remain available with /resume.
 Keys are masked and saved only in an available OS credential store, or used for this launch after your choice.
 `
@@ -797,6 +799,15 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         command = action; line = action
       }
       try {
+        if (host && /^\/queue(?:\s|$)/.test(line.trim())) {
+          try { await runSteeringCommand(host, io, line) }
+          finally { io.setSession(host.session) }
+          continue
+        }
+        if (host?.queuedMessages.length && ['/new', '/resume', '/provider', '/models', '/effort'].includes(command)) {
+          io.write('Send or clear this conversation’s queued messages with /queue before changing conversations\n')
+          continue
+        }
         if (command === '/new') {
           if (settings.model) selected = { fresh: true }
           else io.write('Use /provider and /models to configure this fresh conversation\n')
@@ -890,8 +901,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (!host) { io.write('Use /provider and /models before sending a message\n'); continue }
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
-        try { const result = await sendChatTurn(host, io, line, controller.signal); io.result(result); io.setSession(host.session) }
-        finally { dispose() }
+        try { const result = await sendChatTurn(host, io, line, controller.signal); io.result(result) }
+        finally { dispose(); io.setSession(host.session) }
       } catch (error) { report(error) }
     }
   } finally {

@@ -3,6 +3,8 @@ import { compactContext, measureContext, runAgent } from '@ayayaq/vivi'
 import type { ContextCheckpoint, ContextLimits, ContextOptions, ContextUsage } from '@ayayaq/vivi'
 import { PLAN_MODE_GUIDANCE, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
+import { SteeringQueue } from './steering.js'
+import type { SteeringMessage } from './steering.js'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentAcceptedUpdate, AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
 import { projectDeepSeekHistory, ProviderRequestError } from '@ayayaq/vivi/providers/deepseek'
@@ -360,6 +362,7 @@ export class CliHost {
   }
   async compact(signal?: AbortSignal): Promise<void> { await this.run('', signal, 'compact') }
   private readonly records: CliConversationRecords
+  private readonly steering = new SteeringQueue()
   private controller: AbortController | undefined
   private persistence: Promise<void> = Promise.resolve()
   private enabledMemory: boolean
@@ -578,6 +581,21 @@ export class CliHost {
       const { deepSeekWeb: _old, ...rest } = review
       this.setDecisionReview({ ...rest, ...(config.provider === 'deepseek' ? { deepSeekWeb: true as const } : {}) })
     } else this.reviews.setMode('manual')
+  }
+  get queuedMessages(): readonly SteeringMessage[] { return this.steering.messages }
+  queueMessage(content: string): SteeringMessage {
+    if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host')
+    this.validateMessage(content)
+    if (publicUrlContainsSecret(content, this.options.secrets ?? [])) throw new Error('Queued message contains a known credential; remove it before sending')
+    return this.steering.add(content)
+  }
+  takeLastQueuedMessage(): string | undefined { return this.steering.takeLast() }
+  clearQueuedMessages(): void { this.steering.clear() }
+  private validateMessage(content: string): void {
+    if (!content.trim() || content.length > 64 * 1024) throw new Error('Message must contain 1..65536 characters')
+    if ((this.options.secrets ?? []).some(secret => secret && content.includes(secret))) {
+      throw new Error('Message contains an environment credential; remove it before sending')
+    }
   }
   get approvalMode(): ApprovalMode { return this.reviews.mode }
   get taskMode(): TaskMode { return this.selectedTaskMode }
@@ -1695,16 +1713,20 @@ export class CliHost {
       throw error
     }
   }
-  async send(content: string, signal?: AbortSignal): Promise<AgentResult> { return this.run(content, signal, 'send') }
-  private async run(content: string, signal: AbortSignal | undefined, operation: 'send' | 'compact' | 'measure'): Promise<AgentResult> {
+  async send(content: string, signal?: AbortSignal,
+    onSteeringAccepted?: (content: string, initial?: boolean) => void, queuedId?: string,
+    onSteeringQueueChanged?: () => void): Promise<AgentResult> {
+    return this.run(content, signal, 'send', onSteeringAccepted, queuedId, onSteeringQueueChanged)
+  }
+  private async run(content: string, signal: AbortSignal | undefined, operation: 'send' | 'compact' | 'measure',
+    onSteeringAccepted?: (content: string, initial?: boolean) => void, queuedId?: string,
+    onSteeringQueueChanged?: () => void): Promise<AgentResult> {
     if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host')
     if (this.running) throw new Error('A CLI turn is already running')
     this.discardUnsafeContextCheckpoint(this.current)
-    if (operation === 'send' && (!content.trim() || content.length > 64 * 1024)) throw new Error('Message must contain 1..65536 characters')
+    if (operation === 'send') this.validateMessage(content)
     const secrets = this.options.secrets ?? []
-    if (secrets.some((secret) => secret.length > 0 && content.includes(secret))) {
-      throw new Error('Message contains an environment credential; remove it before sending')
-    }
+    if (queuedId !== undefined) this.steering.claimInitial(queuedId, content, this.current.history.length)
     const enableNotes = this.options.enableNotes ?? false
     const enableTools = this.options.enableTools !== false
     const taskMode = this.taskMode
@@ -1777,6 +1799,7 @@ export class CliHost {
     const captureRecordRows = (): void => { for (const row of this.safeMcpRows()) recordRows.set(row.id, row) }
     let failed = false, primaryFailure: unknown
     try {
+      if (queuedId !== undefined) onSteeringQueueChanged?.()
       const memory = this.enabledMemory && enableTools ? createMemoryExtension({
         listMemories: async ({ signal }) => memoryToolResult(await this.listMemories(signal)),
         executeMutation: (call, { signal }) => this.executeMemory(call, signal, controller.signal)
@@ -2114,11 +2137,33 @@ export class CliHost {
         if (title !== undefined) { this.current.title = title; this.current.titleRevision = 1 }
       }
       try { await this.save() }
-      catch (error) { if (!(error instanceof SessionCommitError)) this.current = previous; throw error }
+      catch (error) {
+        if (!(error instanceof SessionCommitError)) this.current = previous
+        else if (queuedId !== undefined) this.steering.acknowledgeInitial(queuedId)
+        throw error
+      }
+      if (queuedId !== undefined) {
+        this.steering.acknowledgeInitial(queuedId)
+        if (!controller.signal.aborted) onSteeringAccepted?.(content, true)
+      }
       await this.records.begin(this.toolsetRevision, this.current)
       const result = await runAgent({
         provider: guardedProvider, messages: this.current.history, context, getContextPrefix: getInstructionPrefix,
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
+        getSteeringMessages: ({ signal }) => {
+          signal.throwIfAborted()
+          if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return []
+          const queued = this.steering.stage(this.current.history.length)
+          for (const message of queued) {
+            this.validateMessage(message.content)
+            if (publicUrlContainsSecret(message.content, this.options.secrets ?? [])) throw new Error('Queued message contains a known credential; admission was blocked')
+          }
+          const history = [...this.current.history, ...queued]
+          validateSession({ ...this.current, history })
+          this.records.assertOutput({ content: '', toolCalls: [] }, history)
+          if (queued.length) onSteeringQueueChanged?.()
+          return queued
+        },
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
         executeTool: async (call, context) => {
           enteredToolCalls.add(reviewDigest(call))
@@ -2210,7 +2255,24 @@ export class CliHost {
           // It is an observation seam, never an MCP checkpoint acknowledgement.
           if (update.message.kind === 'assistant') for (const call of update.message.toolCalls) acceptedToolCalls.set(reviewDigest(call), structuredClone(call))
           const message = this.reconcileMcpHistory([...this.current.history, structuredClone(update.message)]).at(-1)!
-          const work = this.records.accept(this.toolsetRevision, { ...update, message } as AgentAcceptedUpdate)
+          const recordWork = this.records.accept(this.toolsetRevision, { ...update, message } as AgentAcceptedUpdate)
+          if (update.type === 'user_message_accepted') {
+            if (message.kind !== 'message' || message.role !== 'user') throw new Error('Unexpected queued user message')
+            const index = this.current.history.length
+            // Admit synchronously before any shadow-write wait. Abort may end the
+            // core await, but a late observer must never append this message again.
+            this.current.history.push(structuredClone(message))
+            this.reviews.steer(message.content)
+            this.steering.acknowledge(update.message, index)
+          }
+          const work = (async (): Promise<void> => {
+            await recordWork
+            if (update.type !== 'user_message_accepted') return
+            await this.save()
+            if (!controller.signal.aborted && owner.state === 'open' && this.activeTurn?.scope === owner) {
+              onSteeringAccepted?.(message.content)
+            }
+          })()
           this.eventJobs.add(work)
           void work.then(() => this.eventJobs.delete(work), error => { eventFailures.push(error); this.eventJobs.delete(work) })
           return work
@@ -2340,6 +2402,7 @@ export class CliHost {
       const canonicalResult = { ...result, history: terminalHistory,
         ...(deepSeekHistoryUnsupported && result.error ? { error: { ...result.error, message: historyHelp } } : {}) }
       this.current.history = canonicalResult.history
+      this.steering.reconcile(rawHistory)
       // Reconcile from the original baseline, never add final usage to event sums.
       // A cancelled/unaccepted response contributes no round and preserves prior metrics.
       this.current.usage = aggregateUsage([...priorUsage, ...(result.rounds > 0 ? [result.usage] : [])])
@@ -2390,6 +2453,7 @@ export class CliHost {
         throw cleanupError
       }
       finally {
+        this.steering.release()
         this.controller = undefined
         this.activeTurn = undefined
         this.reviews.endTurn()

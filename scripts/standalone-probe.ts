@@ -311,6 +311,24 @@ try {
 
 } finally { await mcp.close(); await rm(directory, { recursive: true, force: true }) }
 
+let steeringRounds = 0
+const steeringAccepted: string[] = []
+const steeringHost = await CliHost.create({ settings: { provider: 'openai', model: 'compiled-steering' },
+  store: { async save() {} }, provider: { async generate(input) {
+    if (++steeringRounds === 1) {
+      steeringHost.queueMessage('Compiled follow-up'); steeringHost.queueMessage('Compiled follow-up')
+      return { content: '', toolCalls: [{ id: 'compiled-steering-calc', name: 'calculate', arguments: { expression: '1+1' } }] }
+    }
+    assert.deepEqual(input.messages.slice(-3).map(message => message.kind), ['tool_result', 'message', 'message'])
+    assert.deepEqual(input.messages.slice(-2).map(message => message.content), ['Compiled follow-up', 'Compiled follow-up'])
+    return { content: 'Compiled steering accepted', toolCalls: [] }
+  } } })
+try {
+  assert.equal((await steeringHost.send('Start', undefined, text => steeringAccepted.push(text))).status, 'completed')
+  assert.deepEqual(steeringAccepted, ['Compiled follow-up', 'Compiled follow-up'])
+  assert.deepEqual(steeringHost.queuedMessages, [])
+} finally { await steeringHost.shutdown() }
+
 const budget = parseModelCatalog('openrouter', { data: [{ id: 'vendor/embedded-budget',
   reasoning: { mandatory: false, supports_max_tokens: true } }] })[0]!
 assert.deepEqual(budget.efforts, ['none'])

@@ -83,4 +83,3 @@ in the lockfile. No local package override, vendor archive or local-path depende
 is required.
 
 Core publication does not publish this CLI or establish native-platform readiness.
-The separate pending CLI steering rollout is not adopted by this change.

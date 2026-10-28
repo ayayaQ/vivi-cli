@@ -6,6 +6,7 @@ import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult, ContextUsage } from '@ayayaq/vivi'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import type { CliHost } from './host.js'
+import type { SteeringControls, SteeringMessage } from './steering.js'
 import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
@@ -25,6 +26,11 @@ import type { ConversationMode, TaskMode } from './task-mode.js'
 export interface ChatIO {
   /** Dynamic credentials must reach copied display filters before any further output. */
   addSecrets?(secrets: readonly string[]): void
+  /** Scoped actual-turn composer; managers and approvals never become steering sources. */
+  onSteering?(controls: SteeringControls): () => void
+  setSteeringQueue?(messages: readonly SteeringMessage[]): void
+  steeringAccepted?(content: string, initial?: boolean): void
+  setComposerDraft?(content: string): void
   /** Display-only host evidence, re-screened by the consumer before rendering. */
   setToolEvidence?(evidence: CliToolEvidence): void
   /** Persisted display-only host errors, not provider messages or tool outcomes. */
@@ -55,22 +61,88 @@ export interface ChatIO {
 }
 
 /** Share explicit turn boundaries across interactive, one-shot and accessible line flows. */
-export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal): Promise<AgentResult> {
-  let outcome: RunOutcome = 'error'
-  try {
-    io.setToolEvidence?.(host.toolPresentationEvidence)
-    io.setConversationErrors?.(host.conversationErrors)
-    io.runStarted?.()
-    const result = await host.send(content, signal)
-    io.setToolEvidence?.(host.toolPresentationEvidence)
-    io.setConversationErrors?.(host.conversationErrors)
-    outcome = result.status
-    return result
-  } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
-  finally {
-    await refreshChatContext(host, io)
-    io.runFinished?.(outcome)
+export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal,
+  queuedId?: string): Promise<AgentResult> {
+  // A later idle submit joins retained input instead of overtaking it.
+  if (queuedId === undefined && host.queuedMessages?.length) {
+    try { host.queueMessage(content) }
+    catch (error) { io.setComposerDraft?.(content); throw error }
+    const first = host.queuedMessages[0]!
+    content = first.content; queuedId = first.id
   }
+  let interrupt = false, active = true
+  const update = (): void => io.setSteeringQueue?.(host.queuedMessages ?? [])
+  const dispose = io.onSteering?.({
+    submit: (message, force): boolean => {
+      if (!active || io.isClosed || signal?.aborted) return false
+      try { host.queueMessage(message) }
+      catch (error) {
+        io.write(`${error instanceof Error ? error.message : 'Message was not queued'}\n`)
+        return false
+      }
+      update()
+      if (force) { interrupt = true; host.cancel() }
+      return true
+    },
+    takeLast: (): string | undefined => { const message = host.takeLastQueuedMessage(); update(); return message },
+    clear: (): void => { host.clearQueuedMessages(); update() }
+  })
+  update()
+  try {
+    let next = { content, id: queuedId }
+    for (;;) {
+      let outcome: RunOutcome = 'error'
+      let result: AgentResult
+      try {
+        io.setToolEvidence?.(host.toolPresentationEvidence)
+        io.setConversationErrors?.(host.conversationErrors)
+        io.runStarted?.()
+        result = await host.send(next.content, signal, (message, initial) => {
+          io.steeringAccepted?.(message, initial); update()
+        }, next.id, update)
+        outcome = result.status
+      } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
+      finally {
+        io.setToolEvidence?.(host.toolPresentationEvidence)
+        io.setConversationErrors?.(host.conversationErrors)
+        await refreshChatContext(host, io); io.runFinished?.(outcome); update()
+      }
+      const pending = host.queuedMessages?.[0]
+      // Ordinary cancel/error leaves input visibly queued. Explicit interrupt and
+      // final-boundary overflow may continue only after the host has fully settled.
+      if (!pending || io.isClosed || signal?.aborted ||
+        result.status !== 'completed' && !(result.status === 'cancelled' && interrupt)) return result
+      interrupt = false
+      io.result(result)
+      next = { content: pending.content, id: pending.id }
+    }
+  } finally { active = false; dispose?.(); update() }
+}
+
+/** Idle queue control stays with the current host and never changes an account. */
+export async function runSteeringCommand(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
+  if (!/^\/queue(?:\s|$)/.test(line.trim())) return false
+  const command = line.trim()
+  if (command === '/queue clear') host.clearQueuedMessages()
+  else if (command === '/queue undo') {
+    if (io.setComposerDraft) {
+      const content = host.takeLastQueuedMessage()
+      if (content !== undefined) io.setComposerDraft(content)
+    } else io.write('Editing queued input requires the full-screen composer; use /queue clear\n')
+  } else if (command === '/queue send') {
+    const message = host.queuedMessages[0]
+    if (message) {
+      const controller = new AbortController()
+      const dispose = io.onCancel(() => { controller.abort(); host.cancel() })
+      try { io.result(await sendChatTurn(host, io, message.content, controller.signal, message.id)) }
+      finally { dispose() }
+    }
+  } else if (command !== '/queue') io.write('Use /queue, /queue send, /queue undo or /queue clear\n')
+  io.setSteeringQueue?.(host.queuedMessages)
+  io.write(host.queuedMessages.length ? `Queued messages (${host.queuedMessages.length}):\n` : 'No queued messages\n')
+  for (const [index, message] of host.queuedMessages.entries()) io.write(`${index + 1}. ${JSON.stringify(message.content)}${message.state ? ' (sending)' : ''}\n`)
+  if (host.queuedMessages.length) io.write('/queue send · send; /queue undo · edit latest; /queue clear · remove pending input\n')
+  return true
 }
 /** Refresh uses only local snapshots and a pure estimator; it never calls a provider. */
 export async function refreshChatContext(host: CliHost, io: ChatIO): Promise<void> {
@@ -94,6 +166,7 @@ export async function compactChatContext(host: CliHost, io: ChatIO): Promise<Run
   } finally { dispose(); await refreshChatContext(host, io); io.runFinished?.(outcome) }
   return outcome
 }
+
 export interface TerminalOptions {
   input?: Readable
   output?: Writable
@@ -368,6 +441,8 @@ export class TerminalIO implements ChatIO {
   private ended = false
   private disposed = false
   private cancelCallbacks = new Set<() => void>()
+  private steeringControls: SteeringControls | undefined
+  private reviewing = false
   private display = ''
   private status = 'Ready'
   private prompt = ''
@@ -396,6 +471,12 @@ export class TerminalIO implements ChatIO {
     this.readline = createInterface({ input: this.input, output: this.output, terminal: Boolean(this.input.isTTY && this.output.isTTY),
       historySize: 0, removeHistoryDuplicates: true, crlfDelay: Infinity })
     this.readline.on('line', (line: string) => {
+      if (this.steeringControls && this.canAutoReview && !this.reviewing && !this.waiters.length) {
+        const interrupt = /^\/interrupt\s+/.test(line)
+        const content = interrupt ? line.replace(/^\/interrupt\s+/, '') : line
+        if (!this.steeringControls.submit(content, interrupt)) { this.readline.write(content); this.write('Message was not queued; draft kept\n') }
+        return
+      }
       const waiter = this.waiters.shift()
       if (waiter) waiter.resolve(line.length <= 65536 ? line : '')
       else if (this.lines.length < 32 && line.length <= 65536) this.lines.push(line)
@@ -411,7 +492,7 @@ export class TerminalIO implements ChatIO {
     })
     const cancel = (): void => {
       // Do not carry a half-typed approval into a later chat or approval prompt.
-      this.clearEditableInput()
+      if (!this.steeringControls || this.reviewing) this.clearEditableInput()
       if (this.cancelCallbacks.size) for (const callback of this.cancelCallbacks) callback()
       else this.close()
     }
@@ -493,6 +574,15 @@ export class TerminalIO implements ChatIO {
     this.cancelCallbacks.add(callback)
     return () => { this.cancelCallbacks.delete(callback) }
   }
+  onSteering(controls: SteeringControls): () => void {
+    if (!this.canAutoReview) return () => undefined
+    this.steeringControls = controls
+    this.write('Enter queues while working; /interrupt TEXT interrupts and queues a follow-up\n')
+    return () => { if (this.steeringControls === controls) this.steeringControls = undefined }
+  }
+  setSteeringQueue(messages: readonly SteeringMessage[]): void {
+    if (this.canAutoReview) this.status = messages.length ? `${messages.length} queued` : 'Working'
+  }
   private flushStream(final = false): void {
     const secrets = [...new Set(this.secrets)].filter(Boolean).sort((a, b) => b.length - a.length)
     const hold = final ? 0 : Math.max(0, ...secrets.map((secret) => secret.length - 1))
@@ -552,6 +642,10 @@ export class TerminalIO implements ChatIO {
     this.write(`[${this.status}]${result.error ? ` ${result.error.message}` : ''}\n`)
   }
   async approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+    const steering = this.steeringControls
+    const draft = steering ? this.readline.line : ''
+    this.reviewing = true
+    try {
     // An approval starts with fresh input, including text typed without a newline.
     this.lines = []
     this.clearEditableInput()
@@ -565,10 +659,19 @@ export class TerminalIO implements ChatIO {
       if (reply.trim().toLowerCase() === 'allow') return true
       this.write('Please type allow or deny\n')
     }
+    } finally {
+      this.reviewing = false
+      this.lines = []
+      this.clearEditableInput()
+      if (draft && this.canAutoReview && (!this.steeringControls || this.steeringControls === steering)) {
+        this.readline.write(this.safe(draft))
+      }
+    }
   }
   close(): void {
     if (this.disposed) return
     this.disposed = true
+    this.steeringControls = undefined
     this.lines = []
     process.removeListener('SIGINT', this.signalHandler)
     this.input.removeListener('keypress', this.keyHandler)
@@ -605,9 +708,10 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       await refreshChatContext(host, io); io.write(`${formatContextDetails(host.contextUsage)}\n`); return
     }
     if (await runMcpCommand(io, prompt, controls)) return
-    const dispose = io.onCancel(() => host.cancel())
+    const controller = new AbortController()
+    const dispose = io.onCancel(() => { controller.abort(); host.cancel() })
     try {
-      const result = await sendChatTurn(host, io, prompt)
+      const result = await sendChatTurn(host, io, prompt, controller.signal)
       io.result(result)
       return result
     } finally { dispose() }
@@ -634,6 +738,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
     if (!line.trim()) continue
     if (/^\/web(?:\s|$)/.test(line.trim())) { if (controls.web) await controls.web(line); else io.write('Web settings unavailable in this surface\n'); continue }
     if (/^\/reviewer(?:\s|$)/.test(line.trim())) { if (controls.reviewer) await controls.reviewer(line); else io.write('Reviewer settings unavailable in this surface\n'); continue }
+    if (/^\/queue(?:\s|$)/.test(line.trim())) {
+      try { await runSteeringCommand(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Queued turn failed'}\n`) }
+      continue
+    }
     if (isMcpCommand(line)) {
       try { await runMcpCommand(io, line, controls) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'MCP connection management failed'}\n`) }
@@ -677,8 +786,9 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue
     }
-    const dispose = io.onCancel(() => host.cancel())
-    try { io.result(await sendChatTurn(host, io, line)) }
+    const controller = new AbortController()
+    const dispose = io.onCancel(() => { controller.abort(); host.cancel() })
+    try { io.result(await sendChatTurn(host, io, line, controller.signal)) }
     catch (error) { io.write(`${error instanceof Error ? error.message : 'CLI turn failed'}\n`) }
     finally { dispose() }
   }

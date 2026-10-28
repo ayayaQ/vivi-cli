@@ -39,6 +39,7 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/mcp` — configure and explicitly connect trusted installed stdio servers or HTTP endpoints for reviewed tools and resource reads
 - `/context` — show effective-request occupancy, model capacity, source freshness and output reserve
 - `/compact` — summarize eligible older provider context, retaining the full local transcript
+- `/queue` — inspect, send, undo-to-edit or clear retained messages
 - `/session` — show the current session ID and saved usage
 - `/help` — show commands and shortcuts
 - `/exit` — quit
@@ -126,7 +127,22 @@ facts and Windows negotiation state. Ordinary typing and paste are ignored.
 Raw input logging/debug capture must be disabled. No report is saved or sent;
 review it before sharing it voluntarily. This is a diagnostic, not evidence that
 physical Shift+Enter has been fixed.
-Escape or Ctrl+C cancels a running turn; Ctrl+C while idle exits.
+
+While working, Enter queues messages in order at the next safe boundary, after the
+complete tool batch or a text-only response. Pending input has a count and previews;
+accepted input joins the transcript. Sending messages cannot be edited or removed.
+Ctrl+Enter (if reported) or **Interrupt & send** queues the draft and requests
+cancellation, then waits for owned cleanup before continuing. Cancellation cannot
+undo completed writes, requests or command effects. Physical modifier reporting
+is unverified; the button does not depend on it.
+
+Escape or Ctrl+C stops the turn but retains queued input. `/queue send` continues,
+`/queue undo` edits the latest pending message in the full-screen composer, and
+`/queue clear` removes pending input. Send or clear the queue before changing
+conversations, provider, model or effort. Pending input is launch-local and discarded
+on exit; accepted history is saved normally. Ctrl+C while idle exits.
+Interactive line mode uses `/interrupt TEXT`; piped input remains sequential.
+
 In `/models`, type to filter by ID, name or provider; words can be in any order.
 Use arrows or Page Up/Down to browse, Enter to select, Ctrl+U to clear,
 Ctrl+R to refresh the catalog, and Escape to go back.
@@ -172,6 +188,12 @@ There is no plaintext key-storage fallback. Conversations are stored locally in
 `~/.vivi/sessions`; keep secrets out of chat and command arguments.
 
 ## Line mode
+
+Interactive TTY input can queue ordinary chat while a turn runs. `/interrupt TEXT`
+requests cancellation and queues that follow-up; `/queue` controls retained input once
+idle. Approval prompts keep their fresh typed allow/deny input separate. Piped input
+keeps sequential line behavior and never becomes a steering or approval source.
+
 
 Node.js 26.4+ supports line mode without Bun. Set `OPENAI_API_KEY` or
 `OPENROUTER_API_KEY` or `DEEPSEEK_API_KEY` in your environment, then supply a model ID:
