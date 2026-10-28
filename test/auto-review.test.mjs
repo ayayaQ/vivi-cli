@@ -68,6 +68,14 @@ test('unseen image observations route text-only automatic review to fresh human 
   assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 1)
   assert.match(subject.state.humanRequest.description, /text-only reviewer cannot inspect/)
 })
+test('accepted steering retains the unseen-image human-review requirement', async () => {
+  const subject = fixture({ approved: true })
+  subject.controller.markUnseenImageContext()
+  subject.controller.steer('Continue with the updated request')
+  assert.equal(await subject.execute(), 2)
+  assert.equal(subject.state.calls, 0); assert.equal(subject.state.human, 1)
+  assert.match(subject.state.humanRequest.description, /text-only reviewer cannot inspect/)
+})
 test('interactive capability is required for enrollment', () => {
   assert.throws(() => fixture({ canAutoReview: false }), /interactive/)
 })

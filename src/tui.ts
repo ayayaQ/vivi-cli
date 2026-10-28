@@ -16,6 +16,7 @@ import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus }
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
 import type { ChatIO } from './terminal.js'
+import type { SteeringControls, SteeringMessage } from './steering.js'
 import type { ApprovalRequest } from './tools.js'
 import { matchingChoiceIndices } from './picker.js'
 import { createWindowsInputBridge } from './windows-input.js'
@@ -102,6 +103,7 @@ export const SLASH_COMMANDS = [
   { command: '/mcp', description: 'Manage trusted server metadata connections' },
   { command: '/menu', description: 'Open the menu' },
   { command: '/help', description: 'Show commands and shortcuts' },
+  { command: '/queue', description: 'Inspect, send, edit or clear pending messages' },
   { command: '/session', description: 'Show the current session' },
   { command: '/exit', description: 'Exit vivi' }
 ] as const
@@ -159,8 +161,9 @@ function toolHeader(card: { readonly title: string; readonly status: string }, c
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
+const STEERING_HINTS = 'Enter queue · Ctrl+Enter interrupt & send if supported · Alt+Backspace edit latest · Ctrl+Shift+K clear queue'
 const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /menu /help /exit'
-type InputKind = 'chat' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question'
+type InputKind = 'chat' | 'steering' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question'
 interface PendingInput {
   kind: InputKind
   armed: boolean
@@ -182,6 +185,12 @@ interface DisplayEntry {
   approval?: object
   workspaceDiff?: string
   tool?: { encoded: string; key: string; detailBytes?: number; retained?: boolean; localRead?: boolean; resultError?: boolean }
+}
+interface SteeringInput {
+  readonly controls: SteeringControls
+  pending?: PendingInput | undefined
+  draft: string
+  timer?: ReturnType<typeof setTimeout>
 }
 interface SearchPicker {
   choices: readonly Choice<unknown>[]
@@ -257,6 +266,10 @@ export class OpenTuiIO implements ChatIO {
   private lastRenderedFrame = 0
   private transcript!: ScrollBoxRenderable
   private statusLine!: TextRenderable
+  private steeringQueueLine!: TextRenderable
+  private steeringActions!: BoxRenderable
+  private steering: SteeringInput | undefined
+  private steeringQueue: readonly SteeringMessage[] = []
   private composerBox!: BoxRenderable
   private composer!: TextareaRenderable
   private secretMask!: TextRenderable
@@ -347,6 +360,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.completions.length) this.renderCompletions()
     this.updateComposerLayout()
     this.questionDialog?.resize()
+    this.updateSteeringQueue()
     this.rebuild()
   }
   private readonly pasteHandler = (event: PasteEvent): void => {
@@ -456,8 +470,9 @@ export class OpenTuiIO implements ChatIO {
           { name, meta: true, action: 'newline' as const }
         ]), onSubmit: () => this.submit(), onContentChange: () => this.inputChanged() })
       this.composer.onMouse = (event) => {
-        if (event.type === 'down' && event.button === 0 && this.ready() && !this.cancelCallbacks.size &&
-          ['chat', 'text', 'search'].includes(this.pending!.kind)) this.composer.focus()
+        if (event.type === 'down' && event.button === 0 && this.ready() &&
+          (!this.cancelCallbacks.size || this.pending?.kind === 'steering') &&
+          ['chat', 'steering', 'text', 'search'].includes(this.pending!.kind)) this.composer.focus()
       }
       this.composerBox.add(this.composer)
       this.secretMask = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-secret-mask', width: '100%', height: 2,
@@ -476,9 +491,13 @@ export class OpenTuiIO implements ChatIO {
       this.pickerBox = new BoxRenderable(renderer, { id: 'vivi-picker-box', visible: false,
         height: 8, flexShrink: 0, flexDirection: 'column', border: true, borderColor: TUI_THEME.lavender,
         titleColor: TUI_THEME.lavender, paddingX: 1 })
+      this.steeringQueueLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-steering-queue',
+        width: '100%', height: 1, flexShrink: 0, visible: false, fg: TUI_THEME.lavender, wrapMode: 'none' })
+      this.steeringActions = new BoxRenderable(renderer, { id: 'vivi-steering-actions', width: '100%',
+        height: 1, flexShrink: 0, flexDirection: 'row', gap: 1, visible: false })
       this.footer.add(this.actionBar); this.footer.add(this.workspaceLine)
       for (const child of [this.headerBox, this.transcript, this.statusLine, this.pickerBox,
-        this.completionBox, this.modelLine, this.composerBox, this.footer, this.hintLine]) this.shell.add(child)
+        this.completionBox, this.steeringQueueLine, this.modelLine, this.composerBox, this.steeringActions, this.footer, this.hintLine]) this.shell.add(child)
       this.updateHeader(); this.updateActionBar()
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
@@ -500,7 +519,7 @@ export class OpenTuiIO implements ChatIO {
       for (const widget of [this.composer, this.secretMask, this.completionList, this.header,
         this.transcript, this.statusLine, this.composerBox, this.completionBox,
         this.pickerBox, this.hintLine, this.actionBar, this.tokenLine, this.headerBox,
-        this.modelLine, this.workspaceLine, this.footer, this.shell]) {
+        this.modelLine, this.workspaceLine, this.steeringQueueLine, this.steeringActions, this.footer, this.shell]) {
         if (widget && !widget.parent && !widget.isDestroyed) {
           try { widget.destroyRecursively() } catch { /* Still release the renderer and hooks below. */ }
         }
@@ -598,6 +617,7 @@ export class OpenTuiIO implements ChatIO {
     this.inputChanged()
     this.questionDialog?.redact()
     this.rebuild()
+    this.updateSteeringQueue()
     this.updateStatus()
   }
 
@@ -614,7 +634,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private ready(pending = this.pending): boolean {
     return !!pending?.armed && !this.closed &&
-      (!['approval', 'question'].includes(pending.kind) || this.lastRenderedFrame > pending.openedFrame)
+      (!['approval', 'question', 'steering'].includes(pending.kind) || this.lastRenderedFrame > pending.openedFrame)
   }
   private updateApprovalLayout(): void {
     if (this.closed) return
@@ -669,7 +689,7 @@ export class OpenTuiIO implements ChatIO {
   private updateComposerLayout(): void {
     if (!this.composer || !this.composerBox || this.closed) return
     const kind = this.pending?.kind
-    const multiline = kind === 'chat' || kind === 'text'
+    const multiline = kind === 'chat' || kind === 'steering' || kind === 'text'
     // Measure wrapped terminal cells using the same native editor as the draft.
     // Its current viewport only counts visible lines, so measuring the complete
     // buffer is essential for both explicit newlines and long wrapped lines.
@@ -700,7 +720,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
     const pending = this.pending
-    if (!pending || pending.kind === 'chat' || pending.kind === 'question') return
+    if (!pending || pending.kind === 'chat' || pending.kind === 'question' || pending.kind === 'steering') return
     // Preserve room for the query in very small terminals; keyboard paths remain.
     if (pending.kind !== 'approval' && this.renderer.terminalHeight < (pending.kind === 'search' ? 20 : 16)) return
     this.dialogActions = new BoxRenderable(this.renderer, { id: 'vivi-dialog-actions', height: 1,
@@ -817,6 +837,153 @@ export class OpenTuiIO implements ChatIO {
     this.modelLine.content = modelWidth > 0 ? `${fitStatusColumns(this.sessionModel, modelWidth, true)} · ${mode}` : fitStatusColumns(mode, columns, true)
     this.updateTerminalTitle()
   }
+  /** Only an actual agent turn opts into editable, owner-scoped steering. */
+  onSteering(controls: SteeringControls): () => void {
+    if (this.closed) return () => undefined
+    if (this.steering) this.releaseSteering(this.steering)
+    if (this.pending?.kind === 'chat') this.pending.finish(undefined)
+    const steering: SteeringInput = { controls, draft: this.nextComposerDraft }
+    this.nextComposerDraft = ''
+    this.steering = steering
+    if (!this.pending) this.restoreSteering(steering)
+    return () => this.releaseSteering(steering)
+  }
+  private releaseSteering(steering: SteeringInput): void {
+    if (this.steering !== steering) return
+    const editing = this.pending === steering.pending && steering.pending !== undefined
+    const draft = editing ? this.composer.plainText : steering.draft
+    if (draft) this.nextComposerDraft = this.safe(draft, MAX_INPUT)
+    if (steering.timer !== undefined) clearTimeout(steering.timer)
+    this.steering = undefined
+    this.mouseActivation.clear()
+    if (editing) {
+      this.pending = undefined
+      this.clearInput()
+      this.disableComposer()
+      this.composerBox.title = 'Message'
+      this.hintLine.content = HINTS
+    }
+    for (const child of this.steeringActions.getChildren()) child.destroyRecursively()
+    this.steeringActions.visible = false
+    this.updateActionBar()
+    this.updateSteeringQueue()
+  }
+  private restoreSteering(steering: SteeringInput): void {
+    if (this.closed || this.steering !== steering || this.pending) return
+    this.mouseActivation.clear()
+    this.clearInput()
+    const pending: PendingInput = { kind: 'steering', armed: false, openedFrame: this.renderer.frameId,
+      finish: () => undefined }
+    steering.pending = pending
+    this.pending = pending
+    this.composerBox.visible = true
+    this.composer.visible = true
+    this.secretMask.visible = false
+    this.composerBox.title = 'Message while working'
+    this.composerBox.bottomTitle = undefined
+    this.hintLine.content = STEERING_HINTS
+    this.composer.setText(this.safe(steering.draft, MAX_INPUT))
+    this.composer.gotoBufferEnd()
+    this.composer.traits = {}
+    this.composer.showCursor = true
+    this.composer.focus()
+    for (const child of this.steeringActions.getChildren()) child.destroyRecursively()
+    const live = (activate: () => void): (() => void) => () => {
+      if (this.steering === steering && this.pending === pending && this.ready(pending)) activate()
+    }
+    this.steeringActions.add(this.mouseButton('vivi-steering-interrupt', 'Interrupt & send', live(() => this.submitSteering(true))))
+    this.steeringActions.add(this.mouseButton('vivi-steering-undo', 'Undo latest', live(() => this.editLatestSteering())))
+    this.steeringActions.add(this.mouseButton('vivi-steering-clear', 'Clear', live(() => steering.controls.clear())))
+    this.steeringActions.visible = true
+    this.updateActionBar()
+    this.updateSteeringQueue()
+    // A run or modal replacement drains the previous input batch before accepting
+    // new keys, and needs a completed frame before any submit/click is enabled.
+    steering.timer = setTimeout(() => {
+      if (this.steering === steering && this.pending === pending && !this.closed) pending.armed = true
+    }, 0)
+  }
+  setSteeringQueue(messages: readonly SteeringMessage[]): void {
+    if (this.closed) return
+    // The host owns IDs/order and queue admission. This is only a bounded preview.
+    this.steeringQueue = messages.slice(0, 32).map(message => ({ ...message }))
+    this.mouseActivation.clear()
+    this.updateSteeringQueue()
+  }
+  private updateSteeringQueue(): void {
+    if (this.closed || !this.steeringQueueLine) return
+    const columns = Math.max(1, this.renderer.terminalWidth)
+    const modal = this.pending && this.pending.kind !== 'chat' && this.pending.kind !== 'steering'
+    const previews = modal || this.renderer.terminalHeight < 16 ? 0 : Math.min(3, this.steeringQueue.length)
+    const first = this.steeringQueue.length - previews
+    const lines = [`Queued · ${this.steeringQueue.length} · next safe boundary`]
+    if (first > 0 && previews) lines[0] += ` · ${first} earlier`
+    for (let index = first; index < this.steeringQueue.length; index++) {
+      const content = this.safe(this.steeringQueue[index]!.content).replace(/[\t\n]+/g, ' ')
+      const sending = this.steeringQueue[index]!.state === 'sending' ? '[sending] ' : ''
+      lines.push(`${index + 1}. ${sending}${fitStatusColumns(content, Math.max(0, columns - 4 - sending.length), true)}`)
+    }
+    this.steeringQueueLine.content = lines.map(line => fitStatusColumns(line, columns, true)).join('\n')
+    this.steeringQueueLine.height = lines.length
+    this.steeringQueueLine.visible = this.steeringQueue.length > 0
+    const undo = this.steeringActions.getChildren().find(child => child.id === 'vivi-steering-undo') as TextRenderable | undefined
+    const clear = this.steeringActions.getChildren().find(child => child.id === 'vivi-steering-clear')
+    if (undo) {
+      const label = columns < 40 ? 'Undo' : 'Undo latest'
+      undo.content = ` ${label} `
+      undo.width = label.length + 2
+      undo.visible = columns >= 34
+    }
+    if (clear) clear.visible = columns >= 34
+    this.steeringActions.visible = this.pending?.kind === 'steering' && this.steering !== undefined
+    this.updateComposerLayout()
+  }
+  private editLatestSteering(): void {
+    const steering = this.steering
+    if (!steering || this.pending !== steering.pending || !this.ready()) return
+    if (this.composer.plainText) {
+      this.steeringFeedback('Clear your draft before Undo latest')
+      return
+    }
+    const content = steering.controls.takeLast()
+    if (content === undefined) {
+      if (this.steeringQueue.at(-1)?.state === 'sending') this.steeringFeedback('Latest queued message is sending')
+      return
+    }
+    if (this.steering !== steering || this.pending !== steering.pending) return
+    this.composer.setText(this.safe(content, MAX_INPUT))
+    this.composer.gotoBufferEnd()
+    this.composer.focus()
+    steering.draft = this.composer.plainText
+    this.updateComposerLayout()
+  }
+  private submitSteering(interrupt: boolean): void {
+    const steering = this.steering
+    if (!steering || this.pending !== steering.pending || !this.ready()) return
+    this.inputChanged()
+    const content = this.composer.plainText
+    if (!content.trim()) { this.steeringFeedback('Write a message first'); return }
+    if (!steering.controls.submit(content, interrupt)) {
+      if (this.steering === steering) this.steeringFeedback('Message not queued · draft kept')
+      return
+    }
+    // Submission only records host queue ownership. The accepted callback below
+    // is the sole place a steering message becomes a displayed user message.
+    if (this.steering === steering && this.pending === steering.pending) {
+      steering.draft = ''
+      this.clearInput()
+      this.composer.focus()
+    }
+  }
+  private steeringFeedback(message: string): void {
+    if (this.pending?.kind === 'steering') this.composerBox.bottomTitle = this.safe(message, 1024)
+    this.updateStatus(message)
+  }
+  steeringAccepted(content: string, initial = false): void {
+    if (this.closed) return
+    this.appendEntry({ category: 'user', label: 'You', content: this.safe(content), markdown: false })
+    if (!initial) this.liveHistoryIndex++
+  }
   private disableComposer(): void {
     this.composer?.blur()
     if (this.composer) {
@@ -835,6 +1002,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private inputChanged(): void {
     if (this.closed || this.changingInput) return
+    if (this.pending?.kind === 'steering') this.composerBox.bottomTitle = undefined
     const raw = this.composer.plainText
     const safe = this.pending?.kind === 'search'
       ? this.safe(raw, MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
@@ -975,7 +1143,8 @@ export class OpenTuiIO implements ChatIO {
     this.consume(event)
     if (this.diagnosticKey) return
     if (this.pending?.kind === 'question') { this.questionDialog?.handlePaste(event); return }
-    if (!this.pending?.armed || this.closed || this.pending.kind === 'choice') return
+    if (!this.pending?.armed || this.closed || this.pending.kind === 'choice' ||
+      this.pending.kind === 'steering' && !this.ready()) return
     if (this.cancelCallbacks.size && this.pending.kind === 'chat') return
     if (this.pending.kind === 'approval') {
       this.clearInput()
@@ -1048,7 +1217,24 @@ export class OpenTuiIO implements ChatIO {
       return
     }
     const pending = this.pending
-    if (!pending?.armed) { this.consume(key); return }
+    if (!pending?.armed || pending.kind === 'steering' && !this.ready(pending)) { this.consume(key); return }
+    if (pending.kind === 'steering') {
+      // Repeat/release events and batched keys from another input cannot dispatch a new request.
+      if ((key.repeated || key.eventType === 'repeat') &&
+        (['return', 'kpenter', 'linefeed'].includes(key.name) || key.ctrl || key.meta || key.super || key.hyper)) { this.consume(key); return }
+      if (['return', 'kpenter'].includes(key.name) && key.ctrl && !key.shift && !key.meta && !key.super && !key.hyper) {
+        this.consume(key); this.submitSteering(true); return
+      }
+      if (key.name === 'backspace' && key.meta && !key.ctrl && !key.shift && !key.super && !key.hyper) {
+        this.consume(key); this.editLatestSteering(); return
+      }
+      if (key.name === 'k' && key.ctrl && key.shift && !key.meta && !key.super && !key.hyper) {
+        this.consume(key); this.steering?.controls.clear(); return
+      }
+      if (key.ctrl && ['n', 'r', 'p'].includes(key.name)) {
+        this.consume(key); this.steeringFeedback('Navigation is unavailable while working'); return
+      }
+    }
     if (this.cancelCallbacks.size && pending.kind === 'chat') { this.consume(key); return }
     if (pending.kind === 'secret') { this.handleSecretKey(key); return }
     // Modes change only between turns. Dialogs keep their own Tab navigation,
@@ -1064,7 +1250,7 @@ export class OpenTuiIO implements ChatIO {
     // Legacy terminals encode Ctrl+J as LF and may encode Shift+Enter exactly
     // like Enter (CR). Only chat/text editors use LF as a newline fallback;
     // search, secret, choice and approval prompts keep their confirmation keys.
-    if ((pending.kind === 'chat' || pending.kind === 'text') && !key.shift && !key.meta && !key.super && !key.hyper &&
+    if ((pending.kind === 'chat' || pending.kind === 'steering' || pending.kind === 'text') && !key.shift && !key.meta && !key.super && !key.hyper &&
       ((!key.ctrl && key.name === 'linefeed') || (key.ctrl && key.name === 'j'))) {
       this.consume(key)
       this.composer.insertText('\n')
@@ -1097,7 +1283,9 @@ export class OpenTuiIO implements ChatIO {
     // Settle that modal too, so Ctrl-C cannot leave a cancelled picker hanging.
     const chat = this.pending?.kind === 'chat' ? this.pending : undefined
     if (this.pending && this.pending.kind !== 'chat') this.pending.finish(undefined)
-    this.clearInput()
+    // Cancelling a run retains both its queued messages and unfinished steering draft.
+    if (!this.steering) this.clearInput()
+    else if (this.pending === this.steering.pending) this.steering.draft = this.composer.plainText
     if (this.cancelCallbacks.size) {
       this.runStatus.setPhase('cancelling')
       this.updateStatus('Cancelling…')
@@ -1109,6 +1297,7 @@ export class OpenTuiIO implements ChatIO {
   private submit(): void {
     const pending = this.pending
     if (!pending?.armed || pending.kind === 'choice' || this.closed) return
+    if (pending.kind === 'steering') { this.submitSteering(false); return }
     // Native onSubmit and stale editor events must obey the same turn lock as keys.
     if (this.cancelCallbacks.size && pending.kind === 'chat') return
     if (pending.kind === 'search') {
@@ -1126,7 +1315,7 @@ export class OpenTuiIO implements ChatIO {
     }
     const text = this.composer.plainText
     if (pending.kind === 'approval' || pending.kind === 'question') return
-    if (pending.kind === 'chat' && text.trim() && !text.trim().startsWith('/')) {
+    if (pending.kind === 'chat' && !this.steeringQueue.length && text.trim() && !text.trim().startsWith('/')) {
       this.appendEntry({ category: 'user', label: 'You', content: this.safe(text), markdown: false })
     }
     pending.finish(text)
@@ -1141,6 +1330,13 @@ export class OpenTuiIO implements ChatIO {
       this.runStatus.reset()
       if (['Completed', 'Cancelled', 'Error'].includes(this.status)) this.status = 'Ready'
       this.updateStatus()
+    }
+    if (this.steering?.pending && this.pending === this.steering.pending) {
+      this.steering.draft = this.composer.plainText
+      this.steering.pending = undefined
+      if (this.steering.timer !== undefined) clearTimeout(this.steering.timer)
+      this.pending = undefined
+      this.steeringActions.visible = false
     }
     this.pending?.finish(undefined)
     this.mouseActivation.clear()
@@ -1201,6 +1397,8 @@ export class OpenTuiIO implements ChatIO {
         this.composerBox.title = 'Message'
         this.composerBox.bottomTitle = undefined
         this.hintLine.content = HINTS
+        this.updateSteeringQueue()
+        if (this.steering && !this.closed) this.restoreSteering(this.steering)
         if (this.failure) reject(this.failure)
         else if (aborted && kind === 'chat') reject(new Error('Input cancelled'))
         else resolve(value)
@@ -1209,6 +1407,7 @@ export class OpenTuiIO implements ChatIO {
       this.pending = pending
       this.inputQueue.setBlocked(kind !== 'chat' && kind !== 'approval')
       this.updateTerminalTitle()
+      this.updateSteeringQueue()
       this.approvalIndex = 0
       this.updateApprovalLayout()
       this.updateActionBar()
@@ -1330,7 +1529,7 @@ export class OpenTuiIO implements ChatIO {
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return Promise.resolve(false)
     // Preserve the existing approval preemption path, but never reorder a queued dialog.
-    if (!this.inputQueue.pending && this.pending && !['chat', 'approval', 'question'].includes(this.pending.kind)) this.pending.finish(undefined)
+    if (!this.inputQueue.pending && this.pending && !['chat', 'steering', 'approval', 'question'].includes(this.pending.kind)) this.pending.finish(undefined)
     return this.queueDialog(signal, () => false, activeSignal => this.showApproval(request, activeSignal))
   }
   private async showApproval(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
@@ -1369,10 +1568,18 @@ export class OpenTuiIO implements ChatIO {
   }
   private queueDialog<T>(signal: AbortSignal, cancelled: () => T, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (this.closed) return Promise.resolve(cancelled())
-    this.inputQueue.setBlocked(!!this.pending && !['chat', 'approval', 'question'].includes(this.pending.kind))
+    this.inputQueue.setBlocked(!!this.pending && !['chat', 'steering', 'approval', 'question'].includes(this.pending.kind))
     const bound = AbortSignal.any([signal, this.dialogOwner.signal])
     return this.inputQueue.enqueue(bound, () => { if (this.failure) throw this.failure; return cancelled() }, async activeSignal => {
       const token = {}; this.activeDialog = token
+      if (this.steering?.pending && this.pending === this.steering.pending) {
+        this.steering.draft = this.composer.plainText
+        this.steering.pending = undefined
+        if (this.steering.timer !== undefined) clearTimeout(this.steering.timer)
+        this.pending = undefined
+        this.steeringActions.visible = false
+        this.clearInput(); this.disableComposer()
+      }
       if (this.pending?.kind === 'chat') {
         this.suspendedChat = { pending: this.pending, text: this.composer.plainText,
           cursor: this.composer.cursorOffset, title: this.composerBox.title ?? 'Message' }
@@ -1395,6 +1602,7 @@ export class OpenTuiIO implements ChatIO {
             this.hintLine.content = HINTS
             this.updateCompletions(); this.updateActionBar(); this.updateComposerLayout()
           }
+          if (this.steering && !this.closed && !this.pending) this.restoreSteering(this.steering)
           this.updateTerminalTitle()
         }
       }
@@ -1436,7 +1644,7 @@ export class OpenTuiIO implements ChatIO {
       this.hideCompletions(); this.disableComposer()
       this.pickerBox.visible = false
       if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
-      this.updateActionBar(); this.updateHeader()
+      this.updateActionBar(); this.updateHeader(); this.updateSteeringQueue()
       try {
         this.appendEntry({ category: 'activity', label: 'Questions · answers do not authorize actions', markdown: false,
           content: this.safe(request.questions.map((question, index) => `${index + 1}. ${question.header}: ${question.question}${question.options ? '\n' + question.options.map(option => `${option.label}${option.description ? ' · ' + option.description : ''}`).join('\n') : ''}`).join('\n\n')) })
@@ -1445,7 +1653,8 @@ export class OpenTuiIO implements ChatIO {
           mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
           // Keep one transcript row, status, and every visible shell footer.
           availableHeight: () => this.renderer.terminalHeight - this.headerRows - 2 - Number(this.modelLine.visible)
-            - (this.footer.visible ? this.footerRows : 0) - Number(this.hintLine.visible),
+            - (this.footer.visible ? this.footerRows : 0) - Number(this.hintLine.visible)
+            - (this.steeringQueueLine.visible ? this.steeringQueueLine.height : 0),
           status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
           accent: TUI_THEME.lavender, background: TUI_THEME.background })
         this.shell.insertBefore(this.questionDialog.box, this.modelLine)
@@ -1465,6 +1674,13 @@ export class OpenTuiIO implements ChatIO {
   runStarted(): void {
     if (this.closed) return
     this.invalidateDialogs()
+    if (this.steering?.pending && this.pending === this.steering.pending) {
+      this.steering.draft = this.composer.plainText
+      if (this.steering.timer !== undefined) clearTimeout(this.steering.timer)
+      this.steering.pending = undefined
+      this.pending = undefined
+      this.restoreSteering(this.steering)
+    }
     this.settleReviews('cancelled')
     this.turnHistoryStart = this.historyLength
     // The host accepts this turn's user message before its first assistant event.
@@ -1477,6 +1693,11 @@ export class OpenTuiIO implements ChatIO {
   runFinished(outcome: RunOutcome): void {
     if (this.closed) return
     this.invalidateDialogs()
+    this.mouseActivation.clear()
+    if (this.pending?.kind === 'steering') {
+      this.pending.armed = false
+      this.disableComposer()
+    }
     this.settleReviews(outcome)
     for (const [id, live] of this.liveToolCalls) {
       if (!['requested', 'approval_required', 'running'].includes(live.status ?? 'requested')) continue
@@ -1492,8 +1713,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     this.updateActionBar()
     this.resultNotices = []
-    this.clearInput()
-    this.disableComposer()
+    if (!this.steering) { this.clearInput(); this.disableComposer() }
     this.updateStatus('Running · Escape / Ctrl+C cancels')
     return () => {
       this.cancelCallbacks.delete(callback)
@@ -2020,6 +2240,8 @@ export class OpenTuiIO implements ChatIO {
   }
   private dispose(destroyRenderer: boolean): void {
     if (this.closed) return
+    if (this.steering) this.releaseSteering(this.steering)
+    this.steeringQueue = []
     this.closed = true
     this.inputQueue.close()
     this.dialogOwner.abort()

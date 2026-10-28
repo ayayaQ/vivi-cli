@@ -269,6 +269,11 @@ export class AutoReviewController {
   }
   /** The fixed text-only reviewer cannot approve decisions that may depend on unseen pixels. */
   markUnseenImageContext(): void { if (this.turn) this.turn.unseenImages = true }
+  /** Replace the exact current request without renewing budget or stale authority. */
+  steer(text: string): void {
+    if (!this.turn) throw new Error('No active review turn')
+    this.turn = { ...this.turn, text, requestId: randomUUID() }
+  }
   endTurn(): void { this.turn = undefined }
   async drain(): Promise<void> {
     try { await this.config?.ledger.drain?.() }

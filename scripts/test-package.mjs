@@ -255,6 +255,23 @@ import { McpManager } from './dist/mcp-manager.js'
 import { decodeToolPresentation, toolPresentationView } from '@ayayaq/vivi/presentation'
 import { createCliToolPresentation, cliToolPresentationView } from './dist/tool-presentation.js'
 globalThis.fetch = async () => { throw new Error('Live networking is forbidden in the acceptance consumer') }
+let steeringRounds = 0
+const steeringAccepted = []
+const steeringHost = await CliHost.create({ settings: { provider: 'openai', model: 'packed-steering' },
+  store: { async save() {} }, provider: { async generate(input) {
+    if (++steeringRounds === 1) {
+      steeringHost.queueMessage('Packed follow-up'); steeringHost.queueMessage('Packed follow-up')
+      return { content: '', toolCalls: [{ id: 'packed-steering-calc', name: 'calculate', arguments: { expression: '1+1' } }] }
+    }
+    assert.deepEqual(input.messages.slice(-3).map(message => message.kind), ['tool_result', 'message', 'message'])
+    assert.deepEqual(input.messages.slice(-2).map(message => message.content), ['Packed follow-up', 'Packed follow-up'])
+    return { content: 'Packed steering accepted', toolCalls: [] }
+  } } })
+try {
+  assert.equal((await steeringHost.send('Start', undefined, text => steeringAccepted.push(text))).status, 'completed')
+  assert.deepEqual(steeringAccepted, ['Packed follow-up', 'Packed follow-up'])
+  assert.deepEqual(steeringHost.queuedMessages, [])
+} finally { await steeringHost.shutdown() }
 const presentation = createCliToolPresentation({ call: { id: 'packed-presentation', name: 'offline_tool', arguments: {} },
   source: { reference: 'owned://packed/presentation', revision: 'packed-1' }, status: 'approval_required', effect: 'unknown' })
 const cjsPresentation = createRequire(import.meta.url)('@ayayaq/vivi/presentation')

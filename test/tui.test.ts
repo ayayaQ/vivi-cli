@@ -48,12 +48,13 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/web', '/reviewer', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/instructions', '/skills', '/mcp', '/menu', '/help', '/session', '/exit'
+    '/provider', '/web', '/reviewer', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/instructions', '/skills', '/mcp', '/menu', '/help', '/queue', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
   expect(getSlashCommandCompletions('/provider').map(({ command }) => command)).toEqual(['/provider'])
   expect(getSlashCommandCompletions('/commands').map(({ command }) => command)).toEqual(['/commands'])
+  expect(getSlashCommandCompletions('/q').map(({ command }) => command)).toEqual(['/queue'])
   for (const input of ['', 'message', ' /m', 'message /m', '/m ', '/models argument', '/m\n', '/unknown']) {
     expect(getSlashCommandCompletions(input)).toEqual([])
   }
