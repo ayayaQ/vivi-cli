@@ -53,6 +53,8 @@ export interface DecisionLedgerRecord {
   readonly source: DecisionLedgerSource
   readonly reasonCode: DecisionLedgerReasonCode
   readonly checks: readonly DecisionLedgerCheck[]
+  /** Captured effective policy. Absent on legacy rows; never infer it from current preferences. */
+  readonly thresholds?: { readonly allowAt: number; readonly denyAt: number }
   readonly usage?: DecisionLedgerUsage
   readonly createdAt: string
   readonly updatedAt: string
@@ -90,7 +92,7 @@ const predicateNames: readonly string[] = ['exact_action_requested', 'effects_wi
 const checkReasons: readonly string[] = ['allow_threshold_met', 'deny_threshold_met', 'between_thresholds']
 const usageFields = ['inputTokens', 'outputTokens', 'totalTokens', 'cachedTokens', 'cacheWriteTokens', 'reasoningTokens', 'costUsd']
 const recordFields = ['id', 'sessionId', 'runId', 'callId', 'toolName', 'policyRevision', 'provider', 'model',
-  'snapshotDigest', 'source', 'reasonCode', 'checks', 'usage', 'createdAt', 'updatedAt', 'state', 'resultRevision', 'actionKind']
+  'snapshotDigest', 'source', 'reasonCode', 'checks', 'thresholds', 'usage', 'createdAt', 'updatedAt', 'state', 'resultRevision', 'actionKind']
 const identityFields = ['id', 'sessionId', 'runId', 'callId', 'toolName', 'policyRevision', 'provider', 'model',
   'snapshotDigest', 'createdAt', 'actionKind'] as const
 
@@ -158,6 +160,13 @@ export function validateDecisionLedgerRecord(value: unknown): DecisionLedgerReco
     check(typeof predicate.probability === 'number' && Number.isFinite(predicate.probability) &&
       predicate.probability >= 0 && predicate.probability <= 1, 'invalid predicate estimate')
     check(member(predicate.reasonCode, checkReasons), 'unknown predicate reason')
+  }
+  if (Object.hasOwn(record, 'thresholds')) {
+    const thresholds = object(record.thresholds, ['allowAt', 'denyAt'])
+    check(typeof thresholds.allowAt === 'number' && Number.isFinite(thresholds.allowAt) &&
+      thresholds.allowAt >= 0.9 && thresholds.allowAt <= 1 &&
+      thresholds.allowAt === Math.round(thresholds.allowAt * 1000) / 1000 && thresholds.denyAt === 0.05,
+    'invalid captured thresholds')
   }
   if (Object.hasOwn(record, 'usage')) {
     const usage = object(record.usage, usageFields)
@@ -486,6 +495,8 @@ export class FileDecisionLedger implements DecisionLedger {
       const previous = loaded.records.find(record => record.id === captured.id)
       if (previous) {
         check(identityFields.every(field => previous[field] === captured[field]), 'record identity cannot change')
+        check(previous.thresholds?.allowAt === captured.thresholds?.allowAt && previous.thresholds?.denyAt === captured.thresholds?.denyAt,
+          'captured thresholds cannot change')
         check(captured.updatedAt >= previous.updatedAt, 'record timestamp cannot move backwards')
         // Interrupted outcomes are facts to reconcile, never grants to retry a mutation.
         if (this.recover(previous, false).state === 'unknown') {

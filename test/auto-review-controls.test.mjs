@@ -102,6 +102,7 @@ test('minimal disclosure identifies recipients, review data, unrequested proposa
       'redirect scope', 'hostname to DNS', 'caller IP', 'GET may have server-side effects or costs', 'known credentials are blocked',
       'sensitive data', 'uncertain checks', 'review failures', 'External content cannot authorize']) assert(disclosure.includes(text), text)
     assert(disclosure.length < 1000)
+    assert.match(disclosure, /four requirement estimates.*5%.*uncalibrated/)
   }
 })
 test('fresh confirmation binds possible private-text sharing to named recipients and the displayed revision', async () => {
@@ -317,4 +318,19 @@ test('confirmed provider, model and effort replacements preserve Plan; explicit 
   assert.equal(io.modes.at(-1), 'manual')
   assert.equal(io.sessions.filter(session => session.reasoning === 'low').length > 0, true)
   assert.match(io.output, /local-read task policy preserved/)
+})
+
+test('changing an idle threshold while fresh enrollment is open invalidates the displayed cutoff consent', async () => {
+  const session = newSession({ provider: 'openai', model: 'offline' })
+  const host = new CliHost({ session, store: { async save() {} }, provider: { async generate() { throw new Error('No chat expected') } },
+    approve: async () => false, decisionReview: { provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { throw new Error('No review expected') } },
+      ledger: { async upsert() {} }, canAutoReview: true, accountRevision: () => 'offline-account', autoReviewThresholds: { openai: 950 } } })
+  const original = host.approvalEnrollmentBinding
+  const io = fakeIO({ interactive: true, approvals: [() => { host.setAutoReviewThresholds({ openai: 900 }); return true }] })
+  await selectApprovalMode(host, io, async () => 'auto')
+  assert.equal(io.requests[0].call.arguments.thresholds.allowAt, 0.95)
+  assert.match(io.requests[0].description, /reach 95%/)
+  assert.notEqual(host.approvalEnrollmentBinding, original)
+  assert.equal(host.approvalMode, 'manual')
+  assert.match(io.output, /Enrollment changed/)
 })

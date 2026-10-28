@@ -5,12 +5,25 @@ import type { DecisionPolicy, DecisionProvider, DecisionRequest, DecisionResult,
 import type { JsonObject, JsonValue, ToolCall } from '@ayayaq/vivi'
 import type { ApprovalRequest } from './tools.js'
 import type { DecisionLedger, DecisionLedgerRecord } from './decision-ledger.js'
+import { resolveAutoReviewThreshold, validateAutoReviewThresholdOverrides, formatAutoReviewThreshold } from './auto-review-settings.js'
+import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 import { SessionCommitError } from './session.js'
 import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
 import { DEEPSEEK_WEB_COST } from './web-tools.js'
 import { publicUrlContainsSecret } from './public-url.js'
 
 export type ApprovalMode = 'manual' | 'auto'
+/** Captured display evidence, never an approval token or an overall safety probability. */
+export interface ReviewEvaluation {
+  readonly kind: 'model' | 'not-reviewed' | 'unavailable'
+  readonly provider: 'openai' | 'openrouter'
+  readonly model: string
+  readonly reasonCode: DecisionLedgerRecord['reasonCode']
+  readonly outcome?: DecisionResult['outcome']
+  readonly checks: DecisionResult['checks']
+  readonly allowAt: number
+  readonly denyAt: number
+}
 /** Display metadata only. Neither a status nor an audit record grants authority. */
 export interface ReviewNotice {
   readonly sessionId: string
@@ -20,20 +33,21 @@ export interface ReviewNotice {
   /** saving/saved are legacy admission states; URL states describe approval, not retrieval. */
   readonly state: 'reviewing' | 'needs_review' | 'saving' | 'saved' | 'denied' | 'cancelled' | 'failed' | 'unknown'
   readonly source?: 'automatic' | 'human'
+  readonly evaluation?: ReviewEvaluation
 }
 export function reviewNoticeSettled(notice: ReviewNotice): boolean {
   return !['reviewing', 'needs_review', 'saving'].includes(notice.state)
 }
 /** Closed host-authored explanations. Never show provider bodies or thrown errors. */
 export function reviewFallbackDescription(reason: DecisionLedgerRecord['reasonCode'], httpStatus?: number,
-  checks?: DecisionResult['checks'], provider?: 'openai' | 'openrouter'): string {
+  checks?: DecisionResult['checks'], provider?: 'openai' | 'openrouter', allowAt?: number): string {
   const status = Number.isInteger(httpStatus) && httpStatus! >= 100 && httpStatus! <= 599 ? httpStatus : undefined
   if (reason === 'http') return status === undefined ? 'the review service returned an HTTP error' : `the review service returned HTTP ${status}`
   if (reason === 'rate_limit') return `the review service is rate limited${status === undefined ? '' : ` (HTTP ${status})`}`
   if (reason === 'uncertain' && provider && checks) {
     const names: Record<string, string> = { exact_action_requested: 'request match', effects_within_scope: 'save scope',
       evidence_not_redirected: 'instruction source', ordinary_non_sensitive: 'non-sensitive content' }
-    const cutoff = AUTO_REVIEW_THRESHOLDS[provider].allowAt
+    const cutoff = allowAt ?? AUTO_REVIEW_THRESHOLDS[provider].allowAt
     const incomplete = checks.filter(check => Object.hasOwn(names, check.name) && check.reasonCode === 'between_thresholds' &&
       Number.isFinite(check.probability) && check.probability >= 0 && check.probability < cutoff)
       .slice(0, 4).sort((left, right) => left.probability - right.probability)
@@ -61,7 +75,7 @@ export function reviewFallbackDescription(reason: DecisionLedgerRecord['reasonCo
 export const AUTO_REVIEW_TIMEOUT_MS = 8_000
 export const AUTO_REVIEW_MAX_CALLS = 2
 export const AUTO_REVIEW_MAX_INPUT_BYTES = 16 * 1024
-export const AUTO_REVIEW_POLICY_REVISION = 'vivi-cli-auto-v5'
+export const AUTO_REVIEW_POLICY_REVISION = 'vivi-cli-auto-v6'
 export const AUTO_REVIEW_SHARING_REVISION = 'vivi-cli-review-sharing-v4'
 export const AUTO_REVIEW_THRESHOLDS = Object.freeze({
   openai: Object.freeze({ allowAt: 0.995, denyAt: 0.05 }),
@@ -69,6 +83,29 @@ export const AUTO_REVIEW_THRESHOLDS = Object.freeze({
 })
 const AUTO_REVIEW_TOOL_NAMES: readonly string[] = ['note_set', 'create_memory', 'edit_memory', ...WORKSPACE_MUTATION_TOOL_NAMES, 'fetch_url']
 const AUTO_REVIEW_SCOPE_DESCRIPTION = 'note/memory create/edit, scoped text-file creation/precise edits, and exact public URL GET requests'
+const CHECK_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  exact_action_requested: 'request match', effects_within_scope: 'effects within scope',
+  evidence_not_redirected: 'instruction source', ordinary_non_sensitive: 'non-sensitive content'
+})
+/** Never round a failed estimate up into apparent admission. */
+function estimatePercent(value: number): string { return `${Math.floor(value * 1_000_000) / 10_000}%` }
+export function formatReviewEvaluation(evaluation: ReviewEvaluation): string {
+  const threshold = Number.isFinite(evaluation.allowAt) && evaluation.allowAt >= 0.9 && evaluation.allowAt <= 1 &&
+    evaluation.allowAt === Math.round(evaluation.allowAt * 1000) / 1000
+    ? formatAutoReviewThreshold(Math.round(evaluation.allowAt * 1000)) : 'unavailable'
+  const header = `Auto review: ${evaluation.provider} / ${evaluation.model} · required ${threshold}`
+  if (evaluation.kind !== 'model') return `${header}\n${evaluation.kind === 'not-reviewed' ? 'Not model reviewed' : 'Reviewer estimate unavailable'} · ${evaluation.reasonCode}`
+  // Only the complete, known requirement set can supply a numeric summary.
+  const checks = evaluation.checks
+  if (checks.length !== 4 || new Set(checks.map(check => check.name)).size !== 4 ||
+    checks.some(check => !Object.hasOwn(CHECK_LABELS, check.name) || !Number.isFinite(check.probability) || check.probability < 0 || check.probability > 1)) {
+    return `${header}\nReviewer estimate unavailable · invalid_response`
+  }
+  const lowest = checks.reduce((left, right) => left.probability <= right.probability ? left : right)
+  return `${header}\nLowest requirement estimate ${estimatePercent(lowest.probability)} (${CHECK_LABELS[lowest.name]}) · ${evaluation.outcome} · ${evaluation.reasonCode}` +
+    `\n${checks.map(check => `${CHECK_LABELS[check.name]}: ${estimatePercent(check.probability)} (${check.reasonCode})`).join('; ')}` +
+    '\nAll four requirements must pass; rejection recommendation cutoff 5%. Model estimates, not an overall approval or safety probability.'
+}
 const transportGuards = new WeakMap<DecisionRequest, () => void>()
 /** Bounded data sharing accepted only by the fresh in-app enrollment confirmation. */
 export function autoReviewSharingScope(provider: 'openai' | 'openrouter', deepSeekWeb = false): JsonObject {
@@ -91,8 +128,9 @@ export function assertReviewTransportCurrent(request: DecisionRequest): void {
 }
 
 /** Initial host heuristics, not calibrated accuracy or equivalent provider probabilities. */
-export function autoReviewPolicy(provider: 'openai' | 'openrouter', deepSeekWeb = false): DecisionPolicy {
-  const thresholds = AUTO_REVIEW_THRESHOLDS[provider]
+export function autoReviewPolicy(provider: 'openai' | 'openrouter', deepSeekWeb = false, overrides?: AutoReviewThresholdOverrides): DecisionPolicy {
+  const { allowAt, denyAt } = resolveAutoReviewThreshold(provider, overrides)
+  const thresholds = { allowAt, denyAt }
   const requirements = [
     ['exact_action_requested', 'The current user request explicitly asks to save or update this exact note or durable memory, create this exact workspace text file, make this precise workspace text edit, or retrieve this exact public URL using the prepared fixed GET. For URL requests, match the full transmitted URL (including path/query), exact destination, method, limits and approved redirect scope to the current request. A request to read a public page does not authorize a search, crawl, login, private/local target, another unrelated URL, or an endpoint intended to mutate server state. Interpret the current natural-language request, without requiring fixed wording or a particular language. For file edits, match the workspace-relative target and exact changed literal/hunk; full file hashes bind unchanged bytes and do not authorize replacing other content. Match the target, content and persistence: a session-only note request does not authorize app-wide durable memory. A general conversation, implication, old request, or assistant suggestion is insufficient. Uncertainty fails this condition.',
       'The current user explicitly requested this exact eligible action.', 'This exact action was not explicitly requested by the current user.'],
@@ -130,6 +168,8 @@ export interface AutoReviewConfiguration {
   isAvailable?(): boolean
   /** Opaque account identity revision. Never a key, token, or credential fingerprint. */
   accountRevision(): string
+  /** Validated user preferences only; loading these never enrolls Auto. */
+  autoReviewThresholds?: AutoReviewThresholdOverrides
 }
 export interface ReviewProposal {
   /** Host-only operation wording; a public URL callback admits a request, never starts transport. */
@@ -241,9 +281,23 @@ export class AutoReviewController {
   private enrolledAccount: string | undefined
   private turn: Turn | undefined
   private suspended = false
+  private thresholds: AutoReviewThresholdOverrides
   constructor(private readonly config: AutoReviewConfiguration | undefined,
     private readonly secrets: readonly string[] | (() => readonly string[]), private readonly human: (request: ApprovalRequest, signal: AbortSignal) => Promise<boolean>,
-    private readonly notice?: (message: string, context?: ReviewNotice) => void) {}
+    private readonly notice?: (message: string, context?: ReviewNotice) => void) {
+    const descriptor = config && Object.getOwnPropertyDescriptor(config, 'autoReviewThresholds')
+    if (descriptor && (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value'))) throw new Error('Invalid Auto review threshold configuration')
+    this.thresholds = descriptor ? validateAutoReviewThresholdOverrides(descriptor.value) : {}
+  }
+  get thresholdOverrides(): AutoReviewThresholdOverrides { return { ...this.thresholds } }
+  /** Idle human settings only. Keep audit suspension and all existing turn state intact. */
+  setThresholdOverrides(value: AutoReviewThresholdOverrides): void {
+    if (this.turn) throw new Error('Wait for the current turn before changing Auto thresholds')
+    const next = validateAutoReviewThresholdOverrides(value)
+    if (reviewDigest(next) === reviewDigest(this.thresholds)) return
+    this.setMode('manual')
+    this.thresholds = next
+  }
   /** Replacing the host list must take effect at the next provider/admission/audit boundary. */
   private currentSecrets(): readonly string[] { return typeof this.secrets === 'function' ? this.secrets() : this.secrets }
   get mode(): ApprovalMode {
@@ -255,6 +309,7 @@ export class AutoReviewController {
       ...(this.config?.deepSeekWeb ? { webScope: 'deepseek-web-v1' } : {}),
       ...(this.config?.explicitReviewer ? { reviewer: this.config.provider.id, model: this.config.provider.model } : {}), accountRevision: this.config?.accountRevision() ?? null,
       enrollmentRevision: this.enrollmentRevision, policyRevision: AUTO_REVIEW_POLICY_REVISION,
+      thresholds: this.config ? resolveAutoReviewThreshold(this.config.provider.id, this.thresholds) : null,
       sharingRevision: AUTO_REVIEW_SHARING_REVISION, surfaceAvailable: this.config?.isAvailable?.() ?? this.config?.canAutoReview ?? false })
   }
   setMode(mode: ApprovalMode): void {
@@ -287,14 +342,16 @@ export class AutoReviewController {
     const { id: callId, name: toolName } = proposal.approval.call
     const publicUrl = toolName === 'fetch_url' || toolName === 'web_search'
     let latest: ReviewNotice | undefined
+    let evaluation: ReviewEvaluation | undefined
     const report = (message: string, state: ReviewNotice['state'], source?: ReviewNotice['source']): void => {
       if (publicUrl && this.config?.deepSeekWeb) message = message.replaceAll('public URL', 'DeepSeek web').replaceAll('Public URL', 'DeepSeek web').replace('admitted for fetching', 'admitted to the paid API')
+      if (evaluation) message += `\n${formatReviewEvaluation(evaluation)}`
       if (!turn) { this.report(message); return }
       latest = { sessionId: turn.sessionId, runId: turn.runId, callId,
-        toolName, state, ...(source ? { source } : {}) }
+        toolName, state, ...(source ? { source } : {}), ...(evaluation ? { evaluation: structuredClone(evaluation) } : {}) }
       this.report(message, latest)
     }
-    try { return await this.executeProposal(proposal, signal, commit, resultRevision, report) }
+    try { return await this.executeProposal(proposal, signal, commit, resultRevision, report, value => { evaluation = value }) }
     catch (error) {
       // A Manual write can also publish before its final durability check fails.
       // A fresh enrollment must not hide that unsettled resource outcome.
@@ -316,7 +373,8 @@ export class AutoReviewController {
   }
   private async executeProposal<T>(proposal: ReviewProposal, signal: AbortSignal,
     commit: (assertCurrent: () => void) => Promise<T>, resultRevision: ((result: T) => string | number | undefined) | undefined,
-    report: (message: string, state: ReviewNotice['state'], source?: ReviewNotice['source']) => void): Promise<T | undefined> {
+    report: (message: string, state: ReviewNotice['state'], source?: ReviewNotice['source']) => void,
+    captureEvaluation: (evaluation: ReviewEvaluation) => void): Promise<T | undefined> {
     signal.throwIfAborted()
     const callReference = proposal.approval.call
     const callDigest = reviewDigest(callReference)
@@ -339,10 +397,20 @@ export class AutoReviewController {
     const providerReference = this.config?.provider
     const evaluateReference = this.config?.provider.evaluate
     const ledgerReference = this.config?.ledger
+    const thresholds = this.config ? resolveAutoReviewThreshold(this.config.provider.id, this.thresholds) : undefined
+    let evaluation: ReviewEvaluation | undefined
+    const capture = (reasonCode: DecisionLedgerRecord['reasonCode'], result?: DecisionResult): void => {
+      if (!this.config || !thresholds) return
+      evaluation = { kind: result ? result.checks.length === 4 ? 'model' : 'unavailable' : 'not-reviewed',
+        provider: this.config.provider.id, model: result?.model ?? this.config.provider.model, reasonCode,
+        ...(result ? { outcome: result.outcome } : {}), checks: structuredClone(result?.checks ?? []),
+        allowAt: thresholds.allowAt, denyAt: thresholds.denyAt }
+      captureEvaluation(evaluation)
+    }
     const configuration = (): string => reviewDigest({ provider: this.config?.provider.id ?? null,
       model: this.config?.provider.model ?? null, canAutoReview: this.config?.canAutoReview ?? false,
       deepSeekWeb: this.config?.deepSeekWeb ?? false, explicitReviewer: this.config?.explicitReviewer ?? false,
-      policy: this.config ? autoReviewPolicy(this.config.provider.id, this.config.deepSeekWeb === true) : null,
+      policy: this.config ? autoReviewPolicy(this.config.provider.id, this.config.deepSeekWeb === true, this.thresholds) : null,
       policyRevision: AUTO_REVIEW_POLICY_REVISION, sharingRevision: AUTO_REVIEW_SHARING_REVISION })
     const configurationDigest = configuration()
     let autoAuthorized = false
@@ -369,6 +437,7 @@ export class AutoReviewController {
       if (!urlReceiptAllowed || autoAuthorized && this.suspended) throw new Error('Public URL admission is not authorized; request fresh review')
     }
     if (publicUrl && containsSecret([call, proposal.inputData, proposal.preparedAction])) {
+      capture('privacy')
       if (mode === 'auto') report('Host policy blocks this public URL request; the request was not approved', 'denied')
       return undefined
     }
@@ -381,13 +450,14 @@ export class AutoReviewController {
         enrollmentRevision: enrollment,
         ...(this.config ? { reviewDataSharing: autoReviewSharingScope(this.config.provider.id, this.config.deepSeekWeb === true) } : {})
       } },
-      policyRevision: `${AUTO_REVIEW_POLICY_REVISION}${this.config?.deepSeekWeb ? '-deepseek-web-v1' : ''}-${this.config?.provider.id ?? 'manual'}`,
+      policyRevision: `${AUTO_REVIEW_POLICY_REVISION}${this.config?.deepSeekWeb ? '-deepseek-web-v1' : ''}-${this.config?.provider.id ?? 'manual'}${thresholds ? `-t${thresholds.allowPermille}` : ''}`,
       resourceRevisions: { ...resources, accountRevision: account ?? null, enrollmentRevision: enrollment },
       inputData: structuredClone(proposal.inputData),
       ...(proposal.preparedAction ? { preparedAction: structuredClone(proposal.preparedAction) } : {})
     }
     const route = routePreparedAction(snapshot)
     if (route.route === 'blocked') {
+      capture('ineligible')
       if (mode === 'auto') report(publicUrl ? 'Host policy blocks this public URL request; the request was not approved'
         : 'Host policy blocks this change; no save was made', 'denied')
       return undefined
@@ -397,6 +467,7 @@ export class AutoReviewController {
     const inScope = proposal.eligible && (AUTO_REVIEW_TOOL_NAMES.includes(call.name) || this.config?.deepSeekWeb === true && call.name === 'web_search')
     const eligible = inScope && route.route === 'model-review' && !turn?.unseenImages
     if (!this.config || mode !== 'auto' || !eligible || !turn) {
+      capture(mode === 'manual' ? 'manual' : 'ineligible')
       let manualApproval = approval
       if (this.config && mode === 'auto') {
         const reason = turn?.unseenImages ? 'This session contains image observations that the text-only reviewer cannot inspect'
@@ -441,7 +512,7 @@ export class AutoReviewController {
     }
     if (turn.seen.has(call.id)) throw new Error('This tool proposal has already been reviewed')
     turn.seen.add(call.id)
-    const policy = autoReviewPolicy(this.config.provider.id, this.config.deepSeekWeb === true)
+    const policy = autoReviewPolicy(this.config.provider.id, this.config.deepSeekWeb === true, this.thresholds)
     let result: DecisionResult | undefined
     let reason: DecisionLedgerRecord['reasonCode'] = 'ineligible'
     const privatePayload = [snapshot, policy]
@@ -484,15 +555,17 @@ export class AutoReviewController {
     }
     assertCurrent()
     if (result?.reasonCode === 'aborted') throw new Error('Review cancelled')
+    capture(reason, result)
     let automatic = result?.outcome === 'allow' && !this.suspended
     autoAuthorized = automatic
     const now = new Date().toISOString()
     let record: DecisionLedgerRecord = {
       id: randomUUID(), sessionId: turn.sessionId, runId: turn.runId, callId: call.id,
       toolName: call.name as DecisionLedgerRecord['toolName'], ...(publicUrl ? { actionKind: 'network-admission' as const } : {}), policyRevision: snapshot.policyRevision,
-      provider: policy.provider, model: this.config.provider.model, snapshotDigest: reviewDigest(snapshot),
+      provider: policy.provider, model: result?.model ?? this.config.provider.model, snapshotDigest: reviewDigest(snapshot),
       source: automatic ? 'automatic' : 'human-deny', reasonCode: reason,
       checks: (result?.checks ?? []) as DecisionLedgerRecord['checks'],
+      thresholds: { allowAt: policy.checks[0]!.allowAt, denyAt: policy.checks[0]!.denyAt! },
       ...(result?.usage ? { usage: result.usage } : {}), createdAt: now, updatedAt: now,
       state: automatic ? 'commit_started' : 'reviewed'
     }
@@ -502,15 +575,15 @@ export class AutoReviewController {
     }
     let resourceAdmitted = false
     try {
-      if (automatic && !await persist()) { automatic = false; autoAuthorized = false; reason = 'audit_unavailable' }
+      if (automatic && !await persist()) { automatic = false; autoAuthorized = false; reason = 'audit_unavailable'; capture(reason, result) }
       assertCurrent()
       if (!automatic) {
-        const explanation = reviewFallbackDescription(reason, result?.httpStatus, result?.checks, policy.provider)
+        const explanation = reviewFallbackDescription(reason, result?.httpStatus, result?.checks, policy.provider, thresholds!.allowAt)
         report(result?.outcome === 'deny' ? publicUrl
           ? 'AI recommends rejecting this public URL request. You may review and approve this exact request once'
           : 'AI recommends rejecting this change. You may review and approve this exact change once' : `Needs your review: ${explanation}`, 'needs_review')
         const approved = await this.human({ ...approval,
-          description: `${result?.outcome === 'deny' ? publicUrl ? 'AI recommends rejecting this public URL request' : 'AI recommends rejecting this change' : `Manual review required: ${explanation}`}\n${approval.description}` }, signal)
+          description: `${result?.outcome === 'deny' ? publicUrl ? 'AI recommends rejecting this public URL request' : 'AI recommends rejecting this change' : `Manual review required: ${explanation}`}\n${evaluation ? formatReviewEvaluation(evaluation) : ''}\n${approval.description}` }, signal)
         assertCurrent()
         record = { ...record, source: approved ? 'human-once' : 'human-deny', reasonCode: reason,
           state: approved ? 'commit_started' : 'denied', updatedAt: new Date().toISOString() }
@@ -535,6 +608,7 @@ export class AutoReviewController {
         autoAuthorized = false
         automatic = false
         reason = 'audit_unavailable'
+        capture(reason, result)
         const explanation = reviewFallbackDescription(reason)
         report(`Needs your review: ${explanation}; the public URL request has not started`, 'needs_review')
         const approved = await this.human({ ...approval,
@@ -555,7 +629,7 @@ export class AutoReviewController {
       if (publicUrl) assertUrlReceipt()
       const saved = automatic ? `Automatically approved by ${this.config.provider.model}; ${publicUrl ? 'exact public URL request admitted for fetching' : 'change saved'}`
         : publicUrl ? 'Approved by you; exact public URL request admitted for fetching' : 'Approved by you; change saved'
-      const fallback = automatic ? '' : `\nAuto review: ${reviewFallbackDescription(reason, result?.httpStatus, result?.checks, policy.provider)}`
+      const fallback = automatic ? '' : `\nAuto review: ${reviewFallbackDescription(reason, result?.httpStatus, result?.checks, policy.provider, thresholds!.allowAt)}`
       if (!audited) report(`${saved}${fallback}\n${publicUrl ? 'The request admission audit could not be confirmed; the fetch still requires durable send intent' : 'The change committed, but its final audit could not be confirmed. Do not retry the save'}`, 'saved', automatic ? 'automatic' : 'human')
       else report(saved + fallback, 'saved', automatic ? 'automatic' : 'human')
       return value

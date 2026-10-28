@@ -552,3 +552,18 @@ test('fetch_url audit rows distinguish network admission from transmission and n
     assert.throws(() => validateDecisionLedgerRecord(record({ toolName: 'fetch_url', actionKind: 'network-admission', [field]: 'private' })), /unexpected field/)
   }
 })
+
+test('captured thresholds round-trip immutably while legacy records retain unknown thresholds', async t => {
+  const { store } = await fixture(t)
+  const legacy = record(), current = record({ thresholds: { allowAt: 0.95, denyAt: 0.05 } })
+  await store.upsert(legacy); await store.upsert(current)
+  const rows = await store.list()
+  assert.equal(Object.hasOwn(rows[0], 'thresholds'), false)
+  assert.deepEqual(rows[1].thresholds, { allowAt: 0.95, denyAt: 0.05 })
+  await assert.rejects(store.upsert({ ...current, thresholds: { allowAt: 0.9, denyAt: 0.05 } }), /thresholds cannot change/)
+  await assert.rejects(store.upsert({ ...legacy, thresholds: { allowAt: 0.95, denyAt: 0.05 } }), /thresholds cannot change/)
+  for (const thresholds of [null, {}, { allowAt: 0.899, denyAt: 0.05 }, { allowAt: 0.9505, denyAt: 0.05 },
+    { allowAt: 0.95, denyAt: 0.04 }, { allowAt: Infinity, denyAt: 0.05 }, { allowAt: 0.95, denyAt: 0.05, extra: true }]) {
+    assert.throws(() => validateDecisionLedgerRecord(record({ thresholds })))
+  }
+})

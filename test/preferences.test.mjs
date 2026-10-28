@@ -70,6 +70,34 @@ test('old exact schema-1 preferences load memory disabled and save a complete cu
     { ...preferences(), enableMemory: undefined }]) assert.throws(() => validatePreferences(invalid));
 });
 
+test('optional reviewer thresholds persist independently without recording enrollment', async (t) => {
+  const { store } = await fixture(t);
+  const expected = { ...preferences(), autoReviewThresholds: { openai: 900, openrouter: 999 } };
+  await store.save(expected);
+  assert.deepEqual(await store.load(), expected);
+  const loaded = await store.load(); loaded.autoReviewThresholds.openai = 950;
+  assert.deepEqual(await store.load(), expected);
+  delete expected.autoReviewThresholds.openai;
+  await store.save(expected);
+  assert.deepEqual((await store.load()).autoReviewThresholds, { openrouter: 999 });
+  delete expected.autoReviewThresholds;
+  await store.save(expected);
+  assert.deepEqual(await store.load(), preferences());
+});
+
+test('preference thresholds reject invalid entries and accessors without invoking them', () => {
+  let called = 0;
+  const nested = Object.defineProperty({}, 'openai', { enumerable: true, get() { called++; return 900; } });
+  for (const invalid of [undefined, null, [], { openai: 899 }, { openai: 1001 }, { openai: 999.1 },
+    { openai: '950' }, { deepseek: 950 }, { openai: 950, allowAll: true }, nested]) {
+    assert.throws(() => validatePreferences({ ...preferences(), autoReviewThresholds: invalid }));
+  }
+  const outer = { ...preferences() };
+  Object.defineProperty(outer, 'autoReviewThresholds', { enumerable: true, get() { called++; return {}; } });
+  assert.throws(() => validatePreferences(outer));
+  assert.equal(called, 0);
+});
+
 test('session-note intent round-trips independently of model tool availability and memory consent', async (t) => {
   const { store } = await fixture(t);
   for (const model of ['', 'unverified-model', 'chat-only-model']) {

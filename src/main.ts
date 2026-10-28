@@ -33,6 +33,8 @@ import type { CredentialStore } from './credentials.js'
 import type { ApprovalMode } from './auto-review.js'
 import { assertReviewTransportCurrent } from './auto-review.js'
 import { FileDecisionLedger } from './decision-ledger.js'
+import { PreferenceStore, DEFAULT_PREFERENCES } from './preferences.js'
+import { formatAutoReviewThreshold, parseAutoReviewThresholdPercent, resolveAutoReviewThreshold } from './auto-review-settings.js'
 import { McpConfigStore } from './mcp-config.js'
 import { McpManager } from './mcp-manager.js'
 import type { McpManagerOptions } from './mcp-manager.js'
@@ -118,6 +120,7 @@ Workspace tools omit symlinks and private/ignored files; text writes require rev
 /commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval, even in Auto; piped approval is denied.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual / Auto review / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
+/auto-threshold [90–100|default] saves this reviewer’s requirement cutoff (0.1 percentage-point steps); changes revoke Auto and need fresh consent.
 Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
@@ -374,6 +377,10 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     }
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
     if (options.help) { io.write(HELP); return 0 }
+    if (options.prompt !== undefined && /^\/auto-threshold(?:\s|$)/.test(options.prompt.trim())) {
+      io.write('Auto threshold changes require an idle interactive conversation; no setting changed\n')
+      return 0
+    }
     let secretTargets: (values: readonly string[]) => void = () => undefined
     const registerMcpSecrets = (values: readonly string[]): void => {
       const fresh = values.filter(value => value && !secrets.includes(value))
@@ -392,9 +399,14 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
     const store = new FileSessionStore(options.sessionDirectory, secrets)
     const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io!.write(`${message}\n`))
+    const preferences = new PreferenceStore(options.sessionDirectory, secrets)
+    let thresholdPreferencesAvailable = true
+    let savedPreferences = structuredClone(DEFAULT_PREFERENCES)
+    try { savedPreferences = await preferences.load() ?? savedPreferences }
+    catch { thresholdPreferencesAvailable = false; io.write('Saved defaults could not be loaded; Auto enrollment is unavailable until /auto-threshold explicitly saves a valid setting\n') }
     const skills = new InstalledSkillStore(options.sessionDirectory, { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
     secretTargets = values => {
-      memory.addSecrets(values); skills.addSecrets(values); workspace?.addSecrets(values); host?.refreshSecretFilters()
+      memory.addSecrets(values); preferences.addSecrets(values); skills.addSecrets(values); workspace?.addSecrets(values); host?.refreshSecretFilters()
     }
     const fresh = options.resume ? undefined : newSession({
       provider: options.provider ?? 'openai', model: options.model!,
@@ -455,7 +467,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
         ...(options.reviewer ? { explicitReviewer: true as const } : {}),
         ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
-        accountRevision: () => accountRevision, isAvailable: () => io?.canAutoReview === true && !io.isClosed
+        autoReviewThresholds: savedPreferences.autoReviewThresholds ?? {},
+        accountRevision: () => accountRevision, isAvailable: () => thresholdPreferencesAvailable && io?.canAutoReview === true && !io.isClosed
       } } : {}),
       ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
         ask: (request, { signal }) => io!.askQuestions!(request, signal),
@@ -480,7 +493,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const revision = randomUUID()
       host!.setDecisionReview({ provider: deferredDecisionProvider({ ...session, provider: name }, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
         explicitReviewer: true, ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: io!.canAutoReview === true,
-        accountRevision: () => revision, isAvailable: () => io?.canAutoReview === true && !io.isClosed })
+        autoReviewThresholds: savedPreferences.autoReviewThresholds ?? {},
+        accountRevision: () => revision, isAvailable: () => thresholdPreferencesAvailable && io?.canAutoReview === true && !io.isClosed })
       io!.setApprovalMode?.('manual'); io!.write(`Auto reviewer: ${name}. Use /mode for fresh enrollment.\n`); return true
     }
     const configureWeb = async (line: string): Promise<void> => {
@@ -493,8 +507,36 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       } else host!.setWebConfiguration({ provider: name as 'direct' | 'disabled' })
       io!.setApprovalMode?.('manual'); io!.write(`Web provider: ${name}. Auto enrollment revoked.\n`)
     }
+    const configureAutoThreshold = async (line: string): Promise<void> => {
+      const argument = line.trim().replace(/^\/auto-threshold\s*/, '')
+      if (argument && (options.prompt !== undefined || io!.canAutoReview !== true || io!.isClosed || host!.running)) {
+        io!.write('Auto threshold changes require an idle interactive conversation; no setting changed\n'); return
+      }
+      const provider = host!.reviewProvider
+      if (!provider) { io!.write('Choose this conversation’s Auto reviewer with /reviewer first\n'); return }
+      if (!argument) {
+        io!.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, host!.autoReviewThresholds).allowPermille)}. Use /auto-threshold PERCENT or /auto-threshold default. Range 90–100%, steps 0.1 percentage point; estimates are uncalibrated, not an overall approval probability.\n`)
+        return
+      }
+      if (options.prompt !== undefined || io!.canAutoReview !== true || io!.isClosed || host!.running) {
+        io!.write('Auto threshold changes require an idle interactive conversation; no setting changed\n'); return
+      }
+      const previous = host!.autoReviewThresholds, next = { ...previous }
+      if (argument === 'default') delete next[provider]
+      else next[provider] = parseAutoReviewThresholdPercent(argument)
+      host!.setAutoReviewThresholds(next); host!.setApprovalMode('manual'); io!.setApprovalMode?.('manual')
+      const appliedBinding = host!.approvalEnrollmentBinding
+      try { await preferences.save({ ...savedPreferences, autoReviewThresholds: next }) }
+      catch (error) {
+        if (!host!.running && host!.approvalEnrollmentBinding === appliedBinding) host!.setAutoReviewThresholds(previous)
+        throw error
+      }
+      savedPreferences = { ...savedPreferences, autoReviewThresholds: next }; thresholdPreferencesAvailable = true
+      io!.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Lower thresholds allow more uncertain proposals; hard blocks and human-only actions do not change. Auto enrollment revoked; use /mode for fresh consent.\n`)
+    }
     const result = await runChatLoop(host, io, options.prompt, {
       web: configureWeb, reviewer: async line => { await configureReviewer(line) },
+      autoThreshold: configureAutoThreshold,
       mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0

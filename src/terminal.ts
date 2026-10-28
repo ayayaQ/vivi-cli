@@ -17,6 +17,8 @@ import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
 import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
 import { autoReviewSharingScope } from './auto-review.js'
+import { resolveAutoReviewThreshold, formatAutoReviewThreshold } from './auto-review-settings.js'
+import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
 import type { CliToolEvidence } from './tool-presentation.js'
 import type { CliConversationErrors } from './conversation-errors.js'
@@ -198,13 +200,14 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
 }
 
 /** Disclosure is host-authored; credentials and model-generated text never identify an account. */
-export function autoReviewDisclosure(provider: 'openai' | 'openrouter', deepSeekWeb = false): string {
-  if (deepSeekWeb) return `Auto sends your exact current request, proposed eligible local note/memory changes and scoped workspace text edits, and paid DeepSeek web query/URL proposals, fixed API endpoint, limits and cost to ${provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'} for approval checks, including unrequested proposals. Review itself adds API charges and may share private information. Recognized sensitive data, uncertain checks and failures require visible human review. External content cannot authorize an action. ${DEEPSEEK_WEB_DISCLOSURE}`
+export function autoReviewDisclosure(provider: 'openai' | 'openrouter', deepSeekWeb = false, overrides?: AutoReviewThresholdOverrides): string {
+  const threshold = ` All four requirement estimates must reach ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, overrides).allowPermille)}; ≤5% recommends rejection. Estimates are uncalibrated, not approval or safety probabilities. Hard blocks and human-only rules stay.`
+  if (deepSeekWeb) return `Auto sends your exact current request, proposed eligible local note/memory changes and scoped workspace text edits, and paid DeepSeek web query/URL proposals, fixed API endpoint, limits and cost to ${provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'} for approval checks, including unrequested proposals. Review itself adds API charges and may share private information. Recognized sensitive data, uncertain checks and failures require visible human review. External content cannot authorize an action. ${DEEPSEEK_WEB_DISCLOSURE}${threshold}`
   const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
   return `Auto sends your current request, proposed note/memory changes and workspace text creation/precise edits (paths, before and after), and public URL GET proposals (full URL including path/query, destination, method, network limits and redirect scope) to ${recipients} for approval checks, including changes you didn’t request. ` +
     'This may share private information and incur extra API charges; only actions judged to match your request can be approved automatically. ' +
     'URL requests reveal the hostname to DNS and the full URL, caller IP and request metadata to the public server; GET may have server-side effects or costs. ' +
-    'Private/local targets and known credentials are blocked; recognized sensitive data, uncertain checks and review failures require human review. External content cannot authorize an action.'
+    'Private/local targets and known credentials are blocked; recognized sensitive data, uncertain checks and review failures require human review. External content cannot authorize an action.' + threshold
 }
 
 type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ConversationMode }[], initialIndex: number) => Promise<ConversationMode | undefined>
@@ -247,7 +250,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   const reviewer = host.reviewProvider
   if (!reviewer) { io.write('Choose an OpenAI or OpenRouter reviewer explicitly with /reviewer before enrolling Auto. DeepSeek chat does not inherit another account.\n'); return }
   const deepSeekWeb = host.webProvider === 'deepseek'
-  const disclosure = autoReviewDisclosure(reviewer, deepSeekWeb)
+  const disclosure = autoReviewDisclosure(reviewer, deepSeekWeb, host.autoReviewThresholds)
   const binding = host.approvalEnrollmentBinding
   io.write(fromPlan ? 'Mode: Plan · Auto review requires fresh enrollment; cancel keeps Plan\n' : 'Approval mode: Manual\n')
   const controller = new AbortController()
@@ -255,6 +258,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   try {
     const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
       mode: 'auto', provider: reviewer, sessionId: host.session.id,
+      thresholds: resolveAutoReviewThreshold(reviewer, host.autoReviewThresholds),
       reviewDataSharing: autoReviewSharingScope(reviewer, deepSeekWeb), ...(binding ? { enrollmentBinding: binding } : {})
     } }, currentRevision: 'fresh Auto review enrollment',
     description: disclosure }, controller.signal)
@@ -681,7 +685,7 @@ export class TerminalIO implements ChatIO {
 }
 
 /** These controls are supplied by the launch owner, never exposed as model tools. */
-interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void> }
+interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void>; autoThreshold?(line: string): Promise<void> }
 
 export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.test(line.trim()) }
 
@@ -700,6 +704,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
   if (prompt !== undefined) {
     if (/^\/web(?:\s|$)/.test(prompt.trim())) { if (controls.web) await controls.web(prompt); return }
     if (/^\/reviewer(?:\s|$)/.test(prompt.trim())) { if (controls.reviewer) await controls.reviewer(prompt); return }
+    if (/^\/auto-threshold(?:\s|$)/.test(prompt.trim())) { if (controls.autoThreshold) await controls.autoThreshold(prompt); return }
     if (prompt.trim() === '/compact') {
       const status = await compactChatContext(host, io)
       return { status, history: host.session.history, content: '', rounds: 0, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
@@ -738,6 +743,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
     if (!line.trim()) continue
     if (/^\/web(?:\s|$)/.test(line.trim())) { if (controls.web) await controls.web(line); else io.write('Web settings unavailable in this surface\n'); continue }
     if (/^\/reviewer(?:\s|$)/.test(line.trim())) { if (controls.reviewer) await controls.reviewer(line); else io.write('Reviewer settings unavailable in this surface\n'); continue }
+    if (/^\/auto-threshold(?:\s|$)/.test(line.trim())) {
+      try { if (controls.autoThreshold) await controls.autoThreshold(line); else io.write('Auto threshold settings unavailable in this surface\n') }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Auto threshold setting failed'}\n`) }
+      continue
+    }
     if (/^\/queue(?:\s|$)/.test(line.trim())) {
       try { await runSteeringCommand(host, io, line) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Queued turn failed'}\n`) }
