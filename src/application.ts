@@ -14,6 +14,7 @@ import { FileMemoryStore } from './memory.js'
 import { InstalledSkillStore } from './installed-skills.js'
 import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
+import { USER_SHELL_DISCLOSURE } from './user-shell.js'
 import { FileSessionStore, newSession, redactSecrets } from './session.js'
 import { FileImageAssets } from './image-assets.js'
 import type { CliProviderName, CliSession } from './session.js'
@@ -92,7 +93,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
   })), Math.max(0, levels.indexOf(base.reasoning)))
   return selected === undefined ? undefined : { ...base, reasoning: selected }
 }
-const COMMAND_HELP = `Enter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
+const COMMAND_HELP = `${USER_SHELL_DISCLOSURE}\nEnter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
 /provider sets up an OpenAI, OpenRouter or DeepSeek chat key; /web independently selects Direct, DeepSeek or Disabled; /reviewer explicitly selects this conversation’s supported Auto reviewer; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /notes changes the session-note default for new conversations.
 /memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
@@ -793,7 +794,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
-        if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+        if (workspace) io.write(`${USER_SHELL_DISCLOSURE}\nWorkspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
       }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }

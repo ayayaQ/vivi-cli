@@ -20,6 +20,7 @@ import { autoReviewSharingScope } from './auto-review.js'
 import { resolveAutoReviewThreshold, formatAutoReviewThreshold } from './auto-review-settings.js'
 import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
+import { parseUserShellInput, USER_SHELL_DISCLOSURE } from './user-shell.js'
 import type { CliToolEvidence } from './tool-presentation.js'
 import type { CliConversationErrors } from './conversation-errors.js'
 import { conversationModeLabel } from './task-mode.js'
@@ -65,6 +66,15 @@ export interface ChatIO {
 /** Share explicit turn boundaries across interactive, one-shot and accessible line flows. */
 export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal,
   queuedId?: string): Promise<AgentResult> {
+  const shell = queuedId === undefined && parseUserShellInput(content) !== undefined
+  // Only live user submission is parsed. Stored continuation envelopes and raw
+  // host.send() inputs are data, not executable instructions.
+  if (shell) {
+    try { const queued = host.queueUserShell(content); queuedId = queued.id }
+    catch (error) { io.setComposerDraft?.(content); throw error }
+    const first = host.queuedMessages[0]!
+    content = first.content; queuedId = first.id
+  }
   // A later idle submit joins retained input instead of overtaking it.
   if (queuedId === undefined && host.queuedMessages?.length) {
     try { host.queueMessage(content) }
@@ -77,7 +87,7 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
   const dispose = io.onSteering?.({
     submit: (message, force): boolean => {
       if (!active || io.isClosed || signal?.aborted) return false
-      try { host.queueMessage(message) }
+      try { if (parseUserShellInput(message) !== undefined) host.queueUserShell(message); else host.queueMessage(message) }
       catch (error) {
         io.write(`${error instanceof Error ? error.message : 'Message was not queued'}\n`)
         return false
@@ -99,9 +109,11 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
         io.setToolEvidence?.(host.toolPresentationEvidence)
         io.setConversationErrors?.(host.conversationErrors)
         io.runStarted?.()
-        result = await host.send(next.content, signal, (message, initial) => {
-          io.steeringAccepted?.(message, initial); update()
-        }, next.id, update)
+        const accepted = (message: string, initial?: boolean): void => { io.steeringAccepted?.(message, initial); update() }
+        const pending = host.queuedMessages?.[0]
+        result = pending !== undefined && pending.id === next.id && pending.kind === 'shell'
+          ? await host.sendUserShell(pending.id, signal, accepted, update, context => io.write(`Shell result · untrusted output\n${context}\n`))
+          : await host.send(next.content, signal, accepted, next.id, update)
         outcome = result.status
       } catch (error) { if (signal?.aborted) outcome = 'cancelled'; throw error }
       finally {
@@ -701,6 +713,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
   controls: UserChatControls = {}): Promise<AgentResult | undefined> {
   if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
+  if (host.commandsEnabled) io.write(`${USER_SHELL_DISCLOSURE}\n`)
   if (prompt !== undefined) {
     if (/^\/web(?:\s|$)/.test(prompt.trim())) { if (controls.web) await controls.web(prompt); return }
     if (/^\/reviewer(?:\s|$)/.test(prompt.trim())) { if (controls.reviewer) await controls.reviewer(prompt); return }

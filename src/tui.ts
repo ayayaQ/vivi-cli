@@ -15,6 +15,7 @@ import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, ContextUsage } 
 import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
+import { parseUserShellInput } from './user-shell.js'
 import type { ChatIO } from './terminal.js'
 import type { SteeringControls, SteeringMessage } from './steering.js'
 import type { ApprovalRequest } from './tools.js'
@@ -462,7 +463,7 @@ export class OpenTuiIO implements ChatIO {
         flexShrink: 0, border: true, borderColor: TUI_THEME.pink, titleColor: TUI_THEME.pink,
         title: 'Message', paddingX: 1 })
       this.composer = new TextareaRenderable(renderer, { id: 'vivi-composer', width: '100%', height: 2,
-        wrapMode: 'word', placeholder: 'Enter a message or /menu', backgroundColor: TUI_THEME.background,
+        wrapMode: 'word', placeholder: 'Message, !shell command or /menu', backgroundColor: TUI_THEME.background,
         textColor: TUI_THEME.foreground, focusedBackgroundColor: TUI_THEME.background,
         focusedTextColor: TUI_THEME.foreground, placeholderColor: TUI_THEME.muted,
         ...TEXT_SELECTION, cursorColor: TUI_THEME.lavender,
@@ -1005,6 +1006,11 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || this.changingInput) return
     if (this.pending?.kind === 'steering') this.composerBox.bottomTitle = undefined
     const raw = this.composer.plainText
+    if (this.pending?.kind === 'chat' || this.pending?.kind === 'steering') {
+      this.composerBox.title = parseUserShellInput(raw) !== undefined
+        ? this.pending.kind === 'steering' ? 'Shell · queued after turn · Send approves unsandboxed' : 'Shell · Send approves unsandboxed'
+        : this.pending.kind === 'steering' ? 'Message while working' : 'Message'
+    }
     const safe = this.pending?.kind === 'search'
       ? this.safe(raw, MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
       : this.safe(raw, MAX_INPUT).slice(0, MAX_INPUT)
@@ -1316,7 +1322,7 @@ export class OpenTuiIO implements ChatIO {
     }
     const text = this.composer.plainText
     if (pending.kind === 'approval' || pending.kind === 'question') return
-    if (pending.kind === 'chat' && !this.steeringQueue.length && text.trim() && !text.trim().startsWith('/')) {
+    if (pending.kind === 'chat' && !this.steeringQueue.length && text.trim() && !text.trim().startsWith('/') && parseUserShellInput(text) === undefined) {
       this.appendEntry({ category: 'user', label: 'You', content: this.safe(text), markdown: false })
     }
     pending.finish(text)
