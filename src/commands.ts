@@ -14,6 +14,7 @@ import { reviewContainsSecret, reviewDigest } from './auto-review.js'
 import { redactSecrets } from './session.js'
 import { launchCommandProcess } from './command-process.js'
 import type { CommandProcess } from './command-process.js'
+import { validateUserShellScript, userShellArguments, USER_SHELL_LIMITS } from './user-shell.js'
 
 export const COMMAND_TOOL_NAMES = Object.freeze(['command_start', 'command_poll', 'command_stop'] as const)
 export const COMMAND_LIMITS = Object.freeze({ maximumSessions: 16, maximumArguments: 128,
@@ -137,13 +138,14 @@ export class TrustedCommandWorkspace {
   private readonly captures = new WeakMap<PreparedCommand, CapturedCommand>()
   private shutdownStarted = false
   private constructor(readonly directory: string, private readonly rootInfo: Stats,
-    private readonly environment: Readonly<Record<string, string>>, private readonly secrets: readonly string[]) {}
+    private readonly environment: Readonly<Record<string, string>>, private readonly secrets: readonly string[],
+    private readonly launch: typeof launchCommandProcess) {}
 
-  static async open(directory: string, source: NodeJS.ProcessEnv = {}, secrets: readonly string[] = []): Promise<TrustedCommandWorkspace> {
+  static async open(directory: string, source: NodeJS.ProcessEnv = {}, secrets: readonly string[] = [], launch: typeof launchCommandProcess = launchCommandProcess): Promise<TrustedCommandWorkspace> {
     const root = await fs.realpath(resolve(directory)), info = await fs.lstat(root)
     check(info.isDirectory() && !info.isSymbolicLink() && dirname(root) !== root, 'Select a real project directory for commands')
     check(!reviewContainsSecret(root, secrets), 'Command workspace contains a known credential')
-    return new TrustedCommandWorkspace(root, info, commandEnvironment(source, secrets), secrets)
+    return new TrustedCommandWorkspace(root, info, commandEnvironment(source, secrets), secrets, launch)
   }
   get isEnabled(): boolean { return this.enabled && !this.shutdownStarted }
   get canPropose(): boolean { return !this.proposalsDisabled && !this.shutdownStarted }
@@ -254,7 +256,7 @@ export class TrustedCommandWorkspace {
     }
   }
   private async startOwned(call: ToolCall, context: CommandApprovalContext, signal: AbortSignal,
-    lifetimeSignal: AbortSignal, attempt: { started: boolean }): Promise<ToolResult> {
+    lifetimeSignal: AbortSignal, attempt: { started: boolean }, userScript?: string): Promise<ToolResult> {
     const available = (): boolean => this.isEnabledFor(context.launchId, context.sessionId, context.accountRevision) ||
       context.allowFirstApproval === true && this.canPropose
     check(available() && context.canApprove() && context.isCurrent(), 'Trusted commands require an interactive human approval surface and an available command workspace')
@@ -270,12 +272,16 @@ export class TrustedCommandWorkspace {
     const approvalDigest = reviewDigest(approval), preparedDigest = reviewDigest(command)
     const assertCurrent = (): void => {
       signal.throwIfAborted(); lifetimeSignal.throwIfAborted()
+      if (userScript !== undefined) validateUserShellScript(userScript, this.secrets)
       check(available() && context.canApprove() && context.isCurrent() && context.accountRevision === account &&
         owner(context) === executionOwner && this.trustBinding === binding && reviewDigest(call) === callDigest &&
         reviewDigest(approval) === approvalDigest && reviewDigest(command) === preparedDigest, 'Command approval changed; request fresh human approval')
     }
     assertCurrent()
-    if (!await context.approve(approval, signal)) return commandResult({ content: JSON.stringify({ success: false,
+    // Only the separate live user-input path supplies userScript. Agent tools cannot
+    // set it, and every binding/root/account/secret check still runs before launch.
+    if (userScript !== undefined) validateUserShellScript(userScript, this.secrets)
+    if (userScript === undefined && !await context.approve(approval, signal)) return commandResult({ content: JSON.stringify({ success: false,
       executionComplete: false, processEffects: 'not_attempted',
       error: { code: 'approval_denied', message: 'Human denied this command' } }), isError: true },
       { status: 'denied', effect: 'not_attempted' })
@@ -286,7 +292,7 @@ export class TrustedCommandWorkspace {
     this.trustOwner = `${context.launchId}:${context.sessionId}:${account}`
     // Once launch is entered, a thrown error cannot establish absence of effects.
     attempt.started = true
-    const process_ = await launchCommandProcess({ executable: command.executable, args: command.args, cwd: command.cwd, env: this.environment })
+    const process_ = await this.launch({ executable: command.executable, args: command.args, cwd: command.cwd, env: this.environment })
     // Platform setup is asynchronous on Windows. A revocation during setup must
     // stop the process rather than returning a live session to a stale run.
     try { assertCurrent() } catch (error) { await process_.stop(); throw error }
@@ -346,6 +352,37 @@ export class TrustedCommandWorkspace {
     this.executions.set(id, execution)
     if (lifetimeSignal.aborted) abort()
     return this.poll(id, executionOwner, command.yieldMs, signal)
+  }
+  /** Host-only foreground input, not registered as a model tool or restored from records. */
+  async runUserShell(script: string, context: CommandApprovalContext, signal: AbortSignal, lifetimeSignal = signal): Promise<JsonObject> {
+    validateUserShellScript(script, this.secrets)
+    const args = userShellArguments(script, process.platform, this.environment.SystemRoot)
+    const call: ToolCall = { id: randomUUID(), name: 'user_shell', arguments: args }
+    const attempt = { started: false }
+    let final: JsonObject, output = '', truncated = false, executionId: string | undefined
+    const collect = (result: ToolResult): JsonObject => {
+      const value = JSON.parse(result.content) as JsonObject
+      if (typeof value.executionId === 'string') executionId = value.executionId
+      const text = typeof value.output === 'string' ? value.output : ''
+      const remaining = Math.max(0, USER_SHELL_LIMITS.outputBytes - Buffer.byteLength(output))
+      if (Buffer.byteLength(text) > remaining || value.truncated === true) truncated = true
+      output += new StringDecoder('utf8').write(Buffer.from(text).subarray(0, remaining))
+      return value
+    }
+    try {
+      final = collect(await this.startOwned(call, context, signal, lifetimeSignal, attempt, script))
+      while (final.state === 'running') final = collect(await this.poll(executionId, owner(context), COMMAND_LIMITS.maximumYieldMs, signal))
+    } catch {
+      if (executionId) {
+        try { final = collect(await this.stop(executionId, owner(context))) }
+        catch { final = { state: 'failed', executionComplete: false, processEffects: 'unknown', error: { code: 'shell_cleanup_unconfirmed' } } }
+      } else final = { state: signal.aborted || lifetimeSignal.aborted ? 'cancelled' : 'failed', executionComplete: false,
+        processEffects: attempt.started ? 'unknown' : 'not_attempted', error: { code: attempt.started ? 'shell_outcome_unavailable' : 'shell_not_started' } }
+    }
+    const safeOutput = redactSecrets(output, this.secrets)
+    if (Buffer.byteLength(safeOutput) > USER_SHELL_LIMITS.outputBytes) truncated = true
+    return { ...final, shell: String(args.executable),
+      output: new StringDecoder('utf8').write(Buffer.from(safeOutput).subarray(0, USER_SHELL_LIMITS.outputBytes)), truncated, untrusted: true }
   }
   private find(id: unknown, owner: string): Execution {
     check(typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id), 'Use a current command execution ID')

@@ -44,6 +44,42 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/help` — show commands and shortcuts
 - `/exit` — quit
 
+### User shell commands (`!`)
+
+Start a submitted message with `!` to run the remaining text as a shell script,
+then let the agent continue from its actual output and exit status. **Send approves
+that exact unsandboxed command**; there is no second confirmation. Agent-proposed
+`command_start` calls still require fresh human approval, even in Auto review.
+The composer marks shell input before submission. A busy `!` waits until the
+current turn and its cleanup finish; queued commands run in FIFO order. Interrupt
+& send cancels the current turn first. Ordinary Escape/Ctrl-C stops the active
+command/turn and retains unstarted queued input; `/queue clear` removes it.
+Entering Plan or disabling commands revokes unstarted queued shell commands.
+
+This requires a selected workspace, enabled command tools and an interactive
+terminal in Execute mode. The script starts in that workspace and uses `/bin/sh -c`
+on Linux/macOS or explicit profile-free Windows PowerShell on Windows, **not**
+necessarily your login shell. Quoting, pipes, redirects and multiline scripts are
+passed intact (up to 4 KiB); no whitespace splitting is performed. In line mode,
+each submitted line is one script. Shell processes have closed stdin, so interactive
+editors, password prompts and background sessions are unsupported. Each command
+gets a fresh shell and the existing minimal command environment; `cd`/`export` do
+not change later commands or the CLI's selected workspace.
+
+Commands use the existing hard timeout (30 seconds by default, at most 5 minutes)
+and 1 MiB total-output stop limit. Their agent context retains at most 24 KiB of
+output, with explicit truncation and a further encoded-message bound. Output is
+untrusted data and is saved locally and sent to the selected provider. Known
+credentials are blocked in scripts and screened in output, but this is not a
+sandbox or a guarantee that arbitrary output contains no secrets. A successful
+shell exit does not verify file changes or remote effects.
+
+Normal cancellation waits for process cleanup and saves the observed outcome.
+Provider/checkpoint failures retain only inert outcome context, never an executable
+retry. Resuming a saved session never runs `!` text. Abrupt termination or a crash
+before the outcome checkpoint can lose that command's transcript observation;
+it never causes automatic replay. Check external effects before manually retrying.
+
 Changing chat provider, model or effort starts a new conversation and keeps the old
 transcript available through `/resume`.
 

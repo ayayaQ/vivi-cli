@@ -4,6 +4,7 @@ import type { ContextCheckpoint, ContextLimits, ContextOptions, ContextUsage } f
 import { PLAN_MODE_GUIDANCE, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
 import { SteeringQueue } from './steering.js'
+import { parseUserShellInput, validateUserShellScript, userShellContext } from './user-shell.js'
 import type { SteeringMessage } from './steering.js'
 import { closeInterruptedHistory } from '@ayayaq/vivi'
 import type { AgentAcceptedUpdate, AgentEvent, AgentResult, HistoryMessage, ModelProvider, ToolCall, ToolResult, Usage } from '@ayayaq/vivi'
@@ -599,6 +600,24 @@ export class CliHost {
     if (publicUrlContainsSecret(content, this.options.secrets ?? [])) throw new Error('Queued message contains a known credential; remove it before sending')
     return this.steering.add(content)
   }
+  /** Live user-submit API only. Model output and restored messages never call this. */
+  queueUserShell(content: string): SteeringMessage {
+    if (this.shutdownStarted || this.taskMode === 'plan' || !this.commandsEnabled) {
+      throw new Error('! requires enabled commands, a selected workspace, Execute mode and an interactive user surface')
+    }
+    const script = parseUserShellInput(content)
+    if (script === undefined) throw new Error('Shell input must start with !')
+    validateUserShellScript(script, this.options.secrets ?? [])
+    this.validateMessage(content)
+    return this.steering.add(content, 'shell')
+  }
+  async sendUserShell(queuedId: string, signal?: AbortSignal,
+    onSteeringAccepted?: (content: string, initial?: boolean) => void,
+    onSteeringQueueChanged?: () => void, onShellResult?: (content: string) => void): Promise<AgentResult> {
+    const message = this.steering.first()
+    if (message?.id !== queuedId || message.kind !== 'shell') throw new Error('Shell input is no longer queued for this launch')
+    return this.run(message.content, signal, 'send', onSteeringAccepted, queuedId, onSteeringQueueChanged, true, onShellResult)
+  }
   takeLastQueuedMessage(): string | undefined { return this.steering.takeLast() }
   clearQueuedMessages(): void { this.steering.clear() }
   private validateMessage(content: string): void {
@@ -622,7 +641,7 @@ export class CliHost {
     if (mode !== 'execute' && mode !== 'plan') throw new Error('Unknown task mode')
     // Entering Plan revokes enrollment. Leaving it cannot restore prior Auto
     // authority or dispatch a queued proposal; only a new explicit turn can act.
-    if (mode === 'plan') this.reviews.setMode('manual')
+    if (mode === 'plan') { this.reviews.setMode('manual'); this.steering.revokeShells() }
     this.selectedTaskMode = mode
     this.invalidateContext()
   }
@@ -714,6 +733,7 @@ export class CliHost {
     if (this.running) throw new Error('Cancel the current turn before disabling trusted commands')
     this.commandSetupEpoch++; this.commandOpening = undefined
     this.commandProposalsEnabled = false
+    this.steering.revokeShells()
     this.invalidateContext()
     await this.options.commandWorkspace?.disable()
   }
@@ -1730,13 +1750,20 @@ export class CliHost {
   }
   private async run(content: string, signal: AbortSignal | undefined, operation: 'send' | 'compact' | 'measure',
     onSteeringAccepted?: (content: string, initial?: boolean) => void, queuedId?: string,
-    onSteeringQueueChanged?: () => void): Promise<AgentResult> {
+    onSteeringQueueChanged?: () => void, userShell = false, onShellResult?: (content: string) => void): Promise<AgentResult> {
     if (this.shutdownStarted) throw new Error('This CLI host is shut down; start a fresh host')
     if (this.running) throw new Error('A CLI turn is already running')
     this.discardUnsafeContextCheckpoint(this.current)
     if (operation === 'send') this.validateMessage(content)
     const secrets = this.options.secrets ?? []
-    if (queuedId !== undefined) this.steering.claimInitial(queuedId, content, this.current.history.length)
+    const submittedShell = userShell ? content : undefined
+    if (userShell && (this.taskMode === 'plan' || !this.commandsEnabled || queuedId === undefined)) {
+      throw new Error('! is unavailable for this conversation; no command was started')
+    }
+    if (queuedId !== undefined) {
+      if (userShell) this.steering.claimShell(queuedId, content)
+      else this.steering.claimInitial(queuedId, content, this.current.history.length)
+    }
     const enableNotes = this.options.enableNotes ?? false
     const enableTools = this.options.enableTools !== false
     const taskMode = this.taskMode
@@ -2137,13 +2164,38 @@ export class CliHost {
           usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, contextUsage: prepared.usage,
           ...(prepared.checkpoint ? { checkpoint: prepared.checkpoint } : {}) }
       }
+      if (submittedShell !== undefined && queuedId !== undefined) {
+        const script = parseUserShellInput(submittedShell)!
+        let observation: JsonObject
+        let shell = process.platform === 'win32' ? 'Windows PowerShell' : '/bin/sh'
+        // Spend executable authority BEFORE dispatch. An unexpected exception,
+        // context formatting or storage failure can retain only inert data.
+        content = userShellContext(script, shell, this.commandDirectory ?? '', { state: 'unknown', executionComplete: false,
+          processEffects: 'unknown', output: '', error: { code: 'shell_observation_unavailable' } }, this.options.secrets ?? [])
+        this.steering.shellResult(queuedId, content)
+        this.steering.claimInitial(queuedId, content, this.current.history.length)
+        let entered = false
+        try {
+          const workspace = await this.openCommandWorkspace(controller.signal)
+          entered = true
+          observation = await workspace.runUserShell(script, this.commandContext(commandRunId, controller.signal), controller.signal)
+          if (typeof observation.shell === 'string') shell = observation.shell
+        } catch {
+          observation = { state: controller.signal.aborted ? 'cancelled' : 'failed', executionComplete: false,
+            processEffects: entered ? 'unknown' : 'not_attempted', output: '', error: { code: entered ? 'shell_outcome_unavailable' : 'shell_not_started' } }
+        }
+        content = userShellContext(script, shell, this.commandDirectory ?? '', observation, this.options.secrets ?? [])
+        this.steering.reviseInitial(queuedId, content, this.current.history.length)
+        onSteeringQueueChanged?.()
+        onShellResult?.(content)
+      }
       // Accept the prompt and its title in one successful checkpoint. A failed
       // initial write must not leave an unsaved prompt/title in memory for a retry.
       const previous = structuredClone(this.current)
       const firstPrompt = !this.current.history.some(message => message.kind === 'message' && message.role === 'user')
       this.current.history.push({ kind: 'message', role: 'user', content })
       if (firstPrompt && this.current.title === undefined) {
-        const title = sessionTitleFromPrompt(content)
+        const title = sessionTitleFromPrompt(submittedShell ?? content)
         if (title !== undefined) { this.current.title = title; this.current.titleRevision = 1 }
       }
       try { await this.save() }
@@ -2154,7 +2206,7 @@ export class CliHost {
       }
       if (queuedId !== undefined) {
         this.steering.acknowledgeInitial(queuedId)
-        if (!controller.signal.aborted) onSteeringAccepted?.(content, true)
+        if (!controller.signal.aborted) onSteeringAccepted?.(submittedShell ?? content, true)
       }
       await this.records.begin(this.toolsetRevision, this.current)
       const result = await runAgent({
