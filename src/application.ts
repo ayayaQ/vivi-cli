@@ -20,6 +20,7 @@ import { FileImageAssets } from './image-assets.js'
 import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
+import { bindBackgroundProcessControls, runProcessControl } from './process-controls.js'
 import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
@@ -99,6 +100,7 @@ const COMMAND_HELP = `${USER_SHELL_DISCLOSURE}\nEnter submits; Ctrl+J adds a lin
 /memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
 Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
+/processes lists background jobs; logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected job; F7 stops all, even while working or in a dialog.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
 /instructions status|reload|disable manages launch-local AGENTS.md guidance.
@@ -214,6 +216,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const reviewerKeys = new Map<'openai' | 'openrouter', string>()
   const declaredToolTarget = { provider: settings.provider, model: settings.model }
   let host: CliHost | undefined
+  let releaseProcesses: (() => void) | undefined
   // Opaque launch-owned revisions never expose, derive from or persist credentials.
   let accountGeneration = randomUUID()
   let hostAccountGeneration: string | undefined
@@ -335,6 +338,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       // A cancelled model picker can follow a real key replacement. Revoke
       // enrollment immediately and prevent the old host from re-enrolling.
       if (env[envName(provider)] !== key) {
+        await host?.disableCommands()
         host?.setApprovalMode('manual')
         io.setApprovalMode?.('manual')
         accountGeneration = randomUUID()
@@ -744,7 +748,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       catch (error) { sessionCleanupFailed = true; throw error }
       if (io.isClosed) { await discardCandidate(); return false }
     } catch (error) { await discardCandidate(); throw error }
+    releaseProcesses?.()
     release = nextRelease; host = nextHost; hostAccountGeneration = accountGeneration
+    releaseProcesses = bindBackgroundProcessControls(host, io)
     activeSettings = nextSettings; candidate = undefined
     await previousRelease?.().catch(report)
     await refreshChatContext(host, io)
@@ -804,6 +810,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model)))}\n`)
           return 0
         }
+        if (await runProcessControl(host, io, options.prompt)) return 0
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
         try {
@@ -830,6 +837,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           ...(host?.canCompact ? [{ name: 'Compact context', description: 'Summarize older provider context; retain the full transcript', value: '/compact' }] : []),
           { name: 'Mode', description: 'Manual / Auto review / Plan', value: '/mode' },
           { name: 'Trusted commands', value: '/commands' },
+          { name: 'Background processes', value: '/processes' },
           { name: 'Session notes', description: 'Default for new conversations', value: '/notes' },
           { name: 'Persistent memories', description: 'This launch and future-launch default', value: '/memories' },
           { name: 'Skills', value: '/skills' },
@@ -896,6 +904,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           try { await manageMemories() } finally { host?.invalidateContext(); io.setContext?.(undefined, false) }
           continue
         }
+        if (/^\/processes(?:\s|$)/.test(command)) {
+          if (!host) io.write('No background processes in this session\n')
+          else await runProcessControl(host, io, command)
+          continue
+        }
         if (/^\/commands(?:\s|$)/.test(command)) {
           if (!host && /^\/commands\s+off$/.test(command)) {
             activeCommands = false
@@ -950,6 +963,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       } catch (error) { report(error) }
     }
   } finally {
+    releaseProcesses?.()
     await discardCandidate()
     if (sessionCleanupFailed) {
       // Preserve the original failure and keep any incompletely shut-down owner locked.
@@ -960,7 +974,16 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       await skills.drain({ close: true }).catch(reportCleanup)
       if (shutdownConfirmed) await release?.().catch(reportCleanup)
     } else {
-      try { await host?.shutdown(); await skills.drain({ close: true }) } finally { await release?.() }
+      const errors: unknown[] = []
+      let shutdownConfirmed = false
+      try { await host?.shutdown(); shutdownConfirmed = true } catch (error) { errors.push(error) }
+      // Independent domain drains still run when process cleanup is uncertain.
+      try { await skills.drain({ close: true }) } catch (error) { errors.push(error) }
+      // Keep writer ownership when this host may still have an active tree/effect.
+      if (shutdownConfirmed) try { await release?.() } catch (error) { errors.push(error) }
+      if (!shutdownConfirmed) throw new AggregateError(errors, 'Process/session cleanup unconfirmed; session lock retained; inspect owned processes before restarting')
+      if (errors.length === 1) throw errors[0]
+      if (errors.length) throw new AggregateError(errors, 'CLI session cleanup failed')
     }
   }
 }

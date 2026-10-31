@@ -104,6 +104,7 @@ try {
     'src/conversation-records.ts', 'dist/conversation-records.js', 'dist/conversation-records.d.ts',
     'src/tool-presentation.ts', 'dist/tool-presentation.js', 'dist/tool-presentation.d.ts',
     'src/commands.ts', 'dist/commands.js', 'dist/commands.d.ts',
+    'src/process-controls.ts', 'dist/process-controls.js', 'dist/process-controls.d.ts',
     'src/command-process.ts', 'dist/command-process.js', 'dist/command-process.d.ts',
     'src/command-windows.ts', 'dist/command-windows.js', 'dist/command-windows.d.ts',
     'src/workspace-edit.ts', 'dist/workspace-edit.js', 'dist/workspace-edit.d.ts',

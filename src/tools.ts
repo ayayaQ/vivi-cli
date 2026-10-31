@@ -26,7 +26,8 @@ export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
   workspace_read_image: 'local-read',
   workspace_create_text: 'local-mutation', workspace_edit_text: 'local-mutation',
   list_skills: 'local-read', read_skill: 'local-read', save_skill: 'local-mutation', request_user_input: 'local-read',
-  command_start: 'command', command_poll: 'command', command_stop: 'command', fetch_url: 'public-url', web_search: 'public-url',
+  command_start: 'command', command_poll: 'command', command_stop: 'command',
+  command_list: 'command', command_logs: 'command', command_restart: 'command', fetch_url: 'public-url', web_search: 'public-url',
   mcp_list: 'local-read', mcp_setup: 'mcp', list_mcp_resources: 'local-read', read_mcp_resource: 'mcp', read_mcp_resource_template: 'mcp'
 } as const satisfies Record<string, CliToolOutcomePolicy>)
 export function builtinToolOutcomePolicy(name: string): CliToolOutcomePolicy | undefined {

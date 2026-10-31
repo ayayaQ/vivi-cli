@@ -6,6 +6,8 @@ import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult, ContextUsage } from '@ayayaq/vivi'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import type { CliHost } from './host.js'
+import { bindBackgroundProcessControls, runProcessControl } from './process-controls.js'
+import type { BackgroundProcessControls } from './process-controls.js'
 import type { SteeringControls, SteeringMessage } from './steering.js'
 import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
@@ -27,6 +29,8 @@ import { conversationModeLabel } from './task-mode.js'
 import type { ConversationMode, TaskMode } from './task-mode.js'
 
 export interface ChatIO {
+  /** Independent cleanup controls remain available during inference and dialogs. */
+  onProcessControls?(controls: BackgroundProcessControls): () => void
   /** Dynamic credentials must reach copied display filters before any further output. */
   addSecrets?(secrets: readonly string[]): void
   /** Scoped actual-turn composer; managers and approvals never become steering sources. */
@@ -458,6 +462,7 @@ export class TerminalIO implements ChatIO {
   private disposed = false
   private cancelCallbacks = new Set<() => void>()
   private steeringControls: SteeringControls | undefined
+  private processControls: BackgroundProcessControls | undefined
   private reviewing = false
   private display = ''
   private status = 'Ready'
@@ -516,7 +521,12 @@ export class TerminalIO implements ChatIO {
     this.signalHandler = cancel
     process.on('SIGINT', this.signalHandler)
     emitKeypressEvents(this.input, this.readline)
-    this.keyHandler = (_text, key): void => { if (key.name === 'escape') cancel() }
+    this.keyHandler = (_text, key): void => {
+      if (this.canAutoReview && this.processControls && (key.name === 'f6' || key.name === 'f7')) {
+        if (key.name === 'f7') void this.processControls.stopAll()
+        else { const job = [...this.processControls.list()].reverse().find(job => !job.cleanupConfirmed); if (job) void this.processControls.stop(job.executionId) }
+      } else if (key.name === 'escape') cancel()
+    }
     this.input.on('keypress', this.keyHandler)
     if (this.tui) this.output.write('\x1b[?1049h')
   }
@@ -585,6 +595,10 @@ export class TerminalIO implements ChatIO {
         if (signal?.aborted) abort()
       })
     } finally { this.waiting = false }
+  }
+  onProcessControls(controls: BackgroundProcessControls): () => void {
+    this.processControls = controls
+    return () => { if (this.processControls === controls) this.processControls = undefined }
   }
   onCancel(callback: () => void): () => void {
     this.cancelCallbacks.add(callback)
@@ -687,6 +701,7 @@ export class TerminalIO implements ChatIO {
   close(): void {
     if (this.disposed) return
     this.disposed = true
+    this.processControls = undefined
     this.steeringControls = undefined
     this.lines = []
     process.removeListener('SIGINT', this.signalHandler)
@@ -711,6 +726,8 @@ export async function runMcpCommand(io: ChatIO, line: string, controls: UserChat
 
 export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
   controls: UserChatControls = {}): Promise<AgentResult | undefined> {
+  const releaseProcesses = bindBackgroundProcessControls(host, io)
+  try {
   if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (host.commandsEnabled) io.write(`${USER_SHELL_DISCLOSURE}\n`)
@@ -725,6 +742,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
     if (prompt.trim() === '/context') {
       await refreshChatContext(host, io); io.write(`${formatContextDetails(host.contextUsage)}\n`); return
     }
+    if (await runProcessControl(host, io, prompt)) return
     if (await runMcpCommand(io, prompt, controls)) return
     const controller = new AbortController()
     const dispose = io.onCancel(() => { controller.abort(); host.cancel() })
@@ -734,7 +752,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /skills manages skills, /instructions shows project guidance, /mcp manages reviewed server connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /processes manages background jobs (F6 Stop, F7 Stop All), /skills manages skills, /instructions shows project guidance, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return
@@ -770,6 +788,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       try { await runMcpCommand(io, line, controls) }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'MCP connection management failed'}\n`) }
       finally { host.invalidateContext(); io.setContext?.(undefined, false) }
+      continue
+    }
+    if (/^\/processes(?:\s|$)/.test(line.trim())) {
+      try { await runProcessControl(host, io, line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Process cleanup unconfirmed'}\n`) }
       continue
     }
     if (/^\/commands(?:\s|$)/.test(line.trim())) {
@@ -815,4 +838,5 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
     catch (error) { io.write(`${error instanceof Error ? error.message : 'CLI turn failed'}\n`) }
     finally { dispose() }
   }
+  } finally { releaseProcesses() }
 }

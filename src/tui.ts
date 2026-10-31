@@ -17,6 +17,7 @@ import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
 import { parseUserShellInput } from './user-shell.js'
 import type { ChatIO } from './terminal.js'
+import type { BackgroundProcessControls } from './process-controls.js'
 import type { SteeringControls, SteeringMessage } from './steering.js'
 import type { ApprovalRequest } from './tools.js'
 import { matchingChoiceIndices } from './picker.js'
@@ -100,6 +101,7 @@ export const SLASH_COMMANDS = [
   { command: '/compact', description: 'Compact the provider context; retain the full transcript' },
   { command: '/context', description: 'Show context capacity and output reserve' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
+  { command: '/processes', description: 'List, inspect or stop background jobs' },
   { command: '/instructions', description: 'Inspect, reload or disable project guidance' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
   { command: '/mcp', description: 'Manage trusted server metadata connections' },
@@ -259,6 +261,13 @@ export class OpenTuiIO implements ChatIO {
   private footerRows = 1
   private workspaceLine!: TextRenderable
   private actionBar!: BoxRenderable
+  private processBar!: BoxRenderable
+  private processLabel!: TextRenderable
+  private processControls: BackgroundProcessControls | undefined
+  private processSelection: string | undefined
+  private processGesture: object = {}
+  private processStopping = new Map<string, object>()
+  private processTimer: ReturnType<typeof setInterval> | undefined
   private dialogActions: BoxRenderable | undefined
   private approvalIndex = 0
   private approvalMouseNotBefore = 0
@@ -360,6 +369,7 @@ export class OpenTuiIO implements ChatIO {
     this.updateChoiceLayout()
     if (this.searchPicker) this.renderSearchPicker(false)
     if (this.completions.length) this.renderCompletions()
+    this.refreshProcesses()
     this.updateComposerLayout()
     this.questionDialog?.resize()
     this.updateSteeringQueue()
@@ -497,9 +507,27 @@ export class OpenTuiIO implements ChatIO {
         width: '100%', height: 1, flexShrink: 0, visible: false, fg: TUI_THEME.lavender, wrapMode: 'none' })
       this.steeringActions = new BoxRenderable(renderer, { id: 'vivi-steering-actions', width: '100%',
         height: 1, flexShrink: 0, flexDirection: 'row', gap: 1, visible: false })
+      this.processBar = new BoxRenderable(renderer, { id: 'vivi-processes', width: '100%', height: 1,
+        flexShrink: 0, flexDirection: 'row', gap: 1, visible: false })
+      this.processLabel = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-process-label',
+        height: 1, flexGrow: 1, minWidth: 0, fg: TUI_THEME.attention, wrapMode: 'none' })
+      this.processBar.add(this.processLabel)
+      for (const [id, label, action] of [
+        ['vivi-process-next', 'Next', () => this.selectNextProcess()],
+        ['vivi-process-stop', 'Stop F6', () => this.stopProcess(false)],
+        ['vivi-process-stop-all', 'Stop All F7', () => this.stopProcess(true)]
+      ] as const) {
+        const button = new TextRenderable(renderer, { ...TEXT_SELECTION, id, content: ` ${label} `,
+          width: label.length + 2, height: 1, flexShrink: 0, fg: TUI_THEME.lavender,
+          bg: TUI_THEME.selectedBackground, wrapMode: 'none' })
+        button.selectable = false
+        button.onMouse = event => this.mouseActivation.handle(event, button, id, this.processGesture,
+          !this.closed && !!this.processControls && this.processBar.visible, action)
+        this.processBar.add(button)
+      }
       this.footer.add(this.actionBar); this.footer.add(this.workspaceLine)
       for (const child of [this.headerBox, this.transcript, this.statusLine, this.pickerBox,
-        this.completionBox, this.steeringQueueLine, this.modelLine, this.composerBox, this.steeringActions, this.footer, this.hintLine]) this.shell.add(child)
+        this.completionBox, this.steeringQueueLine, this.modelLine, this.composerBox, this.steeringActions, this.processBar, this.footer, this.hintLine]) this.shell.add(child)
       this.updateHeader(); this.updateActionBar()
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
@@ -521,7 +549,7 @@ export class OpenTuiIO implements ChatIO {
       for (const widget of [this.composer, this.secretMask, this.completionList, this.header,
         this.transcript, this.statusLine, this.composerBox, this.completionBox,
         this.pickerBox, this.hintLine, this.actionBar, this.tokenLine, this.headerBox,
-        this.modelLine, this.workspaceLine, this.steeringQueueLine, this.steeringActions, this.footer, this.shell]) {
+        this.modelLine, this.workspaceLine, this.steeringQueueLine, this.steeringActions, this.processBar, this.footer, this.shell]) {
         if (widget && !widget.parent && !widget.isDestroyed) {
           try { widget.destroyRecursively() } catch { /* Still release the renderer and hooks below. */ }
         }
@@ -681,7 +709,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private updateChoiceLayout(): void {
     if (this.pending?.kind !== 'choice' || !this.picker) return
-    const fixedRows = this.headerRows + 2 + (this.footer.visible ? this.footerRows : 0) + (this.hintLine.visible ? 1 : 0)
+    const fixedRows = this.headerRows + 2 + Number(this.processBar.visible) + (this.footer.visible ? this.footerRows : 0) + (this.hintLine.visible ? 1 : 0)
     const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - fixedRows - 1,
       this.picker.options.length * 2 + 2 + (this.dialogActions ? 1 : 0)))
     this.pickerBox.height = height
@@ -1044,7 +1072,7 @@ export class OpenTuiIO implements ChatIO {
       this.picker.setSelectedIndex(0)
     } else if (previous !== undefined) this.picker.setSelectedIndex(search.matches.indexOf(previous))
     this.composerBox.title = `Search models · ${search.matches.length} / ${search.choices.length} results`
-    const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - 9, Math.max(1, search.matches.length) * 2 + 2 + (this.dialogActions ? 1 : 0)))
+    const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - 9 - Number(this.processBar.visible), Math.max(1, search.matches.length) * 2 + 2 + (this.dialogActions ? 1 : 0)))
     this.pickerBox.height = height
     this.picker.showDescription = height - 2 - (this.dialogActions ? 1 : 0) >= 2
   }
@@ -1172,6 +1200,11 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) { this.consume(key); return }
     if (this.diagnosticKey) { this.consume(key); this.diagnosticKey(key); return }
     if (key.eventType === 'release') { this.consume(key); return }
+    if ((key.name === 'f6' || key.name === 'f7') && !key.ctrl && !key.shift && !key.meta && !key.super && !key.hyper) {
+      this.consume(key)
+      if (!key.repeated && key.eventType !== 'repeat') this.stopProcess(key.name === 'f7')
+      return
+    }
     // This shortcut changes display details only, including while an approval is open.
     if (key.ctrl && key.name === 'o') {
       this.consume(key)
@@ -1660,7 +1693,7 @@ export class OpenTuiIO implements ChatIO {
           mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
           // Keep one transcript row, status, and every visible shell footer.
           availableHeight: () => this.renderer.terminalHeight - this.headerRows - 2 - Number(this.modelLine.visible)
-            - (this.footer.visible ? this.footerRows : 0) - Number(this.hintLine.visible)
+            - Number(this.processBar.visible) - (this.footer.visible ? this.footerRows : 0) - Number(this.hintLine.visible)
             - (this.steeringQueueLine.visible ? this.steeringQueueLine.height : 0),
           status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
           accent: TUI_THEME.lavender, background: TUI_THEME.background })
@@ -1712,6 +1745,77 @@ export class OpenTuiIO implements ChatIO {
     }
     this.runStatus.finish(outcome)
     this.updateStatus(outcome === 'completed' ? 'Completed' : outcome === 'cancelled' ? 'Cancelled' : 'Error')
+  }
+  onProcessControls(controls: BackgroundProcessControls): () => void {
+    if (this.processTimer !== undefined) clearInterval(this.processTimer)
+    this.processControls = controls; this.processSelection = undefined; this.processStopping = new Map()
+    this.processGesture = {}; this.mouseActivation.clear()
+    this.refreshProcesses()
+    this.processTimer = setInterval(() => this.refreshProcesses(), 250)
+    this.processTimer.unref()
+    return () => {
+      if (this.processControls !== controls) return
+      if (this.processTimer !== undefined) clearInterval(this.processTimer)
+      this.processTimer = undefined; this.processControls = undefined; this.processSelection = undefined
+      this.processStopping = new Map(); this.processGesture = {}; this.mouseActivation.clear()
+      this.refreshProcesses()
+    }
+  }
+  private refreshProcesses(): void {
+    if (this.closed || !this.processBar) return
+    const jobs = this.processControls?.list().filter(job => !job.cleanupConfirmed) ?? []
+    const selected = jobs.find(job => job.executionId === this.processSelection) ?? jobs[jobs.length - 1]
+    if (this.processSelection !== selected?.executionId) {
+      this.processSelection = selected?.executionId; this.processGesture = {}; this.mouseActivation.clear()
+    }
+    // A hidden/unbound process surface must be inert. Rewriting native text or
+    // layout during every frame can disrupt the separate question editor/page.
+    if (!jobs.length) {
+      if (this.processBar.visible) { this.processBar.visible = false; this.updateComposerLayout() }
+      return
+    }
+    const becameVisible = !this.processBar.visible
+    if (becameVisible) this.processBar.visible = true
+    const compact = this.renderer.terminalWidth < 44
+    const buttons = this.processBar.getChildren().filter(child => child !== this.processLabel) as TextRenderable[]
+    for (const button of buttons) {
+      const buttonVisible = button.id !== 'vivi-process-next' || !compact
+      if (button.visible !== buttonVisible) button.visible = buttonVisible
+      const label = button.id === 'vivi-process-next' ? 'Next' : button.id === 'vivi-process-stop' ? compact ? 'Stop' : 'Stop F6' : compact ? 'Stop All' : 'Stop All F7'
+      const content = ` ${label} `
+      if (button.plainText !== content) { button.content = content; button.width = label.length + 2 }
+    }
+    const visible = buttons.filter(button => button.visible)
+    const controlsWidth = visible.reduce((width, button) => width + Number(button.width), 0) + visible.length
+    if (selected) {
+      const content = fitStatusColumns(this.safe(
+        `${this.processStopping.size ? 'Stopping…' : `Processes ${jobs.length}`} · ${selected.executionId.slice(0, 8)} · ${selected.background ? selected.state : 'cleanup unconfirmed'}`),
+        Math.max(1, this.renderer.terminalWidth - controlsWidth), true)
+      if (this.processLabel.plainText !== content) this.processLabel.content = content
+    }
+    if (becameVisible) this.updateComposerLayout()
+  }
+  private selectNextProcess(): void {
+    const jobs = this.processControls?.list().filter(job => !job.cleanupConfirmed) ?? []
+    const index = jobs.findIndex(job => job.executionId === this.processSelection)
+    this.processSelection = jobs[(index + 1) % jobs.length]?.executionId
+    this.processGesture = {}; this.mouseActivation.clear(); this.refreshProcesses()
+  }
+  private stopProcess(all: boolean): void {
+    const controls = this.processControls
+    if (!controls || this.closed) return
+    this.refreshProcesses()
+    const id = this.processSelection
+    if (!all && !id) return
+    const key = all ? '*' : id!
+    if (this.processStopping.has(key)) return
+    const token = {}; this.processStopping.set(key, token)
+    this.processGesture = {}; this.mouseActivation.clear(); this.refreshProcesses()
+    void (all ? controls.stopAll() : controls.stop(id!)).catch(error => {
+      if (this.processControls === controls && !this.closed) this.write(`Process cleanup unconfirmed: ${error instanceof Error ? error.message : 'inspect /processes'}\n`)
+    }).finally(() => {
+      if (this.processStopping.get(key) === token) { this.processStopping.delete(key); this.refreshProcesses() }
+    })
   }
   onCancel(callback: () => void): () => void {
     if (this.closed) { callback(); return () => undefined }
@@ -2250,6 +2354,8 @@ export class OpenTuiIO implements ChatIO {
     if (this.steering) this.releaseSteering(this.steering)
     this.steeringQueue = []
     this.closed = true
+    if (this.processTimer !== undefined) clearInterval(this.processTimer)
+    this.processTimer = undefined; this.processControls = undefined; this.processStopping = new Map()
     this.inputQueue.close()
     this.dialogOwner.abort()
     this.suspendedChat?.pending.finish(undefined)
