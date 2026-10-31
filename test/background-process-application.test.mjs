@@ -6,12 +6,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { main } from '../dist/main.js'
-import { TrustedCommandWorkspace } from '../dist/commands.js'
+import { TrustedCommandWorkspace, captureCommandEnvironment } from '../dist/commands.js'
 import { documentedOpenAIModel } from '../dist/models.js'
 
 for (const navigation of ['/new', '/provider']) test(`${navigation} drains background jobs before the next composer and revokes obsolete controls`, async t => {
   const root = await mkdtemp(join(tmpdir(), 'vivi-process-app-')), stateDirectory = join(root, 'state')
   t.after(() => rm(root, { recursive: true, force: true }))
+  // Lifecycle fixtures use synthetic credentials, not unrelated CI credentials.
+  // This marker deliberately overlaps the inert command and reproduces the old
+  // prelaunch rejection if a blanket process.env spread is restored.
+  const previousSecret = process.env.VIVI_BACKGROUND_FIXTURE_SECRET
+  process.env.VIVI_BACKGROUND_FIXTURE_SECRET = 'setInterval'
+  t.after(() => { if (previousSecret === undefined) delete process.env.VIVI_BACKGROUND_FIXTURE_SECRET
+    else process.env.VIVI_BACKGROUND_FIXTURE_SECRET = previousSecret })
   const open = TrustedCommandWorkspace.open, processes = [], bindings = []
   TrustedCommandWorkspace.open = (directory, env, secrets) => open.call(TrustedCommandWorkspace, directory, env, secrets, async () => {
     const stdout = new PassThrough(), stderr = new PassThrough(); let complete
@@ -27,7 +34,11 @@ for (const navigation of ['/new', '/provider']) test(`${navigation} drains backg
     onProcessControls(controls) { const binding = { controls, released: false }; bindings.push(binding); return () => { binding.released = true } },
     async readLine() {
       read++
-      if (read === 2) { assert.equal(bindings.at(-1).controls.list()[0].state, 'running'); assert.equal(processes[0].stops, 0) }
+      if (read === 2) {
+        assert.equal(processes.length, 1, 'The lifecycle fixture must reach its injected launcher before navigation')
+        assert.equal(bindings.at(-1).controls.list().length, 1, 'The launched fixture must remain in the owned registry')
+        assert.equal(bindings.at(-1).controls.list()[0].state, 'running'); assert.equal(processes[0].stops, 0)
+      }
       if (read === 3) {
         assert.equal(processes[0].stops, 1, 'Background tree cleanup precedes the next composer')
         if (navigation === '/new') { assert.equal(bindings[0].released, true); assert.deepEqual(bindings[0].controls.list(), []); assert.deepEqual(bindings.at(-1).controls.list(), []) }
@@ -40,7 +51,7 @@ for (const navigation of ['/new', '/provider']) test(`${navigation} drains backg
     write(text) { output += text }, event() {}, result() {}, async approve() { return true }, onCancel() { return () => {} }, close() {} }
   const credentials = { async status() { return { available: false, label: 'Offline fake vault' } }, async load() {}, async save() { throw new Error('Never save fixture credentials') } }
   const catalog = { async list() { return { models: [documentedOpenAIModel('gpt-5.1')], state: 'fresh' } } }
-  const code = await main(['--workspace', root, '--model', 'gpt-5.1', '--tools'], { ...process.env, OPENAI_API_KEY: 'fake-initial-application-key', VIVI_SESSION_DIR: stateDirectory }, {
+  const code = await main(['--workspace', root, '--model', 'gpt-5.1', '--tools'], { ...captureCommandEnvironment(process.env), OPENAI_API_KEY: 'fake-initial-application-key', VIVI_SESSION_DIR: stateDirectory }, {
     tuiIO: io, credentials, catalog, providerFactory: () => ({ async generate() {
       rounds++
       return rounds === 1 ? { content: '', toolCalls: [{ id: 'background-app-fixture', name: 'command_start', arguments: {
