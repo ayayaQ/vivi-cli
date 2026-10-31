@@ -343,3 +343,12 @@ No live MCP server, OAuth account, real credential or paid model call is exercis
 `test/mcp-http.test.mjs` uses the real pinned SDK with owned Fetch/Response fixtures
 for modern and legacy POST JSON/SSE, challenges, bounds and cancellation. External
 server interoperability remains separate evidence.
+
+## ChatGPT integration dependency gate
+
+The ChatGPT source changes require the shared OpenAI request-projection hook.
+Local integration checks may explicitly link the reviewed core source, but the CLI
+registry dependency remains pinned to immutable `@ayayaq/vivi@0.16.0`. Do not publish
+or relabel local core bytes as that release. Adopt a real reviewed core release and
+update its exact version/integrity before claiming registry/package acceptance for
+the new route. Source-linked checks are not immutable-package acceptance.

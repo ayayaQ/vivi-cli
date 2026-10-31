@@ -81,7 +81,7 @@ test('CI runner rejects unknown groups and propagates failed test subprocesses',
 test('PR smoke groups preserve runtime boundaries without repeating broad suites', async () => {
   const groups = await ciTestGroups()
   assert.deepEqual(groups['linux-current'], [
-    'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
+    'chatgpt-auth', 'chatgpt-integration', 'chatgpt-provider', 'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
     'mcp-oauth-native', 'mcp-oauth-store', 'platform-acceptance'
   ].map(name => `./test/${name}.test.mjs`))
   for (const file of groups['windows-current']) assert(groups['windows-minimum'].includes(file))
@@ -102,7 +102,7 @@ test('new OAuth/setup fixtures automatically retain minimum Windows PR coverage'
   const directory = await mkdtemp(join(tmpdir(), 'vivi-ci-minimum-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const names = await readdir(new URL('./', import.meta.url))
-  const added = ['mcp-oauth-new.test.mjs', 'application-mcp-oauth-new.test.mjs', 'mcp-setup-new.test.mjs']
+  const added = ['chatgpt-new.test.mjs', 'mcp-oauth-new.test.mjs', 'application-mcp-oauth-new.test.mjs', 'mcp-setup-new.test.mjs']
   for (const name of [...names.filter(name => /\.test\.(mjs|ts)$/.test(name)), ...added]) {
     await writeFile(join(directory, name), '')
   }

@@ -66,9 +66,10 @@ function decisionFactory(captures, provider = 'openai') {
 
 test('approval launch option defaults Manual, accepts only exact modes and remains independent of feature gates', () => {
   assert.equal(parseArguments(['--model', 'offline-chat'], {}).approvalMode, 'manual')
+  assert.equal(parseArguments(['--model', 'offline-chat', '--approval-mode', 'skip'], {}).approvalMode, 'skip')
   assert.equal(parseArguments(['--model', 'offline-chat', '--approval-mode', 'auto', '--no-tools'], {}).approvalMode, 'auto')
   assert.equal(parseArguments(['--model', 'offline-chat', '--approval-mode', 'auto', '--approval-mode', 'manual'], {}).approvalMode, 'manual')
-  for (const value of ['Auto', 'always', 'auto-review']) assert.throws(() => parseArguments(['--model', 'offline-chat', '--approval-mode', value], {}), /must be manual or auto/)
+  for (const value of ['Auto', 'always', 'auto-review']) assert.throws(() => parseArguments(['--model', 'offline-chat', '--approval-mode', value], {}), /must be manual, auto or skip/)
 })
 
 test('fixed decision providers use the selected existing account and construct without a live request', () => {
@@ -274,8 +275,8 @@ test('full-screen Plan selection and direct command require no enrollment; a new
       return answer()
     } }), decisionProviderFactory: () => { throw new Error('Plan must not construct a decision provider') } }), 0)
   assert.equal(generates, 1); assert.equal(io.requests.length, 0)
-  assert.deepEqual(io.choices[0].values.map(choice => choice.value), ['manual', 'auto', 'plan'])
-  assert.equal(io.choices[1].initialIndex, 2)
+  assert.deepEqual(io.choices[0].values.map(choice => choice.value), ['manual', 'auto', 'skip', 'plan'])
+  assert.equal(io.choices[1].initialIndex, 3)
   assert.match(io.output, /Mode: Plan/); assert.match(io.output, /Mode: Manual/)
   assert.equal(io.taskModes.at(-1), 'execute')
   assert.equal(io.sessions.length, 3) // Initial, post-turn refresh, new conversation.

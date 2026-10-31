@@ -16,9 +16,9 @@ const localReadTools = new Set<string>([
 export function isPlanTool(name: string): boolean { return localReadTools.has(name) }
 export function planModeRefusal(): ToolResult {
   return { content: JSON.stringify({ success: false, error: { code: 'plan_mode_read_only',
-    message: 'Plan mode allows enabled local read tools and informational clarification only. Select Manual or enroll Auto review before executing task changes or remote requests.' } }), isError: true }
+    message: 'Plan mode allows enabled local read tools and informational clarification only. Select Manual or explicitly enroll Auto review or Skip permissions before executing task changes or remote requests.' } }), isError: true }
 }
 export const PLAN_MODE_GUIDANCE = 'Plan mode is active. Investigate using only the enabled local read tools and informational clarification, then describe a plan in your ordinary response. mcp_list can inspect credential-free local MCP status without networking or changing connections. Do not change workspace files, session notes or saved memories, execute commands, request public URLs, use mcp_setup, or call remote MCP tools/resources. Imported extensions are unavailable. A proposed plan is not execution approval. Remain in Plan mode until the user explicitly selects another mode; do not claim planned changes were made.'
 export function conversationModeLabel(taskMode: TaskMode, approvalMode: ApprovalMode): string {
-  return taskMode === 'plan' ? 'Plan' : approvalMode === 'auto' ? 'Auto review' : 'Manual'
+  return taskMode === 'plan' ? 'Plan' : approvalMode === 'auto' ? 'Auto review' : approvalMode === 'skip' ? 'Skip permissions' : 'Manual'
 }

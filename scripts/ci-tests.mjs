@@ -34,6 +34,7 @@ const minimumWindows = new Set([
   'credentials.test.mjs', 'workspace.test.mjs', 'workspace-edit.test.mjs',
   'conpty-package.test.mjs'
 ])
+const isChatGpt = name => name.startsWith('chatgpt-')
 const isOAuth = name => name.includes('mcp-oauth')
 const isAgentMcpSetup = name => name.startsWith('mcp-setup-')
 const isMcp = name => name.startsWith('mcp-') || isOAuth(name)
@@ -48,13 +49,13 @@ export async function ciTestGroups(directory = new URL('../test/', import.meta.u
   const path = name => `./test/${name}`
   return {
     'linux-node': node.map(path),
-    'linux-current': node.filter(name => linuxCurrent.has(name)).map(path),
-    'windows-minimum': node.filter(name => minimumWindows.has(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
+    'linux-current': node.filter(name => linuxCurrent.has(name) || isChatGpt(name)).map(path),
+    'windows-minimum': node.filter(name => minimumWindows.has(name) || isChatGpt(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'windows-mcp': node.filter(isMcp).map(path),
     'windows-headless': node.filter(name => !isMcp(name) && !nativeConpty.has(name) && !linuxOnly.has(name)).map(path),
-    'windows-current': node.filter(name => currentCompatibility.has(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
+    'windows-current': node.filter(name => currentCompatibility.has(name) || isChatGpt(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'bun-tui': tui.map(path),
-    'bun-boundaries': node.filter(name => name.startsWith('public-url') || name === 'mcp-http.test.mjs' || name === 'mcp-auto-compatibility.test.mjs' || ['installed-skills.test.mjs', 'skill-save-host.test.mjs', 'skill-save-outcomes.test.mjs'].includes(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
+    'bun-boundaries': node.filter(name => name.startsWith('public-url') || name === 'mcp-http.test.mjs' || name === 'mcp-auto-compatibility.test.mjs' || ['installed-skills.test.mjs', 'skill-save-host.test.mjs', 'skill-save-outcomes.test.mjs'].includes(name) || isChatGpt(name) || isOAuth(name) || isAgentMcpSetup(name)).map(path),
     'windows-stock': ['./test/windows-conpty-fallback-native.test.mjs'],
     'windows-modern': ['./test/windows-conpty-packaged-native.test.mjs'],
     'linux-only': node.filter(name => linuxOnly.has(name)).map(path),

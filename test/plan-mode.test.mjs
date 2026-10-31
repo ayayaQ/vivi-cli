@@ -149,10 +149,10 @@ test('mode picker offers Plan without enrollment, cancellation preserves Plan, a
     provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('No review expected') } } } })
   const f = controls(subject, true)
   await selectApprovalMode(subject, f.io, async (_title, choices, initial) => {
-    assert.deepEqual(choices.map(choice => choice.value), ['manual', 'auto', 'plan']); assert.equal(initial, 0); return 'plan'
+    assert.deepEqual(choices.map(choice => choice.value), ['manual', 'auto', 'skip', 'plan']); assert.equal(initial, 0); return 'plan'
   })
   assert.equal(subject.taskMode, 'plan'); assert.equal(f.requests.length, 0)
-  await selectApprovalMode(subject, f.io, async (_title, _choices, initial) => { assert.equal(initial, 2); return undefined })
+  await selectApprovalMode(subject, f.io, async (_title, _choices, initial) => { assert.equal(initial, 3); return undefined })
   assert.equal(subject.taskMode, 'plan')
   await cycleApprovalMode(subject, f.io); assert.equal(subject.taskMode, 'execute')
   await cycleApprovalMode(subject, f.io); assert.equal(subject.approvalMode, 'auto'); assert.equal(f.requests.length, 1)
