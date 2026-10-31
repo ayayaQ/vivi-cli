@@ -118,6 +118,7 @@ Workspace defaults to the directory where vivi was launched; --workspace overrid
 Selected files may be sent to your provider and saved in session history.
 Workspace tools omit symlinks and private/ignored files; text writes require review; this is not an OS sandbox.
 /commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval, even in Auto; piped approval is denied.
+/processes lists background jobs; /processes logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected background job; F7 stops all, including while the agent works.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual / Auto review / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
 /auto-threshold [90–100|default] saves this reviewer’s requirement cutoff (0.1 percentage-point steps); changes revoke Auto and need fresh consent.
@@ -546,7 +547,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     else process.stderr.write(`${message}\n`)
     return 1
   } finally {
-    let mcpCleanupFailed = false
+    let mcpCleanupFailed = false, hostCleanupFailed = false, leaseCleanupFailed = false
     try { try { await oauth?.close() } finally { await mcp?.close() } }
     catch (error) {
       mcpCleanupFailed = true
@@ -556,10 +557,26 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         else process.stderr.write(`MCP cleanup failed: ${message}\n`)
       } catch { process.stderr.write('MCP cleanup failed; terminal reporting was unavailable\n') }
     }
-    await host?.shutdown().catch(() => undefined)
-    await release?.().catch(() => undefined)
-    closeIO()
-    if (mcpCleanupFailed) return 1
+    try { await host?.shutdown() }
+    catch (error) {
+      hostCleanupFailed = true
+      const message = redactSecrets(error instanceof Error ? error.message : 'Owned process/session cleanup could not be verified', secrets)
+      try {
+        if (io && !io.failed) io.write(`Process/session cleanup unconfirmed: ${message}. Session lock retained; inspect owned processes before restarting.\n`)
+        else process.stderr.write(`Process/session cleanup unconfirmed: ${message}. Session lock retained; inspect owned processes before restarting.\n`)
+      } catch { process.stderr.write('Process/session cleanup unconfirmed; session lock retained and terminal reporting was unavailable\n') }
+    }
+    // An uncertain host may still own a process or persistence effect. Do not
+    // advertise a clean session handoff by releasing its writer lease.
+    if (!hostCleanupFailed) try { await release?.() }
+    catch {
+      leaseCleanupFailed = true
+      try { if (io && !io.failed) io.write('Session lease release failed; inspect its lock before restarting\n')
+        else process.stderr.write('Session lease release failed; inspect its lock before restarting\n') }
+      catch { process.stderr.write('Session lease release failed\n') }
+    }
+    const terminalCleanupFailed = closeIO()
+    if (mcpCleanupFailed || hostCleanupFailed || leaseCleanupFailed || terminalCleanupFailed) return 1
   }
 }
 

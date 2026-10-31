@@ -63,7 +63,7 @@ test('explicit user script bypasses only the second confirmation; subsequent age
   assert.equal(result.executionComplete, true); assert.equal(result.success, false)
   assert.equal(result.processEffects, 'unknown'); assert.equal(result.untrusted, true)
   assert.match(result.output, /observed fixture stdout/); assert.match(result.output, /observed fixture stderr/)
-  assert.equal(f.calls[0].cwd, f.root)
+  assert.equal(f.calls[0].cwd, await realpath(f.root))
   if (process.platform !== 'win32') {
     assert.equal(f.calls[0].executable, await realpath('/bin/sh'))
     assert.deepEqual(f.calls[0].args, ['-c', script])

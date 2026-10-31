@@ -562,9 +562,34 @@ from history. Piped/headless input cannot approve a process.
 The approval shows the resolved executable, exact argv array, resolved working
 directory, environment variable names, and hard timeout. Execution uses
 `shell:false`; to use shell syntax, explicitly request a shell executable and its
-arguments. `command_poll` reads bounded output; `command_stop` halts that run’s
-process tree. IDs expire at the end of the agent run, which also stops any running
-processes. Output is untrusted and may be sent to your provider and saved in history.
+arguments. Ordinary commands stay foreground/turn-scoped: `command_poll` reads
+bounded output and `command_stop` halts the process tree; turn completion or
+cancellation stops them. Output is untrusted and may be sent to your provider and
+saved in history.
+
+For noninteractive dev servers/watchers, explicitly request `command_start` with
+`background:true`. Approval identifies this longer lifetime. The CLI owns these
+jobs independently of model history: they survive completed/cancelled turns and
+context compaction, and the agent receives a fresh current-job snapshot. Use
+`command_list`, `command_logs`, `command_stop` and `command_restart`, or
+`/processes`, `/processes logs ID`, `/processes stop ID`, `/processes restart ID`
+and `/processes stop-all`. Restart verifies old-tree cleanup first and requires
+fresh exact-command approval; it never automatically retries or revives a job.
+The compact process bar has independent Next, Stop and Stop All controls; F6
+stops its selected job and F7 stops all jobs, even during inference or a dialog.
+Line mode supports the same commands and F6/F7 (F6 targets the latest active job).
+These cleanup controls do not cancel inference or consume the composer draft.
+
+Background log tails are byte-capped and mark older output as truncated; noisy
+servers are not killed just for producing lifetime output. No interactive stdin
+or PTY is provided. `!` remains an explicitly approved one-shot foreground shell
+command. Leaving the owning session, changing command trust/account, or normal
+CLI shutdown stops background jobs. Unconfirmed cleanup remains visible and
+blocks restart; inspect it instead of starting a replacement. IDs are opaque and
+valid only in this CLI launch/session, never raw PIDs or saved execution authority.
+There is no cross-launch persistence or automatic restart. Abrupt host termination
+such as SIGKILL, escaped POSIX descendants and external services are outside the
+normal cleanup guarantee.
 
 This is **unsandboxed**: commands have your OS account’s file and network access,
 including outside cwd. The fixed minimal environment excludes saved provider keys,

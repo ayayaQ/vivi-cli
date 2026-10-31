@@ -10,7 +10,13 @@ export interface CommandProcessInput {
   cwd: string
   env: Readonly<Record<string, string>>
 }
-export interface CommandProcessExit { exitCode: number | null; signal?: string; error?: string }
+export interface CommandProcessExit {
+  exitCode: number | null
+  signal?: string
+  error?: string
+  /** Independent tree evidence: an execution/output failure need not mean cleanup failed. */
+  cleanupConfirmed?: boolean
+}
 export interface CommandProcess {
   stdout: Readable
   stderr: Readable
@@ -68,6 +74,7 @@ export async function launchCommandProcess(input: CommandProcessInput): Promise<
   let failure: string | undefined
   let stopped: Promise<void> | undefined
   let cleanupTimer: ReturnType<typeof setTimeout> | undefined
+  let cleanupTimedOut = false
   let closed = false
   const killGroup = (): void => {
     if (!child.pid) return
@@ -77,6 +84,7 @@ export async function launchCommandProcess(input: CommandProcessInput): Promise<
   const boundedCleanup = (): void => {
     if (cleanupTimer) return
     cleanupTimer = setTimeout(() => {
+      cleanupTimedOut = true
       failure = 'Process group cleanup could not be verified; an escaped process may still hold output pipes'
       child.stdout.destroy(); child.stderr.destroy()
     }, 3_000)
@@ -90,8 +98,12 @@ export async function launchCommandProcess(input: CommandProcessInput): Promise<
     child.once('close', (exitCode, signal) => { if (cleanupTimer) clearTimeout(cleanupTimer)
       closed = true
       void (async () => {
-        if (child.pid) try { await waitForGroupDeath(child.pid) } catch (error) { failure = error instanceof Error ? error.message : 'Process group cleanup could not be verified' }
-        resolve({ exitCode, ...(signal ? { signal } : {}), ...(failure ? { error: failure } : {}) })
+        // A failed spawn with no PID never created an owned process. Otherwise
+        // verification is separate evidence from launch/output lifecycle errors.
+        let cleanupConfirmed = child.pid === undefined
+        if (child.pid) try { await waitForGroupDeath(child.pid); cleanupConfirmed = !cleanupTimedOut }
+        catch (error) { failure = error instanceof Error ? error.message : 'Process group cleanup could not be verified' }
+        resolve({ exitCode, cleanupConfirmed, ...(signal ? { signal } : {}), ...(failure ? { error: failure } : {}) })
       })() })
   })
   return { stdout: child.stdout, stderr: child.stderr, completed,
