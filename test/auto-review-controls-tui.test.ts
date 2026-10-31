@@ -60,7 +60,7 @@ test('native mode picker defaults Manual, shows selected-account disclosure, and
   await f.frame()
   const picker = f.setup.renderer.root.findDescendantById('vivi-picker') as SelectRenderable
   expect(picker.getSelectedIndex()).toBe(0)
-  expect(picker.options.map(option => option.name)).toEqual(['Manual', 'Auto review', 'Plan'])
+  expect(picker.options.map(option => option.name)).toEqual(['Manual', 'Auto review', 'Skip permissions', 'Plan'])
   const contents = text(f.setup.renderer.root)
   expect(contents).toContain('Check proposed note, memory, workspace text and public URL GET actions through your selected provider')
   expect(contents).not.toContain('Auto sends your current request')

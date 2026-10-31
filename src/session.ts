@@ -11,7 +11,7 @@ import { FilePublicUrlOutcomeStore, reconcilePublicUrlOutcomes } from './public-
 
 export const MAX_SESSION_BYTES = 2 * 1024 * 1024
 export const MAX_HISTORY_MESSAGES = 2000
-export type CliProviderName = 'openai' | 'openrouter' | 'deepseek'
+export type CliProviderName = 'openai' | 'openrouter' | 'deepseek' | 'chatgpt'
 export interface CliSession {
   schemaVersion: 1 | 2 | 3
   /** Schema-2 points to an existing shadow anchor; it grants no replay/send authority. */
@@ -19,6 +19,8 @@ export interface CliSession {
   id: string
   provider: CliProviderName
   model: string
+  /** Nonsecret immutable ChatGPT account/workspace registration binding. */
+  chatgptAccountId?: string
   reasoning?: string
   createdAt: string
   updatedAt: string
@@ -91,7 +93,7 @@ export function validateSession(value: unknown): CliSession {
   json(value)
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
-    'history', 'contextCheckpoint', 'contextSummaryUsage', 'contextSummaryUnreported', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
+    'chatgptAccountId', 'history', 'contextCheckpoint', 'contextSummaryUsage', 'contextSummaryUnreported', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
   check(value.schemaVersion === 1 || value.schemaVersion === 2 || value.schemaVersion === 3, 'unsupported schema version')
   if (value.schemaVersion === 1) check(!('recordAnchor' in value), 'schema-1 must not contain a record anchor')
   else if (value.schemaVersion === 2 || 'recordAnchor' in value) {
@@ -101,8 +103,10 @@ export function validateSession(value: unknown): CliSession {
   }
   if ('contextCheckpoint' in value) validateContextCheckpoint(value.contextCheckpoint)
   check(isSessionId(value.id), 'invalid id')
-  check(value.provider === 'openai' || value.provider === 'openrouter' || value.provider === 'deepseek', 'unsupported provider')
+  check(value.provider === 'openai' || value.provider === 'openrouter' || value.provider === 'deepseek' || value.provider === 'chatgpt', 'unsupported provider')
   check(identifier(value.model), 'invalid model')
+  if (value.provider === 'chatgpt') check(typeof value.chatgptAccountId === 'string' && /^[a-f0-9]{64}$/.test(value.chatgptAccountId), 'ChatGPT requires an account registration binding')
+  else check(!('chatgptAccountId' in value), 'unexpected ChatGPT account binding')
   if ('title' in value) check(typeof value.title === 'string' && validSessionTitle(value.title), 'invalid title')
   if ('titleRevision' in value) check('title' in value && Number.isSafeInteger(value.titleRevision) &&
     Number(value.titleRevision) >= 0, 'invalid title revision')
@@ -187,7 +191,7 @@ export function validateSession(value: unknown): CliSession {
 export function isSessionId(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 }
-export function newSession(settings: { provider: CliProviderName; model: string; reasoning?: string }): CliSession {
+export function newSession(settings: { provider: CliProviderName; model: string; reasoning?: string; chatgptAccountId?: string }): CliSession {
   const now = new Date().toISOString()
   return validateSession({ schemaVersion: 1, id: randomUUID(), ...settings, createdAt: now, updatedAt: now,
     history: [], usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, noteRevision: 0, notes: {} })

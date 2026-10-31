@@ -1,6 +1,6 @@
 # vivi CLI
 
-Chat with OpenAI, OpenRouter or DeepSeek from your terminal.
+Chat with your ChatGPT plan, an OpenAI API key, OpenRouter or DeepSeek from your terminal.
 
 ## Run from source
 
@@ -21,12 +21,14 @@ Each launch starts a fresh conversation. An unconfigured interactive launch open
 the existing provider/key and model pickers automatically. Escape cancels; use
 `/provider` to retry. Configured launches use saved defaults without repeating setup.
 
-- `/provider` — choose the chat provider (OpenAI, OpenRouter or DeepSeek) and key
+- `/provider` — choose official Continue with ChatGPT or an API-key provider
 - `/web` — independently choose Direct, DeepSeek or Disabled web access
 - `/reviewer` — explicitly choose this conversation’s OpenAI/OpenRouter Auto reviewer
+- `/account` — choose a ChatGPT account/workspace, enable plan usage or sign out
+- `/usage` — show the ChatGPT usage settings link
 - `/models` — search and select a model
 - `/effort` — choose a supported reasoning effort
-- `/mode` — choose Manual or enroll optional Auto review for the current conversation
+- `/mode` — choose Manual, Auto review or explicit Skip permissions for this conversation
 - `/new` — start a fresh conversation
 - `/resume` — continue a saved conversation
 - `/rename` — rename the current conversation (or `/rename NAME` in line mode)
@@ -44,12 +46,61 @@ the existing provider/key and model pickers automatically. Escape cancels; use
 - `/help` — show commands and shortcuts
 - `/exit` — quit
 
+### Continue with ChatGPT
+
+Choose **Continue with ChatGPT** in `/provider`, or use line-mode controls:
+
+```sh
+vivi auth login
+vivi auth list
+vivi --provider chatgpt --chatgpt-account ACCOUNT_ID --model MODEL --no-tui
+vivi auth logout --chatgpt-account ACCOUNT_ID
+```
+
+Use the exact registration ID from `auth list`; account/workspace registrations
+remain separate even with the same email. `/models` shows the signed-in account's
+catalog in server order. Model capabilities remain unknown unless advertised or
+explicitly declared for this launch; no model availability or reasoning effort is
+inferred from the login. In line mode, `--tools` explicitly declares function-tool
+support, and nondefault reasoning still needs `--reasoning-capabilities`.
+
+Official dynamic registration uses Vivi's own issued client ID, PKCE and verified
+OIDC identity. No legacy Codex client IDs, shared `auth.json`, or ChatGPT private
+backend endpoints are used. Saved token records are encrypted using an OS-protected
+wrapping key; there is no plaintext fallback. The UI offers an explicit launch-only
+choice when secure storage is unavailable. Signing out clears tokens and attempts
+remote refresh-session revocation, while retaining the nonsecret registration and
+stable opaque host ID. Unconfirmed revocation is reported.
+
+Eligible requests use your ChatGPT plan, never an automatic API-key billing fallback.
+[Manage ChatGPT usage](https://chatgpt.com/settings/usage). Local history is replayed
+with `store: false`; HTTP always uses SSE, even when `--no-stream` buffers the UI.
+Auto review requires a separately, explicitly selected supported API reviewer; ChatGPT
+OAuth is never sent to the Decisions API. Manual and Skip need no reviewer.
+
+### Skip permissions
+
+Use `/mode` → **Skip permissions**, `/mode skip`, or `--approval-mode skip` and
+confirm the warning in a live interactive terminal. This is a fresh session-only
+opt-in, never a saved default or a consequence of signing in. It skips ordinary
+prompts without human **or AI** review for eligible, host-prepared local changes,
+public/paid web requests, trusted commands and already-connected MCP operations.
+
+Hard denials, path/workspace and known-secret checks, validation, cancellation and
+session/account/trust boundaries remain. Skill installation, MCP setup/connect/sign-in
+and credential/trust administration still require human action. Account/workspace/trust
+changes revoke enrollment. Unsandboxed commands still run as your OS user and can act
+outside the workspace or read credential files; Skip neither grants OS privileges nor
+adds a sandbox. Shift+Tab retains the existing Manual → Auto → Plan cycle and never
+enables Skip automatically.
+
 ### User shell commands (`!`)
 
 Start a submitted message with `!` to run the remaining text as a shell script,
 then let the agent continue from its actual output and exit status. **Send approves
 that exact unsandboxed command**; there is no second confirmation. Agent-proposed
-`command_start` calls still require fresh human approval, even in Auto review.
+`command_start` calls require fresh human approval in Manual and Auto; deliberately
+enrolled Skip permissions skips that ordinary prompt.
 The composer marks shell input before submission. A busy `!` waits until the
 current turn and its cleanup finish; queued commands run in FIFO order. Interrupt
 & send cancels the current turn first. Ordinary Escape/Ctrl-C stops the active
@@ -110,7 +161,7 @@ Manual / Auto review / Plan while the composer is idle and preserves an unfinish
 draft. Entering Auto still needs the fresh enrollment confirmation. Entering Plan
 revokes Auto enrollment; leaving Plan returns to Manual. During a turn and inside
 dialogs, the shortcut does not change mode. `/mode cycle` provides the same cycle
-through the command interface. `/mode` opens all three choices in full-screen mode;
+through the command interface. `/mode` opens Manual, Auto review, Skip permissions and Plan choices in full-screen mode;
 `/mode plan` enters planning directly and `/mode manual` returns to reviewed execution.
 
 Plan is a read-only task policy, separate from Manual/Auto approval. It advertises
@@ -289,8 +340,8 @@ For account-independent line management, run
 Starting a trusted server runs its code with your OS permissions before any
 tool-call approval. It can access files and network; this is not a sandbox.
 Connected, ready catalogs expose bounded tool aliases and schemas to the agent.
-Every remote tool call and resource read requires human approval, including in Auto
-review. Reads use exact discovered resource URIs. Admitted scalar RFC 6570 templates can
+Remote tool calls and resource reads require human approval in Manual and Auto
+review; explicitly enrolled Skip permissions skips ordinary prompts only for already-connected servers. Reads use exact discovered resource URIs. Admitted scalar RFC 6570 templates can
 propose one expanded absolute URI with every variable supplied as a string; the
 existing human approval shows the template, exact values and expanded URI.
 Unsupported templates remain metadata only. Expansion performs no I/O, URI
@@ -382,7 +433,7 @@ cap or receipt; DeepSeek controls pricing and actual charges. Each call has one
 API dispatch and no automatic retry or fallback. Manual reviews every call;
 freshly enrolled Auto can review exact current-request search/fetch proposals,
 with visible human fallback on uncertainty. Changing web provider/key revokes
-Auto enrollment. Plan continues to omit remote web requests.
+unattended enrollment. Explicit Skip permissions also skips ordinary web prompts. Plan continues to omit remote web requests.
 
 Results are untrusted, provider-reported content with source URLs and explicit
 local truncation. A successful API response does not verify original website
@@ -393,9 +444,9 @@ checks do not attest to DeepSeek’s remote DNS or redirects.
 ## Optional Auto review
 
 Manual is always the default. OpenAI/OpenRouter chat keeps its same-provider
-reviewer by default. DeepSeek chat starts without a reviewer; `/reviewer` or Auto
+reviewer by default. DeepSeek and ChatGPT-plan chat start without a reviewer; `/reviewer` or Auto
 setup explicitly selects an OpenAI/OpenRouter account for this conversation.
-DeepSeek is not a decision backend. A reviewer/account change revokes enrollment,
+DeepSeek and ChatGPT OAuth are not decision backends; ChatGPT Auto requires a separately configured API reviewer credential. A reviewer/account change revokes enrollment,
 and every new recipient needs fresh disclosure and confirmation. `/mode` opens the current conversation’s mode
 choice. The full-screen picker defaults to Manual; choosing Auto review then
 requires a separate fresh, deny-default human confirmation of the disclosure.
@@ -554,7 +605,8 @@ See [project instructions and image input](docs/PROJECT_INPUTS.md) for details.
 Command proposals are available from startup with a selected workspace, supported
 tools and an interactive approval surface. The first exact `command_start` approval
 includes the unsandboxed-execution disclosure; there is no separate enablement
-approval. Every new process still needs fresh human approval, even in Auto.
+approval. Every new process needs fresh human approval in Manual and Auto.
+Explicitly enrolled Skip permissions skips that ordinary prompt, not command validation.
 `/commands off` or `--disable-commands` disables proposals; `/commands on` restores
 them for this launch/session. Execution permission is never saved or restored
 from history. Piped/headless input cannot approve a process.
@@ -574,7 +626,7 @@ context compaction, and the agent receives a fresh current-job snapshot. Use
 `command_list`, `command_logs`, `command_stop` and `command_restart`, or
 `/processes`, `/processes logs ID`, `/processes stop ID`, `/processes restart ID`
 and `/processes stop-all`. Restart verifies old-tree cleanup first and requires
-fresh exact-command approval; it never automatically retries or revives a job.
+fresh command admission under the current mode; it never automatically retries or revives a job.
 The compact process bar has independent Next, Stop and Stop All controls; F6
 stops its selected job and F7 stops all jobs, even during inference or a dialog.
 Line mode supports the same commands and F6/F7 (F6 targets the latest active job).
@@ -696,8 +748,8 @@ provider; instructions and imported UTF-8 text resources load progressively thro
 
 The bundled read-only `skill-creator` can draft an instruction-only skill, then propose
 `save_skill`. Interactive Execute mode shows the exact before/after SKILL.md source,
-canonical name and SHA-256 revisions for a deny-default human review. Auto mode still
-requires that same human review; the automatic reviewer cannot approve skill saves.
+canonical name and SHA-256 revisions for a deny-default human review. Auto and Skip permissions still
+require that same human review; the automatic reviewer cannot approve skill saves.
 Plan, noninteractive launches and models without tools cannot save. A successful save
 becomes discoverable on the next turn; the current turn keeps its fixed catalog.
 

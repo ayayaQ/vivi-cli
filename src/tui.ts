@@ -86,12 +86,14 @@ function guardMarkdownSelection(node: Renderable): void {
 }
 export const SLASH_COMMANDS = [
   { command: '/provider', description: 'Choose a chat provider' },
+  { command: '/account', description: 'Manage ChatGPT accounts and sign-in' },
+  { command: '/usage', description: 'Show usage and ChatGPT plan settings' },
   { command: '/web', description: 'Choose an independent web provider' },
   { command: '/reviewer', description: 'Choose this conversation’s Auto reviewer' },
   { command: '/auto-threshold', description: 'Set the reviewer’s saved requirement cutoff' },
   { command: '/models', description: 'Choose a model' },
   { command: '/effort', description: 'Choose reasoning effort' },
-  { command: '/mode', description: 'Choose Manual / Auto review / Plan' },
+  { command: '/mode', description: 'Choose Manual / Auto review / Skip permissions / Plan' },
   { command: '/new', description: 'Start a new session' },
   { command: '/resume', description: 'Resume a saved session' },
   { command: '/rename', description: 'Rename the current session' },
@@ -1574,7 +1576,9 @@ export class OpenTuiIO implements ChatIO {
   }
   private async showApproval(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
-    const enrollment = request.call.name === 'enroll_auto_review'
+    const skipEnrollment = request.call.name === 'enroll_skip_permissions'
+    const enrollment = request.call.name === 'enroll_auto_review' || skipEnrollment
+    const enrollmentLabel = skipEnrollment ? 'Enable Skip permissions?' : 'Enable Auto review?'
     const publicUrl = request.call.name === 'fetch_url'
     const skillSave = request.call.name === 'save_skill'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
@@ -1582,14 +1586,14 @@ export class OpenTuiIO implements ChatIO {
     const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
     this.activeApproval = approval
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
-    this.appendEntry({ category: 'activity', attention: true, label: enrollment ? 'Enable Auto review?' : `Approval required · ${scope}`,
+    this.appendEntry({ category: 'activity', attention: true, label: enrollment ? enrollmentLabel : `Approval required · ${scope}`,
       content: this.safe(request.description), markdown: false, approval: approval.token,
       ...(['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
         ? { workspaceDiff: request.workspaceDiff } : {}) })
-    const title = enrollment ? 'Enable Auto review? (default: cancel)' : publicUrl
+    const title = enrollment ? `${enrollmentLabel} (default: cancel)` : publicUrl
       ? 'Review this public URL request (default: deny)' : skillSave ? 'Save skill? (default: deny)' : 'Review this change (default: deny)'
-    this.updateStatus(enrollment ? 'Enable Auto review? · Cancel is the default' : `Approval required · ${scope} · denial is the default`)
-    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Auto' }
+    this.updateStatus(enrollment ? `${enrollmentLabel} · Cancel is the default` : `Approval required · ${scope} · denial is the default`)
+    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: skipEnrollment ? 'Enable Skip' : 'Enable Auto' }
       : skillSave ? { deny: 'Deny', allow: 'Save skill' } : undefined)
     this.pickerBox.title = title
     this.pickerBox.height = 3
@@ -2178,7 +2182,7 @@ export class OpenTuiIO implements ChatIO {
     }
     this.sessionId = session.id
     this.sessionTitle = this.safe(sessionDisplayTitle(session), 4096)
-    this.sessionModel = this.safe(`${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}`, 4096)
+    this.sessionModel = this.safe(`${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}${session.provider === 'chatgpt' ? ` · Using ChatGPT plan · account ${session.chatgptAccountId?.slice(0, 12) ?? 'unavailable'}` : ''}`, 4096)
     this.updateHeader()
 
     this.historyLength = session.history.length
@@ -2209,7 +2213,7 @@ export class OpenTuiIO implements ChatIO {
     const content = this.safe(message, 2048)
     if (!context && this.reviewNotices.some(entry => !entry.review && entry.historyStart === this.turnHistoryStart && entry.content === content)) return
     const entry: DisplayEntry = { category: 'activity',
-      attention: !context || ['needs_review', 'failed', 'unknown'].includes(context.state), label: context ? this.safe(`Review · ${context.toolName}`, 4096) : 'Review warning',
+      attention: !context || ['needs_review', 'failed', 'unknown'].includes(context.state), label: context ? this.safe(`${context.source === 'skip' ? 'Skip permissions' : 'Review'} · ${context.toolName}`, 4096) : 'Review warning',
       content, markdown: false,
       historyStart: previous?.historyStart ?? this.turnHistoryStart,
       ...(context ? { review: { ...context }, reviewKey: key! } : {}) }

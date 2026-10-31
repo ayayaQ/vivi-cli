@@ -44,6 +44,10 @@ import { McpOAuthControls } from './mcp-oauth-controls.js'
 import { McpOAuthStore } from './mcp-oauth-store.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 import { McpSetupService } from './mcp-setup.js'
+import { ChatGptAuthManager, CHATGPT_USAGE_URL } from './chatgpt-auth.js'
+import { ChatGPTModelCatalog } from './chatgpt-models.js'
+import { bindChatGptAccount, chatGptPlanStatus, chooseChatGptAccount, confirmChatGptWelcome } from './chatgpt-controls.js'
+import type { ChatGptAuth } from './chatgpt-controls.js'
 
 export interface InteractiveIO extends ChatIO {
   choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
@@ -64,6 +68,7 @@ export interface ApplicationOptions {
   secrets: readonly string[]
   credentials?: CredentialStore
   catalog?: Catalog
+  chatgptAuth?: ChatGptAuth
   registerSecret?(secret: string): void
   providerFactory(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider
   decisionProviderFactory?: typeof decisionProviderForSession
@@ -98,13 +103,13 @@ const COMMAND_HELP = `${USER_SHELL_DISCLOSURE}\nEnter submits; Ctrl+J adds a lin
 /provider sets up an OpenAI, OpenRouter or DeepSeek chat key; /web independently selects Direct, DeepSeek or Disabled; /reviewer explicitly selects this conversation’s supported Auto reviewer; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /notes changes the session-note default for new conversations.
 /memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
-/mode chooses Manual / Auto review / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
-Shift+Tab cycles Manual / Auto review / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
+/mode chooses Manual / Auto review / Skip permissions / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
+Shift+Tab cycles Manual / Auto review / Skip permissions / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
 /processes lists background jobs; logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected job; F7 stops all, even while working or in a dialog.
-/commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval, even in Auto. /commands off disables proposals; /commands on restores them.
+/commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval in Manual/Auto; explicitly enrolled Skip permissions skips ordinary prompts. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
 /instructions status|reload|disable manages launch-local AGENTS.md guidance.
-/mcp manages trusted installed server connections; each launch starts disabled. Every remote tool call or resource read needs human approval, even in Auto.
+/mcp manages trusted installed server connections; each launch starts disabled. Remote tool calls/resources need human approval in Manual/Auto; enrolled Skip applies only to already-connected servers.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
 /context shows effective-request tokens, capacity and output reserve; /compact summarizes older provider context while keeping the full local transcript.\n/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
 Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
@@ -143,13 +148,15 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
     secrets: registration.secrets, ...oauth.managerOptions()
   })
   oauth.bind(manager)
+  const chatgptAuth = input.chatgptAuth ?? new ChatGptAuthManager({ directory: input.options.sessionDirectory,
+    registerSecrets: registration.register })
   try {
     if (input.options.prompt !== undefined && await runMcpCommand(input.io, input.options.prompt, {
       mcp: () => manageMcp(manager, input.io, input.options.workspace, oauth)
     })) return 0
-    return await runManagedApplication(input, manager, oauth, registration)
+    return await runManagedApplication({ ...input, chatgptAuth }, manager, oauth, registration)
   }
-  finally { try { await oauth.close() } finally { await manager.close() } }
+  finally { try { if (!input.chatgptAuth) await chatgptAuth.close() } finally { try { await oauth.close() } finally { await manager.close() } } }
 }
 
 async function runManagedApplication(input: ApplicationOptions, mcp: McpManager, oauth: McpOAuthControls,
@@ -160,7 +167,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const commandEnv = captureCommandEnvironment(input.env)
   const secrets = registration.secrets
   const credentials = input.credentials ?? createCredentialStore()
-  const catalog = input.catalog ?? new ModelCatalog()
+  const chatgptAuth = input.chatgptAuth!
+  const chatgptModels = new ChatGPTModelCatalog({ accessToken: (id, signal) => chatgptAuth.accessToken(id, signal) })
+  const apiCatalog = new ModelCatalog()
+  const catalog: Catalog = input.catalog ?? { list: (provider, credential, signal, refresh) => provider === 'chatgpt'
+    ? chatgptModels.list(credential ?? '', signal, refresh) : apiCatalog.list(provider, credential, signal, refresh) }
   const store = new FileSessionStore(options.sessionDirectory, secrets)
   const preferences = new PreferenceStore(options.sessionDirectory, secrets)
   const memory = new FileMemoryStore(options.sessionDirectory, secrets, message => io.write(`${message}\n`))
@@ -171,7 +182,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
   io.setWorkspace?.(workspace?.directory)
   const knownModels = new Map<string, ModelEntry>()
-  const modelKey = (provider: CliProviderName, id: string): string => `${provider}:${id}`
+  const declaredToolModels = new Set<string>()
+  const modelKey = (provider: CliProviderName, id: string, accountId = settings.chatgptAccountId): string =>
+    provider === 'chatgpt' ? `${provider}:${accountId ?? 'unselected'}:${id}` : `${provider}:${id}`
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
   const register = (key: string): void => registration.register([key])
   let settings = structuredClone(DEFAULT_PREFERENCES)
@@ -187,6 +200,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false }
   }
   if (args.includes('--provider')) settings.provider = options.provider!
+  if (options.chatgptAccountId) settings.chatgptAccountId = options.chatgptAccountId
   if (args.includes('--model')) settings.model = options.model!
   if (args.includes('--reasoning')) settings.reasoning = options.reasoning!
   if (args.includes('--reasoning-capabilities')) {
@@ -220,7 +234,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   // Opaque launch-owned revisions never expose, derive from or persist credentials.
   let accountGeneration = randomUUID()
   let hostAccountGeneration: string | undefined
-  let launchModePending = options.approvalMode === 'auto'
+  let launchModePending = options.approvalMode !== 'manual'
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
   let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
@@ -248,6 +262,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   let selected: { resume?: string; fresh?: boolean; preservePlan?: boolean } | undefined = options.resume ? { resume: options.resume }
     : settings.model ? { fresh: true } : undefined
   const loadKey = async (provider: CliProviderName): Promise<string | undefined> => {
+    if (provider === 'chatgpt') return settings.chatgptAccountId
     const name = envName(provider)
     if (env[name]) { register(env[name]!); return env[name] }
     try {
@@ -272,6 +287,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       let notice = ''
       for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
       const model = hydrated.model
+      if (settings.provider === 'chatgpt' && !result.models.some(model => model.id === settings.model)) throw new Error('This model is not listed for the selected ChatGPT account. Choose a current model with /models')
       knownModels.set(modelKey(settings.provider, model.id), model)
       const previous = settings
       settings = settingsForModel(settings, model)
@@ -294,17 +310,31 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed || controller.signal.aborted) return false
       // Authentication denial is not an offline fallback and cannot authorize a
       // provider attempt, even when --tools was explicitly declared this launch.
-      if (modelAccessDenied(error)) throw error
+      if (modelAccessDenied(error) || settings.provider === 'chatgpt') throw error
       return `${redactSecrets(error instanceof Error ? error.message : 'Model capabilities could not be loaded', secrets)}\n`
     } finally { dispose() }
   }
   const setupProvider = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
     const provider = await io.choose('Provider', [
-      { name: 'OpenAI', description: 'Responses API', value: 'openai' as const },
+      { name: 'Continue with ChatGPT', description: 'Official sign-in · use your ChatGPT plan', value: 'chatgpt' as const },
+      { name: 'OpenAI API key', description: 'Responses API · separate API billing', value: 'openai' as const },
       { name: 'OpenRouter', description: 'Chat Completions gateway', value: 'openrouter' as const },
       { name: 'DeepSeek', description: 'Native Chat Completions; separate from web', value: 'deepseek' as const }
-    ], ['openai', 'openrouter', 'deepseek'].indexOf(base.provider))
+    ], ['chatgpt', 'openai', 'openrouter', 'deepseek'].indexOf(base.provider))
     if (!provider || io.isClosed) return
+    if (provider === 'chatgpt') {
+      const account = await chooseChatGptAccount(io, chatgptAuth, base.chatgptAccountId)
+      if (!account || io.isClosed) return
+      // Even reauthorization of the same registration requires fresh task authority.
+      {
+        await host?.disableCommands(); host?.revokeApprovalEnrollment(); io.setApprovalMode?.('manual')
+        accountGeneration = randomUUID(); chatgptModels.clear()
+        for (const id of knownModels.keys()) if (id.startsWith('chatgpt:')) knownModels.delete(id)
+        host?.invalidateContext(); io.setContext?.(undefined, false)
+      }
+      return { ...base, provider: 'chatgpt', chatgptAccountId: account.id,
+        model: '', reasoning: 'default', reasoningCapabilities: [], enableTools: false }
+    }
     const current = await loadKey(provider)
     if (io.isClosed) return
     const action = current ? await io.choose(`${provider} API key`, [
@@ -351,7 +381,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       reasoningCapabilities: [], enableTools: false }
   }
   const chooseModel = async (base: TuiPreferences): Promise<TuiPreferences | undefined> => {
-    const key = await loadKey(base.provider)
+    const key = base.provider === 'chatgpt' ? base.chatgptAccountId : await loadKey(base.provider)
     const controller = new AbortController()
     const dispose = io.onCancel(() => controller.abort())
     let result
@@ -360,7 +390,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     finally { dispose() }
     if (io.isClosed || controller.signal.aborted) return
     if (!result) {
-      if (!base.model || base.provider === 'openai' && documentedOpenAIModel(base.model).conversation === 'unsupported') {
+      if (base.provider === 'chatgpt' || !base.model || base.provider === 'openai' && documentedOpenAIModel(base.model).conversation === 'unsupported') {
         io.write('No compatible model catalog available. Check /provider and try /models again\n'); return
       }
       const keep = await io.choose('Model catalog unavailable', [
@@ -372,14 +402,14 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     const remember = (): void => {
       for (const key of knownModels.keys()) if (key.startsWith(`${base.provider}:`)) knownModels.delete(key)
       host?.invalidateContext(); io.setContext?.(undefined, false)
-      for (const model of result!.models) knownModels.set(modelKey(base.provider, model.id), model)
+      for (const model of result!.models) knownModels.set(modelKey(base.provider, model.id, base.chatgptAccountId), model)
     }
     remember()
     if (result.warning) io.write(`${result.warning}. Showing a stale cached catalog\n`)
     else if (result.state === 'cached') io.write('Using the cached model catalog (up to 15 minutes old)\n')
     let search = ''
     for (;;) {
-      const choices = result.models.map(model => ({ name: model.id,
+      const choices = result.models.map(model => ({ name: base.provider === 'chatgpt' ? model.name : model.id,
         description: `${model.name} · conversation ${model.conversation} · tools ${model.tools} · reasoning ${model.reasoning}`,
         searchTerms: [model.name, base.provider], value: model.id }))
       const selection = await io.chooseSearchable(`Models · ${base.provider} · ${result.state}`, choices,
@@ -408,9 +438,19 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         ])
         if (!use) continue
       }
-      if (model.tools === 'unknown') io.write('Tool capabilities are unknown; this model will use chat only\n')
+      let declaredTools = false
+      if (base.provider === 'chatgpt' && model.tools === 'unknown') {
+        const use = await io.choose(`Function-tool support is not advertised · ${model.name}`, [
+          { name: 'Use chat only', description: 'Default; do not assume tool support', value: false },
+          { name: 'Enable host function tools', description: 'I verified this model supports function tools. Requests may still be rejected by account/workspace policy', value: true }
+        ])
+        if (use === undefined || io.isClosed) return
+        declaredTools = use
+        if (use) declaredToolModels.add(modelKey(base.provider, model.id, base.chatgptAccountId))
+      }
+      if (model.tools === 'unknown' && !declaredTools) io.write('Tool capabilities are unknown; this model will use chat only\n')
       if (model.reasoning === 'unknown') io.write('Reasoning capabilities are unknown; using provider default\n')
-      return settingsForModel(base, model)
+      return { ...settingsForModel(base, model), ...(declaredTools ? { enableTools: true } : {}) }
     }
   }
   const save = async (next: TuiPreferences, changed: { notes?: boolean; memory?: boolean } = {}): Promise<void> => {
@@ -426,11 +466,46 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     const model = await chooseModel(configured)
     if (io.isClosed) return
     if (model) { await save(model); selected = { fresh: true, preservePlan: true } }
-    else if (!host && configured.provider !== settings.provider) {
+    else if ((!host && configured.provider !== settings.provider) || configured.provider === 'chatgpt') {
       // Keep a completed provider choice after cancelling model selection, so
       // /models can continue setup without a wizard loop or storing credentials.
-      await save(configured); io.setDraft?.(configured.provider)
+      await save(configured); if (!host) io.setDraft?.(configured.provider)
     }
+  }
+  const configureChatGptAccount = async (): Promise<void> => {
+    const current = host?.session.provider === 'chatgpt' ? host.session.chatgptAccountId : settings.chatgptAccountId
+    const accounts = await chatgptAuth.listAccounts()
+    const active = accounts.find(account => account.id === current)
+    if (active) io.write(chatGptPlanStatus(active))
+    const action = await io.choose('ChatGPT account controls', [
+      { name: 'Back', value: 'back' },
+      { name: 'Choose account / Continue with ChatGPT', description: 'Account and workspace changes start a fresh conversation', value: 'choose' },
+      ...(active?.signedIn ? [{ name: 'Sign out this ChatGPT account', description: 'Stop owned commands, revoke renewable session and clear local tokens', value: 'logout' }] : []),
+      { name: 'Manage usage', description: CHATGPT_USAGE_URL, value: 'usage' }
+    ])
+    if (!action || action === 'back' || io.isClosed) return
+    if (action === 'usage') { io.write(`Manage ChatGPT usage: ${CHATGPT_USAGE_URL}\n`); return }
+    if (action === 'logout' && active) {
+      host?.revokeApprovalEnrollment(); io.setApprovalMode?.('manual'); accountGeneration = randomUUID()
+      await host?.disableCommands()
+      const result = await chatgptAuth.signOut(active.id)
+      chatgptModels.clear(); for (const key of knownModels.keys()) if (key.startsWith('chatgpt:')) knownModels.delete(key)
+      host?.invalidateContext(); io.setContext?.(undefined, false)
+      io.write(result.revoked ? 'ChatGPT signed out. Renewable session revoked; local tokens cleared.\n'
+        : 'ChatGPT signed out locally. Remote revocation is unconfirmed; review connected apps in ChatGPT settings.\n')
+      return
+    }
+    const account = await chooseChatGptAccount(io, chatgptAuth, current)
+    if (!account || io.isClosed) return
+    host?.revokeApprovalEnrollment(); io.setApprovalMode?.('manual'); accountGeneration = randomUUID()
+    await host?.disableCommands(); chatgptModels.clear()
+    for (const key of knownModels.keys()) if (key.startsWith('chatgpt:')) knownModels.delete(key)
+    host?.invalidateContext(); io.setContext?.(undefined, false)
+    const configured = { ...(activeSettings ?? settings), provider: 'chatgpt' as const, chatgptAccountId: account.id,
+      model: '', reasoning: 'default', reasoningCapabilities: [], enableTools: false }
+    const model = await chooseModel(configured)
+    if (model) { await save(model); selected = { fresh: true, preservePlan: true } }
+    else { await save(configured); if (!host) io.setDraft?.('chatgpt') }
   }
   const webConfiguration = async (): Promise<CliWebConfiguration> => {
     const provider = settings.webProvider ?? 'direct'
@@ -470,7 +545,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     settings = { ...settings, webProvider: provider }
     host?.setWebConfiguration(await webConfiguration())
     io.setApprovalMode?.('manual'); io.setContext?.(undefined, false)
-    io.write(`Web provider: ${provider}. Auto enrollment revoked; chat provider is ${host?.session.provider ?? settings.provider}.\n`)
+    io.write(`Web provider: ${provider}. Unattended enrollment revoked; chat provider is ${host?.session.provider ?? settings.provider}.\n`)
   }
   const configureReviewer = async (): Promise<boolean> => {
     if (!host) { io.write('Choose a chat model before selecting this conversation’s reviewer\n'); return false }
@@ -662,25 +737,33 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     if (capabilityNotice === false) return false
     await host?.drainMemory()
     await host?.drainSkills()
-    const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning })
+    const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning,
+      ...(settings.provider === 'chatgpt' && settings.chatgptAccountId ? { chatgptAccountId: settings.chatgptAccountId } : {}) })
     const nextRelease = await store.acquire(selection.resume ?? fresh!.id)
     candidate = { release: nextRelease }
     let nextHost: CliHost, nextSettings: TuiPreferences
     const previousRelease = release, previousHost = host
     try {
       const session = selection.resume ? await store.load(selection.resume) : fresh!
+      if (session.provider === 'chatgpt') {
+        const account = await chatgptAuth.select(session.chatgptAccountId!)
+        if (!account.planUsageEnabled) throw new Error('ChatGPT plan usage is disabled. Use /account to enable it or explicitly choose another provider')
+        if (host?.session.chatgptAccountId !== session.chatgptAccountId) chatgptModels.clear()
+        await confirmChatGptWelcome(io, chatgptAuth, account)
+      }
       const sameModel = session.provider === settings.provider && session.model === settings.model
       const explicitResume = session.id === options.resume
-      let metadata = knownModels.get(modelKey(session.provider, session.model)) ??
+      let metadata = knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)
       if (!metadata && selection.resume) {
-        const key = await loadKey(session.provider), controller = new AbortController()
+        const key = session.provider === 'chatgpt' ? session.chatgptAccountId : await loadKey(session.provider), controller = new AbortController()
         const dispose = io.onCancel(() => controller.abort())
         try {
           const hydrated = await hydrateModelCapabilities(catalog, session.provider, session.model, key, controller.signal)
           metadata = hydrated.model
-          knownModels.set(modelKey(session.provider, session.model), metadata)
-        } catch (error) { if (modelAccessDenied(error)) throw error; if (!controller.signal.aborted) report(error) }
+          if (session.provider === 'chatgpt' && !hydrated.catalog?.models.some(model => model.id === session.model)) throw new Error('This model is not listed for the selected ChatGPT account. Choose a current model with /models')
+          knownModels.set(modelKey(session.provider, session.model, session.chatgptAccountId), metadata)
+        } catch (error) { if (modelAccessDenied(error) || session.provider === 'chatgpt') throw error; if (!controller.signal.aborted) report(error) }
         finally { dispose() }
         if (controller.signal.aborted || io.isClosed) { await discardCandidate(); return false }
       }
@@ -695,10 +778,12 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         capabilities = [session.reasoning as ReasoningEffort]
       }
       const declaredTools = args.includes('--tools') &&
-        (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model)
+        (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model) ||
+        declaredToolModels.has(modelKey(session.provider, session.model, session.chatgptAccountId))
       const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
         declared: declaredTools, enabled: !sameModel || settings.enableTools })
       const effective: CliOptions = { ...options, reasoningCapabilities: capabilities,
+        ...(session.provider === 'chatgpt' ? { chatgptAuth } : {}),
         stream: metadata?.streaming === 'unsupported' ? false : settings.stream,
         enableTools, enableNotes: enableTools && settings.enableNotes,
         enableMemory: activeMemory, enableSkills: activeSkills,
@@ -711,16 +796,31 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       effective.imageAssets = images
       effective.imageCapability = metadata?.vision ?? 'unknown'
       if (metadata?.modelCapabilities) effective.imageModelCapabilities = metadata.modelCapabilities
-      const provider = providerFactory(session, effective, env)
+      const generation = accountGeneration
+      const accountAvailable = (): boolean => session.provider !== 'chatgpt' || accountGeneration === generation
+      if (session.provider === 'chatgpt') effective.chatgptIsCurrent = accountAvailable
+      const rawProvider = providerFactory(session, effective, env)
+      const provider = session.provider === 'chatgpt' ? bindChatGptAccount(rawProvider, {
+        isCurrent: () => accountGeneration === generation && !io.isClosed,
+        invalidate: async () => {
+          if (accountGeneration !== generation) return
+          accountGeneration = randomUUID(); chatgptModels.clear()
+          for (const key of knownModels.keys()) if (key.startsWith('chatgpt:')) knownModels.delete(key)
+          nextHost.revokeApprovalEnrollment(); nextHost.invalidateContext(); io.setApprovalMode?.('manual'); io.setContext?.(undefined, false)
+          io.write('ChatGPT account access needs attention. Unattended permissions revoked; stopping owned background commands. Credentials were not deleted solely because inference was denied.\n')
+          await nextHost.stopAllBackgroundCommands()
+        }
+      }) : rawProvider
       const web = await webConfiguration()
       if (io.isClosed) { await discardCandidate(); return false }
-      nextHost = new CliHost({ provider, images, imageCapability: metadata?.vision ?? 'unknown', ...(metadata?.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model)) ??
+      nextHost = new CliHost({ provider, images, imageCapability: metadata?.vision ?? 'unknown', ...(metadata?.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)), mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
         enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
-        skillSaveApproval: { isAvailable: () => io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
+        permissionApproval: { accountRevision: () => accountGeneration, isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed },
+        skillSaveApproval: { isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
         ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountGeneration,
-          isAvailable: () => io.canAutoReview === true && !io.isClosed } } : {}),
+          isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed } } : {}),
         onMemoryNotice: message => io.write(`${message}\n`),
         onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
         ...(io.canAutoReview === true && selectedReviewer ? { decisionReview: {
@@ -728,11 +828,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           ...(options.reviewer ? { explicitReviewer: true as const } : {}),
           ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
           autoReviewThresholds: settings.autoReviewThresholds ?? {},
-          isAvailable: () => thresholdPreferencesAvailable && io.canAutoReview === true && !io.isClosed
+          isAvailable: () => accountAvailable() && thresholdPreferencesAvailable && io.canAutoReview === true && !io.isClosed
         } } : {}),
         ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
           ask: (request, { signal }) => io.askQuestions!(request, signal),
-          isAvailable: () => io.canAskQuestions === true && !io.isClosed,
+          isAvailable: () => accountAvailable() && io.canAskQuestions === true && !io.isClosed,
           accountRevision: () => accountGeneration
         } } : {}),
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
@@ -742,6 +842,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
       if (io.isClosed) { await discardCandidate(); return false }
       nextSettings = { ...settings, provider: session.provider, model: session.model,
+        ...(session.provider === 'chatgpt' ? { chatgptAccountId: session.chatgptAccountId! } : {}),
         reasoning: session.reasoning ?? 'default', reasoningCapabilities: [...capabilities],
         enableTools: effective.enableTools, enableNotes: settings.enableNotes }
       try { await previousHost?.shutdown() }
@@ -760,10 +861,14 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     io.setContext?.(host.contextUsage, host.canCompact)
     io.setTaskMode?.(host.taskMode)
     io.setApprovalMode?.('manual')
-    io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; Auto review enrollment revoked\n' : 'Approval mode: Manual\n')
+    io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; unattended enrollment revoked\n' : 'Approval mode: Manual\n')
     // Native transcript setup clears earlier loading output. Keep stale-cache
     // disclosure visible after that rebuild and before the first provider turn.
     if (capabilityNotice) io.write(capabilityNotice)
+    if (host.session.provider === 'chatgpt') {
+      const account = (await chatgptAuth.listAccounts()).find(account => account.id === host!.session.chatgptAccountId)
+      if (account) io.write(chatGptPlanStatus(account))
+    }
     return true
   }
   let workspaceNoticePending = true
@@ -773,7 +878,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {
       if (io.setDraft) io.setDraft(settings.provider)
-      else io.setSession(newSession({ provider: settings.provider, model: 'Choose a model with /models' }))
+      else if (settings.provider !== 'chatgpt' || settings.chatgptAccountId) io.setSession(newSession({ provider: settings.provider,
+        ...(settings.provider === 'chatgpt' && settings.chatgptAccountId ? { chatgptAccountId: settings.chatgptAccountId } : {}), model: 'Choose a model with /models' }))
     }
     if (!settings.model) io.write('vivi · fresh conversation · use /provider to set up, then /models and /effort\n')
     // Offer the existing minimal setup once per unconfigured interactive launch.
@@ -792,7 +898,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) continue
       if (launchModePending && host) {
         launchModePending = false
-        await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
+        if (options.approvalMode === 'skip') {
+          if (io.canAutoReview !== true || io.isClosed) io.write('Skip permissions requires a live interactive terminal and fresh confirmation. Using Manual; piped and headless launches cannot enroll.\n')
+          else await selectApprovalMode(host, io, async () => 'skip', configureReviewer)
+        } else await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
       } else if (launchModePending && io.canAutoReview !== true) {
         launchModePending = false
         io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
@@ -807,7 +916,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (options.prompt.trim() === '/compact') { return await compactChatContext(host, io) === 'cancelled' ? 130 : 0 }
         if (options.prompt.trim() === '/context') {
           await refreshChatContext(host, io)
-          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model)))}\n`)
+          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model, host.session.chatgptAccountId)))}\n`)
           return 0
         }
         if (await runProcessControl(host, io, options.prompt)) return 0
@@ -827,6 +936,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (command === '/menu' || command === '/settings') {
         const action = await io.choose('Conversation actions', [
           { name: 'Continue conversation', value: 'continue' }, { name: 'Chat provider', value: '/provider' },
+          { name: 'ChatGPT accounts', description: 'Choose account/workspace or sign out', value: '/account' },
+          { name: 'ChatGPT usage', description: CHATGPT_USAGE_URL, value: '/usage' },
           { name: 'Web provider', description: settings.webProvider ?? 'direct', value: '/web' },
           { name: 'Auto reviewer', description: host?.reviewProvider ?? 'None selected', value: '/reviewer' },
           { name: 'Auto threshold', description: host?.reviewProvider ? formatAutoReviewThreshold(resolveAutoReviewThreshold(host.reviewProvider, host.autoReviewThresholds).allowPermille) : 'Choose a reviewer first', value: '/auto-threshold' },
@@ -835,7 +946,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Rename conversation', value: '/rename' },
           ...(host ? [{ name: 'Context details', description: 'Request occupancy, capacity and output reserve', value: '/context' }] : []),
           ...(host?.canCompact ? [{ name: 'Compact context', description: 'Summarize older provider context; retain the full transcript', value: '/compact' }] : []),
-          { name: 'Mode', description: 'Manual / Auto review / Plan', value: '/mode' },
+          { name: 'Mode', description: 'Manual / Auto review / Skip permissions / Plan', value: '/mode' },
           { name: 'Trusted commands', value: '/commands' },
           { name: 'Background processes', value: '/processes' },
           { name: 'Session notes', description: 'Default for new conversations', value: '/notes' },
@@ -855,7 +966,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           finally { io.setSession(host.session) }
           continue
         }
-        if (host?.queuedMessages.length && ['/new', '/resume', '/provider', '/models', '/effort'].includes(command)) {
+        if (host?.queuedMessages.length && ['/new', '/resume', '/provider', '/account', '/models', '/effort'].includes(command)) {
           io.write('Send or clear this conversation’s queued messages with /queue before changing conversations\n')
           continue
         }
@@ -877,14 +988,16 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           continue
         }
         if (command === '/web') { await configureWeb(); continue }
+        if (command === '/account') { await configureChatGptAccount(); continue }
+        if (command === '/usage') { io.write(`Manage ChatGPT usage: ${CHATGPT_USAGE_URL}\n`); continue }
         if (command === '/reviewer') { await configureReviewer(); continue }
         if (/^\/auto-threshold(?:\s|$)/.test(command)) { await configureAutoThreshold(command); continue }
         if (command === '/provider') {
           await configureProviderModel()
           continue
         }
-        if (command === '/models') { const model = await chooseModel(activeSettings ?? settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
-        if (command === '/effort') { const effort = await chooseEffort(io, activeSettings ?? settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
+        if (command === '/models') { const model = await chooseModel(hostAccountGeneration === accountGeneration ? activeSettings ?? settings : settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
+        if (command === '/effort') { const effort = await chooseEffort(io, hostAccountGeneration === accountGeneration ? activeSettings ?? settings : settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/notes') { await configureNotes(); continue }
         if (/^\/instructions(?:\s|$)/.test(command)) {
           if (!host) { io.write('Choose a model before inspecting project instructions\n'); continue }
@@ -927,7 +1040,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           if (hostAccountGeneration !== accountGeneration && command !== '/mode plan' && command !== '/mode manual' &&
             !(command === '/mode cycle' && host.taskMode === 'plan')) {
             host.setApprovalMode('manual'); io.setApprovalMode?.('manual')
-            io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling Auto review again\n')
+            io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling unattended permissions again\n')
             continue
           }
           await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
@@ -935,6 +1048,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           continue
         }
         if (command === '/compact') {
+          if (host && host.session.provider === 'chatgpt' && hostAccountGeneration !== accountGeneration) { io.write('The selected ChatGPT account changed. Use /new or /models before compacting; no request was sent.\n'); continue }
           if (!host) { io.write('Choose a provider and model before compacting context\n'); continue }
           await compactChatContext(host, io)
           continue
@@ -942,13 +1056,13 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (command === '/context') {
           if (!host) { io.write('Choose a model before measuring context\n'); continue }
           await refreshChatContext(host, io)
-          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model)))}\n`)
+          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model, host.session.chatgptAccountId)))}\n`)
           continue
         }
         if (command === '/help') { io.write(COMMAND_HELP); continue }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n${formatContextSummaryUsage(session)}${formatContextDetails(host!.contextUsage, knownModels.get(modelKey(session.provider, session.model)))}\n`
+          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n${formatContextSummaryUsage(session)}${formatContextDetails(host!.contextUsage, knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)))}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
           io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           continue
@@ -956,6 +1070,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }
         if (!line.trim()) continue
         if (!host) { io.write('Use /provider and /models before sending a message\n'); continue }
+        if (hostAccountGeneration !== accountGeneration && (host.session.provider === 'chatgpt' || settings.provider === 'chatgpt')) { io.write('The selected account changed. Use /new or /models before sending another message; no previous-account request was sent.\n'); continue }
         const controller = new AbortController()
         const dispose = io.onCancel(() => { controller.abort(); host!.cancel() })
         try { const result = await sendChatTurn(host, io, line, controller.signal); io.result(result) }

@@ -162,6 +162,7 @@ export function documentedOpenAIModel(id: string): ModelEntry {
   return model
 }
 export function parseModelCatalog(provider: CliProviderName, input: unknown): ModelEntry[] {
+  if (provider === 'chatgpt') throw new ModelCatalogError('Use the selected ChatGPT account catalog')
   const data = field(input, 'data')
   if (!Array.isArray(data) || data.length > MAX_MODELS) throw new ModelCatalogError('Model catalog has an unsupported format or size')
   const models = new Map<string, ModelEntry>()
@@ -200,6 +201,7 @@ export class ModelCatalog implements Catalog {
   }
   async list(provider: CliProviderName, apiKey?: string, signal?: AbortSignal, refresh = false): Promise<CatalogResult> {
     if (signal?.aborted) throw new ModelCatalogError('Model loading cancelled')
+    if (provider === 'chatgpt') throw new ModelCatalogError('Use the selected ChatGPT account catalog')
     const fingerprint = createHash('sha256').update(apiKey ?? '').digest('hex')
     const cached = this.cache.get(provider)
     // OpenAI visibility is account-specific; never reuse another key's catalog.
