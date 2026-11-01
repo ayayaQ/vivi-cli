@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { npmInvocation, packageAcceptanceEvidence, supportsCliNode } from '../scripts/platform-acceptance.mjs'
+import { manualStageChecks, manualStageEvidence, npmInvocation, packageAcceptanceEvidence,
+  supportsCliNode, syntheticAcceptanceEvidence, syntheticChecks, targetPreflight } from '../scripts/platform-acceptance.mjs'
 import { resolve } from '../scripts/no-tui-loader.mjs'
 
 const artifact = { filename: 'ayayaq-vivi-cli-0.1.0-dev.0.tgz', sha256: 'a'.repeat(64),
@@ -71,4 +72,96 @@ test('Node no-TUI loader blocks native routes before resolution and allows publi
   }
   assert.equal(calls, 4)
   await assert.rejects(resolve('alias', {}, async () => ({ url: 'file:///package/node_modules/@opentui/core/index.js' })), /native TUI/)
+})
+
+const binding = { candidateSha: 'b'.repeat(40), artifactSha256: 'c'.repeat(64),
+  artifactKind: 'synthetic-fixture', platform: 'win32', arch: 'x64', node: 'v26.10.0' }
+const generatedAt = '2026-11-01T00:00:00.000Z'
+const checks = () => Object.fromEntries(syntheticChecks.map(name => [name, true]))
+const evidence = (override = {}) => syntheticAcceptanceEvidence({ binding, generatedAt, checks: checks(), ...override })
+
+test('synthetic report binds exact source/runtime/stage while all live stages remain not_run', () => {
+  const report = evidence()
+  assert.equal(report.schemaVersion, 2)
+  assert.equal(report.kind, 'synthetic-platform-acceptance')
+  assert.deepEqual(report.binding, binding)
+  assert.equal(report.stage, 'synthetic-helper-store-report')
+  assert.equal(report.syntheticResult, 'passed')
+  assert.equal(report.platformAcceptance, 'pending_manual_validation')
+  assert.equal(report.authSuccessIsInferenceSuccess, false)
+  assert.equal(report.apiKeyBillingFallback, false)
+  assert.deepEqual(Object.keys(report.manual), Object.keys(manualStageChecks))
+  assert(Object.values(report.manual).every(stage => stage.status === 'not_run'))
+  for (const name of syntheticChecks) {
+    const result = evidence({ checks: { ...checks(), [name]: false } })
+    assert.equal(result.syntheticResult, 'failed'); assert.equal(result.checks[name], 'failed')
+  }
+})
+
+test('report rejects missing checks, incomplete outcomes and arbitrary secret-bearing fields', () => {
+  const incomplete = checks(); delete incomplete.chatgptEnvelope
+  for (const override of [
+    { checks: incomplete }, { checks: { ...checks(), chatgptEnvelope: 'passed' } },
+    { checks: { ...checks(), accessToken: 'secret-fixture' } }, { generatedAt: 'yesterday' },
+    { generatedAt: '2026-02-30T00:00:00.000Z' }, { generatedAt: '2026-11-01T00:00:00Z' },
+    { binding: { ...binding, node: 'v24.14.0' } }, { binding: { ...binding, platform: 'mac' } },
+    { binding: { ...binding, candidateSha: 'HEAD' } }, { binding: { ...binding, artifactSha256: 'abc' } },
+    { binding: { ...binding, artifactKind: 'native' } }, { binding: { ...binding, arch: '' } },
+    { binding: { ...binding, email: 'secret-fixture' } }, { manual: { chatgptInference: 'passed' } },
+    { rawOutput: 'secret-fixture' }, { stage: 'live' }
+  ]) assert.throws(() => evidence(override), error => error.message === 'Invalid acceptance evidence')
+})
+
+test('metadata-only preflight fails closed without ever reading existing values', async () => {
+  const targets = ['openai', 'openrouter', 'deepseek', 'deepseek-web', `mcp-oauth-key-v1-${'a'.repeat(64)}`]
+  let reads = 0
+  for (const state of ['absent', 'occupied', 'uncertain', undefined, { value: 'never-copy' }]) {
+    const observed = []
+    const result = await targetPreflight(targets, { available: async () => true,
+      presence: async target => { observed.push(target); return state }, load: () => { reads++; throw Error('forbidden') } })
+    assert.equal(result.status, state === 'absent' ? 'eligible' : 'blocked')
+    assert(!JSON.stringify(result).includes('never-copy'))
+    assert(observed.includes('openai'))
+  }
+  assert.equal(reads, 0)
+  for (const available of [false, undefined, 'yes']) {
+    assert.deepEqual(await targetPreflight(targets, { available: async () => available,
+      presence: () => assert.fail('unavailable helper must not be queried') }), { status: 'blocked', reason: 'helper_unavailable' })
+  }
+  assert.deepEqual(await targetPreflight(targets, { available: async () => { throw Error('secret-fixture') } }),
+    { status: 'blocked', reason: 'uncertain' })
+  for (const bad of [[], ['openai', 'openai'], ['chatgpt'], ['unknown'], ['openai\n']]) {
+    await assert.rejects(targetPreflight(bad, {}), /Invalid acceptance evidence/)
+  }
+  const mixed = await targetPreflight(targets, { available: async () => true,
+    presence: async target => target === 'deepseek' ? 'occupied' : 'absent' })
+  assert.deepEqual(mixed, { status: 'blocked', reason: 'occupied' })
+})
+
+const canonical = { ...binding, artifactKind: 'canonical-package' }
+const receiptFor = stage => ({ binding: canonical, stage, completedAt: generatedAt,
+  checks: [...manualStageChecks[stage]], receiptSha256: 'd'.repeat(64) })
+
+test('manual stage assertions require exact canonical receipt binding and complete stage checks', () => {
+  for (const stage of Object.keys(manualStageChecks)) {
+    const receipt = receiptFor(stage)
+    assert.equal(manualStageEvidence(canonical, stage, { status: 'passed', receipt }).status, 'passed')
+    assert.equal(manualStageEvidence(canonical, stage, { status: 'failed', receipt: { ...receipt, checks: [] } }).status, 'failed')
+    assert.deepEqual(manualStageEvidence(binding, stage, { status: 'not_run' }), { status: 'not_run' })
+    assert.deepEqual(manualStageEvidence(binding, stage, { status: 'blocked', reason: 'interactive_required' }),
+      { status: 'blocked', reason: 'interactive_required' })
+    assert.throws(() => manualStageEvidence(binding, stage, { status: 'passed', receipt }), /Invalid/)
+    for (const changed of [
+      { stage: 'wrong' }, { completedAt: '' }, { checks: receipt.checks.slice(1) },
+      { checks: [...receipt.checks, 'apiKeyBillingFallback'] }, { receiptSha256: '' }, { accessToken: 'secret-fixture' },
+      ...Object.keys(canonical).map(key => ({ binding: { ...canonical, [key]: key === 'platform' ? 'darwin' : 'wrong' } }))
+    ]) assert.throws(() => manualStageEvidence(canonical, stage, { status: 'passed', receipt: { ...receipt, ...changed } }), /Invalid/)
+  }
+  assert.throws(() => manualStageEvidence(canonical, 'unknown', { status: 'passed' }), /Invalid/)
+  assert.throws(() => manualStageEvidence(canonical, 'chatgptInference', { status: 'passed' }), /Invalid/)
+  assert.throws(() => manualStageEvidence(canonical, 'chatgptInference', { status: 'blocked', reason: 'secret-fixture' }), /Invalid/)
+  assert.throws(() => manualStageEvidence(canonical, 'chatgptInference', { status: 'not_run', token: 'secret-fixture' }), /Invalid/)
+  const mac = { ...canonical, platform: 'darwin' }
+  assert.throws(() => manualStageEvidence(mac, 'windowsPhysicalKeys', { status: 'passed',
+    receipt: { ...receiptFor('windowsPhysicalKeys'), binding: mac } }), /Invalid/)
 })

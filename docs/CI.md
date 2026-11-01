@@ -10,52 +10,52 @@ main/manual runs have unique concurrency groups. There are no path filters.
 `.github/workflows/ci.yml` is the single entrypoint for PRs, main pushes and manual
 runs. It combines the previously parallel CLI checks and Windows acceptance
 preparation workflows; their test responsibilities were distinct, not duplicate.
-No matrix legs or tests were removed. Linux correctness stays independent of the
-Windows/package graph, and MCP and pinned ConPTY still start independently of the
+Linux correctness stays independent of the Windows/package graph, and MCP and
+pinned ConPTY still start independently of the
 candidate. Only archive-consuming jobs retain their existing candidate dependency.
 
 Check names identify three responsibilities: `Linux correctness`, `Windows
 compatibility`, and `Package/runtime`. Job IDs, runner isolation, matrix strategies,
 step ordering, artifacts and runtime versions remain unchanged. Consolidating the
-configuration does not reduce computation or serialize the existing parallel jobs.
+configuration keeps the independent jobs parallel.
 PR cancellation now applies to the one combined workflow; main/manual runs remain
 unique and are never superseded by another run.
 
-PRs have eight execution jobs plus one summary job (nine total). Main/manual runs
-have nine execution jobs plus one summary (ten total). The PR-only current
-compatibility job is intentionally skipped on main/manual and is not counted as
-an executed job (GitHub can therefore display eleven main/manual job entries,
-including that skipped entry). Before consolidation there were two workflows and eight/nine
-execution jobs, with no overall summary.
+PRs use focused latest-Node smoke groups and minimum-Windows boundaries. Main/manual
+runs use the broad Windows matrices and full latest-Linux coverage. Skipped matrix
+jobs can appear in GitHub's job list; they are not executed coverage.
 
-The execution coverage is unchanged:
+The workflow selects these groups:
 
-- Linux Node 26.4.0 and current 26: build once, then every Node test file
+- Linux Node 26.4.0: build once, then `linux-node`; current 26 uses `linux-current`
+  on PRs and `linux-node` on main/manual
 - Linux candidate: pinned Bun 1.4.2 TUI suite, cold packed Node/Bun consumer
   acceptance, immutable archive/evidence export, standalone probe/build/help
-- Windows minimum Node MCP: every MCP/OAuth test file, serial native helpers
-- Windows minimum Node headless: remaining platform-compatible Node files
+- Windows MCP and headless matrices: `windows-mcp` and `windows-headless` on both
+  minimum and current Node on main/manual, with serial native helpers
 - Windows current Node compatibility: native MCP/command startup, exact argv and
   environment, binary I/O, cancellation, verified descendant cleanup, every OAuth
   callback/lifecycle file, and cold packed Node acceptance
 - Windows pinned Bun: public URL/HTTP/OAuth boundaries, all TUI files, genuine stock
   ConPTY fallback, cold packed minimum-Node/Bun consumer acceptance, standalone
-  probe/build/help
+  probe/build/help; PRs also run `windows-minimum` with Node
 - Windows pinned modern ConPTY: independent hash-verified official Microsoft
   mode1 transport gate, with unconditional private-backend cleanup
 
 Main/manual runs replace focused current-Node compatibility with the complete
 current-Node Windows MCP and headless suites plus packed Node acceptance. The
-minimum-Node Windows coverage is unchanged across these events. Wider current-Node
-regressions can therefore surface after merge; critical native runtime boundaries
+minimum-Node Windows PR boundaries run in the Bun job before its Bun suites.
+Wider Windows regressions can therefore surface after merge; critical native runtime boundaries
 and OAuth lifecycle remain premerge on both versions.
 
 ## Overall result
 
 `CI summary` directly depends on all seven execution job IDs (including both
 matrix jobs and the Linux matrix) and uses `always()` to inspect their results.
-Every expected job must report `success`; failures, cancellations, unknown results,
-missing jobs and unexpected skips fail the summary. On main/manual only,
+Every expected executed job must report `success`; failures, cancellations,
+unknown results, missing jobs and unexpected skips fail the summary. On PRs,
+`mcp` and `headless` must report `skipped` because focused Windows gates run instead.
+On main/manual,
 `current-compatibility` must report `skipped`, because the complete current-Node
 Windows MCP/headless matrix legs run instead. No job uses `continue-on-error`.
 A failed matrix leg therefore prevents a passing matrix result. If GitHub cancels
@@ -69,22 +69,30 @@ requiring the new name or removing old required names.
 
 ## Test ownership and runtime evidence
 
-At this revision the inventory contains 111 Node files and 24 TUI files:
+File selection comes from `ciTestGroups()` in `scripts/ci-tests.mjs`. Generate the
+current file map and counts from the checkout instead of copying numbers here:
 
-| Group | Files | Executed coverage |
-| --- | ---: | --- |
-| `linux-node` | 111 | Both Linux Node versions |
-| `windows-mcp` | 35 | Minimum always, current on main/manual |
-| `windows-headless` | 71 | Minimum always, current on main/manual |
-| `windows-current` | 25 | Focused current Node on PRs |
-| `bun-tui` | 24 | Linux candidate and Windows Bun |
-| `bun-boundaries` | 28 | Windows Bun |
-| `windows-stock` | 1 | Windows Bun stock fallback |
-| `windows-modern` | 1 | Independent Windows pinned ConPTY |
-| `linux-only` | 2 | Included in Linux Node, excluded on Windows |
-| `manual-system-mode1` | 1 | Original OS-dependent diagnostic, not a CI Windows gate |
+```sh
+node scripts/ci-tests.mjs --list
+node --input-type=module -e "import {ciTestGroups} from './scripts/ci-tests.mjs'; console.log(JSON.stringify(Object.fromEntries(Object.entries(await ciTestGroups()).map(([name, files]) => [name, files.length])), null, 2))"
+```
 
-These counts describe file selection, not individual test cases or claims that
+| Group | Executed coverage |
+| --- | --- |
+| `linux-node` | Every Node file; minimum always, current on main/manual |
+| `linux-current` | Focused current Node on PRs |
+| `windows-minimum` | Minimum Node PR boundaries in the Windows Bun job |
+| `windows-mcp` | Both Node versions on main/manual |
+| `windows-headless` | Both Node versions on main/manual |
+| `windows-current` | Focused current Node on PRs |
+| `bun-tui` | Linux candidate and Windows Bun |
+| `bun-boundaries` | Windows Bun |
+| `windows-stock` | Windows Bun stock fallback |
+| `windows-modern` | Independent Windows pinned ConPTY |
+| `linux-only` | Included in Linux Node, excluded on Windows |
+| `manual-system-mode1` | Original OS-dependent diagnostic, not a CI Windows gate |
+
+Generated counts describe file selection, not individual test cases or claims that
 platform-specific skipped fixtures executed. The seven restricted/adversarial
 skills-store assessments remain unconditionally skipped; neither this reorganization
 nor summary validation enables or reruns them.
@@ -106,6 +114,14 @@ does not establish physical-terminal, native-vault, or binary-release acceptance
 Run `npm run build` before a leaf test group or `npm run test:package:built`.
 The ordinary `npm test`, `npm run check`, and other developer commands still build
 as before. Run the full main/manual gates before development release validation.
+Audit lane checks select explicit ordinary files and never run
+`test/skills-store.test.mjs`, broad groups containing it, or blanket `npm test`.
+
+The separate [synthetic acceptance report](../PLATFORM_ACCEPTANCE.md#synthetic-report-contract)
+requires an explicit backend and a clean committed source SHA. Its fixture hash is
+not a package hash. Windows and macOS reports must be generated independently on
+the same frozen source with Node >=26.4; Node24 does not qualify. Synthetic
+helper/store results never cover real OAuth, vault or physical-input stages.
 
 For focused CI-organization validation without running application assessments:
 

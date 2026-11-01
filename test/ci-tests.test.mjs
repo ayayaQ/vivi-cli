@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { ciTestGroups } from '../scripts/ci-tests.mjs'
+
+test('CI documentation inventories selector groups without stale file counts', async () => {
+  const groups = await ciTestGroups()
+  const docs = await readFile(new URL('../docs/CI.md', import.meta.url), 'utf8')
+  const documented = [...docs.matchAll(/^\| `([^`]+)` \|/gm)].map(match => match[1])
+  assert.deepEqual(documented.sort(), Object.keys(groups).sort())
+  assert(!/^\| `[^`]+` \| \d+ \|/m.test(docs), 'Generate file counts from selectors')
+  assert(docs.includes('node scripts/ci-tests.mjs --list'))
+  assert(docs.includes('files.length'))
+  assert(groups['linux-node'].includes('./test/platform-acceptance-synthetic.test.mjs'))
+  assert(groups['windows-headless'].includes('./test/platform-acceptance-synthetic.test.mjs'))
+})
 
 test('CI inventories every Node and Bun test with explicit Windows native ownership', async () => {
   const groups = await ciTestGroups()

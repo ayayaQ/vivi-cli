@@ -95,9 +95,10 @@ byte-exact.
 Use a real Windows machine and terminal with the same final canonical npm archive.
 The safe offline native probe must default to read-only availability and record
 presence checks. It must never display existing record values. The current vault
-implementation uses fixed targets `vivi-cli/openai` and `vivi-cli/openrouter`;
+implementation uses fixed targets `vivi-cli/openai`, `vivi-cli/openrouter`,
+`vivi-cli/deepseek` and `vivi-cli/deepseek-web`, plus scoped native wrapping-key slots;
 saving a fake value could overwrite an existing key. Refuse every save if either
-target already has a Vivi record, or if safe absence cannot be established.
+target in the intended probe already has a Vivi record, or if safe absence cannot be established.
 No account creation, security-setting change or deletion is required. Nothing in
 the automated workflow invokes the real vault or performs these saves.
 
@@ -114,8 +115,8 @@ existing records untouched; unavailable or unsafe steps must be reported as such
   CLI commit, exact artifact SHA-256 and whether package or executable is tested
 - Install into a fresh consumer with no repository dependency fallback; run the
   installed bin's help and Node line-mode route without importing native TUI modules
-- Verify read-only availability and presence/absence for both fixed provider targets
-- Only after explicit write approval and confirmed absence of both records, verify
+- Verify read-only availability and metadata-only presence/absence for every intended target
+- Only after explicit write approval and confirmed absence of all intended records, verify
   fake save and exact-byte read-back separately; recheck absence before any save
 - Restart the process and verify the saved fake value is still readable; check
   shell arguments, diagnostics, preferences and sessions contain no marker
@@ -135,6 +136,119 @@ On Windows, "locked/unavailable" is the actual unsupported/restricted credential
 session or helper failure path. Do not manufacture that condition by changing
 security settings. Fake protocol errors are useful automated coverage, not proof
 that the native failure path worked.
+
+`NativeCredentialStore.load()` returns a value and is never a safe presence probe
+for an existing target. A metadata-only preflight must not call it, even to discard
+the result. The synthetic `targetPreflight()` helper accepts only availability and
+presence callbacks. It blocks occupied, uncertain, malformed and unavailable
+results; `eligible` means absence was reported, not permission to write. There is
+no real presence backend or live write harness in the A8 tooling. If absence
+cannot be established safely, record `blocked` and leave the target untouched.
+
+## Synthetic report contract
+
+`scripts/platform-acceptance.mjs` retains the package-check schemaVersion 1 API
+used by the packed-consumer checks above. Its new schemaVersion 2 API and
+`scripts/platform-acceptance-synthetic.mjs` record a separate exact stage:
+`synthetic-helper-store-report`. Neither module has a default live acceptance
+route. The executable requires `--synthetic`; no flags enable native or live work.
+
+Build once with an assigned machine lease, commit the candidate, then generate
+reports outside the checkout. Use Node >=26.4 (Windows audit runtime: 26.10):
+
+```powershell
+$candidate = git rev-parse HEAD
+node scripts/platform-acceptance-synthetic.mjs --synthetic --candidate $candidate --output C:\a8-evidence\windows-synthetic.json
+```
+
+For an independently assigned Mac shell on the same frozen commit, with its
+project-local Node26.4 or newer selected:
+
+```sh
+candidate=$(git rev-parse HEAD)
+node scripts/platform-acceptance-synthetic.mjs --synthetic --candidate "$candidate" --output /tmp/macos-synthetic.json
+```
+
+The command rejects a mismatched SHA, a dirty checkout and an existing output
+file. The output directory must already exist. It uses only an in-memory native
+helper runner and newly allocated temporary ChatGPT records. Cleanup removes
+only that temporary fixture directory. No browser, real auth store, vault,
+provider catalog, OAuth exchange or inference request is involved.
+
+Every v2 report binds `candidateSha`, `artifactSha256`, `artifactKind`, actual
+`platform`, `arch`, Node runtime and UTC `generatedAt`. The CLI uses the fixed
+`synthetic-fixture` identity exported as `fixtureSha256`, which hashes the UTF-8
+fixture identity `vivi-cli/a8/synthetic-helper-store-report/v1`. It is not a tarball
+digest. `canonical-package` bindings, used only for separately collected manual
+receipts, must use the selected archive's actual SHA-256. Synthetic runs on
+different machines are separate observations; do not copy or relabel one report.
+
+All twelve fixed synthetic checks must be present and boolean before report
+generation. A false check becomes `failed`; missing checks, string outcomes,
+unknown fields, unsupported runtime or malformed bindings are rejected. The CLI
+emits no success report if an assertion or fixture step throws. It never copies
+native output, tokens, account identifiers, authorization URLs, paths or arbitrary
+diagnostics into reports. The seven historical `excludedAssessment` names and
+bodies in `test/skills-store.test.mjs` remain unchanged and unrun.
+
+The current credential model includes OpenAI/OpenRouter/DeepSeek API keys and the
+separate `deepseek-web` slot. MCP and ChatGPT store only a base64-encoded 32-byte
+wrapping key in `mcp-oauth-key-v1-{sha256}` native slots. ChatGPT derives its scope
+from SHA-256 of `vivi-cli/chatgpt-auth/v1` + NUL + the canonical auth directory;
+MCP hashes its canonical directory without that ChatGPT prefix. They remain
+independent even under the same settings root. ChatGPT `host.json` and
+`registrations.json` retain host and registration metadata without tokens; each
+`account-{sha256}.json` credential record contains exactly `version`, `iv`, `tag`
+and `ciphertext` (version 1, AES-256-GCM, 12-byte IV and 16-byte tag). Its AAD binds
+`vivi-cli/chatgpt-auth/v1/{hostId}/{accountId}`. The synthetic fixture verifies
+encryption, AAD, scoped key separation, restart, tamper rejection, locked storage
+and metadata-only/session-only clearing against these current source interfaces.
+It does not prove live OAuth or complete end-to-end session-only login behavior.
+
+All manual stages default to `not_run` and overall platform acceptance remains
+`pending_manual_validation`, even when every synthetic check passes. Fixed stages
+cover native preflight/save/restart/unavailable/session-only, ChatGPT registration,
+browser return, cancellation, account/workspace selection, entitlement, restart,
+logout, revocation, session-only fallback and separately authorized inference,
+plus terminal startup/restoration and physical Windows keys.
+
+`manualStageEvidence(binding, stage, evidence)` validates a separately collected
+human assertion. `blocked` requires a fixed reason (`not_authorized`,
+`helper_unavailable`, `occupied`, `uncertain`, `interactive_required` or
+`unsupported_platform`). `passed` or `failed` requires a canonical-package receipt
+with exactly `binding`, `stage`, UTC `completedAt`, fixed `checks`, and
+`receiptSha256` (the hash of the independently retained sanitized receipt). A pass
+requires every identifier in `manualStageChecks[stage]`; incomplete or mismatched
+receipts cannot pass. Synthetic-fixture receipts cannot become live passes.
+The validator records assertions; it does not authenticate a human receipt or
+execute a live stage. Keep the sanitized receipt outside source alongside its
+hash. Do not include account names, credentials, native output or OAuth payloads.
+See the [ChatGPT procedure](docs/CHATGPT_ACCEPTANCE.md) for scope and evidence.
+
+## Physical Windows Enter/Shift+Enter/Ctrl+J procedure
+
+This is a user-run procedure on the canonical artifact in the actual terminal.
+Record Windows build, terminal/version, architecture, Node/Bun versions, commit,
+archive SHA-256 and date in the separately reviewed receipt. Keep
+`windowsPhysicalKeys` as `not_run` until performed; synthetic ConPTY records,
+headless OpenTUI rendering and the ordinary input tests cannot satisfy it.
+
+1. Disable raw input/debug capture. Start the installed canonical `vivi
+   --diagnose-input` command by itself in the affected Windows terminal. The
+   existing offline diagnostic bypasses credentials, providers and configuration.
+2. Physically press Enter, Shift+Enter, then Ctrl+J once each. Press Escape to
+   restore the terminal and print bounded key/modifier and negotiation metadata.
+   Do not type credentials or paste content. Review the diagnostic before sharing.
+3. Compare reported modifiers: Enter is a send action, Ctrl+J is a newline, and
+   Shift+Enter is a newline only when the terminal supplies its modifier. If the
+   terminal reports identical input for Enter and Shift+Enter, retain that
+   limitation and use Ctrl+J. A diagnostic pass establishes observed reporting,
+   not a claim that a prior physical-key defect is fixed.
+4. Record failure or unavailable conditions honestly. Any composer send/newline
+   smoke must use an explicitly configured offline fake-provider harness; do not
+   send a live turn. Record terminal restoration separately after normal exit and
+   idle Ctrl+C. Input runtime changes require a sanitized reproduction and a
+   separate assignment; A8 changes no input behavior or PR66 helper diagnostic.
 
 ## macOS/Linux and later binary gates
 
