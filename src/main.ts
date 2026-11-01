@@ -43,11 +43,18 @@ import { McpOAuthControls } from './mcp-oauth-controls.js'
 import { McpOAuthStore } from './mcp-oauth-store.js'
 import type { McpOAuthControlsOptions } from './mcp-oauth-controls.js'
 import { isMcpCliCommand, runMcpCli } from './mcp-cli.js'
+import { ChatGptAuthManager } from './chatgpt-auth.js'
+import { createChatGPTProvider } from './chatgpt-provider.js'
+import { ChatGPTModelCatalog } from './chatgpt-models.js'
+import { bindChatGptAccount, chatGptPlanStatus } from './chatgpt-controls.js'
+import type { ChatGptAuth } from './chatgpt-controls.js'
+import { isChatGptCliCommand, runChatGptCli } from './chatgpt-cli.js'
 
 export interface CliOptions {
   /** Launch-only request to open enrollment; never a saved approval. */
   approvalMode: ApprovalMode
   provider?: CliProviderName
+  chatgptAccountId?: string
   webProvider?: CliWebProviderName
   reviewer?: 'openai' | 'openrouter' | 'none'
   model?: string
@@ -73,15 +80,20 @@ export interface CliOptions {
   imageAssets?: CliImageAssets
   imageCapability?: import('./models.js').Capability
   imageModelCapabilities?: import('@ayayaq/vivi/providers/models').ModelCapabilities
+  /** Runtime-only selected-registration credential resolver; never serialized. */
+  chatgptAuth?: ChatGptAuth
+  chatgptIsCurrent?: () => boolean
 }
 export const HELP = `vivi - a shared-agent terminal application
 
-Usage: vivi --provider openai|openrouter|deepseek --model MODEL [options]
+Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options]
+       vivi auth login|list|logout|usage
        vivi --resume SESSION_ID [options]
        vivi mcp add|list|login|connect|logout|remove   Provider-independent MCP setup
        vivi                       Interactive setup and saved defaults (Bun)
 
-  --provider NAME             openai (default), openrouter or deepseek
+  --provider NAME             openai (default), openrouter, deepseek or chatgpt
+  --chatgpt-account ID         Exact ChatGPT account/workspace registration from vivi auth list
   --web-provider NAME         direct (keyless default), deepseek (explicit paid opt-in), disabled
   --reviewer NAME             Explicit Auto reviewer: openai, openrouter or none (conversation only)
   --model MODEL               Required for a new session
@@ -95,7 +107,7 @@ Usage: vivi --provider openai|openrouter|deepseek --model MODEL [options]
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
   --prompt TEXT               Run one turn and exit
   --no-stream                 Display accepted complete messages only
-  --approval-mode MODE        manual (default) or auto; auto still needs fresh interactive enrollment
+  --approval-mode MODE        manual (default), auto or skip; fresh interactive enrollment required
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
   --tools / --no-tools        Declare tool support / use chat only
   --enable-notes              Enable session-only reviewed notes (default)
@@ -109,7 +121,9 @@ Usage: vivi --provider openai|openrouter|deepseek --model MODEL [options]
   --max-rounds NUMBER         Bounded provider rounds, 1..100 (default 25)
   --help                      Show this help
 
-Credentials: environment variables, or masked /provider setup in the full-screen UI.
+Credentials: API keys via environment or masked /provider setup; official ChatGPT sign-in via vivi auth login or /provider.
+ChatGPT never inherits an Auto reviewer; use /reviewer with a separately configured supported API credential.
+Skip permissions is explicit, launch/session-only and not an AI review. Hard denials remain; unsandboxed commands can act beyond the workspace.
 Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its name, id and usage; /rename NAME changes its name.
 Streaming is display-only. Notes never access other files; piped approval is denied.
@@ -117,16 +131,16 @@ Saved memory is off by default. When enabled, it is sent to the selected provide
 Workspace defaults to the directory where vivi was launched; --workspace overrides it, --no-workspace disables it.
 Selected files may be sent to your provider and saved in session history.
 Workspace tools omit symlinks and private/ignored files; text writes require review; this is not an OS sandbox.
-/commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval, even in Auto; piped approval is denied.
+/commands off disables command proposals; /commands on restores them for this launch/session. Every unsandboxed process requires exact human approval in Manual/Auto; Skip permissions requires separate enrollment; piped approval is denied.
 /processes lists background jobs; /processes logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected background job; F7 stops all, including while the agent works.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
-/mode selects Manual / Auto review / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
+/mode selects Manual / Auto review / Skip permissions / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
 /auto-threshold [90–100|default] saves this reviewer’s requirement cutoff (0.1 percentage-point steps); changes revoke Auto and need fresh consent.
 Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
 /mcp configures trusted installed stdio servers and Streamable HTTP endpoints; fresh human connection approval is required.
-MCP connections start disabled each launch. HTTPS entries guide reviewed browser sign-in and public client setup; browser sign-in and connection use one reviewed setup approval. Approved sign-in can be saved in OS-protected encrypted storage and refreshed before a later approved Connect. Explicit session-only sign-in is available; Sign out forgets saved tokens locally. Every remote operation needs human approval, even in Auto.
+MCP connections start disabled each launch. HTTPS entries guide reviewed browser sign-in and public client setup; browser sign-in and connection use one reviewed setup approval. Approved sign-in can be saved in OS-protected encrypted storage and refreshed before a later approved Connect. Explicit session-only sign-in is available; Sign out forgets saved tokens locally. Remote operations need human approval in Manual/Auto; enrolled Skip applies only to already-connected servers.
 Skills are app-wide standard SKILL.md files. Metadata and selected text go to your provider.
 The bundled creator is read-only. Scripts are never executed; workspace skills are never auto-loaded.
 `
@@ -153,9 +167,14 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--help': case '-h': options.help = true; break
       case '--provider': {
         const name = value()
-        if (name !== 'openai' && name !== 'openrouter' && name !== 'deepseek') throw new Error('Provider must be openai, openrouter or deepseek')
+        if (name !== 'openai' && name !== 'openrouter' && name !== 'deepseek' && name !== 'chatgpt') throw new Error('Provider must be openai, openrouter, deepseek or chatgpt')
         options.provider = name
         break
+      }
+      case '--chatgpt-account': {
+        const id = value()
+        if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Use an exact ChatGPT account registration ID from vivi auth list')
+        options.chatgptAccountId = id; break
       }
       case '--web-provider': {
         const name = value()
@@ -191,7 +210,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--no-stream': options.stream = false; break
       case '--approval-mode': {
         const mode = value()
-        if (mode !== 'manual' && mode !== 'auto') throw new Error('Approval mode must be manual or auto')
+        if (mode !== 'manual' && mode !== 'auto' && mode !== 'skip') throw new Error('Approval mode must be manual, auto or skip')
         options.approvalMode = mode
         break
       }
@@ -224,6 +243,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
     options.workspace = resolve(launchDirectory, options.workspace)
   }
   if (options.help) return options
+  if (options.chatgptAccountId && options.provider !== 'chatgpt' && !options.resume) throw new Error('--chatgpt-account requires --provider chatgpt')
+  if (options.resume && options.chatgptAccountId) throw new Error('Resumed sessions retain their ChatGPT account registration; omit --chatgpt-account')
   if (options.resume && (!isSessionId(options.resume) || explicitlyNew)) throw new Error('Use a valid session UUID and either new or resume')
   if (options.resume && (options.provider !== undefined || options.model !== undefined || options.reasoning !== undefined)) {
     throw new Error('Resumed sessions retain their provider, model and reasoning; omit selection flags')
@@ -260,6 +281,16 @@ export function supportsBunTui(version: string | undefined = process.versions.bu
 }
 
 export function providerForSession(session: CliSession, options: CliOptions, env: NodeJS.ProcessEnv): ModelProvider {
+  if (session.provider === 'chatgpt') {
+    const auth = options.chatgptAuth, accountId = session.chatgptAccountId
+    if (!auth || !accountId) throw new Error('Choose a signed-in ChatGPT account with /provider or vivi auth login')
+    return createChatGPTProvider({ model: session.model, accountId, accessToken: signal => auth.accessToken(accountId, signal),
+      ...(options.chatgptIsCurrent ? { isCurrent: options.chatgptIsCurrent } : {}),
+      reasoning: reasoningPolicy(session.reasoning), supportedReasoningEfforts: options.reasoningCapabilities,
+      stream: options.stream,
+      ...(options.imageAssets ? { resolveImage: (reference: import('@ayayaq/vivi').ToolImageReference) => options.imageAssets!.resolve(reference) } : {}),
+      ...(options.imageModelCapabilities ? { modelCapabilities: options.imageModelCapabilities } : {}) })
+  }
   const name = providerEnvironmentName(session.provider)
   const apiKey = env[name]
   if (!apiKey) throw new Error(`Set ${name} in your environment`)
@@ -278,7 +309,7 @@ export function providerForSession(session: CliSession, options: CliOptions, env
 
 /** Dedicated fixed-model review on the selected existing account; never discover or copy credentials. */
 export function decisionProviderForSession(session: CliSession, env: NodeJS.ProcessEnv, beforeRequest?: () => void): DecisionProvider {
-  if (!isReviewProvider(session.provider)) throw new Error('DeepSeek is not an Auto reviewer. Choose OpenAI or OpenRouter explicitly with /reviewer')
+  if (!isReviewProvider(session.provider)) throw new Error('This chat provider is not an Auto reviewer. Choose a separately configured OpenAI or OpenRouter reviewer explicitly with /reviewer')
   const name = providerEnvironmentName(session.provider)
   const apiKey = (): string => {
     beforeRequest?.()
@@ -311,11 +342,13 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
     decisionProviderFactory?: typeof decisionProviderForSession;
     credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
+    chatgptAuth?: ChatGptAuth;
     mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
     mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>;
     inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
   // MCP setup is independent of chat credentials, sessions and full-screen startup.
   if (isMcpCliCommand(args)) return runMcpCli(args, env, dependencies)
+  if (isChatGptCliCommand(args)) return runChatGptCli(args, env, dependencies)
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
     if (args.length !== 1) { process.stderr.write('Use --diagnose-input by itself\n'); return 1 }
@@ -337,6 +370,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
   let host: CliHost | undefined
   let mcp: McpManager | undefined
   let oauth: McpOAuthControls | undefined
+  let chatgptAuth: ChatGptAuth | undefined
   const secrets = environmentSecrets(env)
   const closeIO = (): boolean => {
     const closing = io
@@ -368,6 +402,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const status = await runApplication({ io: tui, options, args, env, secrets,
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
         ...(dependencies.catalog ? { catalog: dependencies.catalog } : {}),
+        ...(dependencies.chatgptAuth ? { chatgptAuth: dependencies.chatgptAuth } : {}),
         ...(dependencies.mcpManagerFactory ? { mcpManagerFactory: dependencies.mcpManagerFactory } : {}),
         ...(dependencies.mcpOAuth ? { mcpOAuth: dependencies.mcpOAuth } : {}),
         registerSecret: secret => { if (!secrets.includes(secret)) secrets.push(secret) },
@@ -409,21 +444,41 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     secretTargets = values => {
       memory.addSecrets(values); preferences.addSecrets(values); skills.addSecrets(values); workspace?.addSecrets(values); host?.refreshSecretFilters()
     }
+    chatgptAuth = dependencies.chatgptAuth ?? new ChatGptAuthManager({ directory: options.sessionDirectory,
+      registerSecrets: values => {
+        const fresh = values.filter(value => value && !secrets.includes(value))
+        secrets.push(...fresh); mcp?.addSecrets(fresh); secretTargets(fresh); io?.addSecrets?.(fresh)
+      } })
+    const accountId = options.chatgptAccountId ?? savedPreferences.chatgptAccountId
+    if (!options.resume && options.provider === 'chatgpt' && !accountId) throw new Error('Choose an exact ChatGPT account with --chatgpt-account ID from vivi auth list; no account was selected automatically')
     const fresh = options.resume ? undefined : newSession({
       provider: options.provider ?? 'openai', model: options.model!,
+      ...(options.provider === 'chatgpt' && accountId ? { chatgptAccountId: accountId } : {}),
       ...(options.reasoning ? { reasoning: options.reasoning } : {})
     })
     release = await store.acquire(options.resume ?? fresh!.id)
     const session = options.resume ? await store.load(options.resume) : fresh!
+    if (session.provider === 'chatgpt') {
+      const account = await chatgptAuth.select(session.chatgptAccountId!)
+      if (!account.planUsageEnabled) throw new Error('ChatGPT plan usage is disabled. Use vivi auth login --chatgpt-account ID --enable-plan-usage or explicitly choose another provider')
+      io.write(chatGptPlanStatus(account))
+    }
+    const chatgptModels = new ChatGPTModelCatalog({ accessToken: (id, signal) => chatgptAuth!.accessToken(id, signal) })
+    const apiCatalog = new ModelCatalog()
+    const catalog: Catalog = dependencies.catalog ?? { list: (provider, credential, signal, refresh) => provider === 'chatgpt'
+      ? chatgptModels.list(credential ?? '', signal, refresh) : apiCatalog.list(provider, credential, signal, refresh) }
     let metadata: ModelEntry
     const controller = new AbortController()
     const dispose = io.onCancel(() => controller.abort())
     const surfaceClosed = (): boolean => io instanceof TerminalIO ? io.isDisposed : io?.isClosed === true
     try {
       if (session.provider !== 'openai') io.write(`Loading ${session.provider} model capabilities…\n`)
-      const key = env[providerEnvironmentName(session.provider)]
-      const hydrated = await hydrateModelCapabilities(dependencies.catalog ?? new ModelCatalog(),
+      const key = session.provider === 'chatgpt' ? session.chatgptAccountId : env[providerEnvironmentName(session.provider)]
+      const hydrated = await hydrateModelCapabilities(catalog,
         session.provider, session.model, key, controller.signal)
+      if (session.provider === 'chatgpt' && !hydrated.catalog?.models.some(model => model.id === session.model)) {
+        throw new Error('This model is not listed for the selected ChatGPT account. Choose a current account model')
+      }
       if (surfaceClosed() || controller.signal.aborted) return 130
       metadata = hydrated.model
       if (hydrated.catalog?.warning) io.write(`${redactSecrets(hydrated.catalog.warning, secrets)}. Using a stale cached catalog\n`)
@@ -432,7 +487,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       if (surfaceClosed() || controller.signal.aborted) return 130
       // An unavailable catalog permits chat only or this launch's explicit
       // declaration. Authentication denial must never fall back to a request.
-      if (modelAccessDenied(error)) throw error
+      if (modelAccessDenied(error) || session.provider === 'chatgpt') throw error
       metadata = unknownModel(session.model)
       io.write(`${redactSecrets(error instanceof Error ? error.message : 'Model capabilities could not be loaded', secrets)}\n`)
     } finally { dispose() }
@@ -440,14 +495,25 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
       declared: args.includes('--tools') })
     const effective: CliOptions = { ...options, enableTools, enableNotes: options.enableNotes && enableTools,
+      ...(session.provider === 'chatgpt' ? { chatgptAuth } : {}),
       reasoningCapabilities: metadata.reasoning === 'supported' ? [...metadata.efforts] : options.reasoningCapabilities,
       stream: metadata.streaming === 'unsupported' ? false : options.stream }
     const images = new FileImageAssets(join(options.sessionDirectory, 'images'), session.id)
     effective.imageAssets = images
     effective.imageCapability = metadata.vision ?? 'unknown'
     if (metadata.modelCapabilities) effective.imageModelCapabilities = metadata.modelCapabilities
-    const provider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
-    const accountRevision = randomUUID()
+    let accountRevision = randomUUID(), accountCurrent = true
+    if (session.provider === 'chatgpt') effective.chatgptIsCurrent = () => accountCurrent
+    const rawProvider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
+    const provider = session.provider === 'chatgpt' ? bindChatGptAccount(rawProvider, {
+      isCurrent: () => accountCurrent,
+      invalidate: async () => {
+        accountCurrent = false; accountRevision = randomUUID(); chatgptModels.clear()
+        host?.revokeApprovalEnrollment(); host?.invalidateContext(); io?.setApprovalMode?.('manual'); io?.setContext?.(undefined, false)
+        io?.write('ChatGPT account access needs attention. Unattended permissions revoked; stopping owned background commands. Credentials were not deleted solely because inference was denied.\n')
+        await host?.stopAllBackgroundCommands()
+      }
+    }) : rawProvider
     const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
     const webKey = env.DEEPSEEK_WEB_API_KEY
     const web: CliWebConfiguration = options.webProvider === 'deepseek' ? { provider: 'deepseek', revision: randomUUID(), apiKey: () => {
@@ -457,11 +523,12 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     if (web.provider === 'deepseek') io.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
     const commandEnv = captureCommandEnvironment(env)
     host = new CliHost({ provider, images, imageCapability: metadata.vision ?? 'unknown', ...(metadata.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+      permissionApproval: { accountRevision: () => accountRevision, isAvailable: () => accountCurrent && io?.canAutoReview === true && !io.isClosed },
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
-      skillSaveApproval: { isAvailable: () => options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
+      skillSaveApproval: { isAvailable: () => accountCurrent && options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
       onSkillsNotice: message => io!.write(`${message}\n`), ...(workspace ? { workspace } : {}),
       ...(workspace ? { commandWorkspaceFactory: () => TrustedCommandWorkspace.open(workspace.directory, commandEnv, secrets), commandApproval: { accountRevision: () => accountRevision,
-        isAvailable: () => io?.canAutoReview === true && !io.isClosed } } : {}),
+        isAvailable: () => accountCurrent && io?.canAutoReview === true && !io.isClosed } } : {}),
       onMemoryNotice: message => io!.write(`${message}\n`),
       onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
       ...(io.canAutoReview === true && selectedReviewer ? { decisionReview: {
@@ -469,11 +536,11 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         ...(options.reviewer ? { explicitReviewer: true as const } : {}),
         ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
         autoReviewThresholds: savedPreferences.autoReviewThresholds ?? {},
-        accountRevision: () => accountRevision, isAvailable: () => thresholdPreferencesAvailable && io?.canAutoReview === true && !io.isClosed
+        accountRevision: () => accountRevision, isAvailable: () => accountCurrent && thresholdPreferencesAvailable && io?.canAutoReview === true && !io.isClosed
       } } : {}),
       ...(io.canAskQuestions === true && io.askQuestions ? { questionHost: {
         ask: (request, { signal }) => io!.askQuestions!(request, signal),
-        isAvailable: () => io?.canAskQuestions === true && !io.isClosed,
+        isAvailable: () => accountCurrent && io?.canAskQuestions === true && !io.isClosed,
         accountRevision: () => accountRevision
       } } : {}),
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
@@ -486,6 +553,10 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
     if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
+    else if (options.approvalMode === 'skip') {
+      if (io.canAutoReview !== true || io.isClosed) io.write('Skip permissions requires a live interactive terminal and fresh confirmation. Using Manual; piped and headless launches cannot enroll.\n')
+      else await selectApprovalMode(host, io, async () => 'skip')
+    }
     const configureReviewer = async (line = ''): Promise<boolean> => {
       const name = line.trim().replace(/^\/reviewer\s*/, '')
       if (name === 'none') { host!.setDecisionReview(undefined); io!.setApprovalMode?.('manual'); io!.write('Auto reviewer: none\n'); return false }
@@ -575,6 +646,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         else process.stderr.write('Session lease release failed; inspect its lock before restarting\n') }
       catch { process.stderr.write('Session lease release failed\n') }
     }
+    if (!dependencies.chatgptAuth) await chatgptAuth?.close()
     const terminalCleanupFailed = closeIO()
     if (mcpCleanupFailed || hostCleanupFailed || leaseCleanupFailed || terminalCleanupFailed) return 1
   }

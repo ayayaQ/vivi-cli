@@ -5,7 +5,7 @@ import { mcpFreeze, mcpRecord, mcpText, validateMcpServer } from './mcp-config.j
 import { mcpContainsSecret } from './mcp-content.js'
 
 export const MCP_SETUP_TOOL_NAMES = ['mcp_list', 'mcp_setup'] as const
-export const MCP_SETUP_GUIDANCE = 'mcp_list reads only local, credential-free MCP configuration and connection status. mcp_setup proposes a bounded HTTP endpoint setup action through the same trusted host controls as /mcp. Every configuration change, connection and sign-in action requires fresh human review, including in Auto. An expectedRevision is only a freshness check, never approval. Add saves a disabled entry and does not connect. Login opens the host-guided browser flow; the user grants account access in the browser. Trusted controls review the exact connection or bundled registration/sign-in/connection plan. Never request or supply passwords, tokens, headers, environment values, OAuth client secrets, arbitrary settings or installation commands. Newly connected MCP tools become available in the next turn. Do not retry uncertain setup outcomes; inspect /mcp first.'
+export const MCP_SETUP_GUIDANCE = 'mcp_list reads only local, credential-free MCP configuration and connection status. mcp_setup proposes a bounded HTTP endpoint setup action through the same trusted host controls as /mcp. Every configuration change, connection and sign-in action requires fresh human review, including in Auto and Skip permissions. An expectedRevision is only a freshness check, never approval. Add saves a disabled entry and does not connect. Login opens the host-guided browser flow; the user grants account access in the browser. Trusted controls review the exact connection or bundled registration/sign-in/connection plan. Never request or supply passwords, tokens, headers, environment values, OAuth client secrets, arbitrary settings or installation commands. Newly connected MCP tools become available in the next turn. Do not retry uncertain setup outcomes; inspect /mcp first.'
 
 /** Trusted application callbacks only. This pack exposes no store, credentials or IO object.
  * listLocal must be an inert local projection: no reload-driven revocation, refresh or network.
@@ -114,7 +114,7 @@ export function createMcpSetupExtension(host: McpSetupToolHost): ToolExtension {
       validateArguments(args) { if (!mcpRecord(args) || Object.keys(args).length) throw new Error('mcp_list accepts no arguments') },
       execute: (call, { signal }) => run(call, signal, true) },
     { definition: { name: 'mcp_setup',
-      description: 'Propose adding a disabled HTTPS MCP endpoint, connecting, guided login, local logout or removing its saved entry. Each action uses fresh human host review, including in Auto. Read mcp_list for expectedRevision. No commands, credentials or arbitrary settings. Newly connected tools are next-turn only.',
+      description: 'Propose adding a disabled HTTPS MCP endpoint, connecting, guided login, local logout or removing its saved entry. Each action uses fresh human host review, including in Auto and Skip permissions. Read mcp_list for expectedRevision. No commands, credentials or arbitrary settings. Newly connected tools are next-turn only.',
       parameters: { type: 'object', properties: {
         action: { type: 'string', enum: ['add', 'connect', 'login', 'logout', 'remove'] },
         id: { type: 'string', pattern: '^[a-z][a-z0-9_-]{0,15}$' },

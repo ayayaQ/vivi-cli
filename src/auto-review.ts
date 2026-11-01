@@ -12,7 +12,7 @@ import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace
 import { DEEPSEEK_WEB_COST } from './web-tools.js'
 import { publicUrlContainsSecret } from './public-url.js'
 
-export type ApprovalMode = 'manual' | 'auto'
+export type ApprovalMode = 'manual' | 'auto' | 'skip'
 /** Captured display evidence, never an approval token or an overall safety probability. */
 export interface ReviewEvaluation {
   readonly kind: 'model' | 'not-reviewed' | 'unavailable'
@@ -32,7 +32,7 @@ export interface ReviewNotice {
   readonly toolName: string
   /** saving/saved are legacy admission states; URL states describe approval, not retrieval. */
   readonly state: 'reviewing' | 'needs_review' | 'saving' | 'saved' | 'denied' | 'cancelled' | 'failed' | 'unknown'
-  readonly source?: 'automatic' | 'human'
+  readonly source?: 'automatic' | 'human' | 'skip'
   readonly evaluation?: ReviewEvaluation
 }
 export function reviewNoticeSettled(notice: ReviewNotice): boolean {
@@ -171,6 +171,12 @@ export interface AutoReviewConfiguration {
   /** Validated user preferences only; loading these never enrolls Auto. */
   autoReviewThresholds?: AutoReviewThresholdOverrides
 }
+export interface SkipPermissionsConfiguration {
+  /** A live interactive host surface; no reviewer credentials are involved. */
+  isAvailable(): boolean
+  /** Opaque current chat-account, workspace and capability/trust identity. */
+  binding(): string
+}
 export interface ReviewProposal {
   /** Host-only operation wording; a public URL callback admits a request, never starts transport. */
   operationLabel?: 'MCP operation' | 'public URL request' | 'web request'
@@ -180,6 +186,8 @@ export interface ReviewProposal {
   currentResourceRevisions(): JsonObject
   isActive(): boolean
   eligible: boolean
+  /** Trusted host opt-in only; tool names or extension metadata cannot grant this. */
+  skipEligible?: boolean
   /** Trusted host preparation is required for model review; absence stays manual. */
   preparedAction?: PreparedActionMetadata
   /** Recompute host classification at resource admission, not from model arguments. */
@@ -279,12 +287,15 @@ export class AutoReviewController {
   private selectedMode: ApprovalMode = 'manual'
   private enrollmentRevision = 0
   private enrolledAccount: string | undefined
+  private enrolledSkipBinding: string | undefined
   private turn: Turn | undefined
   private suspended = false
+  private uncertainResource = false
   private thresholds: AutoReviewThresholdOverrides
   constructor(private readonly config: AutoReviewConfiguration | undefined,
     private readonly secrets: readonly string[] | (() => readonly string[]), private readonly human: (request: ApprovalRequest, signal: AbortSignal) => Promise<boolean>,
-    private readonly notice?: (message: string, context?: ReviewNotice) => void) {
+    private readonly notice?: (message: string, context?: ReviewNotice) => void,
+    private readonly skip?: SkipPermissionsConfiguration) {
     const descriptor = config && Object.getOwnPropertyDescriptor(config, 'autoReviewThresholds')
     if (descriptor && (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value'))) throw new Error('Invalid Auto review threshold configuration')
     this.thresholds = descriptor ? validateAutoReviewThresholdOverrides(descriptor.value) : {}
@@ -300,24 +311,32 @@ export class AutoReviewController {
   }
   /** Replacing the host list must take effect at the next provider/admission/audit boundary. */
   private currentSecrets(): readonly string[] { return typeof this.secrets === 'function' ? this.secrets() : this.secrets }
+  /** Changing reviewer configuration cannot settle an unknown local write outcome. */
+  retainUncertainResource(previous: AutoReviewController): void {
+    if (previous.uncertainResource) { this.suspended = true; this.uncertainResource = true; this.setMode('manual') }
+  }
   get mode(): ApprovalMode {
-    if (this.selectedMode === 'auto' && this.config?.accountRevision() !== this.enrolledAccount) this.setMode('manual')
+    if (this.selectedMode === 'auto' && this.config?.accountRevision() !== this.enrolledAccount ||
+      this.selectedMode === 'skip' && (this.uncertainResource || !this.skip?.isAvailable() || this.skip.binding() !== this.enrolledSkipBinding)) this.setMode('manual')
     return this.selectedMode
   }
   get enrollmentBinding(): string {
     return reviewDigest({
       ...(this.config?.deepSeekWeb ? { webScope: 'deepseek-web-v1' } : {}),
       ...(this.config?.explicitReviewer ? { reviewer: this.config.provider.id, model: this.config.provider.model } : {}), accountRevision: this.config?.accountRevision() ?? null,
+      skipBinding: this.skip?.binding() ?? null, skipAvailable: this.skip?.isAvailable() ?? false,
       enrollmentRevision: this.enrollmentRevision, policyRevision: AUTO_REVIEW_POLICY_REVISION,
       thresholds: this.config ? resolveAutoReviewThreshold(this.config.provider.id, this.thresholds) : null,
       sharingRevision: AUTO_REVIEW_SHARING_REVISION, surfaceAvailable: this.config?.isAvailable?.() ?? this.config?.canAutoReview ?? false })
   }
   setMode(mode: ApprovalMode): void {
-    if (mode !== 'manual' && mode !== 'auto') throw new Error('Unknown approval mode')
+    if (mode !== 'manual' && mode !== 'auto' && mode !== 'skip') throw new Error('Unknown approval mode')
     if (mode === 'auto' && (!this.config?.canAutoReview || this.config.isAvailable?.() === false || this.suspended)) throw new Error('Auto review needs an interactive approval UI and a healthy review ledger')
+    if (mode === 'skip' && (!this.skip?.isAvailable() || this.uncertainResource)) throw new Error('Skip permissions needs a live interactive approval surface and healthy host state')
     this.enrollmentRevision++
     this.selectedMode = mode
     this.enrolledAccount = mode === 'auto' ? this.config!.accountRevision() : undefined
+    this.enrolledSkipBinding = mode === 'skip' ? this.skip!.binding() : undefined
   }
   beginTurn(sessionId: string, text: string): void {
     this.turn = { sessionId, text, runId: randomUUID(), requestId: randomUUID(), calls: 0, seen: new Set() }
@@ -355,7 +374,7 @@ export class AutoReviewController {
     catch (error) {
       // A Manual write can also publish before its final durability check fails.
       // A fresh enrollment must not hide that unsettled resource outcome.
-      if (error instanceof WorkspaceCommitError) this.suspended = true
+      if (error instanceof WorkspaceCommitError || error instanceof SessionCommitError) { this.suspended = true; this.uncertainResource = true }
       if (latest && !reviewNoticeSettled(latest)) {
         if (latest.state === 'saving') report(publicUrl
           ? 'Public URL admission could not be confirmed; no fetch result was confirmed'
@@ -382,6 +401,7 @@ export class AutoReviewController {
     const inputDigest = reviewDigest(proposal.inputData)
     const preparedDigest = reviewDigest(proposal.preparedAction ?? null)
     const capturedEligibility = proposal.eligible
+    const capturedSkipEligibility = proposal.skipEligible === true
     const call: ToolCall = structuredClone(callReference)
     const publicUrl = call.name === 'fetch_url' || call.name === 'web_search'
     const containsSecret = (value: unknown): boolean => {
@@ -400,7 +420,7 @@ export class AutoReviewController {
     const thresholds = this.config ? resolveAutoReviewThreshold(this.config.provider.id, this.thresholds) : undefined
     let evaluation: ReviewEvaluation | undefined
     const capture = (reasonCode: DecisionLedgerRecord['reasonCode'], result?: DecisionResult): void => {
-      if (!this.config || !thresholds) return
+      if (mode === 'skip' || !this.config || !thresholds) return
       evaluation = { kind: result ? result.checks.length === 4 ? 'model' : 'unavailable' : 'not-reviewed',
         provider: this.config.provider.id, model: result?.model ?? this.config.provider.model, reasonCode,
         ...(result ? { outcome: result.outcome } : {}), checks: structuredClone(result?.checks ?? []),
@@ -414,22 +434,23 @@ export class AutoReviewController {
       policyRevision: AUTO_REVIEW_POLICY_REVISION, sharingRevision: AUTO_REVIEW_SHARING_REVISION })
     const configurationDigest = configuration()
     let autoAuthorized = false
+    let skipAuthorized = false
     let urlReceiptAllowed = false
     const assertCurrent = (): void => {
       signal.throwIfAborted()
-      if (!proposal.isActive() || mode === 'auto' && this.config?.isAvailable?.() === false || this.turn !== turn || this.enrollmentRevision !== enrollment ||
+      if (this.mode !== mode || !proposal.isActive() || mode === 'auto' && this.config?.isAvailable?.() === false || this.turn !== turn || this.enrollmentRevision !== enrollment ||
         this.config?.accountRevision() !== account || reviewDigest(callReference) !== callDigest ||
         this.config?.provider !== providerReference || this.config?.provider.evaluate !== evaluateReference ||
         this.config?.ledger !== ledgerReference || configuration() !== configurationDigest ||
-        proposal.eligible !== capturedEligibility || reviewDigest(proposal.resourceRevisions) !== resourceDigest ||
+        proposal.eligible !== capturedEligibility || (proposal.skipEligible === true) !== capturedSkipEligibility || reviewDigest(proposal.resourceRevisions) !== resourceDigest ||
         reviewDigest(proposal.inputData) !== inputDigest || reviewDigest(proposal.preparedAction ?? null) !== preparedDigest ||
         reviewDigest(proposal.currentPreparedAction ? proposal.currentPreparedAction() ?? null : proposal.preparedAction ?? null) !== preparedDigest ||
         reviewDigest(proposal.currentResourceRevisions()) !== resourceDigest) throw new Error('Change became stale; request a fresh review')
       if (publicUrl && containsSecret([call, proposal.inputData, proposal.preparedAction])) {
         throw new Error('Host policy blocks a public URL request containing a known credential')
       }
-      if (autoAuthorized && containsSecret([call, proposal.inputData, proposal.preparedAction, turn?.text])) {
-        throw new Error('A newly registered credential invalidated automatic review; request fresh manual review')
+      if ((autoAuthorized || skipAuthorized) && containsSecret([call, proposal.inputData, proposal.preparedAction, turn?.text])) {
+        throw new Error(autoAuthorized ? 'A newly registered credential invalidated automatic review; request fresh manual review' : 'A known credential blocks this unattended action; request fresh manual review')
       }
     }
     const assertUrlReceipt = (): void => {
@@ -438,7 +459,7 @@ export class AutoReviewController {
     }
     if (publicUrl && containsSecret([call, proposal.inputData, proposal.preparedAction])) {
       capture('privacy')
-      if (mode === 'auto') report('Host policy blocks this public URL request; the request was not approved', 'denied')
+      if (mode === 'auto' || mode === 'skip') report('Host policy blocks this public URL request; the request was not approved', 'denied')
       return undefined
     }
     assertCurrent()
@@ -458,9 +479,36 @@ export class AutoReviewController {
     const route = routePreparedAction(snapshot)
     if (route.route === 'blocked') {
       capture('ineligible')
-      if (mode === 'auto') report(publicUrl ? 'Host policy blocks this public URL request; the request was not approved'
+      if (mode === 'auto' || mode === 'skip') report(publicUrl ? 'Host policy blocks this public URL request; the request was not approved'
         : 'Host policy blocks this change; no save was made', 'denied')
       return undefined
+    }
+    // Skip is explicit host-local permission enrollment, not a model decision. It
+    // never enters the reviewer or its ledger, and cannot override a hard route.
+    if (mode === 'skip' && capturedSkipEligibility && turn) {
+      if (containsSecret([call, proposal.inputData, proposal.preparedAction])) {
+        report('Host policy blocks a known credential in this action; no action was admitted', 'denied', 'skip')
+        return undefined
+      }
+      if (turn.seen.has(call.id)) throw new Error('This tool proposal has already been admitted')
+      turn.seen.add(call.id)
+      skipAuthorized = true
+      assertCurrent()
+      report('Skip permissions · no human or AI review; admitting this host-prepared action', 'saving', 'skip')
+      if (publicUrl) urlReceiptAllowed = true
+      let value: T
+      try { value = await commit(publicUrl ? assertUrlReceipt : assertCurrent) }
+      catch (error) { urlReceiptAllowed = false; throw error }
+      if (publicUrl) report('Skip permissions · exact request admitted; retrieval outcome is reported separately', 'saved', 'skip')
+      else if (proposal.operationLabel === 'MCP operation') {
+        const result = value as unknown as { isError?: boolean; content?: string }
+        let unknownOutcome = false
+        try { unknownOutcome = typeof result?.content === 'string' && JSON.parse(result.content)?.unknownOutcome === true } catch { /* Result carries no unknown-outcome envelope. */ }
+        report(unknownOutcome ? 'Skip permissions · remote outcome is unknown; inspect before retrying'
+          : result?.isError ? 'Skip permissions · remote operation returned an error' : 'Skip permissions · remote operation returned a response',
+          unknownOutcome ? 'unknown' : result?.isError ? 'failed' : 'saved', 'skip')
+      } else report('Skip permissions · host-prepared change saved without human or AI review', 'saved', 'skip')
+      return value
     }
     // A shared route is classification only. It cannot broaden the CLI action allowlist,
     // enroll Auto, authorize data sharing, or bypass the existing resource commit guard.
@@ -641,7 +689,7 @@ export class AutoReviewController {
       record = { ...record, state: resourceAdmitted && !publicUrl ? 'unknown' : signal.aborted ? 'cancelled' : 'failed',
         reasonCode: resourceAdmitted && !publicUrl ? 'commit_unknown' : signal.aborted ? 'cancelled' : 'stale', updatedAt: new Date().toISOString() }
       if (resourceAdmitted && !publicUrl) {
-        this.suspended = true
+        this.suspended = true; this.uncertainResource = true
         if (error instanceof WorkspaceCommitError) {
           record = { ...record, state: 'committed', resultRevision: error.result.revision }
           report('The workspace change was saved, but final durability or staging cleanup could not be confirmed. Automatic saves are suspended; check the file before retrying', 'saved', automatic ? 'automatic' : 'human')

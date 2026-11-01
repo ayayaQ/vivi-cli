@@ -46,13 +46,14 @@
     "test:package:built": "node scripts/test-package.mjs"
   },
   "dependencies": {
-    "@ayayaq/vivi": "0.16.0",
+    "@ayayaq/vivi": "0.17.0",
     "@modelcontextprotocol/client": "2.3.1",
     "@opentui/core": "0.5.14",
     "ignore": "7.0.12",
     "picomatch": "4.0.7",
     "url-template": "3.1.1",
-    "web-tree-sitter": "0.25.10"
+    "web-tree-sitter": "0.25.10",
+    "jose": "6.2.12"
   },
   "bundledDependencies": [
     "@ayayaq/vivi"

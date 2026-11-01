@@ -61,6 +61,17 @@ test('Manual shows the exact full diff and requires one approval for every actua
     await noStages(subject.root)
   }
 })
+test('Skip uses normal host workspace preparation and commit without an approval prompt or model audit', async t => {
+  const subject = await fixture(t)
+  subject.options.permissionApproval = { isAvailable: () => true, accountRevision: () => 'chat-account' }
+  subject.host.setApprovalMode('skip')
+  const result = mutationResult(await subject.host.send('Create the task file'))
+  assert.equal(result.success, true); assert.equal(subject.approvals.length, 0)
+  assert.equal(subject.requests.length, 0); assert.equal(subject.records.length, 0)
+  assert.equal(await fs.readFile(join(subject.root, 'new.txt'), 'utf8'), 'ordinary project text\n')
+  await noStages(subject.root)
+})
+
 test('Manual edit display metadata is the exact host-prepared diff, including unchanged context and revisions', async t => {
   const before = 'header\nold\nfooter\n', after = 'header\nnew\nfooter\n'
   const subject = await fixture(t, { name: 'workspace_edit_text', initial: before })

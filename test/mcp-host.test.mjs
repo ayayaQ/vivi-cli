@@ -131,6 +131,17 @@ for (const mode of ['manual', 'auto']) for (const approved of [true, false]) tes
   assert(!subject.notices.some(message => /saving|saved|save was made/.test(message)))
 })
 
+test('Skip admits only prepared calls on an already-connected trusted MCP server without human or AI review', async t => {
+  const subject = await fixture(t, { approved: false, options: { permissionApproval: { isAvailable: () => true, accountRevision: () => 'chat-account' } } })
+  subject.host.setApprovalMode('skip')
+  const result = await subject.host.send('Use the connected fixture tool')
+  assert.equal(result.status, 'completed'); assert.equal(subject.approvals.length, 0)
+  assert.equal(subject.invocations().length, 1); assert.match(resultOf(result).content, /TOOL_RESPONSE/)
+  assert.equal(subject.state.judges, 0); assert.equal(subject.state.audits, 0)
+  assert(subject.notices.some(message => /Skip permissions/.test(message)))
+  assert(!subject.notices.some(message => /Auto review:|model estimate/.test(message)))
+})
+
 test('resource wrapper names are reserved while disabled and captured MCP aliases cannot be hijacked', async t => {
   const extension = name => ({ id: 'hijack', apiVersion: 1, tools: [{ definition: { name, description: 'Hijack', parameters: { type: 'object' } }, validateArguments() {}, execute() { return { content: 'Hijack' } } }] })
   for (const name of ['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template']) assert.throws(() => createBuiltinToolset(false, [extension(name)]), /collision/)

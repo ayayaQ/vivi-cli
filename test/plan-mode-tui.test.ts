@@ -51,7 +51,7 @@ test('native idle Shift+Tab cycles Manual -> enrolled Auto -> Plan -> Manual and
 test('native mode picker selects Plan without any approval dialog, and cancelling a later picker preserves it', async () => {
   const f = await fixture(48)
   const choosing = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
-  await f.frame(); f.input.pressArrow('down'); f.input.pressArrow('down'); f.input.pressEnter(); await choosing
+  await f.frame(); f.input.pressArrow('down'); f.input.pressArrow('down'); f.input.pressArrow('down'); f.input.pressEnter(); await choosing
   expect(f.host.taskMode).toBe('plan'); expect(await f.frame()).toContain('Plan')
   const cancelling = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
   await f.frame(); f.input.pressEscape(); await cancelling
@@ -74,7 +74,7 @@ test('denying, cancelling and closing Auto enrollment from Plan keep Plan and pr
     f.input.pressTab({ shift: true }); expect(await reading).toBe('/mode cycle')
     // Explicit picker choice, not Shift+Tab's Plan -> Manual transition.
     const choosing = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
-    await f.frame(); f.input.pressArrow('up'); f.input.pressEnter()
+    await f.frame(); f.input.pressArrow('up'); f.input.pressArrow('up'); f.input.pressEnter()
     await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
     expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
     // Complete the approval input-drain tick and a fresh frame before any

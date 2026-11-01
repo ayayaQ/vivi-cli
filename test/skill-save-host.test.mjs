@@ -69,6 +69,15 @@ test('Auto mode still requires human review and never calls the model reviewer f
   assert.equal(human, 1); assert.equal(automatic, 0); assert.equal((await f.skills.snapshot()).document('brief-summary').content, content)
 })
 
+test('Skip still requires exact human review for installed skills and never invokes a model reviewer', async t => {
+  let rounds = 0, human = 0
+  const f = await fixture(t, { permissionApproval: { isAvailable: () => true, accountRevision: () => 'chat-account' },
+    approve: async request => { human++; assert.equal(request.call.name, 'save_skill'); return false },
+    provider: { async generate() { return ++rounds === 1 ? answer([call]) : answer() } } })
+  f.host.setApprovalMode('skip'); await f.host.send('Prepare this skill')
+  assert.equal(human, 1); assert.equal((await f.skills.snapshot()).document('brief-summary'), undefined)
+})
+
 test('oversized exact review is denied in the host before any approval callback or commit', async t => {
   let rounds = 0, reviews = 0
   const large = content.replace('Return three factual points.', 'x'.repeat(64_000))

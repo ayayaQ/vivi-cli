@@ -178,7 +178,8 @@ async function runChild(executable, args, options) {
 test('real Node launcher uses child launch cwd outside the install path and ignores PWD/profile', async t => {
   const { directory, project, state } = await fixture(t)
   const provider = join(directory, 'fake-provider.mjs'), hooks = join(directory, 'hooks.mjs'), register = join(directory, 'register.mjs')
-  await writeFile(provider, `import assert from 'node:assert/strict'; export function createOpenAIProvider() { let rounds=0; return { async generate({tools,messages}) {
+  await writeFile(provider, `export { ProviderRequestError } from ${JSON.stringify(import.meta.resolve('@ayayaq/vivi/providers/openai'))};
+  import assert from 'node:assert/strict'; export function createOpenAIProvider() { let rounds=0; return { async generate({tools,messages}) {
     assert(tools.some(tool=>tool.name==='workspace_read'));
     if (++rounds===1) return {content:'',toolCalls:[{id:'read',name:'workspace_read',arguments:{path:'readme.txt'}}]};
     assert.equal(JSON.parse(messages.at(-1).content).content,'Launch folder fixture'); return {content:'Launcher fixture accepted',toolCalls:[]};

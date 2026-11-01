@@ -13,7 +13,7 @@ const MACOS_SECRET_PREFIX = 'vivi-cli-api-key-v1:'
 const LINUX_SECRET_INPUT_BYTES = 8191
 const service = 'vivi-cli'
 const MCP_KEY_SLOT_PREFIX = 'mcp-oauth-key-v1-'
-export type CredentialProviderName = CliProviderName | 'deepseek-web'
+export type CredentialProviderName = Exclude<CliProviderName, 'chatgpt'> | 'deepseek-web'
 type NativeCredentialSlot = CredentialProviderName | `mcp-oauth-key-v1-${string}`
 
 // Only this fixed, nonsecret source enters PowerShell's argv/script-block logging. All request

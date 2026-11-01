@@ -110,6 +110,7 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
       let outcome: RunOutcome = 'error'
       let result: AgentResult
       try {
+        io.setApprovalMode?.(host.approvalMode)
         io.setToolEvidence?.(host.toolPresentationEvidence)
         io.setConversationErrors?.(host.conversationErrors)
         io.runStarted?.()
@@ -123,7 +124,7 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
       finally {
         io.setToolEvidence?.(host.toolPresentationEvidence)
         io.setConversationErrors?.(host.conversationErrors)
-        await refreshChatContext(host, io); io.runFinished?.(outcome); update()
+        await refreshChatContext(host, io); io.setApprovalMode?.(host.approvalMode); io.runFinished?.(outcome); update()
       }
       const pending = host.queuedMessages?.[0]
       // Ordinary cancel/error leaves input visibly queued. Explicit interrupt and
@@ -168,6 +169,7 @@ export async function refreshChatContext(host: CliHost, io: ChatIO): Promise<voi
   try { await host.refreshContext?.(); io.setContext?.(host.contextUsage, host.canCompact) }
   catch { io.setContext?.(undefined, false) }
 }
+
 export async function compactChatContext(host: CliHost, io: ChatIO): Promise<RunOutcome> {
   await refreshChatContext(host, io)
   if (!host.canCompact) { io.write('No older complete conversation to compact yet\n'); return 'completed' }
@@ -192,7 +194,7 @@ export interface TerminalOptions {
   stream?: boolean
   secrets?: readonly string[]
 }
-export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Every create, edit or delete requires review. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Manager changes and deletion always require human allow/deny review. Disabling retains existing records.'
+export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Explicit session-only Skip permissions bypasses ordinary agent create/edit/delete prompts with no human or AI review. Manager changes still require human allow/deny review. Disabling retains existing records.'
 export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
 
 /** Human controls proposal availability; exact execution approval is always separate. */
@@ -206,7 +208,7 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
     const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
     try {
       const enabled = await host.enableCommands(controller.signal)
-      io.write(enabled ? `Trusted commands enabled for ${JSON.stringify(host.commandDirectory)} · every process still needs human approval\n`
+      io.write(enabled ? `Trusted commands enabled for ${JSON.stringify(host.commandDirectory)} · ordinary process prompts follow the current permission mode\n`
         : 'Command proposals are unavailable; every process requires interactive human approval\n')
     } finally { dispose() }
     return true
@@ -248,10 +250,12 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   const selected = choose ? await choose('Mode · Manual is the default', [
     { name: 'Manual', description: 'Human allow/deny review for writes and public URL requests', value: 'manual' },
     { name: 'Auto review', description: 'Check proposed note, memory, workspace text and public URL GET actions through your selected provider', value: 'auto' },
+    { name: 'Skip permissions', description: 'Explicit session-only opt-in; skip ordinary prompts with no human or AI review', value: 'skip' },
     { name: 'Plan', description: 'Investigate with enabled local reads and describe a plan; no task changes or remote requests', value: 'plan' }
-  ], ['manual', 'auto', 'plan'].indexOf(current)) : 'auto'
+  ], ['manual', 'auto', 'skip', 'plan'].indexOf(current)) : 'auto'
   if (selected === undefined || (choose && io.isClosed)) return
   if (selected === 'plan') { selectPlan(host, io); return }
+  if (selected === 'skip') { await enrollSkipPermissions(host, io, current === 'plan'); return }
   if (selected !== 'auto') { selectManual(host, io); io.write('Approval mode: Manual\n'); return }
   // Leaving Plan for Auto is contingent on successful fresh enrollment. While
   // consent is pending, Plan remains the task policy even if its dialog closes.
@@ -306,6 +310,41 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   } finally { dispose() }
 }
 
+export const SKIP_PERMISSIONS_DISCLOSURE = 'Skip permissions is session-only and skips ordinary approval prompts for enabled host-prepared local note/memory and workspace changes, public URL requests and configured paid web requests, trusted commands, and calls or resource reads on already-connected MCP servers. There is no human or AI review of those actions. Remote requests disclose their arguments and can have effects or costs. Trusted commands are unsandboxed: they run with your OS account’s file and network access, can act outside the workspace, and can read credential files your account can access. Existing hard denials, workspace/path and known-credential protections, tool validation, cancellation and session isolation remain; this does not grant OS privileges or add a sandbox. Skill installation, MCP setup/connections/sign-in and credential/trust administration still require human action. This enrollment is not saved; changing account, workspace or trust revokes it. Enable only for a task and environment you trust.'
+
+async function enrollSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolean): Promise<void> {
+  if (fromPlan) host.setApprovalMode('manual')
+  else selectManual(host, io)
+  if (io.canAutoReview !== true || io.isClosed) {
+    io.write(`Skip permissions requires a live interactive terminal and fresh confirmation. ${fromPlan ? 'Plan remains active' : 'Using Manual'}; piped and headless launches cannot enroll.\n`)
+    return
+  }
+  const binding = host.approvalEnrollmentBinding
+  const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
+  try {
+    const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_skip_permissions', arguments: {
+      mode: 'skip', sessionId: host.session.id, enrollmentBinding: binding
+    } }, currentRevision: 'fresh session-only Skip permissions enrollment', description: SKIP_PERMISSIONS_DISCLOSURE }, controller.signal)
+    const changed = binding !== host.approvalEnrollmentBinding
+    if (enrolled && !changed && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true) {
+      try {
+        if (fromPlan) host.setTaskMode('execute')
+        host.setApprovalMode('skip')
+      } catch (error) {
+        if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
+        io.setTaskMode?.(host.taskMode); io.setApprovalMode?.(host.approvalMode)
+        throw error
+      }
+      io.setTaskMode?.('execute'); io.setApprovalMode?.('skip')
+      io.write('Approval mode: Skip permissions · session-only; no human or AI review of ordinary actions\n')
+    } else {
+      if (!changed) host.setApprovalMode('manual')
+      io.setTaskMode?.(host.taskMode); io.setApprovalMode?.(host.approvalMode)
+      io.write(`Mode: ${conversationModeLabel(host.taskMode, host.approvalMode)}${changed ? '. Enrollment changed; open /mode for a fresh confirmation' : ''}\n`)
+    }
+  } finally { dispose() }
+}
+
 /** Manual -> freshly enrolled Auto -> Plan -> Manual. No task implicitly leaves Plan. */
 export async function cycleApprovalMode(host: CliHost, io: ChatIO, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
@@ -314,7 +353,7 @@ export async function cycleApprovalMode(host: CliHost, io: ChatIO, setupReviewer
     io.write('Approval mode: Manual\n')
     return
   }
-  if (host.approvalMode === 'auto') {
+  if (host.approvalMode === 'auto' || host.approvalMode === 'skip') {
     selectPlan(host, io)
     return
   }
@@ -327,11 +366,12 @@ export async function runModeControl(host: CliHost, io: ChatIO, line: string, ch
     case '/mode plan': selectPlan(host, io); return
     case '/mode manual': selectManual(host, io); io.write('Approval mode: Manual\n'); return
     case '/mode cycle': await cycleApprovalMode(host, io, setupReviewer); return
+    case '/mode skip': await selectApprovalMode(host, io, async () => 'skip', setupReviewer); return
     case '/mode': await selectApprovalMode(host, io, choose, setupReviewer); return
-    default: io.write('Use /mode by itself for a fresh Manual / Auto review / Plan choice, /mode plan, /mode manual, or /mode cycle\n')
+    default: io.write('Use /mode by itself for a fresh Manual / Auto review / Skip permissions / Plan choice, /mode skip, /mode plan, /mode manual, or /mode cycle\n')
   }
 }
-export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Creator drafts can be saved to the app-owned SQLite installed store after exact-content human review, including in Auto mode; changes are available next turn. Plan and noninteractive launches cannot save. Legacy folders and bundled skills remain read-only; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
+export const SKILLS_DISCLOSURE = 'Skills are instruction-only standard SKILL.md files in this CLI’s app-wide local store. Metadata and selected text are sent to your provider when enabled. Creator drafts can be saved to the app-owned SQLite installed store after exact-content human review, including in Auto and Skip permissions modes; changes are available next turn. Plan and noninteractive launches cannot save. Legacy folders and bundled skills remain read-only; scripts and binary assets are never executed. Extra --skills-dir roots are read-only. No workspace skills are loaded automatically.'
 const MEMORY_COMMAND_HELP = `/memories list · show IDs, revisions and content
 /memories add TEXT · review a new saved memory
 /memories edit ID REVISION TEXT · review an edit to the displayed revision
@@ -752,7 +792,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       return result
     } finally { dispose() }
   }
-  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /processes manages background jobs (F6 Stop, F7 Stop All), /skills manages skills, /instructions shows project guidance, /mcp manages reviewed server connections\n')
+  io.write('Enter a message; /exit quits, /session shows the session id, /context shows request capacity, /compact compacts older provider context, /rename NAME renames it, /mode selects Manual / Auto review / Skip permissions / Plan, /mode plan enters read-only planning, /memories manages saved context, /commands controls reviewed unsandboxed proposals, /processes manages background jobs (F6 Stop, F7 Stop All), /skills manages skills, /instructions shows project guidance, /mcp manages reviewed server connections\n')
   for (;;) {
     const line = await io.readLine('You: ')
     if (line === undefined || line.trim() === '/exit') return

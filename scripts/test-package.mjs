@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.16.0'
-const coreIntegrity = 'sha512-Df2VOeDwf6/20jt0MT0eiq1oSH7Jaf/wa6wmsy0X0G5vYgVRxvF8gnpyyVni5zs6o+6o+z5BxBvTRSiwPCGR3g=='
+const coreVersion = '0.17.0'
+const coreIntegrity = 'sha512-inMbmRN+0RGtZZKtjhq9TsmwNJHVlqo4TyKsKSGD6wtPGQUBXI18U4kTk5AV6V4ehKoWx9RD5WrBpZv8M/i/Jw=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.16.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.17.0 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -245,7 +245,7 @@ import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extension
 import { calculatorExtension, calculate as sharedCalculate } from '@ayayaq/vivi/extensions/calculator'
 import { createMemoryService, decodeMemories, encodeMemories, formatMemoryContext } from '@ayayaq/vivi/extensions/memory'
 import { parseSkillDocument, skillCreatorSource } from '@ayayaq/vivi/extensions/skills'
-import { createOpenAIProvider } from '@ayayaq/vivi/providers/openai'
+import { createOpenAIProvider, ProviderRequestError } from '@ayayaq/vivi/providers/openai'
 import { createOpenRouterProvider } from '@ayayaq/vivi/providers/openrouter'
 import { createDeepSeekProvider, projectDeepSeekHistory } from '@ayayaq/vivi/providers/deepseek'
 import { WebProviderError } from '@ayayaq/vivi/web'
@@ -699,6 +699,41 @@ try {
   assert.equal((await openai.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenAI shared')
   assert.equal((await router.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'OpenRouter shared')
   const require = createRequire(import.meta.url)
+  // The installed registry core must provide both new host compatibility contracts.
+  for (const module of [{ createOpenAIProvider, ProviderRequestError }, require('@ayayaq/vivi/providers/openai')]) {
+    let credentials = 0, sends = 0
+    const efforts = [], tools = [{ name: 'packed_projection', description: 'Offline projection',
+      parameters: { type: 'object', properties: { value: { type: 'string' } } } }]
+    const projected = module.createOpenAIProvider({ model: 'packed-projection', apiKey: async () => { credentials++; return 'packed-only-key' },
+      reasoning: { mode: 'effort', effort: 'low' }, supportedReasoningEfforts: ['low', 'high'], errorDetails: true,
+      transformRequest(body) {
+        efforts.push(body.reasoning.effort)
+        body.reasoning.effort = 'high'
+        body.tools[0].parameters.properties.value.description = 'projection only'
+        delete body.max_output_tokens
+        return body
+      }, fetch: async (input, init) => {
+        sends++
+        assert.equal(String(input), 'https://api.openai.com/v1/responses')
+        const body = JSON.parse(init.body)
+        assert.equal(body.reasoning.effort, 'high'); assert.equal(body.max_output_tokens, undefined)
+        return new Response(JSON.stringify({ error: { code: 'rate_limit_exceeded', param: 'input[0]',
+          message: 'private-packed-response packed-only-key' } }), { status: 429, headers: { 'x-request-id': 'req_packed_core' } })
+      } })
+    const input = { messages: [], tools }
+    projected.estimateContext(input, { maxOutputTokens: 8 })
+    assert.equal(credentials, 0); assert.equal(sends, 0)
+    await assert.rejects(projected.generate(input, new AbortController().signal, { maxOutputTokens: 8 }), error => {
+      assert(error instanceof module.ProviderRequestError); assert.equal(error.status, 429)
+      assert.deepEqual(error.details, { code: 'rate_limit_exceeded', param: 'input[0]', requestId: 'req_packed_core', bodyShape: 'error' })
+      assert(Object.isFrozen(error.details)); assert.doesNotMatch(error.message, /private-packed-response|packed-only-key/)
+      return true
+    })
+    projected.estimateContext(input)
+    assert.deepEqual(efforts, ['low', 'low', 'low'])
+    assert.deepEqual(tools[0].parameters.properties.value, { type: 'string' })
+    assert.equal(credentials, 1); assert.equal(sends, 1)
+  }
   for (const module of [{ createDeepSeekProvider, projectDeepSeekHistory }, require('@ayayaq/vivi/providers/deepseek')]) {
     const deepseek = module.createDeepSeekProvider({ model: 'deepseek-flash', apiKey: 'packed-chat-fixture', fetch: async (input, init) => {
       assert.equal(String(input), 'https://api.deepseek.com/chat/completions')
@@ -831,9 +866,24 @@ const presentationView = cliToolPresentationView(JSON.stringify(createCliToolPre
 void presentationView; void toolDecision
 void result; void io; void usageText; void selection; void createBuiltinToolset(false, [extension])
 `)
+  await writeFile(join(installed, 'core-compatibility.cts'), `
+import { createOpenAIProvider, ProviderRequestError, type OpenAIProviderOptions, type ProviderErrorDetails } from '@ayayaq/vivi/providers/openai'
+const options: OpenAIProviderOptions = { model: 'types-only', apiKey: 'fake', errorDetails: true,
+  transformRequest(body) { delete body.max_output_tokens; return body } }
+const projected = createOpenAIProvider(options)
+function diagnostic(error: ProviderRequestError): Readonly<ProviderErrorDetails> | undefined {
+  // @ts-expect-error captured diagnostics are immutable
+  error.details!.code = 'changed'
+  return error.details
+}
+// @ts-expect-error request projections must be synchronous JSON projections
+const invalid: OpenAIProviderOptions['transformRequest'] = async body => body
+void projected; void diagnostic; void invalid
+`)
   const typeRoots = join(root, 'node_modules/@types')
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext',
-    '--target', 'ES2022', '--lib', 'ES2022,DOM', '--types', 'node', '--typeRoots', typeRoots, join(installed, 'consumer.ts')], temporary)
+    '--target', 'ES2022', '--lib', 'ES2022,DOM', '--types', 'node', '--typeRoots', typeRoots,
+    join(installed, 'consumer.ts'), join(installed, 'core-compatibility.cts')], temporary)
   if (process.env.VIVI_TEST_BUN) {
     run(process.env.VIVI_TEST_BUN, [join(installed, 'consumer.mjs')], temporary)
     await writeFile(join(installed, 'tui-consumer.ts'), `

@@ -17,14 +17,16 @@ export const MAX_SESSION_LIST_ENTRIES = 1000
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 const preferenceKeys = ['schemaVersion', 'provider', 'model', 'reasoning',
   'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'enableMemory', 'maxRounds'] as const
-const optionalPreferenceKeys = ['enableMemory', 'webProvider', 'autoReviewThresholds'] as const
-const allowedPreferenceKeys = [...preferenceKeys, 'webProvider', 'autoReviewThresholds'] as const
+const optionalPreferenceKeys = ['enableMemory', 'webProvider', 'autoReviewThresholds', 'chatgptAccountId'] as const
+const allowedPreferenceKeys = [...preferenceKeys, 'webProvider', 'autoReviewThresholds', 'chatgptAccountId'] as const
 
 /** Host preferences only. Credentials, transcripts, prompts and paths are never settings. */
 export interface TuiPreferences {
   schemaVersion: 1
   provider: CliProviderName
   model: string
+  /** Nonsecret saved registration selection, never a credential. */
+  chatgptAccountId?: string
   reasoning: string
   reasoningCapabilities: ReasoningEffort[]
   stream: boolean
@@ -82,7 +84,7 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     fields[key] = descriptor.value
   }
   check(fields.schemaVersion === 1, 'unsupported schema version')
-  check(fields.provider === 'openai' || fields.provider === 'openrouter' || fields.provider === 'deepseek', 'unsupported provider')
+  check(fields.provider === 'openai' || fields.provider === 'openrouter' || fields.provider === 'deepseek' || fields.provider === 'chatgpt', 'unsupported provider')
   check(typeof fields.model === 'string' && fields.model.length <= 200 &&
     fields.model.trim() === fields.model && !/[\u0000-\u001f\u007f-\u009f]/.test(fields.model), 'invalid model')
   check(typeof fields.reasoning === 'string' &&
@@ -116,6 +118,11 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     reasoningCapabilities: supported, stream: fields.stream, enableTools: fields.enableTools,
     enableNotes: fields.enableNotes, enableMemory: fields.enableMemory,
     maxRounds: fields.maxRounds as number
+  }
+  if (keys.includes('chatgptAccountId')) {
+    const descriptor = descriptors.chatgptAccountId
+    check(descriptor && descriptor.enumerable && 'value' in descriptor && typeof descriptor.value === 'string' && /^[a-f0-9]{64}$/.test(descriptor.value), 'invalid ChatGPT account binding')
+    preferences.chatgptAccountId = descriptor.value
   }
   if (keys.includes('webProvider')) {
     const descriptor = descriptors.webProvider
