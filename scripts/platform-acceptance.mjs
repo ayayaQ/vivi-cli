@@ -36,23 +36,34 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 function exact(value, keys) {
   if (!record(value) || Object.keys(value).length !== keys.length || !keys.every(key => Object.hasOwn(value, key))) invalid()
 }
+function denseStrings(value) {
+  if (!Array.isArray(value)) return false
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index) || typeof value[index] !== 'string' || value[index].length === 0) return false
+  }
+  return true
+}
 function utc(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) ||
     !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) invalid()
 }
 function validateBinding(binding) {
   exact(binding, ['candidateSha', 'artifactSha256', 'artifactKind', 'platform', 'arch', 'node'])
-  if (!/^[a-f0-9]{40}$/.test(binding.candidateSha) || !/^[a-f0-9]{64}$/.test(binding.artifactSha256) ||
-    !['synthetic-fixture', 'canonical-package'].includes(binding.artifactKind) ||
-    !['win32', 'darwin', 'linux'].includes(binding.platform) ||
-    !['x64', 'arm64'].includes(binding.arch) || !supportsCliNode(binding.node)) invalid()
+  const { candidateSha, artifactSha256, artifactKind, platform, arch, node } = binding
+  if (typeof candidateSha !== 'string' || !/^[a-f0-9]{40}$/.test(candidateSha) ||
+    typeof artifactSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(artifactSha256) ||
+    !['synthetic-fixture', 'canonical-package'].includes(artifactKind) ||
+    !['win32', 'darwin', 'linux'].includes(platform) ||
+    !['x64', 'arm64'].includes(arch) || !supportsCliNode(node)) invalid()
+  return { candidateSha, artifactSha256, artifactKind, platform, arch, node }
 }
 
 /** A presence probe accepts metadata, never a credential store or its load method.
  * Absence permits planning only: it does not authorize writes or eliminate races. */
 export async function targetPreflight(targets, metadata) {
-  if (!Array.isArray(targets) || targets.length < 1 || targets.length > 40 || new Set(targets).size !== targets.length ||
-    targets.some(target => typeof target !== 'string' || !/^(openai|openrouter|deepseek|deepseek-web|mcp-oauth-key-v1-[a-f0-9]{64})$/.test(target))) invalid()
+  if (!Array.isArray(targets) || targets.length < 1 || targets.length > 40 || !denseStrings(targets) ||
+    new Set(targets).size !== targets.length ||
+    targets.some(target => !/^(openai|openrouter|deepseek|deepseek-web|mcp-oauth-key-v1-[a-f0-9]{64})$/.test(target))) invalid()
   try {
     if (await metadata.available() !== true) return { status: 'blocked', reason: 'helper_unavailable' }
     const states = []
@@ -70,12 +81,12 @@ export async function targetPreflight(targets, metadata) {
 /** Synthetic checks cannot promote any live/manual stage to passed. */
 export function syntheticAcceptanceEvidence(input) {
   exact(input, ['binding', 'generatedAt', 'checks'])
-  validateBinding(input.binding); utc(input.generatedAt)
+  const binding = validateBinding(input.binding); utc(input.generatedAt)
   exact(input.checks, syntheticChecks)
   if (syntheticChecks.some(check => typeof input.checks[check] !== 'boolean')) invalid()
   return {
     schemaVersion: 2, kind: 'synthetic-platform-acceptance',
-    generatedAt: input.generatedAt, binding: { ...input.binding },
+    generatedAt: input.generatedAt, binding,
     stage: 'synthetic-helper-store-report',
     checks: Object.fromEntries(syntheticChecks.map(check => [check, input.checks[check] ? 'passed' : 'failed'])),
     syntheticResult: syntheticChecks.every(check => input.checks[check]) ? 'passed' : 'failed',
@@ -97,7 +108,7 @@ export function syntheticAcceptanceEvidence(input) {
 /** Records a human assertion, not a live executor. Receipts must be sanitized and
  * bound to canonical bytes. Synthetic-fixture receipts cannot become live passes. */
 export function manualStageEvidence(binding, stage, evidence) {
-  validateBinding(binding)
+  const expectedBinding = validateBinding(binding)
   if (!Object.hasOwn(manualStageChecks, stage)) invalid()
   if (evidence?.status === 'not_run') { exact(evidence, ['status']); return { status: 'not_run' } }
   if (evidence?.status === 'blocked') {
@@ -106,17 +117,20 @@ export function manualStageEvidence(binding, stage, evidence) {
     return { ...evidence }
   }
   exact(evidence, ['status', 'receipt'])
-  if (!['passed', 'failed'].includes(evidence.status) || binding.artifactKind !== 'canonical-package') invalid()
+  if (!['passed', 'failed'].includes(evidence.status) || expectedBinding.artifactKind !== 'canonical-package') invalid()
   const receipt = evidence.receipt
   exact(receipt, ['binding', 'stage', 'completedAt', 'checks', 'receiptSha256'])
-  validateBinding(receipt.binding); utc(receipt.completedAt)
-  if (Object.keys(binding).some(key => binding[key] !== receipt.binding[key]) || receipt.stage !== stage ||
-    !/^[a-f0-9]{64}$/.test(receipt.receiptSha256) || !Array.isArray(receipt.checks) ||
-    new Set(receipt.checks).size !== receipt.checks.length ||
-    receipt.checks.some(check => !manualStageChecks[stage].includes(check)) ||
-    evidence.status === 'passed' && receipt.checks.length !== manualStageChecks[stage].length ||
-    stage === 'windowsPhysicalKeys' && binding.platform !== 'win32') invalid()
-  return structuredClone(evidence)
+  const { stage: receiptStage, completedAt, checks, receiptSha256 } = receipt
+  const receiptBinding = validateBinding(receipt.binding); utc(completedAt)
+  const requiredChecks = manualStageChecks[stage]
+  if (Object.keys(expectedBinding).some(key => expectedBinding[key] !== receiptBinding[key]) || receiptStage !== stage ||
+    typeof receiptSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(receiptSha256) || !Array.isArray(checks) ||
+    checks.length > requiredChecks.length || !denseStrings(checks) || new Set(checks).size !== checks.length ||
+    checks.some(check => !requiredChecks.includes(check)) ||
+    evidence.status === 'passed' && !requiredChecks.every(check => checks.includes(check)) ||
+    stage === 'windowsPhysicalKeys' && expectedBinding.platform !== 'win32') invalid()
+  return { status: evidence.status,
+    receipt: { binding: receiptBinding, stage: receiptStage, completedAt, checks: [...checks], receiptSha256 } }
 }
 
 export function supportsCliNode(version) {

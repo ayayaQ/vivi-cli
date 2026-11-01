@@ -165,3 +165,78 @@ test('manual stage assertions require exact canonical receipt binding and comple
   assert.throws(() => manualStageEvidence(mac, 'windowsPhysicalKeys', { status: 'passed',
     receipt: { ...receiptFor('windowsPhysicalKeys'), binding: mac } }), /Invalid/)
 })
+
+test('deleted receipt check elements never satisfy manual stage completion', () => {
+  for (const stage of Object.keys(manualStageChecks)) {
+    const receipt = receiptFor(stage)
+    assert.deepEqual(manualStageEvidence(canonical, stage, { status: 'passed', receipt }), { status: 'passed', receipt })
+    for (let index = 0; index < receipt.checks.length; index++) {
+      const sparse = [...receipt.checks]; delete sparse[index]
+      for (const status of ['passed', 'failed']) {
+        assert.throws(() => manualStageEvidence(canonical, stage, { status,
+          receipt: { ...receipt, checks: sparse } }), /Invalid acceptance evidence/)
+      }
+    }
+    for (const incomplete of [receipt.checks.slice(1), [...receipt.checks.slice(1), undefined],
+      [...receipt.checks.slice(1), ''], [...receipt.checks.slice(1), receipt.checks[1]]]) {
+      assert.throws(() => manualStageEvidence(canonical, stage, { status: 'passed',
+        receipt: { ...receipt, checks: incomplete } }), /Invalid acceptance evidence/)
+    }
+    assert.equal(manualStageEvidence(canonical, stage, { status: 'failed', receipt: { ...receipt, checks: [] } }).status, 'failed')
+  }
+})
+
+test('sparse target lists reject before fake metadata is queried', async () => {
+  let metadataCalls = 0
+  const metadata = { available: async () => { metadataCalls++; return true },
+    presence: async () => { metadataCalls++; return 'absent' } }
+  const sparse = ['openai', 'openrouter']; delete sparse[0]
+  for (const targets of [sparse, new Array(1), [undefined], [''], ['openai', 'openai']]) {
+    await assert.rejects(targetPreflight(targets, metadata), /Invalid acceptance evidence/)
+  }
+  assert.equal(metadataCalls, 0)
+  assert.deepEqual(await targetPreflight(['openai', 'openrouter'], metadata), { status: 'eligible', reason: 'all_absent' })
+  assert.equal(metadataCalls, 3)
+})
+
+const malformedHashes = value => [
+  [value], { toString: () => value, accessToken: 'A8_REVIEW_FAKE_MARKER' }, new String(value)
+]
+
+test('synthetic and manual binding hashes require primitive strings without nested marker propagation', () => {
+  for (const key of ['candidateSha', 'artifactSha256']) {
+    for (const value of malformedHashes(binding[key])) {
+      const malformed = { ...binding, [key]: value }
+      assert.throws(() => evidence({ binding: malformed }), /Invalid acceptance evidence/)
+      const malformedCanonical = { ...canonical, [key]: value }
+      for (const status of ['not_run', 'blocked', 'passed', 'failed']) {
+        const input = status === 'not_run' ? { status } : status === 'blocked'
+          ? { status, reason: 'interactive_required' } : { status, receipt: receiptFor('chatgptInference') }
+        assert.throws(() => manualStageEvidence(malformedCanonical, 'chatgptInference', input), /Invalid acceptance evidence/)
+      }
+      for (const status of ['passed', 'failed']) {
+        assert.throws(() => manualStageEvidence(canonical, 'chatgptInference', { status,
+          receipt: { ...receiptFor('chatgptInference'), binding: malformedCanonical } }), /Invalid acceptance evidence/)
+      }
+    }
+  }
+  const report = evidence()
+  assert.deepEqual(report.binding, binding)
+  assert(Object.values(report.binding).every(value => typeof value === 'string'))
+  assert(!JSON.stringify(report).includes('A8_REVIEW_FAKE_MARKER'))
+})
+
+test('manual receipt hashes require primitive strings and preserve legitimate evidence', () => {
+  const receipt = receiptFor('chatgptInference')
+  for (const receiptSha256 of malformedHashes(receipt.receiptSha256)) {
+    for (const status of ['passed', 'failed']) {
+      assert.throws(() => manualStageEvidence(canonical, 'chatgptInference', { status,
+        receipt: { ...receipt, receiptSha256 } }), /Invalid acceptance evidence/)
+    }
+  }
+  const valid = { status: 'passed', receipt }
+  const result = manualStageEvidence(canonical, 'chatgptInference', valid)
+  assert.deepEqual(result, valid)
+  assert.notEqual(result.receipt.binding, canonical)
+  assert(!JSON.stringify(result).includes('A8_REVIEW_FAKE_MARKER'))
+})
