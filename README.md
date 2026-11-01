@@ -155,6 +155,26 @@ updates only when its state or session name changes. The prior title is restored
 on exit where the terminal supports xterm title stacks. Line and JSON output do
 not change the terminal title.
 
+Both full-screen and line modes report machine-readable agent activity using
+[OSC 7501](https://www.superlogical.com/rex/docs/build/program-status) when their
+output is a terminal. Compatible consumers such as Herdr can show `idle`,
+`working`, `blocked` (permission, question or authentication), `done`, and `error`.
+Only a fixed application name and state are sent—never conversation text, tool
+arguments, session names, paths or credentials. Ordinary tool errors do not mark
+the whole turn failed; cancellation stays working until the turn settles. Immediate
+queued continuations stay working, and a completed turn stays done while the composer
+waits. Interactive exit clears the report; one-shot terminal runs retain their final
+done/error report (a consumer may independently clear it on process exit).
+
+Set `VIVI_OSC7501=0` (also `false` or `off`) to disable reporting. It is also disabled
+for redirected output, `TERM=dumb`, known VTE versions below 0.54 and help output.
+There are no terminal capability queries or input interception. Unknown terminals
+normally ignore OSC; delivery through terminal multiplexers is not guaranteed and
+no passthrough escapes are used. This is CLI terminal integration, not a change to
+vivi core; embedded/core users do not emit these sequences. See
+[the implementation contract](docs/TERMINAL_PROGRAM_STATUS.md) for lifecycle and
+verification details.
+
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
 terminal reports those modifiers. Tab completes slash commands. Shift+Tab cycles
 Manual / Auto review / Plan while the composer is idle and preserves an unfinished

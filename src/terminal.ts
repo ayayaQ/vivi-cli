@@ -13,6 +13,8 @@ import type { MemoryChangeRequest } from './host.js'
 import { redactSecrets } from './session.js'
 import type { ApprovalRequest } from './tools.js'
 import { aggregateUsage, formatUsage } from './usage.js'
+import { TerminalProgramStatus, createProgramStatusSink } from './terminal-program-status.js'
+import type { ProgramStatusSink } from './terminal-program-status.js'
 import type { RunOutcome } from './run-status.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { sessionDisplayTitle } from './session-display.js'
@@ -55,9 +57,10 @@ export interface ChatIO {
   setTaskMode?(mode: TaskMode): void
   /** Optional safe display sink that survives canonical transcript refresh. */
   reviewNotice?(message: string, context?: ReviewNotice): void
-  /** Optional visual run lifecycle. Generic cancellation listeners also cover non-turn dialogs. */
+  /** Explicit run lifecycle. continuing keeps terminal status working for immediate queued work.
+   * Generic cancellation listeners also cover non-turn dialogs. */
   runStarted?(): void
-  runFinished?(outcome: RunOutcome): void
+  runFinished?(outcome: RunOutcome, continuing?: boolean): void
   readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined>
   write(text: string): void
   event(event: AgentEvent): void
@@ -124,7 +127,12 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
       finally {
         io.setToolEvidence?.(host.toolPresentationEvidence)
         io.setConversationErrors?.(host.conversationErrors)
-        await refreshChatContext(host, io); io.setApprovalMode?.(host.approvalMode); io.runFinished?.(outcome); update()
+        try { await refreshChatContext(host, io); io.setApprovalMode?.(host.approvalMode) }
+        finally {
+          const continuing = Boolean(host.queuedMessages?.length && !io.isClosed && !signal?.aborted &&
+            (outcome === 'completed' || outcome === 'cancelled' && interrupt))
+          io.runFinished?.(outcome, continuing); update()
+        }
       }
       const pending = host.queuedMessages?.[0]
       // Ordinary cancel/error leaves input visibly queued. Explicit interrupt and
@@ -188,6 +196,10 @@ export async function compactChatContext(host: CliHost, io: ChatIO): Promise<Run
 }
 
 export interface TerminalOptions {
+  programStatus?: ProgramStatusSink
+  statusEnvironment?: NodeJS.ProcessEnv
+  programStatusEnabled?: boolean
+  oneShot?: boolean
   input?: Readable
   output?: Writable
   tui?: boolean
@@ -493,6 +505,7 @@ export class TerminalIO implements ChatIO {
   private readonly input: TtyReadable
   private readonly output: TtyWritable
   private readonly readline: Interface
+  private readonly programStatus: TerminalProgramStatus
   private secrets: readonly string[]
   private readonly tui: boolean
   private readonly stream: boolean
@@ -513,6 +526,7 @@ export class TerminalIO implements ChatIO {
   private streamOverflow = false
   private readonly keyHandler: (_text: string, key: { name?: string }) => void
   private readonly signalHandler: () => void
+  private readonly processExitHandler = (): void => this.programStatus.close()
   get canAutoReview(): boolean { return Boolean(this.input.isTTY && this.output.isTTY && !this.disposed && !this.ended &&
     !this.input.destroyed && !this.output.destroyed && !this.output.writableEnded) }
   readonly canAskQuestions = false
@@ -526,6 +540,8 @@ export class TerminalIO implements ChatIO {
   constructor(options: TerminalOptions = {}) {
     this.input = options.input ?? process.stdin
     this.output = options.output ?? process.stdout
+    this.programStatus = new TerminalProgramStatus(options.programStatusEnabled === false ? undefined
+      : options.programStatus ?? createProgramStatusSink(this.output, options.statusEnvironment), !options.oneShot)
     this.secrets = options.secrets ?? []
     this.tui = Boolean(options.tui && this.input.isTTY && this.output.isTTY)
     this.stream = options.stream ?? true
@@ -560,6 +576,7 @@ export class TerminalIO implements ChatIO {
     this.readline.on('SIGINT', cancel)
     this.signalHandler = cancel
     process.on('SIGINT', this.signalHandler)
+    process.on('exit', this.processExitHandler)
     emitKeypressEvents(this.input, this.readline)
     this.keyHandler = (_text, key): void => {
       if (this.canAutoReview && this.processControls && (key.name === 'f6' || key.name === 'f7')) {
@@ -570,6 +587,8 @@ export class TerminalIO implements ChatIO {
     this.input.on('keypress', this.keyHandler)
     if (this.tui) this.output.write('\x1b[?1049h')
   }
+  runStarted(): void { if (!this.disposed) this.programStatus.runStarted() }
+  runFinished(outcome: RunOutcome, continuing = false): void { if (!this.disposed && !continuing) this.programStatus.runFinished(outcome) }
   addSecrets(secrets: readonly string[]): void {
     this.secrets = [...new Set([...this.secrets, ...secrets])].filter(Boolean)
   }
@@ -723,6 +742,7 @@ export class TerminalIO implements ChatIO {
     this.write(`Approval required (${scope}): ${request.description}\n`)
     // Piped or queued text cannot grant approval for an action that has not been shown yet.
     if (!this.input.isTTY || !this.output.isTTY) { this.write('Denied: interactive approval is required\n'); return false }
+    if (!signal.aborted && !this.isClosed) this.programStatus.setBlocked('permission')
     for (;;) {
       const reply = await this.readLine('Type allow or deny: ', signal)
       if (reply === undefined || reply.trim().toLowerCase() === 'deny') return false
@@ -730,6 +750,7 @@ export class TerminalIO implements ChatIO {
       this.write('Please type allow or deny\n')
     }
     } finally {
+      this.programStatus.setBlocked()
       this.reviewing = false
       this.lines = []
       this.clearEditableInput()
@@ -745,9 +766,11 @@ export class TerminalIO implements ChatIO {
     this.steeringControls = undefined
     this.lines = []
     process.removeListener('SIGINT', this.signalHandler)
+    process.off('exit', this.processExitHandler)
     this.input.removeListener('keypress', this.keyHandler)
     this.readline.close()
     if (this.tui) this.output.write('\x1b[?1049l')
+    this.programStatus.close()
   }
 }
 

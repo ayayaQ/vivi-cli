@@ -397,7 +397,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     const options = parseArguments(args, env, interactive, launchDirectory)
     if (interactive) {
       const { runApplication } = await import('./application.js')
-      const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets })
+      const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets, statusEnvironment: env,
+        oneShot: options.prompt !== undefined })
       io = tui
       const status = await runApplication({ io: tui, options, args, env, secrets,
         ...(dependencies.credentials ? { credentials: dependencies.credentials } : {}),
@@ -411,7 +412,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       const cleanupFailed = closeIO()
       return cleanupFailed && status === 0 ? 1 : status
     }
-    io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets })
+    io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets,
+      statusEnvironment: env, programStatusEnabled: !options.help, oneShot: options.prompt !== undefined })
     if (options.help) { io.write(HELP); return 0 }
     if (options.prompt !== undefined && /^\/auto-threshold(?:\s|$)/.test(options.prompt.trim())) {
       io.write('Auto threshold changes require an idle interactive conversation; no setting changed\n')

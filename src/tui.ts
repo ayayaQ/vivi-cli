@@ -42,13 +42,15 @@ import { WorkspaceDiffRenderable } from './tui-diff.js'
 import { createTerminalTitleSink, TerminalTitleController } from './terminal-title.js'
 import type { TerminalTitleSink } from './terminal-title.js'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
+import { TerminalProgramStatus, createProgramStatusSink } from './terminal-program-status.js'
+import type { ProgramStatusSink } from './terminal-program-status.js'
 import { InputQueue } from './input-queue.js'
 import { QuestionDialog } from './question-dialog.js'
 
 export type { Choice } from './picker.js'
-export interface OpenTuiOptions { stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
+export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
   /** Trusted production wiring or an offline test sink; omitted on directly constructed test surfaces. */
-  terminalTitle?: TerminalTitleSink }
+  terminalTitle?: TerminalTitleSink; programStatus?: ProgramStatusSink; statusEnvironment?: NodeJS.ProcessEnv }
 
 // Ordinary surfaces and text inherit the terminal palette. Dark localized
 // highlights need their own foreground, including native text selections.
@@ -327,6 +329,7 @@ export class OpenTuiIO implements ChatIO {
   private status = 'Ready'
   private readonly runStatus: RunStatus
   private readonly terminalTitle: TerminalTitleController
+  private readonly programStatus: TerminalProgramStatus
   private workspaceDirectory: string | undefined
   private workspaceStatus = false
   private sessionTitle = 'Untitled conversation'
@@ -420,12 +423,14 @@ export class OpenTuiIO implements ChatIO {
     })
   }
 
-  constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}, terminalTitle?: TerminalTitleController) {
+  constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}, terminalTitle?: TerminalTitleController,
+    programStatus?: TerminalProgramStatus) {
+    if (renderer.isDestroyed) throw new Error('Cannot use a destroyed OpenTUI renderer')
     this.terminalTitle = terminalTitle ?? new TerminalTitleController(options.terminalTitle)
+    this.programStatus = programStatus ?? new TerminalProgramStatus(options.programStatus, !options.oneShot)
     this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
     this.secrets = [...new Set(options.secrets ?? [])].filter(Boolean).sort((a, b) => b.length - a.length)
     this.stream = options.stream ?? true
-    if (renderer.isDestroyed) throw new Error('Cannot use a destroyed OpenTUI renderer')
     renderer.once(CliRenderEvents.DESTROY, this.destroyHandler)
     try {
       this.style = SyntaxStyle.fromStyles({
@@ -564,6 +569,7 @@ export class OpenTuiIO implements ChatIO {
   static async create(options: OpenTuiOptions = {}): Promise<OpenTuiIO> {
     let renderer: CliRenderer | undefined
     let terminalTitle: TerminalTitleController | undefined
+    let programStatus: TerminalProgramStatus | undefined
     let io: OpenTuiIO | undefined
     const windowsInput = process.platform === 'win32' && process.stdin.isTTY
       ? createWindowsInputBridge(process.stdin, text => { process.stdout.write(text) }, () => {
@@ -574,7 +580,7 @@ export class OpenTuiIO implements ChatIO {
       renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [],
         // Unlike DESTROY, the supported callback follows native output cleanup,
         // including a destruction request deferred until the current render ends.
-        onDestroy: () => { if (io) io.restoreTerminalTitle(); else terminalTitle?.close() },
+        onDestroy: () => { if (io) io.restoreTerminalTitle(); else { terminalTitle?.close(); programStatus?.close() } },
         ...(windowsInput ? { stdin: windowsInput.stdin } : {}),
         screenMode: 'alternate-screen', consoleMode: 'disabled', openConsoleOnError: false,
         externalOutputMode: 'passthrough', useKittyKeyboard: { disambiguate: true, alternateKeys: true },
@@ -582,12 +588,16 @@ export class OpenTuiIO implements ChatIO {
       if (windowsInput?.failure) throw windowsInput.failure
       const titleSink = options.terminalTitle ?? createTerminalTitleSink(title => renderer!.setTerminalTitle(title), process.stdout, process.env.TERM)
       terminalTitle = new TerminalTitleController(titleSink)
-      io = new OpenTuiIO(renderer, options, terminalTitle)
+      programStatus = new TerminalProgramStatus(options.programStatus ?? createProgramStatusSink(process.stdout, options.statusEnvironment), !options.oneShot)
+      io = new OpenTuiIO(renderer, options, terminalTitle, programStatus)
       io.windowsInput = windowsInput
       windowsInput?.start()
       return io
     } catch (error) {
-      try { windowsInput?.close() } finally { if (renderer && !renderer.isDestroyed) renderer.destroy() }
+      try { windowsInput?.close() } finally {
+        if (renderer && !renderer.isDestroyed) renderer.destroy()
+        if (!renderer || renderer.isDestroyed) programStatus?.close()
+      }
       throw error
     }
   }
@@ -839,6 +849,8 @@ export class OpenTuiIO implements ChatIO {
   private updateTerminalTitle(): void {
     if (this.closed) return
     const input = this.pending !== undefined && ['text', 'secret', 'approval', 'choice', 'search', 'question'].includes(this.pending.kind)
+    this.programStatus.setBlocked(input ? this.pending!.kind === 'approval' ? 'permission'
+      : this.pending!.kind === 'secret' ? 'auth' : 'question' : undefined)
     this.terminalTitle.update(this.sessionTitle, input ? 'input'
       : this.runStatus.running || this.cancelCallbacks.size ? 'working' : 'idle', this.secrets)
   }
@@ -1731,10 +1743,11 @@ export class OpenTuiIO implements ChatIO {
     this.liveHistoryIndex = this.historyLength + 1
     this.liveToolCalls.clear()
     for (const entry of this.entries) if (entry.tool) entry.tool.retained = false
+    this.programStatus.runStarted()
     this.runStatus.start()
     this.updateStatus('Working · Escape / Ctrl+C cancels')
   }
-  runFinished(outcome: RunOutcome): void {
+  runFinished(outcome: RunOutcome, continuing = false): void {
     if (this.closed) return
     this.invalidateDialogs()
     this.mouseActivation.clear()
@@ -1747,6 +1760,7 @@ export class OpenTuiIO implements ChatIO {
       if (!['requested', 'approval_required', 'running'].includes(live.status ?? 'requested')) continue
       this.showTool(id, live.effect === 'not_attempted' ? 'cancelled' : 'unknown', live.effect === 'not_attempted' ? 'not_attempted' : 'unreported')
     }
+    if (!continuing) this.programStatus.runFinished(outcome)
     this.runStatus.finish(outcome)
     this.updateStatus(outcome === 'completed' ? 'Completed' : outcome === 'cancelled' ? 'Cancelled' : 'Error')
   }
@@ -2393,6 +2407,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private restoreTerminalTitle(): void {
     this.terminalTitle.close()
+    this.programStatus.close()
     // Keep this finalizer while native destruction is deferred. A synchronous
     // exit immediately after close still needs the final title-stack pop.
     process.off('exit', this.processExitHandler)
