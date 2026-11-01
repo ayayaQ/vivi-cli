@@ -27,12 +27,12 @@ async function fixture(t, options = {}) {
   return { host, snapshots, queries, accepted }
 }
 function surface() {
-  const state = { messages: [], accepted: [], results: [], starts: 0, finishes: [], controls: undefined }
+  const state = { messages: [], accepted: [], results: [], starts: 0, finishes: [], continuations: [], controls: undefined }
   const io = {
     onSteering(controls) { state.controls = controls; return () => { state.controls = undefined } },
     setSteeringQueue(messages) { state.queue = messages },
     steeringAccepted(content, initial) { state.accepted.push({ content, initial }) },
-    runStarted() { state.starts++ }, runFinished(outcome) { state.finishes.push(outcome) },
+    runStarted() { state.starts++ }, runFinished(outcome, continuing) { state.finishes.push(outcome); state.continuations.push(continuing) },
     write(text) { state.messages.push(text) }, result(result) { state.results.push(result) },
     onCancel() { return () => {} }, close() {}, event() {}, approve() { return Promise.resolve(false) }
   }
@@ -86,6 +86,7 @@ test('force send waits for owned cleanup before the next run and ignores late pr
   const result = await run
   assert.equal(result.status, 'completed'); assert.equal(result.content, 'New answer')
   assert.deepEqual(state.finishes, ['cancelled', 'completed'])
+  assert.deepEqual(state.continuations, [true, false])
   assert.deepEqual(state.accepted, [{ content: 'Follow-up', initial: true }])
   assert.deepEqual(result.history.filter(message => message.kind === 'message').map(message => message.content), ['Start', 'Follow-up'])
   assert.equal(state.results[0].status, 'cancelled')
@@ -123,6 +124,7 @@ test('final text response queues continue, including rollover at the exhausted r
   assert.equal(result.content, 'answer 2')
   assert.equal(f.queries.length, 2)
   assert.deepEqual(state.finishes, ['completed', 'completed'])
+  assert.deepEqual(state.continuations, [true, false])
   assert.deepEqual(f.host.queuedMessages, [])
 })
 

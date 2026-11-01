@@ -29,6 +29,7 @@
     "src",
     "scripts",
     "docs/PROJECT_INPUTS.md",
+    "docs/TERMINAL_PROGRAM_STATUS.md",
     "tsconfig.json",
     "LICENSE",
     "NOTICE",
