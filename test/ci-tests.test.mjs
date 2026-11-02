@@ -121,3 +121,44 @@ test('new OAuth/setup fixtures automatically retain minimum Windows PR coverage'
   const groups = await ciTestGroups(directory)
   for (const name of added) assert(groups['windows-minimum'].includes(`./test/${name}`))
 })
+
+
+test('every CI install first bootstraps supported npm and verifies the dependency policy', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const verify = source => {
+    const blocks = [...source.matchAll(/^  ([a-z][a-z0-9-]*):\n([\s\S]*?)(?=^  [a-z][a-z0-9-]*:\n|$(?![\s\S]))/gm)]
+    const installing = blocks.filter(([, , body]) => body.includes('      - run: npm ci --ignore-scripts\n'))
+    assert.deepEqual(installing.map(([, name]) => name), [
+      'check', 'candidate', 'mcp', 'headless', 'current-compatibility', 'bun', 'packaged-conpty'
+    ])
+    const required = [
+      '      - name: Install policy-aware npm',
+      '        run: node scripts/bootstrap-ci-npm.mjs',
+      '      - name: Verify dependency resolution policy',
+      '        run: node scripts/verify-dependency-policy.mjs npm',
+      '      - run: npm ci --ignore-scripts', ''
+    ].join('\n')
+    for (const [, name, body] of installing) {
+      assert(body.includes(required), `${name}: supported npm and policy fixture must precede npm ci`)
+      assert.equal(body.match(/      - run: npm ci --ignore-scripts\n/g)?.length, 1)
+      assert(!body.includes('continue-on-error:'), `${name}: dependency policy must be required`)
+    }
+    const bunJobs = blocks.filter(([, , body]) => body.includes('      - uses: oven-sh/setup-bun@v2\n'))
+    assert.deepEqual(bunJobs.map(([, name]) => name), ['candidate', 'bun', 'packaged-conpty'])
+    for (const [, name, body] of bunJobs) {
+      assert(body.includes([
+        '          bun-version: 1.4.2',
+        '      - name: Verify Bun dependency resolution policy',
+        '        run: node scripts/verify-dependency-policy.mjs bun', ''
+      ].join('\n')), `${name}: pinned Bun setup must be followed by the policy fixture`)
+      assert(body.indexOf('node scripts/verify-dependency-policy.mjs bun') < body.indexOf('npm ci --ignore-scripts'))
+    }
+  }
+  verify(workflow)
+  for (const [before, after] of [
+    ['node scripts/bootstrap-ci-npm.mjs', 'echo skipped-bootstrap'],
+    ['        run: node scripts/verify-dependency-policy.mjs npm\n', ''],
+    ['      - name: Verify dependency resolution policy\n', '      - name: Verify dependency resolution policy\n        if: false\n'],
+    ['        run: node scripts/verify-dependency-policy.mjs bun\n', '']
+  ]) assert.throws(() => verify(workflow.replace(before, after)))
+})

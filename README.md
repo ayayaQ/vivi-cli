@@ -5,7 +5,8 @@ Chat with your ChatGPT plan, an OpenAI API key, OpenRouter or DeepSeek from your
 ## Run from source
 
 Requires Node.js 26.4+ and [Bun](https://bun.sh) 1.3+ for the full-screen interface.
-The CLI is not yet published to npm.
+The CLI is not yet published to npm. Source dependency installation requires npm
+11.17.0 or newer; see the [dependency policy and upgrade instructions](docs/DEPENDENCY_POLICY.md).
 
 ```sh
 git clone https://github.com/ayayaQ/vivi-cli.git
@@ -814,3 +815,7 @@ reasoning history and reported usage. Unknown limits remain unknown. Unsupported
 imported or inconsistent reasoning/tool history fails before HTTP with `/new`
 guidance; it is never silently rewritten or retried. Context compaction uses only
 core-validated provider views and retains the original local transcript.
+
+## Dependency policy
+
+Source development requires npm >=11.17.0. Read the [seven-day dependency cooldown](docs/DEPENDENCY_POLICY.md) before installing or updating dependencies.

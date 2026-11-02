@@ -44,7 +44,8 @@
     "test:tui": "npm run build && bun test test/*.test.ts",
     "build:standalone": "npm run build && bun scripts/build-standalone.ts",
     "test:standalone": "bun scripts/test-standalone.ts",
-    "test:package:built": "node scripts/test-package.mjs"
+    "test:package:built": "node scripts/test-package.mjs",
+    "verify:dependency-policy": "node scripts/verify-dependency-policy.mjs"
   },
   "dependencies": {
     "@ayayaq/vivi": "0.17.0",
@@ -63,5 +64,12 @@
     "@types/node": "26.2.0",
     "@types/picomatch": "4.0.3",
     "typescript": "6.0.3"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": ">=11.17.0",
+      "onFail": "error"
+    }
   }
 }
