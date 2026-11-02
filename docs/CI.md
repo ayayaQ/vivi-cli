@@ -16,7 +16,7 @@ candidate. Only archive-consuming jobs retain their existing candidate dependenc
 
 Check names identify three responsibilities: `Linux correctness`, `Windows
 compatibility`, and `Package/runtime`. Job IDs, runner isolation, matrix strategies,
-step ordering, artifacts and runtime versions remain unchanged. Consolidating the
+relative build/test ordering, artifacts and Node/Bun runtime versions remain unchanged. Consolidating the
 configuration keeps the independent jobs parallel.
 PR cancellation now applies to the one combined workflow; main/manual runs remain
 unique and are never superseded by another run.
@@ -131,3 +131,27 @@ node scripts/ci-tests.mjs --list
 # If installed:
 actionlint
 ```
+
+
+## Dependency resolution policy
+
+Before each `npm ci`, CI installs the exact mature npm **11.17.0** toolchain with
+lifecycle scripts disabled, then runs `node scripts/verify-dependency-policy.mjs npm`.
+The verifier is a required pre-install step: unsupported npm or failed cooldown
+fixtures stop the job. npm 11.17.0 introduced the exact-package exclusion needed
+for trusted Vivi releases and was released on 2026-06-11. This contributor/CI
+requirement does not raise the published package's Node runtime requirement;
+the selected CI Node versions satisfy npm's own engine requirement.
+
+The bootstrap changes the CI runner's npm tool only; it does not update project
+dependencies or the lockfile. It does not lower the project's seven-day window.
+`npm ci` remains a locked install, **not** a retrospective release-age audit of
+already-locked versions. See [the dependency policy](DEPENDENCY_POLICY.md) for
+new-resolution scope, supported tools, trusted-package scope, and lockfile limits.
+
+Every job that installs Bun 1.4.2 also runs
+`node scripts/verify-dependency-policy.mjs bun` before dependency installation.
+The existing native/runtime/acceptance gates and seven excluded assessments retain
+their scope; no new provider, credential-store, or physical-input checks are added.
+The CI inventory regression test rejects missing, conditional, or obsolete-toolchain
+policy steps in each existing dependency-installing job.

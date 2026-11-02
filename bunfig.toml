@@ -1,0 +1,4 @@
+[install]
+# Seven days in seconds; this does not change the primary npm lockfile.
+minimumReleaseAge = 604800
+minimumReleaseAgeExcludes = ["@ayayaq/vivi"]
