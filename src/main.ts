@@ -391,14 +391,15 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
 
 async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
   dependencies: MainDependencies, automation?: AutomationIO, schema?: OutputSchema): Promise<number> {
+  const report = (text: string): void => { if (automation) automation.write(text); else process.stderr.write(text) }
   // MCP setup is independent of chat credentials, sessions and full-screen startup.
   if (isMcpCliCommand(args)) return runMcpCli(args, env, dependencies)
   if (isChatGptCliCommand(args)) return runChatGptCli(args, env, dependencies)
   // This isolated path never reads credentials, preferences, workspace or sessions.
   if (args.includes('--diagnose-input')) {
-    if (args.length !== 1) { process.stderr.write('Use --diagnose-input by itself\n'); return 1 }
+    if (args.length !== 1) { report('Use --diagnose-input by itself\n'); return 1 }
     if (!dependencies.inputDiagnostic && (!supportsBunTui() || !process.stdin.isTTY || !process.stdout.isTTY)) {
-      process.stderr.write('Input diagnostics require Bun >=1.3.0 in an interactive terminal. Run vivi --diagnose-input there.\n')
+      report('Input diagnostics require Bun >=1.3.0 in an interactive terminal. Run vivi --diagnose-input there.\n')
       return 1
     }
     try {
@@ -406,7 +407,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       process.stdout.write(await diagnose())
       return 0
     } catch {
-      process.stderr.write('Input diagnostic failed; no input contents were saved or reported. Close this terminal tab if restoration failed.\n')
+      report('Input diagnostic failed; no input contents were saved or reported. Close this terminal tab if restoration failed.\n')
       return 1
     }
   }
@@ -424,7 +425,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     const failedBeforeClose = closing.failed
     closing.close()
     if (!failedBeforeClose && closing.failed) {
-      process.stderr.write('vivi: terminal cleanup failed. Close this terminal window or tab before restarting vivi.\n')
+      report('vivi: terminal cleanup failed. Close this terminal window or tab before restarting vivi.\n')
       return true
     }
     return false
@@ -674,7 +675,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     automation?.caught(error)
     const message = redactSecrets(error instanceof Error ? error.message : 'CLI failed', secrets)
     if (io && !io.failed) io.write(`${message}\n`)
-    else process.stderr.write(`${message}\n`)
+    else report(`${message}\n`)
     return 1
   } finally {
     let mcpCleanupFailed = false, hostCleanupFailed = false, leaseCleanupFailed = false
@@ -684,8 +685,8 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       const message = redactSecrets(error instanceof Error ? error.message : 'Owned server cleanup failed', secrets)
       try {
         if (io && !io.failed) io.write(`MCP cleanup failed: ${message}\n`)
-        else process.stderr.write(`MCP cleanup failed: ${message}\n`)
-      } catch { process.stderr.write('MCP cleanup failed; terminal reporting was unavailable\n') }
+        else report(`MCP cleanup failed: ${message}\n`)
+      } catch { report('MCP cleanup failed; terminal reporting was unavailable\n') }
     }
     try { await host?.shutdown() }
     catch (error) {
@@ -693,8 +694,8 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       const message = redactSecrets(error instanceof Error ? error.message : 'Owned process/session cleanup could not be verified', secrets)
       try {
         if (io && !io.failed) io.write(`Process/session cleanup unconfirmed: ${message}. Session lock retained; inspect owned processes before restarting.\n`)
-        else process.stderr.write(`Process/session cleanup unconfirmed: ${message}. Session lock retained; inspect owned processes before restarting.\n`)
-      } catch { process.stderr.write('Process/session cleanup unconfirmed; session lock retained and terminal reporting was unavailable\n') }
+        else report(`Process/session cleanup unconfirmed: ${message}. Session lock retained; inspect owned processes before restarting.\n`)
+      } catch { report('Process/session cleanup unconfirmed; session lock retained and terminal reporting was unavailable\n') }
     }
     // An uncertain host may still own a process or persistence effect. Do not
     // advertise a clean session handoff by releasing its writer lease.
@@ -702,15 +703,15 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     catch {
       leaseCleanupFailed = true
       try { if (io && !io.failed) io.write('Session lease release failed; inspect its lock before restarting\n')
-        else process.stderr.write('Session lease release failed; inspect its lock before restarting\n') }
-      catch { process.stderr.write('Session lease release failed\n') }
+        else report('Session lease release failed; inspect its lock before restarting\n') }
+      catch { report('Session lease release failed\n') }
     }
     let authCleanupFailed = false
     try { if (!dependencies.chatgptAuth) await chatgptAuth?.close() }
-    catch { authCleanupFailed = true; automation?.cleanupFailure() }
+    catch (error) { if (!automation) throw error; authCleanupFailed = true; automation.cleanupFailure() }
     let terminalCleanupFailed = false
     try { terminalCleanupFailed = closeIO() }
-    catch { terminalCleanupFailed = true; automation?.cleanupFailure() }
+    catch (error) { if (!automation) throw error; terminalCleanupFailed = true; automation.cleanupFailure() }
     if (mcpCleanupFailed || hostCleanupFailed || leaseCleanupFailed || terminalCleanupFailed || authCleanupFailed) {
       automation?.cleanupFailure()
       return 1

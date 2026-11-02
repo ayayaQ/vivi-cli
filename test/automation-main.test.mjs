@@ -306,3 +306,49 @@ test('JSONL genuine cleanup failure takes precedence over a requested cancellati
   assert.equal(result.status, 1); assert.equal(result.rows.at(-1).code, 'cleanup_failed')
   assert(!result.rows.some(row => row.type === 'run.cancelled'))
 })
+
+test('JSONL failed injected stderr never falls back to global stderr during runtime and cleanup failures', async t => {
+  const f = await fixture(t), stdout = capture(), globalWrites = []
+  let providers = 0, closes = 0, streamErrors = 0
+  const stderr = new Writable({ write(_chunk, _encoding, callback) {
+    callback(Object.assign(new Error('offline stderr failure'), { code: 'EPIPE' }))
+  } })
+  stderr.on('error', () => { streamErrors++ })
+  const originalWrite = process.stderr.write
+  process.stderr.write = function (chunk, encoding, callback) {
+    globalWrites.push(String(chunk))
+    const done = typeof encoding === 'function' ? encoding : callback
+    done?.()
+    return true
+  }
+  let status
+  try {
+    status = await main(['--jsonl', '--model', 'offline-model', '--no-workspace', '--no-skills', '--disable-commands', '--prompt', 'Hello'], f.env, {
+      launchDirectory: f.root, automation: { stdout: stdout.stream, stderr },
+      providerFactory() { providers++; throw new Error('offline provider startup failure') },
+      mcpManagerFactory(options) {
+        const manager = new McpManager(options), close = manager.close.bind(manager)
+        manager.close = async () => {
+          closes++; await close(); await new Promise(resolve => setImmediate(resolve))
+          throw new Error('offline MCP cleanup failure')
+        }
+        return manager
+      }
+    })
+    // Writable can emit EPIPE after its failed write callback; the owned output
+    // path must remain safe through those late notifications too.
+    await new Promise(resolve => setImmediate(resolve))
+  } finally { process.stderr.write = originalWrite }
+  assert.equal(status, 74); assert.equal(providers, 1); assert.equal(closes, 1); assert.equal(streamErrors, 1)
+  assert.deepEqual(globalWrites, [], 'An automation diagnostic failure cannot route to a different output stream')
+  const rows = stdout.text().trimEnd().split('\n').map(line => JSON.parse(line))
+  assert.equal(rows[0].type, 'run.started')
+  assert(!rows.some(row => row.type === 'run.completed'))
+})
+
+test('Plain CLI retains its existing thrown IO-close error semantics', async t => {
+  const f = await fixture(t), expected = new Error('offline plain IO close failure')
+  const io = { write() {}, event() {}, result() {}, async readLine() {}, async approve() { return false },
+    onCancel() { return () => {} }, close() { throw expected } }
+  await assert.rejects(main(['--help'], f.env, { io, launchDirectory: f.root }), error => error === expected)
+})

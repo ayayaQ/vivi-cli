@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { estimateContext } from '@ayayaq/vivi';
 import { OutputSchema, OutputSchemaError, OUTPUT_SCHEMA_LIMITS, OUTPUT_SCHEMA_DIALECT, loadOutputSchema } from '../dist/output-schema.js';
 const matches = (code, phase = 'configuration') => error => {
   assert(error instanceof OutputSchemaError);
@@ -134,7 +135,7 @@ test('output schema wrapper preserves inputs, signals/options, provider this and
   assert(seen[1].input.messages[0].content.includes(JSON.stringify(objectSchema)));
   assert.equal(seen[1].signal, signal); assert.equal(seen[1].options, options);
   assert.equal(seen[2].input, input);
-  assert.equal(schema.wrapProvider({ generate: async () => ({ content: '{}', toolCalls: [] }) }, () => []).estimateContext, undefined);
+  assert.equal(typeof schema.wrapProvider({ generate: async () => ({ content: '{}', toolCalls: [] }) }, () => []).estimateContext, 'function');
 });
 
 test('output schema descriptor loader handles regular files and refuses missing, directories, malformed UTF8 and bounds', async t => {
@@ -157,4 +158,18 @@ test('output schema descriptor loader handles regular files and refuses missing,
 test('output schema accepts bounded wide JSON arrays without argument-spread overflow', () => {
   const content = '[' + Array(100_000).fill('0').join(',') + ']';
   assert.equal(new OutputSchema(true).validate(content, []).length, 100_000);
+});
+
+
+test('output schema fallback estimate includes its exact ephemeral prefix and rechecks dynamic secrets', async () => {
+  const secrets = [], schema = new OutputSchema({ type: 'string', description: 'sensitive' });
+  let received;
+  const wrapped = schema.wrapProvider({ generate: async input => { received = input; return { content: '\"ok\"', toolCalls: [] }; } }, () => secrets);
+  const input = { messages: [{ kind: 'message', role: 'user', content: 'Original' }], tools: [] };
+  const measured = wrapped.estimateContext(input);
+  await wrapped.generate(input, new AbortController().signal);
+  assert.deepEqual(measured, estimateContext(received));
+  assert(measured.inputTokens > estimateContext(input).inputTokens);
+  secrets.push('sensitive');
+  assert.throws(() => wrapped.estimateContext(input), matches('output_schema_redacted'));
 });

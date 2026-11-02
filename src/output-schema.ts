@@ -4,6 +4,7 @@ import { open } from 'node:fs/promises'
 import { TextDecoder } from 'node:util'
 import { Ajv2020 } from 'ajv/dist/2020.js'
 import type { ValidateFunction } from 'ajv/dist/2020.js'
+import { estimateContext } from '@ayayaq/vivi'
 import type { JsonValue, Message, ModelProvider } from '@ayayaq/vivi'
 
 export const OUTPUT_SCHEMA_LIMITS = Object.freeze({
@@ -143,7 +144,10 @@ export class OutputSchema {
       ...(provider.defaultOutputTokens === undefined ? {} : { defaultOutputTokens: provider.defaultOutputTokens }),
       // estimateContext has no purpose field. Including the prefix for summary estimates
       // is conservative; actual summary generation never receives the output constraint.
-      ...(provider.estimateContext ? { estimateContext: (input, options) => provider.estimateContext!(inputWithSchema(input), options) } : {}),
+      estimateContext: (input, options) => {
+        const effective = inputWithSchema(input)
+        return provider.estimateContext ? provider.estimateContext(effective, options) : estimateContext(effective)
+      },
       generate: (input, signal, options) => {
         this.checkSecrets(getSecrets())
         return provider.generate(options?.purpose === 'context-summary' ? input : inputWithSchema(input), signal, options)
