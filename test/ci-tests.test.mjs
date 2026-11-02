@@ -96,9 +96,12 @@ test('CI runner rejects unknown groups and propagates failed test subprocesses',
 test('PR smoke groups preserve runtime boundaries without repeating broad suites', async () => {
   const groups = await ciTestGroups()
   assert.deepEqual(groups['linux-current'], [
-    'chatgpt-auth', 'chatgpt-integration', 'chatgpt-provider', 'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
-    'mcp-oauth-native', 'mcp-oauth-store', 'platform-acceptance'
+    'automation-main', 'automation-output', 'chatgpt-auth', 'chatgpt-integration', 'chatgpt-provider', 'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
+    'mcp-oauth-native', 'mcp-oauth-store', 'output-schema', 'platform-acceptance'
   ].map(name => `./test/${name}.test.mjs`))
+  for (const name of ['automation-main', 'automation-output', 'output-schema']) {
+    for (const group of ['linux-node', 'linux-current', 'windows-minimum', 'windows-current']) assert(groups[group].includes(`./test/${name}.test.mjs`))
+  }
   for (const file of groups['windows-current']) assert(groups['windows-minimum'].includes(file))
   for (const name of ['mcp-http', 'mcp-integration', 'mcp-invocation', 'mcp-lifecycle',
     'mcp-transport', 'mcp-send-boundary', 'installed-skills', 'skills-store', 'memory-store',

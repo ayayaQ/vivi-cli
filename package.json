@@ -34,7 +34,9 @@
     "LICENSE",
     "NOTICE",
     "README.md",
-    "RELEASING.md"
+    "RELEASING.md",
+    "docs/AUTOMATION.md",
+    "docs/automation-v1.schema.json"
   ],
   "scripts": {
     "build": "node scripts/clean-build.mjs && tsc -p tsconfig.json && node scripts/finish-build.mjs",
@@ -51,11 +53,12 @@
     "@ayayaq/vivi": "0.17.0",
     "@modelcontextprotocol/client": "2.3.1",
     "@opentui/core": "0.5.14",
+    "ajv": "8.17.1",
     "ignore": "7.0.12",
+    "jose": "6.2.12",
     "picomatch": "4.0.7",
     "url-template": "3.1.1",
-    "web-tree-sitter": "0.25.10",
-    "jose": "6.2.12"
+    "web-tree-sitter": "0.25.10"
   },
   "bundledDependencies": [
     "@ayayaq/vivi"

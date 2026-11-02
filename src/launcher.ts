@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { isMcpCliCommand } from './mcp-cli.js'
 
 const args = process.argv.slice(2)
-const fullScreen = !isMcpCliCommand(args) && Boolean(process.stdin.isTTY && process.stdout.isTTY) && !args.includes('--no-tui') &&
+const fullScreen = !args.includes('--jsonl') && !isMcpCliCommand(args) && Boolean(process.stdin.isTTY && process.stdout.isTTY) && !args.includes('--no-tui') &&
   !args.includes('--help') && !args.includes('-h') && (!args.includes('--prompt') || args.includes('--tui'))
 if (fullScreen && !('bun' in process.versions)) {
   const child = spawn('bun', [fileURLToPath(new URL('./main.js', import.meta.url)), ...args], { stdio: 'inherit', shell: false })

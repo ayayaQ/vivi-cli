@@ -226,6 +226,8 @@ try {
   // npm exec resolves the platform's installed bin shim, including vivi.cmd on Windows.
   assert.match(runNpm(['exec', '--offline', '--', 'vivi', '--help'], temporary), /--provider/)
   const launcher = join(installed, installedManifest.bin.vivi)
+  for (const path of ['docs/AUTOMATION.md', 'docs/automation-v1.schema.json', 'dist/automation.js', 'dist/output-schema.js', 'scripts/automation-package-probe.mjs']) assert(paths.has(path), `Missing automation artifact ${path}`)
+  run(process.execPath, [...nodeGuard, join(installed, 'scripts/automation-package-probe.mjs')], temporary)
   assert.match(run(process.execPath, [...nodeGuard, launcher, '--no-tui', '--help'], temporary), /--provider/)
   // Anchor runtime/type consumers beside the installed package: its bundled core is an
   // implementation dependency, not a promise that npm hoists that package for other consumers.
