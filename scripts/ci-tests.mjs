@@ -16,13 +16,14 @@ const linuxOnly = new Set(['cli.test.mjs', 'preferences.test.mjs'])
 const currentCompatibility = new Set([
   // Exercise workflow-text portability in both existing Windows PR jobs.
   'ci-tests.test.mjs',
+  'automation-output.test.mjs', 'automation-main.test.mjs', 'output-schema.test.mjs',
   'command-process.test.mjs', 'command-windows.test.mjs', 'command-windows-real.test.mjs',
   'mcp-windows.test.mjs', 'mcp-windows-real.test.mjs', 'mcp-windows-node-env.test.mjs',
   'platform-acceptance.test.mjs', 'windows-input.test.mjs', 'windows-conpty.test.mjs'
 ])
 // Small latest-Linux smoke: actual startup/signals, subprocesses, HTTP/OAuth and SQLite.
 const linuxCurrent = new Set([
-  'launcher.test.mjs', 'command-process.test.mjs', 'mcp-http.test.mjs',
+  'launcher.test.mjs', 'automation-output.test.mjs', 'automation-main.test.mjs', 'output-schema.test.mjs', 'command-process.test.mjs', 'mcp-http.test.mjs',
   'mcp-lifecycle.test.mjs', 'mcp-oauth-native.test.mjs', 'mcp-oauth-store.test.mjs',
   'installed-skills.test.mjs', 'platform-acceptance.test.mjs'
 ])

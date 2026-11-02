@@ -1,0 +1,666 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Vivi automation event protocol v1",
+  "description": "A single JSONL record. Stream ordering, sequence continuity and exactly one terminal are additional protocol requirements.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "run.started"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "session.started"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "session_id",
+        "provider",
+        "model"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "assistant.completed"
+        },
+        "round": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tool_call_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "round",
+        "tool_call_count"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "tool.started"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "call_id",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "tool.completed"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "is_error": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "call_id",
+        "name",
+        "is_error"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "round.completed"
+        },
+        "round": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "inputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "outputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "totalTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cachedInputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cacheWriteInputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "inputTokens",
+                "outputTokens",
+                "totalTokens"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "round",
+        "usage"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "context.compaction.started"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "context.compaction.completed"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "before_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "after_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "reason",
+        "before_tokens",
+        "after_tokens"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "context.compaction.failed"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "reason",
+        "code"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "approval.denied"
+        },
+        "reason": {
+          "const": "interaction_required"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "run.completed"
+        },
+        "exit_code": {
+          "const": 0
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "final_text": {
+          "type": "string"
+        },
+        "structured_output": {},
+        "rounds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage": {
+          "type": "object",
+          "properties": {
+            "reported": {
+              "type": "object",
+              "properties": {
+                "inputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "outputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "totalTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cachedInputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cacheWriteInputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "inputTokens",
+                "outputTokens",
+                "totalTokens"
+              ],
+              "additionalProperties": false
+            },
+            "complete": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "reported",
+            "complete"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "exit_code",
+        "final_text",
+        "rounds",
+        "usage"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "run.failed"
+        },
+        "exit_code": {
+          "type": "integer",
+          "enum": [
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "rounds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage": {
+          "type": "object",
+          "properties": {
+            "reported": {
+              "type": "object",
+              "properties": {
+                "inputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "outputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "totalTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cachedInputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cacheWriteInputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "inputTokens",
+                "outputTokens",
+                "totalTokens"
+              ],
+              "additionalProperties": false
+            },
+            "complete": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "reported",
+            "complete"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "exit_code",
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "vivi.automation"
+        },
+        "version": {
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "run.cancelled"
+        },
+        "exit_code": {
+          "type": "integer",
+          "enum": [
+            130,
+            143
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "SIGINT",
+            "SIGTERM"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "run_id",
+        "seq",
+        "type",
+        "exit_code",
+        "reason"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

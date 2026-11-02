@@ -819,3 +819,7 @@ core-validated provider views and retains the original local transcript.
 ## Dependency policy
 
 Source development requires npm >=11.17.0. Read the [seven-day dependency cooldown](docs/DEPENDENCY_POLICY.md) before installing or updating dependencies.
+
+## Structured automation
+
+Use `vivi --jsonl --model MODEL --prompt "Summarize the repository"` for versioned JSONL events and stable exit codes. Add `--output-schema answer.schema.json` for locally validated structured final output. This is noninteractive Manual mode; it does not enroll Skip/Auto or turn piped text into approval. See [automation protocol and schema limits](docs/AUTOMATION.md).

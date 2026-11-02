@@ -63,7 +63,7 @@ export interface ChatIO {
   runFinished?(outcome: RunOutcome, continuing?: boolean): void
   readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined>
   write(text: string): void
-  event(event: AgentEvent): void
+  event(event: AgentEvent): void | Promise<void>
   result(result: AgentResult): void
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
   onCancel(callback: () => void): () => void

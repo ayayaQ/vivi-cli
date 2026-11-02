@@ -5,6 +5,10 @@ import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { AutomationIO } from './automation.js'
+import type { AutomationDependencies } from './automation.js'
+import { loadOutputSchema } from './output-schema.js'
+import type { OutputSchema } from './output-schema.js'
 import { createDeepSeekProvider } from '@ayayaq/vivi/providers/deepseek'
 import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
 import type { CliWebConfiguration, CliWebProviderName } from './web-tools.js'
@@ -76,6 +80,9 @@ export interface CliOptions {
   maxRounds: number
   prompt?: string
   help: boolean
+  /** Opt-in single-turn machine protocol; never a saved preference. */
+  jsonl?: boolean
+  outputSchema?: string
   /** Ephemeral host-owned runtime capabilities, never command-line or saved preference inputs. */
   imageAssets?: CliImageAssets
   imageCapability?: import('./models.js').Capability
@@ -106,6 +113,8 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --no-workspace              Disable workspace files for this launch
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
   --prompt TEXT               Run one turn and exit
+  --jsonl                     Versioned JSONL automation; requires --prompt; noninteractive Manual only
+  --output-schema PATH        Validate final JSON against a local schema (requires --jsonl)
   --no-stream                 Display accepted complete messages only
   --approval-mode MODE        manual (default), auto or skip; fresh interactive enrollment required
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
@@ -150,7 +159,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   interactiveSetup = false, launchDirectory?: string): CliOptions {
   const options: CliOptions = {
     reasoningCapabilities: [], sessionDirectory: env.VIVI_SESSION_DIR ?? join(homedir(), '.vivi', 'sessions'),
-    approvalMode: 'manual', stream: true, tui: true, enableNotes: true, enableMemory: false, enableCommands: true, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false,
+    approvalMode: 'manual', stream: true, tui: true, enableNotes: true, enableMemory: false, enableCommands: true, enableSkills: true, skillsDirectories: [], enableTools: true, startNew: false, maxRounds: 25, help: false, jsonl: false,
     ...(launchDirectory === undefined ? {} : { workspace: launchDirectory })
   }
   let explicitlyNew = false
@@ -206,6 +215,8 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       case '--enable-commands': options.enableCommands = true; break
       case '--disable-commands': options.enableCommands = false; break
       case '--prompt': options.prompt = value(); break
+      case '--jsonl': options.jsonl = true; break
+      case '--output-schema': options.outputSchema = value(); break
       case '--new': explicitlyNew = true; options.startNew = true; break
       case '--no-stream': options.stream = false; break
       case '--approval-mode': {
@@ -242,6 +253,11 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   if (options.workspace !== undefined && launchDirectory !== undefined) {
     options.workspace = resolve(launchDirectory, options.workspace)
   }
+  if (options.jsonl) {
+    if (options.prompt === undefined || !options.prompt.trim()) throw new Error('--jsonl requires a nonempty --prompt')
+    if (options.help || args.includes('--tui') || options.approvalMode !== 'manual') throw new Error('--jsonl requires noninteractive Manual mode without --help or --tui')
+    options.tui = false
+  } else if (options.outputSchema !== undefined) throw new Error('--output-schema requires --jsonl')
   if (options.help) return options
   if (options.chatgptAccountId && options.provider !== 'chatgpt' && !options.resume) throw new Error('--chatgpt-account requires --provider chatgpt')
   if (options.resume && options.chatgptAccountId) throw new Error('Resumed sessions retain their ChatGPT account registration; omit --chatgpt-account')
@@ -249,7 +265,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   if (options.resume && (options.provider !== undefined || options.model !== undefined || options.reasoning !== undefined)) {
     throw new Error('Resumed sessions retain their provider, model and reasoning; omit selection flags')
   }
-  const mcpPrompt = options.prompt !== undefined && isMcpCommand(options.prompt)
+  const mcpPrompt = !options.jsonl && options.prompt !== undefined && isMcpCommand(options.prompt)
   if (!options.resume && ((!options.model && !interactiveSetup && !mcpPrompt) || (options.model !== undefined &&
     (!options.model || options.model.length > 200 || options.model.trim() !== options.model)))) {
     throw new Error('A new session requires --model with a bounded model identifier')
@@ -337,15 +353,44 @@ export function deferredDecisionProvider(session: CliSession, env: NodeJS.Proces
     } }
 }
 
+export interface MainDependencies {
+  io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession
+  decisionProviderFactory?: typeof decisionProviderForSession
+  credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string
+  chatgptAuth?: ChatGptAuth
+  mcpManagerFactory?: (options: McpManagerOptions) => McpManager
+  mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>
+  inputDiagnostic?: () => Promise<string>
+  automation?: AutomationDependencies
+}
+
 /** Injection avoids provider calls and real terminal use in tests; importing this module does nothing. */
 export async function main(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env,
-  dependencies: { io?: ChatIO; tuiIO?: InteractiveIO; providerFactory?: typeof providerForSession;
-    decisionProviderFactory?: typeof decisionProviderForSession;
-    credentials?: CredentialStore; catalog?: Catalog; launchDirectory?: string;
-    chatgptAuth?: ChatGptAuth;
-    mcpManagerFactory?: (options: McpManagerOptions) => McpManager;
-    mcpOAuth?: Omit<McpOAuthControlsOptions, 'registerSecrets' | 'secrets'>;
-    inputDiagnostic?: () => Promise<string> } = {}): Promise<number> {
+  dependencies: MainDependencies = {}): Promise<number> {
+  if (!args.includes('--jsonl')) return mainInternal(args, env, dependencies)
+  const automation = new AutomationIO(environmentSecrets(env), dependencies.automation)
+  let status = 1, schema: OutputSchema | undefined
+  try {
+    await automation.started()
+    try {
+      // Validate before session/profile/catalog/provider side effects. Unknown
+      // subcommands and diagnostics are intentionally not automation commands.
+      const options = parseArguments(args, env, false, dependencies.launchDirectory ?? process.cwd())
+      automation.schemaMode = options.outputSchema !== undefined
+      if (options.outputSchema !== undefined) schema = await loadOutputSchema(options.outputSchema, automation.secrets)
+    } catch {
+      automation.failure('invalid_configuration', 2, 'Invalid automation arguments or output schema')
+      return await automation.finish(2)
+    }
+    if (!automation.signal.aborted) {
+      status = await mainInternal(args, env, { ...dependencies, io: automation }, automation, schema)
+    }
+  } catch (error) { automation.caught(error) }
+  return automation.finish(status, schema ? (content, secrets) => schema!.validate(content, secrets) : undefined)
+}
+
+async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
+  dependencies: MainDependencies, automation?: AutomationIO, schema?: OutputSchema): Promise<number> {
   // MCP setup is independent of chat credentials, sessions and full-screen startup.
   if (isMcpCliCommand(args)) return runMcpCli(args, env, dependencies)
   if (isChatGptCliCommand(args)) return runChatGptCli(args, env, dependencies)
@@ -389,8 +434,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     // Help and opt-outs do not need a usable cwd; injected directories keep tests isolated.
     const launchDirectory = dependencies.launchDirectory ?? (args.includes('--no-workspace') || args.includes('--help') ||
       args.includes('-h') ? undefined : process.cwd())
-    const interactive = dependencies.tuiIO !== undefined || (!dependencies.io && Boolean(process.stdin.isTTY && process.stdout.isTTY) &&
-      !args.includes('--no-tui') && (!args.includes('--prompt') || args.includes('--tui')) && !args.includes('--help') && !args.includes('-h'))
+    const interactive = !automation && (dependencies.tuiIO !== undefined || (!dependencies.io && Boolean(process.stdin.isTTY && process.stdout.isTTY) &&
+      !args.includes('--no-tui') && (!args.includes('--prompt') || args.includes('--tui')) && !args.includes('--help') && !args.includes('-h')))
     if (interactive && !dependencies.tuiIO && !supportsBunTui()) {
       throw new Error('The full-screen UI requires Bun >=1.3.0. Install Bun from https://bun.sh, then run bun dist/main.js. Use --no-tui --model MODEL for Node line mode.')
     }
@@ -415,7 +460,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     io = dependencies.io ?? new TerminalIO({ stream: options.stream, tui: false, secrets,
       statusEnvironment: env, programStatusEnabled: !options.help, oneShot: options.prompt !== undefined })
     if (options.help) { io.write(HELP); return 0 }
-    if (options.prompt !== undefined && /^\/auto-threshold(?:\s|$)/.test(options.prompt.trim())) {
+    if (!automation && options.prompt !== undefined && /^\/auto-threshold(?:\s|$)/.test(options.prompt.trim())) {
       io.write('Auto threshold changes require an idle interactive conversation; no setting changed\n')
       return 0
     }
@@ -431,7 +476,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       store: new McpConfigStore(options.sessionDirectory, secrets), env, secrets, ...oauth.managerOptions()
     })
     oauth.bind(mcp)
-    if (options.prompt !== undefined && await runMcpCommand(io, options.prompt, {
+    if (!automation && options.prompt !== undefined && await runMcpCommand(io, options.prompt, {
       mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })) return 0
     const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
@@ -506,7 +551,8 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     if (metadata.modelCapabilities) effective.imageModelCapabilities = metadata.modelCapabilities
     let accountRevision = randomUUID(), accountCurrent = true
     if (session.provider === 'chatgpt') effective.chatgptIsCurrent = () => accountCurrent
-    const rawProvider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
+    const baseProvider = (dependencies.providerFactory ?? providerForSession)(session, effective, env)
+    const rawProvider = schema ? schema.wrapProvider(baseProvider, () => automation!.secrets) : baseProvider
     const provider = session.provider === 'chatgpt' ? bindChatGptAccount(rawProvider, {
       isCurrent: () => accountCurrent,
       invalidate: async () => {
@@ -548,9 +594,19 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
       maxRounds: options.maxRounds, approve: (request, signal) => io!.approve(request, signal),
       onEvent: (event) => {
         if (event.type === 'tool_completed') io!.setToolEvidence?.(host!.toolPresentationEvidence)
-        io!.event(event)
+        return io!.event(event)
       } })
     await host.initialize()
+    if (automation) {
+      automation.signal.throwIfAborted()
+      if (host.queuedMessages.length) throw new Error('Automation cannot replay queued input')
+      await automation.sessionStarted(session.id, session.provider, session.model)
+      // Single literal turn: never dispatch slash management, ! shell input,
+      // queued continuations or interactive enrollment through this surface.
+      const result = await host.send(options.prompt!, automation.signal)
+      automation.result(result)
+      return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0
+    }
     io.setApprovalMode?.('manual')
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
@@ -615,6 +671,7 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
     })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0
   } catch (error) {
+    automation?.caught(error)
     const message = redactSecrets(error instanceof Error ? error.message : 'CLI failed', secrets)
     if (io && !io.failed) io.write(`${message}\n`)
     else process.stderr.write(`${message}\n`)
@@ -648,9 +705,16 @@ export async function main(args: readonly string[] = process.argv.slice(2), env:
         else process.stderr.write('Session lease release failed; inspect its lock before restarting\n') }
       catch { process.stderr.write('Session lease release failed\n') }
     }
-    if (!dependencies.chatgptAuth) await chatgptAuth?.close()
-    const terminalCleanupFailed = closeIO()
-    if (mcpCleanupFailed || hostCleanupFailed || leaseCleanupFailed || terminalCleanupFailed) return 1
+    let authCleanupFailed = false
+    try { if (!dependencies.chatgptAuth) await chatgptAuth?.close() }
+    catch { authCleanupFailed = true; automation?.cleanupFailure() }
+    let terminalCleanupFailed = false
+    try { terminalCleanupFailed = closeIO() }
+    catch { terminalCleanupFailed = true; automation?.cleanupFailure() }
+    if (mcpCleanupFailed || hostCleanupFailed || leaseCleanupFailed || terminalCleanupFailed || authCleanupFailed) {
+      automation?.cleanupFailure()
+      return 1
+    }
   }
 }
 
