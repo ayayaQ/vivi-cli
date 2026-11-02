@@ -135,15 +135,17 @@ actionlint
 
 ## Dependency resolution policy
 
-Before each `npm ci`, CI installs the exact mature npm **11.17.0** toolchain with
-lifecycle scripts disabled, then runs `node scripts/verify-dependency-policy.mjs npm`.
+Before each `npm ci`, `node scripts/bootstrap-ci-npm.mjs` installs exact mature
+npm **11.17.0** into a runner-temporary prefix with lifecycle scripts disabled,
+verifies its exact version, and selects its bin path/CLI identity for later steps.
+CI then runs `node scripts/verify-dependency-policy.mjs npm`.
 The verifier is a required pre-install step: unsupported npm or failed cooldown
 fixtures stop the job. npm 11.17.0 introduced the exact-package exclusion needed
 for trusted Vivi releases and was released on 2026-06-11. This contributor/CI
 requirement does not raise the published package's Node runtime requirement;
 the selected CI Node versions satisfy npm's own engine requirement.
 
-The bootstrap changes the CI runner's npm tool only; it does not update project
+The bootstrap selects an isolated CI runner npm tool only; it does not update project
 dependencies or the lockfile. It does not lower the project's seven-day window.
 `npm ci` remains a locked install, **not** a retrospective release-age audit of
 already-locked versions. See [the dependency policy](DEPENDENCY_POLICY.md) for

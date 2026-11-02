@@ -133,7 +133,7 @@ test('every CI install first bootstraps supported npm and verifies the dependenc
     ])
     const required = [
       '      - name: Install policy-aware npm',
-      '        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund',
+      '        run: node scripts/bootstrap-ci-npm.mjs',
       '      - name: Verify dependency resolution policy',
       '        run: node scripts/verify-dependency-policy.mjs npm',
       '      - run: npm ci --ignore-scripts', ''
@@ -156,7 +156,7 @@ test('every CI install first bootstraps supported npm and verifies the dependenc
   }
   verify(workflow)
   for (const [before, after] of [
-    ['npm@11.17.0', 'npm@11.9.0'],
+    ['node scripts/bootstrap-ci-npm.mjs', 'echo skipped-bootstrap'],
     ['        run: node scripts/verify-dependency-policy.mjs npm\n', ''],
     ['      - name: Verify dependency resolution policy\n', '      - name: Verify dependency resolution policy\n        if: false\n'],
     ['        run: node scripts/verify-dependency-policy.mjs bun\n', '']

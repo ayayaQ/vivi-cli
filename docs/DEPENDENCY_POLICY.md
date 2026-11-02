@@ -21,8 +21,11 @@ that guard reject unsupported install/ci/run commands, even with
 engine change. npm 11.17 itself needs Node `^20.17.0 || >=22.9.0`; use a compatible
 Node version that also meets this project's unchanged runtime requirement.
 
-CI bootstraps exact **npm 11.17.0**, with lifecycle scripts disabled, before
-running the local policy verifier and installing the locked graph. The pin was
+CI bootstraps exact **npm 11.17.0** into a runner-temporary prefix, with lifecycle
+scripts disabled. It checks the installed version before selecting both its bin
+path and npm CLI identity for subsequent steps, then runs the local policy
+verifier and installs the locked graph. This avoids a successful global install
+leaving an older bundled npm active on Windows. The pin was
 published on June 11, 2026 (well outside the window when adopted); it is a
 reviewed toolchain bootstrap, not a third-party dependency exception. Global npm
 installation does not read project `.npmrc` or apply the project's contributor
@@ -32,6 +35,7 @@ To upgrade an older contributor npm, run:
 
 ```sh
 npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+npm --version
 node scripts/verify-dependency-policy.mjs npm
 npm ci --ignore-scripts
 ```

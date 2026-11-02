@@ -38,7 +38,7 @@ jobs:
           cache: npm
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
@@ -62,7 +62,7 @@ jobs:
         run: node scripts/verify-dependency-policy.mjs bun
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
@@ -112,7 +112,7 @@ jobs:
           cache: npm
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
@@ -139,7 +139,7 @@ jobs:
           cache: npm
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
@@ -183,7 +183,7 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
@@ -224,7 +224,7 @@ jobs:
           path: ${{ runner.temp }}/canonical-npm-candidate
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
@@ -286,7 +286,7 @@ jobs:
         run: node scripts/verify-dependency-policy.mjs bun
       # Pinned mature npm supports the cooldown and exact trusted-package exception.
       - name: Install policy-aware npm
-        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+        run: node scripts/bootstrap-ci-npm.mjs
       - name: Verify dependency resolution policy
         run: node scripts/verify-dependency-policy.mjs npm
       - run: npm ci --ignore-scripts
