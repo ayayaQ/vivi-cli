@@ -14,6 +14,8 @@ const nativeConpty = new Set([
 // They retain complete minimum Linux coverage and full latest coverage on main/manual.
 const linuxOnly = new Set(['cli.test.mjs', 'preferences.test.mjs'])
 const currentCompatibility = new Set([
+  // Exercise workflow-text portability in both existing Windows PR jobs.
+  'ci-tests.test.mjs',
   'command-process.test.mjs', 'command-windows.test.mjs', 'command-windows-real.test.mjs',
   'mcp-windows.test.mjs', 'mcp-windows-real.test.mjs', 'mcp-windows-node-env.test.mjs',
   'platform-acceptance.test.mjs', 'windows-input.test.mjs', 'windows-conpty.test.mjs'

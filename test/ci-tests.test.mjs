@@ -18,6 +18,9 @@ test('CI documentation inventories selector groups without stale file counts', a
   assert(docs.includes('files.length'))
   assert(groups['linux-node'].includes('./test/platform-acceptance-synthetic.test.mjs'))
   assert(groups['windows-headless'].includes('./test/platform-acceptance-synthetic.test.mjs'))
+  for (const group of ['windows-minimum', 'windows-current']) {
+    assert(groups[group].includes('./test/ci-tests.test.mjs'), `${group}: workflow policy regression must run on Windows PRs`)
+  }
 })
 
 test('CI inventories every Node and Bun test with explicit Windows native ownership', async () => {
@@ -126,6 +129,8 @@ test('new OAuth/setup fixtures automatically retain minimum Windows PR coverage'
 test('every CI install first bootstraps supported npm and verifies the dependency policy', async () => {
   const workflow = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   const verify = source => {
+    // Git may check out workflow text with CRLF on Windows.
+    source = source.replace(/\r\n/g, '\n')
     const blocks = [...source.matchAll(/^  ([a-z][a-z0-9-]*):\n([\s\S]*?)(?=^  [a-z][a-z0-9-]*:\n|$(?![\s\S]))/gm)]
     const installing = blocks.filter(([, , body]) => body.includes('      - run: npm ci --ignore-scripts\n'))
     assert.deepEqual(installing.map(([, name]) => name), [
@@ -154,11 +159,18 @@ test('every CI install first bootstraps supported npm and verifies the dependenc
       assert(body.indexOf('node scripts/verify-dependency-policy.mjs bun') < body.indexOf('npm ci --ignore-scripts'))
     }
   }
-  verify(workflow)
-  for (const [before, after] of [
-    ['node scripts/bootstrap-ci-npm.mjs', 'echo skipped-bootstrap'],
-    ['        run: node scripts/verify-dependency-policy.mjs npm\n', ''],
-    ['      - name: Verify dependency resolution policy\n', '      - name: Verify dependency resolution policy\n        if: false\n'],
-    ['        run: node scripts/verify-dependency-policy.mjs bun\n', '']
-  ]) assert.throws(() => verify(workflow.replace(before, after)))
+  const lf = workflow.replace(/\r\n/g, '\n')
+  for (const eol of ['\n', '\r\n']) {
+    const checkout = source => source.replace(/\n/g, eol)
+    verify(checkout(lf))
+    for (const [before, after] of [
+      ['node scripts/bootstrap-ci-npm.mjs', 'echo skipped-bootstrap'],
+      ['        run: node scripts/verify-dependency-policy.mjs npm\n', ''],
+      ['      - name: Verify dependency resolution policy\n', '      - name: Verify dependency resolution policy\n        if: false\n'],
+      ['        run: node scripts/verify-dependency-policy.mjs bun\n', '']
+    ]) {
+      assert(lf.includes(before), 'Mutation must change the workflow')
+      assert.throws(() => verify(checkout(lf.replace(before, after))))
+    }
+  }
 })
