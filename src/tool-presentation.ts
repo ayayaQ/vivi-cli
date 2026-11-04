@@ -150,6 +150,7 @@ function targetSummary(snapshot: ToolPresentation): string | undefined {
   const keys: Record<string, readonly string[]> = {
     workspace_list: ['path'], workspace_read: ['path'], workspace_search: ['query', 'path'], workspace_glob: ['pattern', 'path'],
     workspace_create_text: ['path'], workspace_edit_text: ['path'], note_set: ['key'], current_time: ['timezone'],
+    workspace_delete_file: ['path'], workspace_move_file: ['path', 'destination'], workspace_mkdir: ['path'],
     read_skill: ['name', 'path'], create_memory: ['title'], edit_memory: ['id'], delete_memory: ['id'], command_start: ['executable'], mcp_setup: ['action', 'id'] }
   if (snapshot.name === 'fetch_url' && typeof values.url === 'string') {
     try { const url = new URL(values.url); return oneLine(url.hostname + url.pathname) }

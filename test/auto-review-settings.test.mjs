@@ -69,7 +69,7 @@ test('threshold menu offers exact agreed choices and resets only selected review
   assert.equal(state.choices[0].index, 1)
   assert.match(state.choices[0].choices[0].description, /99\.5%/)
   assert.match(state.writes.join(''), /not an overall approval probability/)
-  assert.match(state.writes.join(''), /uncalibrated.*Lower thresholds.*fresh enrollment/)
+  assert.match(state.writes.join(''), /uncalibrated.*Lower thresholds.*selecting Auto again/)
   const router = ioFixture({ selection: 'default' })
   await chooseAutoReviewThreshold(router.io, 'openrouter')
   assert.match(router.state.choices[0].choices[0].description, /99\.9%/)

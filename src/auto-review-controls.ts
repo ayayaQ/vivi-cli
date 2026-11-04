@@ -5,13 +5,13 @@ import { AUTO_REVIEW_DEFAULT_PERMILLE, formatAutoReviewThreshold, parseAutoRevie
 import type { AutoReviewThresholdOverrides, ReviewProvider } from './auto-review-settings.js'
 
 type ThresholdChoice = 'default' | 900 | 950 | 990 | 'custom'
-/** Display/selection only. The caller owns idle checks, persistence, revocation and fresh enrollment. */
+/** Display/selection only. The caller owns idle checks, persistence and revocation. */
 export async function chooseAutoReviewThreshold(io: Pick<InteractiveIO, 'choose' | 'askText' | 'write' | 'isClosed'>,
   provider: ReviewProvider, overrides?: AutoReviewThresholdOverrides): Promise<AutoReviewThresholdOverrides | undefined> {
   const captured = validateAutoReviewThresholdOverrides(overrides ?? {})
   const current = resolveAutoReviewThreshold(provider, captured)
   if (io.isClosed) return undefined
-  io.write('Auto review uses one estimate for each required check, not an overall approval probability. Estimates are uncalibrated and may be wrong. Lower thresholds allow more uncertain proposals; hard blocks and human-only actions do not change. Changing a threshold revokes Auto and requires fresh enrollment.\n')
+  io.write('Auto review uses one estimate for each required check, not an overall approval probability. Estimates are uncalibrated and may be wrong. Lower thresholds allow more uncertain proposals; hard blocks and human-only actions do not change. Changing a threshold revokes Auto and requires selecting Auto again.\n')
   const selectedValue: ThresholdChoice = captured[provider] === undefined ? 'default'
     : current.allowPermille === 900 || current.allowPermille === 950 || current.allowPermille === 990 ? current.allowPermille : 'custom'
   const choices: readonly { name: string; description: string; value: ThresholdChoice }[] = [

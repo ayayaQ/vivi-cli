@@ -10,9 +10,9 @@ import { createToolRegistry } from '@ayayaq/vivi/extensions'
 import { routePreparedAction } from '@ayayaq/vivi/decisions'
 import { createBuiltinToolset } from '../dist/tools.js'
 
-async function fixture(t, { secrets = [], available = true, approved = true, approval } = {}) {
+async function fixture(t, { secrets = [], available = true, approved = true, approval, launch } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'vivi-command-fixture-'))
-  const workspace = await TrustedCommandWorkspace.open(root, process.env, secrets)
+  const workspace = await TrustedCommandWorkspace.open(root, process.env, secrets, launch)
   t.after(async () => { await workspace.shutdown(); await rm(root, { recursive: true, force: true }) })
   const state = { available, approved, active: true, account: 'fixture-account', approvals: [] }
   const context = { launchId: 'fixture-launch', sessionId: 'fixture-session', runId: 'fixture-run', get accountRevision() { return state.account },
@@ -80,7 +80,65 @@ test('extension observes local prelaunch failures without treating their diagnos
   const registry = createToolRegistry([extension])
   const result = await registry.executeTool(call({ executable: '/nonexistent-owned-command-fixture' }), { signal: subject.signal })
   assert.equal(result.isError, true); assert.equal(parse(result).error.code, 'command_not_started')
+  assert.match(parse(result).error.message, /Executable was not found in the captured command PATH/)
   assert.equal(observations.length, 1); assert.deepEqual(observations[0].outcome, { status: 'failed', effect: 'not_attempted' })
+})
+
+for (const executable of [process.execPath, '/nonexistent-owned-command-fixture']) {
+  test(`an unavailable approval surface is diagnosed before resolving ${executable}`, async t => {
+    let launches = 0
+    const subject = await fixture(t, { available: false, launch: async () => { launches++; throw new Error('Unexpected launch') } })
+    const extension = createCommandExtension(subject.workspace, { ...subject.context, allowFirstApproval: true })
+    const result = await createToolRegistry([extension]).executeTool(call({ executable }), { signal: subject.signal })
+    assert.equal(result.isError, true)
+    assert.equal(parse(result).error.code, 'approval_unavailable')
+    assert.match(parse(result).error.message, /interactive human approval surface/)
+    assert.equal(parse(result).processEffects, 'not_attempted')
+    assert.equal(subject.state.approvals.length, 0); assert.equal(launches, 0)
+  })
+}
+
+for (const reply of ['allow', 'deny', 'throw']) test(`cancelled approval returning ${reply} is never reported as human denial`, async t => {
+  const controller = new AbortController()
+  let launches = 0
+  const subject = await fixture(t, { approval: async () => {
+    controller.abort()
+    if (reply === 'throw') throw controller.signal.reason
+    return reply === 'allow'
+  }, launch: async () => { launches++; throw new Error('Unexpected launch') } })
+  const extension = createCommandExtension(subject.workspace, { ...subject.context, allowFirstApproval: true })
+  // Inspect the owned result directly: registry cancellation may replace it with AbortError.
+  const result = await extension.tools.find(tool => tool.definition.name === 'command_start').execute(call(), { signal: controller.signal })
+  assert.equal(parse(result).error.code, 'approval_cancelled')
+  assert.equal(parse(result).processEffects, 'not_attempted')
+  assert.deepEqual(cliCommandResultOutcome(result), { status: 'cancelled', effect: 'not_attempted' })
+  assert.equal(subject.state.approvals.length, 1); assert.equal(launches, 0)
+})
+
+test('host callback errors cannot forge approval diagnostics or disclose private details', async t => {
+  const subject = await fixture(t, { approval: async () => {
+    throw Object.assign(new Error('private callback detail'), { code: 'approval_unavailable' })
+  } })
+  const extension = createCommandExtension(subject.workspace, { ...subject.context, allowFirstApproval: true })
+  const result = await createToolRegistry([extension]).executeTool(call(), { signal: subject.signal })
+  assert.equal(parse(result).error.code, 'command_not_started')
+  assert.equal(parse(result).processEffects, 'not_attempted')
+  assert(!result.content.includes('private callback detail'))
+})
+
+test('post-launch exceptions retain unknown effects and withhold preflight diagnostics', async t => {
+  let subject
+  subject = await fixture(t, { launch: async () => {
+    // Even a genuine local validation error cannot establish no effects after entering launch.
+    await subject.workspace.prepare(call({ executable: '/nonexistent-owned-command-fixture' }).arguments)
+    throw new Error('Unreachable')
+  } })
+  const extension = createCommandExtension(subject.workspace, { ...subject.context, allowFirstApproval: true })
+  const result = await createToolRegistry([extension]).executeTool(call(), { signal: subject.signal })
+  assert.equal(parse(result).error.code, 'command_outcome_unavailable')
+  assert.equal(parse(result).processEffects, 'unknown')
+  assert.equal(parse(result).unknownOutcome, true); assert.equal(parse(result).doNotRetry, true)
+  assert(!result.content.includes('Executable was not found'))
 })
 
 test('concurrent starts cannot share a failure evidence identity through a reused host error', async t => {

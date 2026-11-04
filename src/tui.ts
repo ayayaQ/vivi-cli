@@ -38,7 +38,7 @@ import { reviewNoticeSettled } from './auto-review.js'
 import { createCliToolPresentation, cliHistoryToolPresentation, cliToolPresentationView, cliToolCardView, cliToolSource, cliToolResultDecision, isCliLocalReadTool } from './tool-presentation.js'
 import type { CliToolEvidence } from './tool-presentation.js'
 import { mcpContainsSecret } from './mcp-content.js'
-import { WorkspaceDiffRenderable } from './tui-diff.js'
+import { WorkspaceDiffRenderable, workspaceDiffPresentation } from './tui-diff.js'
 import { createTerminalTitleSink, TerminalTitleController } from './terminal-title.js'
 import type { TerminalTitleSink } from './terminal-title.js'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
@@ -46,9 +46,12 @@ import { TerminalProgramStatus, createProgramStatusSink } from './terminal-progr
 import type { ProgramStatusSink } from './terminal-program-status.js'
 import { InputQueue } from './input-queue.js'
 import { QuestionDialog } from './question-dialog.js'
+import { PromptHistory } from './prompt-history.js'
+import type { PromptHistoryStore } from './prompt-history.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
+  promptHistory?: readonly string[]; promptHistoryStore?: PromptHistoryStore;
   /** Trusted production wiring or an offline test sink; omitted on directly constructed test surfaces. */
   terminalTitle?: TerminalTitleSink; programStatus?: ProgramStatusSink; statusEnvironment?: NodeJS.ProcessEnv }
 
@@ -170,7 +173,7 @@ function toolHeader(card: { readonly title: string; readonly status: string }, c
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
 const STEERING_HINTS = 'Enter queue · Ctrl+Enter interrupt & send if supported · Alt+Backspace edit latest · Ctrl+Shift+K clear queue'
-const HINTS = 'Enter send · Ctrl+J newline · /new /resume /mode /memories /skills /mcp /menu /help /exit'
+const HINTS = 'Enter send · Ctrl+J line · ↑↓ history · /new /resume /mode /memories /skills /mcp /menu /help /exit'
 type InputKind = 'chat' | 'steering' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question'
 interface PendingInput {
   kind: InputKind
@@ -287,6 +290,8 @@ export class OpenTuiIO implements ChatIO {
   private steeringQueue: readonly SteeringMessage[] = []
   private composerBox!: BoxRenderable
   private composer!: TextareaRenderable
+  private readonly promptHistory: PromptHistory
+  private readonly promptHistoryStore: PromptHistoryStore | undefined
   private secretMask!: TextRenderable
   // Secret characters never enter an editable/renderable buffer or its undo history.
   private secretInput: string[] = []
@@ -431,6 +436,8 @@ export class OpenTuiIO implements ChatIO {
     this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
     this.secrets = [...new Set(options.secrets ?? [])].filter(Boolean).sort((a, b) => b.length - a.length)
     this.stream = options.stream ?? true
+    this.promptHistory = new PromptHistory(options.promptHistory)
+    this.promptHistoryStore = options.promptHistoryStore
     renderer.once(CliRenderEvents.DESTROY, this.destroyHandler)
     try {
       this.style = SyntaxStyle.fromStyles({
@@ -567,6 +574,11 @@ export class OpenTuiIO implements ChatIO {
   }
 
   static async create(options: OpenTuiOptions = {}): Promise<OpenTuiIO> {
+    let historyUnavailable = false
+    if (options.promptHistoryStore && options.promptHistory === undefined) {
+      try { options = { ...options, promptHistory: await options.promptHistoryStore.load() } }
+      catch { historyUnavailable = true }
+    }
     let renderer: CliRenderer | undefined
     let terminalTitle: TerminalTitleController | undefined
     let programStatus: TerminalProgramStatus | undefined
@@ -590,6 +602,7 @@ export class OpenTuiIO implements ChatIO {
       terminalTitle = new TerminalTitleController(titleSink)
       programStatus = new TerminalProgramStatus(options.programStatus ?? createProgramStatusSink(process.stdout, options.statusEnvironment), !options.oneShot)
       io = new OpenTuiIO(renderer, options, terminalTitle, programStatus)
+      if (historyUnavailable) io.updateStatus('Saved prompt history unavailable; history works for this launch')
       io.windowsInput = windowsInput
       windowsInput?.start()
       return io
@@ -1011,6 +1024,7 @@ export class OpenTuiIO implements ChatIO {
       if (this.steering === steering) this.steeringFeedback('Message not queued · draft kept')
       return
     }
+    this.rememberPrompt(content)
     // Submission only records host queue ownership. The accepted callback below
     // is the sole place a steering message becomes a displayed user message.
     if (this.steering === steering && this.pending === steering.pending) {
@@ -1036,6 +1050,7 @@ export class OpenTuiIO implements ChatIO {
     }
   }
   private clearInput(): void {
+    this.promptHistory.reset()
     this.clearSecret()
     this.acceptedCompletion = undefined
     this.hideCompletions()
@@ -1324,6 +1339,27 @@ export class OpenTuiIO implements ChatIO {
         return
       }
     }
+    if ((pending.kind === 'chat' || pending.kind === 'steering') &&
+      !key.ctrl && !key.shift && !key.meta && !key.super && !key.hyper &&
+      (key.name === 'up' || key.name === 'down')) {
+      const row = this.composer.visualCursor.visualRow
+      if (key.name === 'up' ? row === 0 : row === this.composer.virtualLineCount - 1) {
+        this.consume(key)
+        const draft = this.promptHistory.move(key.name === 'up' ? -1 : 1,
+          { text: this.composer.plainText, cursor: this.composer.cursorOffset })
+        if (draft) {
+          this.changingInput = true
+          try {
+            this.composer.setText(this.safe(draft.text, MAX_INPUT))
+            this.composer.cursorOffset = draft.cursor
+          } finally { this.changingInput = false }
+          // A recalled slash command is ready to edit/send; its menu must not trap history arrows.
+          this.acceptedCompletion = this.composer.plainText
+          this.inputChanged()
+        }
+        return
+      }
+    }
     if (pending.kind === 'chat' && key.ctrl && ['n', 'r', 'p'].includes(key.name)) {
       this.consume(key)
       if (!this.cancelCallbacks.size && !this.composer.plainText) {
@@ -1369,10 +1405,18 @@ export class OpenTuiIO implements ChatIO {
     }
     const text = this.composer.plainText
     if (pending.kind === 'approval' || pending.kind === 'question') return
+    if (pending.kind === 'chat') this.rememberPrompt(text)
     if (pending.kind === 'chat' && !this.steeringQueue.length && text.trim() && !text.trim().startsWith('/') && parseUserShellInput(text) === undefined) {
       this.appendEntry({ category: 'user', label: 'You', content: this.safe(text), markdown: false })
     }
     pending.finish(text)
+  }
+  private rememberPrompt(text: string): void {
+    const safe = this.safe(text, MAX_INPUT)
+    this.promptHistory.add(safe)
+    void this.promptHistoryStore?.append(safe).catch(() => {
+      if (!this.closed) this.updateStatus('Could not save prompt history; history works for this launch')
+    })
   }
   private openInput(kind: InputKind, title: string, initial = '', signal?: AbortSignal,
     approvalLabels?: { deny: string; allow: string }): Promise<string | number | undefined> {
@@ -1588,9 +1632,8 @@ export class OpenTuiIO implements ChatIO {
   }
   private async showApproval(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
-    const skipEnrollment = request.call.name === 'enroll_skip_permissions'
-    const enrollment = request.call.name === 'enroll_auto_review' || skipEnrollment
-    const enrollmentLabel = skipEnrollment ? 'Enable Skip permissions?' : 'Enable Auto review?'
+    const enrollment = request.call.name === 'enroll_skip_permissions'
+    const enrollmentLabel = 'Enable Skip permissions?'
     const publicUrl = request.call.name === 'fetch_url'
     const skillSave = request.call.name === 'save_skill'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
@@ -1598,14 +1641,15 @@ export class OpenTuiIO implements ChatIO {
     const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
     this.activeApproval = approval
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
-    this.appendEntry({ category: 'activity', attention: true, label: enrollment ? enrollmentLabel : `Approval required · ${scope}`,
-      content: this.safe(request.description), markdown: false, approval: approval.token,
-      ...(['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
-        ? { workspaceDiff: request.workspaceDiff } : {}) })
+    const workspace = ['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
+      ? workspaceDiffPresentation(request.description, request.workspaceDiff) : undefined
+    this.appendEntry({ category: 'activity', attention: true, label: workspace ? workspace.path : enrollment ? enrollmentLabel : `Approval required · ${scope}`,
+      content: this.safe(workspace?.content ?? request.description), markdown: false, approval: approval.token,
+      ...(workspace ? { workspaceDiff: workspace.content } : {}) })
     const title = enrollment ? `${enrollmentLabel} (default: cancel)` : publicUrl
       ? 'Review this public URL request (default: deny)' : skillSave ? 'Save skill? (default: deny)' : 'Review this change (default: deny)'
-    this.updateStatus(enrollment ? `${enrollmentLabel} · Cancel is the default` : `Approval required · ${scope} · denial is the default`)
-    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: skipEnrollment ? 'Enable Skip' : 'Enable Auto' }
+    this.updateStatus(enrollment ? `${enrollmentLabel} · Cancel is the default` : `Approval required${workspace ? '' : ` · ${scope}`} · denial is the default`)
+    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Skip' }
       : skillSave ? { deny: 'Deny', allow: 'Save skill' } : undefined)
     this.pickerBox.title = title
     this.pickerBox.height = 3

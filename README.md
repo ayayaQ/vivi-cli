@@ -76,14 +76,14 @@ stable opaque host ID. Unconfirmed revocation is reported.
 Eligible requests use your ChatGPT plan, never an automatic API-key billing fallback.
 [Manage ChatGPT usage](https://chatgpt.com/settings/usage). Local history is replayed
 with `store: false`; HTTP always uses SSE, even when `--no-stream` buffers the UI.
-Auto review requires a separately, explicitly selected supported API reviewer; ChatGPT
+Auto review uses your saved supported API reviewer, or asks you to configure one once; ChatGPT
 OAuth is never sent to the Decisions API. Manual and Skip need no reviewer.
 
 ### Skip permissions
 
 Use `/mode` → **Skip permissions**, `/mode skip`, or `--approval-mode skip` and
-confirm the warning in a live interactive terminal. This is a fresh session-only
-opt-in, never a saved default or a consequence of signing in. It skips ordinary
+confirm the warning in a live interactive terminal. Your choice is remembered across
+new conversations, resumes and launches, alongside the other modes. It skips ordinary
 prompts without human **or AI** review for eligible, host-prepared local changes,
 public/paid web requests, trusted commands and already-connected MCP operations.
 
@@ -92,8 +92,8 @@ session/account/trust boundaries remain. Skill installation, MCP setup/connect/s
 and credential/trust administration still require human action. Account/workspace/trust
 changes revoke enrollment. Unsandboxed commands still run as your OS user and can act
 outside the workspace or read credential files; Skip neither grants OS privileges nor
-adds a sandbox. Shift+Tab retains the existing Manual → Auto → Plan cycle and never
-enables Skip automatically.
+adds a sandbox. Shift+Tab cycles Manual → Auto → Skip permissions → Plan.
+The saved Skip mode restores without another confirmation on an interactive launch.
 
 ### User shell commands (`!`)
 
@@ -177,9 +177,17 @@ vivi core; embedded/core users do not emit these sequences. See
 verification details.
 
 Enter sends; Ctrl+J adds a line. Shift+Enter or Alt+Enter also adds a line when the
-terminal reports those modifiers. Tab completes slash commands. Shift+Tab cycles
-Manual / Auto review / Plan while the composer is idle and preserves an unfinished
-draft. Entering Auto still needs the fresh enrollment confirmation. Entering Plan
+terminal reports those modifiers. Up/Down browses the last 100 submitted prompts,
+including commands and queued messages, across workspaces and conversations. History
+persists across launches in `prompt-history.json` in the shared profile directory
+(default `~/.vivi/sessions`, overridden by `--session-dir` or `VIVI_SESSION_DIR`).
+Repeated consecutive prompts occupy one entry. Down past the newest entry restores
+your unfinished draft and cursor; edits made while browsing are kept until you send
+or leave the composer. In multiline or wrapped text, arrows move within the text
+until the first/last row. Setup dialogs and masked inputs are excluded.
+Tab completes slash commands. Shift+Tab cycles
+Manual / Auto review / Skip permissions / Plan while the composer is idle and preserves an unfinished
+draft. Selecting Auto enables it immediately, without an extra confirmation. Entering Plan
 revokes Auto enrollment; leaving Plan returns to Manual. During a turn and inside
 dialogs, the shortcut does not change mode. `/mode cycle` provides the same cycle
 through the command interface. `/mode` opens Manual, Auto review, Skip permissions and Plan choices in full-screen mode;
@@ -194,14 +202,14 @@ still apply. Workspace/note/memory mutations, every unsandboxed command, public 
 GETs, MCP setup changes and remote calls/resources, and imported extensions are unavailable, even if described
 as read-only. The assistant describes its plan in a normal response and stays in
 Plan until you explicitly change mode. Switching does not execute old proposals.
-Choosing Auto from Plan leaves Plan only after successful fresh enrollment;
-cancelling, denying or closing that confirmation keeps Plan active.
+Choosing Auto from Plan switches to execution once an available reviewer is selected.
+Cancelling reviewer setup or an unavailable reviewer keeps Plan active.
 Plan does not mean zero filesystem writes: normal conversation checkpoints,
 transcripts, local store locks/recovery and shutdown bookkeeping still run. Explicit
 host controls such as session renaming and memory management keep their existing
-review rules. Explicit new/resumed conversations start in Manual execution mode.
-Model and reasoning-effort changes preserve Plan when it is selected, while
-revoking any Auto review enrollment.
+review rules. New and resumed conversations restore your saved mode, as do new launches.
+Model and reasoning-effort changes keep your selected mode. Each host still applies
+its current account, workspace, tool and trust checks.
 The assistant can ask 1–3 clarification questions in the native full-screen UI.
 Choose an option, write an answer, skip, or cancel; review the answers and select
 Submit to send them. Questions work in Manual, Auto review and Plan, and never
@@ -464,19 +472,21 @@ checks do not attest to DeepSeek’s remote DNS or redirects.
 
 ## Optional Auto review
 
-Manual is always the default. OpenAI/OpenRouter chat keeps its same-provider
-reviewer by default. DeepSeek and ChatGPT-plan chat start without a reviewer; `/reviewer` or Auto
-setup explicitly selects an OpenAI/OpenRouter account for this conversation.
-DeepSeek and ChatGPT OAuth are not decision backends; ChatGPT Auto requires a separately configured API reviewer credential. A reviewer/account change revokes enrollment,
-and every new recipient needs fresh disclosure and confirmation. `/mode` opens the current conversation’s mode
-choice. The full-screen picker defaults to Manual; choosing Auto review then
-requires a separate fresh, deny-default human confirmation of the disclosure.
-Line mode shows the same disclosure and requires fresh typed `allow` to enroll;
-`deny`, Escape, cancellation or closing keep Manual. `--approval-mode auto`
-requests this enrollment at launch, and does not bypass it. Piped, headless and
-unavailable approval surfaces stay Manual, even with that flag. Use `/mode` again
-to return to Manual. Approval mode is never stored in preferences or sessions,
-restored by `/resume`, or carried into a new conversation, provider, model or account.
+Manual is the initial default. Your last selected mode (Manual, Auto, Skip permissions
+or Plan) is saved for future conversations and launches. `/reviewer` or first-time
+Auto setup saves your OpenAI/OpenRouter reviewer independently of the chat provider.
+The configured environment or OS credential-store key is reused automatically; keys
+chosen for one launch only must be provided again after exiting.
+DeepSeek and ChatGPT OAuth are not decision backends; ChatGPT Auto requires a separately configured API reviewer credential. Account changes revoke the current host’s unattended authority. Changing the reviewer while Auto is active keeps Auto enabled with the new reviewer.
+`/mode` opens the current conversation's mode choice. Choosing Auto review enables
+it immediately, with a brief status message and no additional confirmation.
+Shift+Tab and `/mode cycle` switch modes directly, and `--approval-mode auto`
+enables Auto at launch on an interactive terminal. Piped, headless and unavailable
+approval surfaces stay Manual, even with that flag. Use `/mode` again
+to return to Manual. Mode and reviewer choices are saved in app preferences.
+Resuming a transcript uses the current preferences; transcripts never grant approval
+authority or restore old tool actions. `--approval-mode manual` overrides a saved
+Auto or Skip choice and becomes the new remembered mode on an interactive launch.
 Replacing an API key revokes enrollment immediately, including if the subsequent
 model picker is cancelled; start a new conversation before enrolling again.
 
@@ -490,18 +500,18 @@ the exact proposal’s final freshness and revision checks.
 The review sends the exact current user request, tool arguments and prepared
 before/after changed text, workspace-relative paths and full-file hashes, or full URL/destination/method/limits/redirect scope to the currently selected existing account: OpenAI
 `gpt-6-luna`, or OpenRouter routed to TypeSafe `typesafe/jev-1.13`. It uses only
-that account’s existing key, with no copied credential store, account discovery,
-cross-provider fallback or live model selection. The fresh in-app confirmation
-asks for consent to share this bounded request/proposal text with those named
-recipients for decision review, including eligible agent proposals you did not
-request, to assess whether you authorized the exact change. It may contain personal or sensitive information
+that account’s configured key, with no copied credential store, account discovery,
+cross-provider fallback or live model selection. Enabling Auto allows this bounded
+request/proposal text to be sent to those recipients for decision review, including
+eligible agent proposals you did not request, to assess whether you authorized
+the exact change. It may contain personal or sensitive information
 about you or others. Known credentials are excluded; content recognized as
 sensitive stays Manual and is not sent to the decision provider. This lexical
 filter cannot reliably identify every private detail. Keep Manual if you do not
 want potentially private text shared. A conversation or provider/account change
-invalidates the versioned consent; this product setting is not global permission
+disables Auto; this product setting is not global permission
 to transmit credentials or unrelated content. The automatic-save policy remains
-ordinary non-sensitive note/memory create/edit, scoped text creation/precise edits and exact public URL GET requests only; the sharing consent does not expand
+ordinary non-sensitive note/memory create/edit, scoped text creation/precise edits and exact public URL GET requests only; enabling Auto does not expand
 which actions may execute automatically. This adds API charges. Review
 is limited to two calls per turn, an eight-second deadline and 16 KiB for the
 full decision request. Larger exact evidence stays Manual without truncation;
@@ -520,7 +530,7 @@ Default, 90%, 95%, 99%, and Custom. Custom values are **90–100% inclusive, in
 estimate of exactly 1 for every check. These nonsecret settings persist across
 launches and apply in both the full-screen and line interfaces, but never
 restore Auto enrollment. Changes require an idle interactive conversation,
-revoke existing Auto enrollment, and require fresh `/mode` consent.
+revoke existing Auto enrollment, and require selecting Auto again with `/mode`.
 
 Lower thresholds allow more uncertain proposals. The 90% minimum is a product
 input bound, **not a validated safety floor**. These thresholds are uncalibrated
@@ -564,8 +574,9 @@ The assistant can list files, match file paths with `workspace_glob`, read UTF-8
 sent to your selected provider and saved in the local conversation transcript.
 Choose a folder whose contents you are comfortable sharing. File names and contents
 are treated as untrusted data. Text creation and precise edits require host review.
-Commands need separate trust as described below. Workspace file tools do not grant
-deletion, renaming, network tools, plugin discovery or permanent folder trust.
+Commands need separate trust as described below. Reviewed workspace tools also
+support individual text-file deletion, move/rename and directory creation. They do
+not grant network tools, plugin discovery or permanent folder trust.
 
 The default applies to CLI launches only. Library users of `CliHost` must still
 explicitly open and pass a `ReadOnlyWorkspace`; importing or constructing a host
@@ -588,7 +599,19 @@ bounded at 256 KiB and the complete JSON-quoted unified review diff at 48 KiB.
 Larger diffs are refused; exact Auto requests above 16 KiB stay Manual without
 truncation. Manual shows the diff and asks each time; piped/headless writes are denied.
 
-Publication uses an exclusive temporary sibling `.vivi-stage-*.tmp`, then exclusive
+`workspace_delete_file` deletes one UTF-8 text file, and `workspace_move_file` moves
+or renames one to an absent destination inside the workspace. Both require the
+latest `workspace_read` SHA-256 revision and files no larger than 256 KiB. Deletion
+also requires a complete review diff within 48 KiB. Directory moves and recursive
+deletion are unavailable. `workspace_mkdir` creates one absent directory; parent
+folders must already exist. These operations require human review in Manual and
+Auto, while explicitly enrolled Skip permissions retains ordinary host checks.
+Both move endpoints follow workspace policy and project guidance. Moves create an
+exclusive destination copy, verify bytes, then remove the source. An interrupted
+move can leave both paths; a partial result identifies this and requires inspection
+before retrying. No existing destination is overwritten.
+
+Text creation/edit publication uses an exclusive temporary sibling `.vivi-stage-*.tmp`, then exclusive
 hard-link creation or replacement rename. Staging is cleaned up; no persistent
 backup is retained. Creation fails closed if the filesystem cannot create hard links.
 An uncertain outcome requires reading the file before retrying. These are ordinary
@@ -606,6 +629,17 @@ matches; reads return up to 8 KiB from text files no larger than 256 KiB. Traver
 is at most 8 levels per call and stops after 1,000 entries, 200 search/glob files, 2 MiB
 of searched text, or 10 seconds. `truncated: true` means the result is incomplete,
 including deeper directories not visited. Escape/Ctrl+C cancels a running turn.
+
+`workspace_list` includes file `sizeBytes` and ISO `modifiedAt` timestamps.
+`scannedEntries` counts examined directory entries, including excluded entries and
+lookahead used to detect truncation; it can exceed returned results. `scannedFiles`
+counts eligible files examined. `scannedBytes` counts scanned file content bytes,
+so metadata-only listings report zero.
+
+The read-only `session_status` tool exposes the current provider, model, reasoning,
+task mode, approval mode and effective request context usage, including in Plan.
+Unknown context is `null`; token estimates retain their estimated flag. It works
+independently of session notes and does not change permissions or settings.
 
 Paths are workspace-relative, with forward slashes. Parent traversal, drive/UNC
 paths, ambiguous Windows components, and link aliases are refused. The host checks

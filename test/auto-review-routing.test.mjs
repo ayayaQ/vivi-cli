@@ -53,7 +53,7 @@ async function route(t, surface, { text, content, name = 'create_memory', exact 
   const io = { canAutoReview: true, get isClosed() { return closed },
     write(text) { notices.push(text) }, event() {}, result() {}, setSession() {}, setDraft() {},
     setApprovalMode(mode) { modes.push(mode) }, async readLine() { return '/exit' },
-    async approve(request) { approvals.push(request); return request.call.name === 'enroll_auto_review' || approve },
+    async approve(request) { approvals.push(request); return approve },
     async choose(_title, choices) { return choices.find(choice => choice.value === 'auto')?.value },
     async chooseSearchable() {}, async askText() {}, async askSecret() {}, addSecrets() {},
     onCancel() { return () => {} }, close() { closed = true } }
@@ -82,8 +82,8 @@ for (const surface of ['line', 'application']) {
       const result = await route(t, surface, { text: 'Make a memory that on Tuesdays we start every sentence with howdy.',
         content: 'On Tuesdays, start every sentence with howdy.', httpStatus, approve })
       assert.equal(result.fetches.length, 1)
-      assert.deepEqual(result.approvals.map(request => request.call.name), ['enroll_auto_review', 'create_memory'])
-      assert.match(result.approvals[1].description, new RegExp(`HTTP ${httpStatus}`))
+      assert.deepEqual(result.approvals.map(request => request.call.name), ['create_memory'])
+      assert.match(result.approvals[0].description, new RegExp(`HTTP ${httpStatus}`))
       assert.match(result.notices, new RegExp(`HTTP ${httpStatus}`))
       assert.match(result.notices, approve ? /Approved by you; change saved/ : /Denied by you; no save was made/)
       assert(!result.notices.includes('private-provider-error-body'))
@@ -101,7 +101,7 @@ for (const surface of ['line', 'application']) {
   ]) test(`${surface}: natural-language memory proposal reaches the default Jev adapter after enrollment: ${text}`, async t => {
     const result = await route(t, surface, { text, content })
     assert.equal(result.fetches.length, 1)
-    assert.deepEqual(result.approvals.map(request => request.call.name), ['enroll_auto_review'])
+    assert.deepEqual(result.approvals.map(request => request.call.name), [])
     assert(result.modes.includes('auto'))
     assert.deepEqual(result.stored.map(memory => memory.content), [content])
     assert.match(result.ledger, /"state":"committed"/)
@@ -118,8 +118,8 @@ for (const surface of ['line', 'application']) {
     test(`${surface}: unrequested or mismatched memory is reviewed but exact-action denial cannot autosave: ${text}`, async t => {
       const result = await route(t, surface, { text, content: 'Prefer blue.', exact: 0 })
       assert.equal(result.fetches.length, 1)
-      assert.deepEqual(result.approvals.map(request => request.call.name), ['enroll_auto_review', 'create_memory'])
-      assert.match(result.approvals[1].description, /AI recommends rejecting/)
+      assert.deepEqual(result.approvals.map(request => request.call.name), ['create_memory'])
+      assert.match(result.approvals[0].description, /AI recommends rejecting/)
       assert.deepEqual(result.stored, [])
       assert.match(result.notices, /AI recommends rejecting/)
     })
@@ -127,7 +127,7 @@ for (const surface of ['line', 'application']) {
   test(`${surface}: uncertain exact-action estimate falls back to human`, async t => {
     const result = await route(t, surface, { text: 'Maybe blue would suit me.', content: 'Prefer blue.', exact: 0.5 })
     assert.equal(result.fetches.length, 1)
-    assert.equal(result.approvals[1].call.name, 'create_memory')
+    assert.equal(result.approvals[0].call.name, 'create_memory')
     assert.match(result.notices, /Needs your review/)
     assert.deepEqual(result.stored, [])
   })

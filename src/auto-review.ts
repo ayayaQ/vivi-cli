@@ -8,11 +8,13 @@ import type { DecisionLedger, DecisionLedgerRecord } from './decision-ledger.js'
 import { resolveAutoReviewThreshold, validateAutoReviewThresholdOverrides, formatAutoReviewThreshold } from './auto-review-settings.js'
 import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 import { SessionCommitError } from './session.js'
-import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace-edit.js'
+import { WorkspaceCommitError } from './workspace-edit.js'
 import { DEEPSEEK_WEB_COST } from './web-tools.js'
 import { publicUrlContainsSecret } from './public-url.js'
 
 export type ApprovalMode = 'manual' | 'auto' | 'skip'
+/** Evidence of the admission path for this exact action, never reusable authority. */
+export type ReviewSource = 'automatic' | 'human' | 'skip'
 /** Captured display evidence, never an approval token or an overall safety probability. */
 export interface ReviewEvaluation {
   readonly kind: 'model' | 'not-reviewed' | 'unavailable'
@@ -32,7 +34,7 @@ export interface ReviewNotice {
   readonly toolName: string
   /** saving/saved are legacy admission states; URL states describe approval, not retrieval. */
   readonly state: 'reviewing' | 'needs_review' | 'saving' | 'saved' | 'denied' | 'cancelled' | 'failed' | 'unknown'
-  readonly source?: 'automatic' | 'human' | 'skip'
+  readonly source?: ReviewSource
   readonly evaluation?: ReviewEvaluation
 }
 export function reviewNoticeSettled(notice: ReviewNotice): boolean {
@@ -81,7 +83,7 @@ export const AUTO_REVIEW_THRESHOLDS = Object.freeze({
   openai: Object.freeze({ allowAt: 0.995, denyAt: 0.05 }),
   openrouter: Object.freeze({ allowAt: 0.999, denyAt: 0.05 })
 })
-const AUTO_REVIEW_TOOL_NAMES: readonly string[] = ['note_set', 'create_memory', 'edit_memory', ...WORKSPACE_MUTATION_TOOL_NAMES, 'fetch_url']
+const AUTO_REVIEW_TOOL_NAMES: readonly string[] = ['note_set', 'create_memory', 'edit_memory', 'workspace_create_text', 'workspace_edit_text', 'fetch_url']
 const AUTO_REVIEW_SCOPE_DESCRIPTION = 'note/memory create/edit, scoped text-file creation/precise edits, and exact public URL GET requests'
 const CHECK_LABELS: Readonly<Record<string, string>> = Object.freeze({
   exact_action_requested: 'request match', effects_within_scope: 'effects within scope',
@@ -356,7 +358,7 @@ export class AutoReviewController {
   private report(message: string, context?: ReviewNotice): void { try { this.notice?.(message, context) } catch { /* Display is never execution authority. */ } }
 
   async execute<T>(proposal: ReviewProposal, signal: AbortSignal,
-    commit: (assertCurrent: () => void) => Promise<T>, resultRevision?: (result: T) => string | number | undefined): Promise<T | undefined> {
+    commit: (assertCurrent: () => void, reviewSource: ReviewSource) => Promise<T>, resultRevision?: (result: T) => string | number | undefined): Promise<T | undefined> {
     const turn = this.turn
     const { id: callId, name: toolName } = proposal.approval.call
     const publicUrl = toolName === 'fetch_url' || toolName === 'web_search'
@@ -391,7 +393,7 @@ export class AutoReviewController {
     }
   }
   private async executeProposal<T>(proposal: ReviewProposal, signal: AbortSignal,
-    commit: (assertCurrent: () => void) => Promise<T>, resultRevision: ((result: T) => string | number | undefined) | undefined,
+    commit: (assertCurrent: () => void, reviewSource: ReviewSource) => Promise<T>, resultRevision: ((result: T) => string | number | undefined) | undefined,
     report: (message: string, state: ReviewNotice['state'], source?: ReviewNotice['source']) => void,
     captureEvaluation: (evaluation: ReviewEvaluation) => void): Promise<T | undefined> {
     signal.throwIfAborted()
@@ -497,7 +499,7 @@ export class AutoReviewController {
       report('Skip permissions · no human or AI review; admitting this host-prepared action', 'saving', 'skip')
       if (publicUrl) urlReceiptAllowed = true
       let value: T
-      try { value = await commit(publicUrl ? assertUrlReceipt : assertCurrent) }
+      try { value = await commit(publicUrl ? assertUrlReceipt : assertCurrent, 'skip') }
       catch (error) { urlReceiptAllowed = false; throw error }
       if (publicUrl) report('Skip permissions · exact request admitted; retrieval outcome is reported separately', 'saved', 'skip')
       else if (proposal.operationLabel === 'MCP operation') {
@@ -540,7 +542,7 @@ export class AutoReviewController {
         : 'Approved by you; saving this change', 'saving', 'human')
       if (publicUrl) urlReceiptAllowed = true
       let value: T
-      try { value = await commit(publicUrl ? assertUrlReceipt : assertCurrent) }
+      try { value = await commit(publicUrl ? assertUrlReceipt : assertCurrent, 'human') }
       catch (error) { urlReceiptAllowed = false; throw error }
       if (mode === 'auto') {
         if (publicUrl) report('Approved by you; exact public URL request admitted for fetching', 'saved', 'human')
@@ -644,7 +646,7 @@ export class AutoReviewController {
       assertCurrent()
       resourceAdmitted = true
       if (publicUrl) urlReceiptAllowed = true
-      const value = await commit(publicUrl ? assertUrlReceipt : assertCurrent)
+      const value = await commit(publicUrl ? assertUrlReceipt : assertCurrent, automatic ? 'automatic' : 'human')
       record = { ...record, state: 'committed', updatedAt: new Date().toISOString(),
         ...(resultRevision?.(value) === undefined ? {} : { resultRevision: resultRevision!(value)! }) }
       let audited = await persist()

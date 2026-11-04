@@ -56,6 +56,20 @@ test('read_skill body is explicit tool output and never system priority', async 
   } } })
   assert.equal((await subject.send('Read it')).status, 'completed')
 })
+
+test('read_skill advertises its runtime-required revision to the provider', async () => {
+  const skills = skillStore(); skills.documents.set('brief-summary', source('brief-summary'))
+  let rounds = 0
+  const subject = host(skills, { enableSkills: true, provider: { async generate(input) {
+    const definition = input.tools.find(tool => tool.name === 'read_skill')
+    assert.deepEqual(definition.parameters.required, ['name', 'path', 'expectedRevision'])
+    if (++rounds === 1) return answer('', [call('read_skill', { name: 'brief-summary', path: 'SKILL.md' })])
+    const result = input.messages.find(message => message.kind === 'tool_result')
+    assert.equal(result.isError, true); assert.match(result.content, /Missing or unexpected skill tool arguments/)
+    return answer()
+  } } })
+  assert.equal((await subject.send('Read the skill')).status, 'completed')
+})
 test('known credential introduced after a read blocks the next provider request', async () => {
   const skills = skillStore(), secrets = [], text = 'fake-known-secret'; let rounds = 0
   skills.documents.set('brief-summary', source('brief-summary', text))

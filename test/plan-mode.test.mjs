@@ -42,12 +42,12 @@ test('Plan uses enabled local reads, blocks every mutation/remote/extension befo
   const catalog = createSkillCatalog([{ content: '---\nname: offline-guide\ndescription: Local guide\n---\nInert local instructions\n', readOnly: true }])
   const revision = catalog.skills[0].revision
   const effects = { human: 0, judge: 0, capture: 0, command: 0, url: 0, extension: 0 }
-  const reads = [call('calculate', { expression: '2 + 3' }), call('current_time'), call('note_read'), call('list_memories'),
+  const reads = [call('calculate', { expression: '2 + 3' }), call('current_time'), call('session_status'), call('note_read'), call('list_memories'),
     call('list_skills'), call('read_skill', { name: 'offline-guide', path: 'SKILL.md', expectedRevision: revision }),
     call('workspace_read', { path: 'readme.txt' }), call('workspace_list'),
     call('workspace_search', { query: 'Local' }), call('workspace_glob', { pattern: '*.txt' })]
   const blocked = ['note_set', 'create_memory', 'edit_memory', 'delete_memory', 'save_skill',
-    'workspace_create_text', 'workspace_edit_text', 'command_start', 'command_poll', 'command_stop',
+    'workspace_create_text', 'workspace_edit_text', 'workspace_delete_file', 'workspace_move_file', 'workspace_mkdir', 'command_start', 'command_poll', 'command_stop',
     'fetch_url', 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', 'mcp_offline_read', 'custom_read', 'unknown_future_tool']
   let rounds = 0
   const subject = host({ store, memory, enableMemory: true, enableNotes: true, enableSkills: true,
@@ -118,7 +118,7 @@ test('Plan does not enable disabled features or override chat-only model capabil
   for (const enableTools of [true, false]) {
     let rounds = 0
     const subject = host({ enableTools, provider: { async generate({ tools }) {
-      assert.deepEqual(tools.map(tool => tool.name), enableTools ? ['calculate', 'current_time'] : [])
+      assert.deepEqual(tools.map(tool => tool.name), enableTools ? ['calculate', 'session_status', 'current_time'] : [])
       return ++rounds === 1 ? answer('', ['note_read', 'list_memories', 'read_skill', 'workspace_read'].map(name => call(name))) : answer()
     } } })
     subject.setTaskMode('plan')
@@ -144,8 +144,8 @@ test('Plan stays selected across turns; leaving it never replays an old proposal
   await subject.shutdown()
 })
 
-test('mode picker offers Plan without enrollment, cancellation preserves Plan, and the full cycle requires fresh Auto consent', async () => {
-  const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
+test('mode picker offers Plan without enrollment, cancellation preserves Plan, and the full cycle switches Auto directly', async () => {
+  const subject = host({ permissionApproval: { isAvailable: () => true, accountRevision: () => 'offline' }, decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
     provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('No review expected') } } } })
   const f = controls(subject, true)
   await selectApprovalMode(subject, f.io, async (_title, choices, initial) => {
@@ -155,14 +155,14 @@ test('mode picker offers Plan without enrollment, cancellation preserves Plan, a
   await selectApprovalMode(subject, f.io, async (_title, _choices, initial) => { assert.equal(initial, 3); return undefined })
   assert.equal(subject.taskMode, 'plan')
   await cycleApprovalMode(subject, f.io); assert.equal(subject.taskMode, 'execute')
-  await cycleApprovalMode(subject, f.io); assert.equal(subject.approvalMode, 'auto'); assert.equal(f.requests.length, 1)
+  await cycleApprovalMode(subject, f.io); assert.equal(subject.approvalMode, 'auto'); assert.equal(f.requests.length, 0)
+  await cycleApprovalMode(subject, f.io); assert.equal(subject.approvalMode, 'skip')
   await cycleApprovalMode(subject, f.io); assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
   await runModeControl(subject, f.io, '/mode manual')
-  await cycleApprovalMode(subject, f.io); assert.equal(f.requests.length, 2)
-  assert.notEqual(f.requests[0].call.id, f.requests[1].call.id)
+  await cycleApprovalMode(subject, f.io); assert.equal(f.requests.length, 1)
   f.io.canAutoReview = false
   await runModeControl(subject, f.io, '/mode plan'); assert.equal(subject.taskMode, 'plan')
-  assert.equal(f.requests.length, 2)
+  assert.equal(f.requests.length, 1)
   await subject.shutdown()
 })
 
@@ -186,43 +186,22 @@ test('mode setters reject active turns and cancelled old approvals cannot commit
   await subject.shutdown()
 })
 
-test('Auto enrollment from Plan is transactional on deny, cancel, close, unavailable surface and errors', async () => {
-  for (const outcome of ['deny', 'cancel', 'close', 'unavailable', 'error', 'allow']) {
+test('Auto selection from Plan switches directly when available and preserves Plan otherwise', async () => {
+  for (const available of [false, true]) {
     const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
-      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('Enrollment cannot call the judge') } } } })
+      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('Mode selection cannot call the judge') } } } })
     subject.setTaskMode('plan')
-    const f = controls(subject); let cancel
-    f.io.onCancel = callback => { cancel = callback; return () => {} }
-    f.io.canAutoReview = outcome !== 'unavailable'
-    f.io.approve = async () => {
-      assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
-      if (outcome === 'cancel') cancel()
-      if (outcome === 'close') f.io.isClosed = true
-      if (outcome === 'error') throw new Error('Offline approval failure')
-      return outcome !== 'deny'
-    }
-    const selection = selectApprovalMode(subject, f.io, async () => 'auto')
-    if (outcome === 'error') await assert.rejects(selection, /Offline approval failure/)
-    else await selection
-    assert.equal(subject.taskMode, outcome === 'allow' ? 'execute' : 'plan')
-    assert.equal(subject.approvalMode, outcome === 'allow' ? 'auto' : 'manual')
+    const f = controls(subject)
+    f.io.canAutoReview = available
+    await selectApprovalMode(subject, f.io, async () => 'auto')
+    assert.equal(subject.taskMode, available ? 'execute' : 'plan')
+    assert.equal(subject.approvalMode, available ? 'auto' : 'manual')
+    assert.equal(f.requests.length, 0)
     await subject.shutdown()
   }
 })
 
-test('stale Auto confirmation from Plan preserves a newer explicit Plan or Manual choice', async () => {
-  for (const latest of ['plan', 'manual']) {
-    const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
-      provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('No judge during enrollment') } } } })
-    subject.setTaskMode('plan'); const f = controls(subject)
-    f.io.approve = async () => { await runModeControl(subject, f.io, `/mode ${latest}`); return true }
-    await selectApprovalMode(subject, f.io, async () => 'auto')
-    assert.equal(subject.taskMode, latest === 'plan' ? 'plan' : 'execute')
-    assert.equal(subject.approvalMode, 'manual'); await subject.shutdown()
-  }
-})
-
-test('Auto enrollment failure after human allow restores Plan before exposing an unhealthy-ledger error', async () => {
+test('Auto activation failure restores Plan before exposing an unhealthy-ledger error', async () => {
   const subject = host({ decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: {
     async upsert() {}, async drain() { throw new Error('Offline ledger failure') } },
     provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { assert.fail('No judge during enrollment') } } } })
@@ -230,7 +209,7 @@ test('Auto enrollment failure after human allow restores Plan before exposing an
   await subject.send('Ordinary read-only planning response')
   const f = controls(subject, true)
   await assert.rejects(selectApprovalMode(subject, f.io, async () => 'auto'), /healthy review ledger/)
-  assert.equal(f.requests.length, 1); assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
+  assert.equal(f.requests.length, 0); assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
   await subject.shutdown()
 })
 

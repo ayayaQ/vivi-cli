@@ -17,39 +17,31 @@ function fixture({ mode = 'manual', interactive = true, allow = false, lines = [
   return { host, io, requests }
 }
 
-test('Manual -> enrolled Auto -> Plan -> Manual revokes Auto and needs fresh enrollment next time', async () => {
+test('Manual -> Auto -> Skip -> Plan -> Manual visits every mode', async () => {
   const f = fixture({ allow: true })
-  await cycleApprovalMode(f.host, f.io)
-  assert.equal(f.host.approvalMode, 'auto')
-  assert.equal(f.requests[0].call.name, 'enroll_auto_review')
-  assert.match(f.requests[0].description, /extra API charges/)
-  await cycleApprovalMode(f.host, f.io)
-  assert.equal(f.host.approvalMode, 'manual')
-  assert.equal(f.host.taskMode, 'plan')
+  for (const [mode, task] of [['auto', 'execute'], ['skip', 'execute'], ['manual', 'plan'], ['manual', 'execute'], ['auto', 'execute']]) {
+    await cycleApprovalMode(f.host, f.io)
+    assert.equal(f.host.approvalMode, mode)
+    assert.equal(f.host.taskMode, task)
+  }
   assert.equal(f.requests.length, 1)
-  await cycleApprovalMode(f.host, f.io)
-  assert.equal(f.host.taskMode, 'execute')
-  assert.equal(f.host.approvalMode, 'manual')
-  assert.equal(f.requests.length, 1)
-  await cycleApprovalMode(f.host, f.io)
-  assert.equal(f.host.approvalMode, 'auto')
-  assert.equal(f.requests.length, 2)
-  assert.notEqual(f.requests[0].call.id, f.requests[1].call.id)
+  assert.equal(f.requests[0].call.name, 'enroll_skip_permissions')
 })
 
-test('denied and unavailable cycle enrollment stays Manual', async () => {
+test('cycle enables Auto directly when interactive and stays Manual when unavailable', async () => {
   for (const interactive of [true, false]) {
     const f = fixture({ interactive })
     await cycleApprovalMode(f.host, f.io)
-    assert.equal(f.host.approvalMode, 'manual')
-    assert.equal(f.requests.length, interactive ? 1 : 0)
+    assert.equal(f.host.approvalMode, interactive ? 'auto' : 'manual')
+    assert.equal(f.requests.length, 0)
   }
 })
 
-test('line command cycle uses the same enrollment and revocation without allowing mode arguments to bypass it', async () => {
-  const f = fixture({ allow: true, lines: ['/mode auto', '/mode cycle', '/mode cycle', '/exit'] })
+test('line command cycle switches directly and revokes Auto while rejecting unsupported mode arguments', async () => {
+  const f = fixture({ allow: true, lines: ['/mode auto', '/mode cycle', '/mode cycle', '/mode cycle', '/exit'] })
   await runChatLoop(f.host, f.io)
   assert.equal(f.requests.length, 1)
+  assert.equal(f.requests[0].call.name, 'enroll_skip_permissions')
   assert.equal(f.host.approvalMode, 'manual')
   assert.match(f.io.output, /Use \/mode by itself/)
 })

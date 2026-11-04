@@ -18,6 +18,7 @@ async function fixture(width = 100) {
   const host = new CliHost({ session: newSession({ provider: 'openai', model: 'offline' }),
     store: { async save() {}, async load() { throw new Error('No resume in fixture') } },
     provider: { async generate() { throw new Error('Mode controls must not call a model') } },
+    permissionApproval: { isAvailable: () => !io.isClosed, accountRevision: () => 'offline' },
     decisionReview: { canAutoReview: true, accountRevision: () => 'offline', ledger: { async upsert() {} },
       provider: { id: 'openai', model: 'gpt-6-luna', async evaluate() { throw new Error('No decision model in fixture') } } } })
   active.push({ io, host }); io.setSession(host.session)
@@ -26,15 +27,20 @@ async function fixture(width = 100) {
   return { io, host, setup, composer, frame, input: setup.mockInput }
 }
 
-test('native idle Shift+Tab cycles Manual -> enrolled Auto -> Plan -> Manual and preserves an unfinished draft', async () => {
+test('native idle Shift+Tab cycles Manual -> Auto -> Skip -> Plan -> Manual and preserves an unfinished draft', async () => {
   const f = await fixture(), first = f.io.readLine('Message')
   await f.input.typeText('Unsent planning draft'); await f.frame()
   f.input.pressTab({ shift: true }); expect(await first).toBe('/mode cycle')
-  const enrolling = cycleApprovalMode(f.host, f.io)
-  await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
-  expect(f.host.approvalMode).toBe('manual')
-  f.input.pressArrow('right'); f.input.pressEnter(); await enrolling
+  await cycleApprovalMode(f.host, f.io)
   expect(f.host.approvalMode).toBe('auto'); expect(await f.frame()).toContain('Auto review')
+  const skipping = f.io.readLine('Message'); await f.frame()
+  expect(f.composer.plainText).toBe('Unsent planning draft')
+  f.input.pressTab({ shift: true }); expect(await skipping).toBe('/mode cycle')
+  const enablingSkip = cycleApprovalMode(f.host, f.io)
+  await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
+  await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
+  f.input.pressArrow('right'); f.input.pressEnter(); await enablingSkip
+  expect(f.host.approvalMode).toBe('skip'); expect(await f.frame()).toContain('Skip permissions')
   for (const expected of ['plan', 'execute']) {
     const reading = f.io.readLine('Message'); await f.frame()
     expect(f.composer.plainText).toBe('Unsent planning draft')
@@ -66,29 +72,15 @@ test('closing the native mode picker leaves the current Plan policy in force', a
   expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
 })
 
-test('denying, cancelling and closing Auto enrollment from Plan keep Plan and preserve the idle draft', async () => {
-  for (const outcome of ['deny', 'cancel', 'close'] as const) {
-    const f = await fixture()
-    f.host.setTaskMode('plan'); f.io.setTaskMode('plan')
-    const reading = f.io.readLine('Message'); await f.input.typeText('Keep this planning draft'); await f.frame()
-    f.input.pressTab({ shift: true }); expect(await reading).toBe('/mode cycle')
-    // Explicit picker choice, not Shift+Tab's Plan -> Manual transition.
-    const choosing = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
-    await f.frame(); f.input.pressArrow('up'); f.input.pressArrow('up'); f.input.pressEnter()
-    await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
-    expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
-    // Complete the approval input-drain tick and a fresh frame before any
-    // gesture; the picker Return cannot count as enrollment confirmation.
-    await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
-    if (outcome === 'deny') f.input.pressEnter()
-    else if (outcome === 'cancel') f.input.pressEscape()
-    else f.io.close()
-    await choosing
-    expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
-    if (outcome !== 'close') {
-      const next = f.io.readLine('Message'); await f.frame()
-      expect((f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('Keep this planning draft')
-      f.input.pressEnter(); expect(await next).toBe('Keep this planning draft')
-    }
-  }
+test('selecting Auto from Plan enables it directly and preserves the idle draft', async () => {
+  const f = await fixture()
+  f.host.setTaskMode('plan'); f.io.setTaskMode('plan')
+  const reading = f.io.readLine('Message'); await f.input.typeText('Keep this planning draft'); await f.frame()
+  f.input.pressTab({ shift: true }); expect(await reading).toBe('/mode cycle')
+  const choosing = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
+  await f.frame(); f.input.pressArrow('up'); f.input.pressArrow('up'); f.input.pressEnter(); await choosing
+  expect(f.host.taskMode).toBe('execute'); expect(f.host.approvalMode).toBe('auto')
+  const next = f.io.readLine('Message'); await f.frame()
+  expect(f.composer.plainText).toBe('Keep this planning draft')
+  f.input.pressEnter(); expect(await next).toBe('Keep this planning draft')
 })

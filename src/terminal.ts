@@ -19,10 +19,6 @@ import type { RunOutcome } from './run-status.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { sessionDisplayTitle } from './session-display.js'
 import type { ApprovalMode, ReviewNotice } from './auto-review.js'
-import { DEEPSEEK_WEB_DISCLOSURE } from './web-tools.js'
-import { autoReviewSharingScope } from './auto-review.js'
-import { resolveAutoReviewThreshold, formatAutoReviewThreshold } from './auto-review-settings.js'
-import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
 import { COMMAND_DISCLOSURE } from './commands.js'
 import { parseUserShellInput, USER_SHELL_DISCLOSURE } from './user-shell.js'
 import type { CliToolEvidence } from './tool-presentation.js'
@@ -48,7 +44,7 @@ export interface ChatIO {
   /** Fatal native UI failure means output should go to stderr after terminal restoration. */
   readonly failed?: boolean
   readonly isClosed?: boolean
-  /** Enrollment requires a real interactive approval surface; omitted means unavailable. */
+  /** Auto review requires a live interactive surface; omitted means unavailable. */
   readonly canAutoReview?: boolean
   /** A genuine human question surface. Piped/headless and line-only flows are unavailable. */
   readonly canAskQuestions?: boolean
@@ -206,8 +202,8 @@ export interface TerminalOptions {
   stream?: boolean
   secrets?: readonly string[]
 }
-export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. Manual is the default; eligible current-request create/edit tool calls may use enrolled Auto review. Explicit session-only Skip permissions bypasses ordinary agent create/edit/delete prompts with no human or AI review. Manager changes still require human allow/deny review. Disabling retains existing records.'
-export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires an interactive terminal with fresh human enrollment. Using Manual; piped, headless and unavailable approval surfaces cannot enroll.'
+export const MEMORY_DISCLOSURE = 'Saved memories are plaintext in this CLI’s local state directory and are sent to the selected provider when enabled. The selected mode is remembered; eligible current-request create/edit tool calls may use enrolled Auto review. Skip permissions bypasses ordinary agent create/edit/delete prompts with no human or AI review. Manager changes still require human allow/deny review. Disabling retains existing records.'
+export const AUTO_REVIEW_UNAVAILABLE = 'Auto review requires a live interactive terminal. Using Manual; piped, headless and unavailable approval surfaces cannot enable Auto.'
 
 /** Human controls proposal availability; exact execution approval is always separate. */
 export async function runCommandControl(host: CliHost, io: ChatIO, line: string): Promise<boolean> {
@@ -229,15 +225,9 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
   return true
 }
 
-/** Disclosure is host-authored; credentials and model-generated text never identify an account. */
-export function autoReviewDisclosure(provider: 'openai' | 'openrouter', deepSeekWeb = false, overrides?: AutoReviewThresholdOverrides): string {
-  const threshold = ` All four requirement estimates must reach ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, overrides).allowPermille)}; ≤5% recommends rejection. Estimates are uncalibrated, not approval or safety probabilities. Hard blocks and human-only rules stay.`
-  if (deepSeekWeb) return `Auto sends your exact current request, proposed eligible local note/memory changes and scoped workspace text edits, and paid DeepSeek web query/URL proposals, fixed API endpoint, limits and cost to ${provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'} for approval checks, including unrequested proposals. Review itself adds API charges and may share private information. Recognized sensitive data, uncertain checks and failures require visible human review. External content cannot authorize an action. ${DEEPSEEK_WEB_DISCLOSURE}${threshold}`
-  const recipients = provider === 'openai' ? 'OpenAI' : 'OpenRouter and TypeSafe'
-  return `Auto sends your current request, proposed note/memory changes and workspace text creation/precise edits (paths, before and after), and public URL GET proposals (full URL including path/query, destination, method, network limits and redirect scope) to ${recipients} for approval checks, including changes you didn’t request. ` +
-    'This may share private information and incur extra API charges; only actions judged to match your request can be approved automatically. ' +
-    'URL requests reveal the hostname to DNS and the full URL, caller IP and request metadata to the public server; GET may have server-side effects or costs. ' +
-    'Private/local targets and known credentials are blocked; recognized sensitive data, uncertain checks and review failures require human review. External content cannot authorize an action.' + threshold
+/** Brief host-authored explanation for the active reviewer. */
+export function autoReviewDisclosure(provider: 'openai' | 'openrouter', deepSeekWeb = false): string {
+  return `${provider === 'openai' ? 'OpenAI reviews' : 'OpenRouter and TypeSafe review'} eligible actions automatically; extra API charges may apply.${deepSeekWeb ? ' DeepSeek web requests are billed separately.' : ''}`
 }
 
 type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ConversationMode }[], initialIndex: number) => Promise<ConversationMode | undefined>
@@ -255,22 +245,20 @@ function selectPlan(host: CliHost, io: ChatIO): void {
   io.write('Mode: Plan · enabled local reads only; select another mode explicitly to execute\n')
 }
 
-/** Mode choices are not authority. Auto enrollment always uses the fresh deny-default approval path. */
+/** Explicit Auto selection enables review directly on a live interactive surface. */
 export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   const current: ConversationMode = host.taskMode === 'plan' ? 'plan' : host.approvalMode
-  const selected = choose ? await choose('Mode · Manual is the default', [
+  const selected = choose ? await choose('Mode', [
     { name: 'Manual', description: 'Human allow/deny review for writes and public URL requests', value: 'manual' },
-    { name: 'Auto review', description: 'Check proposed note, memory, workspace text and public URL GET actions through your selected provider', value: 'auto' },
-    { name: 'Skip permissions', description: 'Explicit session-only opt-in; skip ordinary prompts with no human or AI review', value: 'skip' },
+    { name: 'Auto review', description: 'AI reviews eligible actions automatically; extra API charges may apply', value: 'auto' },
+    { name: 'Skip permissions', description: 'Skip ordinary prompts with no human or AI review; remembered across launches', value: 'skip' },
     { name: 'Plan', description: 'Investigate with enabled local reads and describe a plan; no task changes or remote requests', value: 'plan' }
   ], ['manual', 'auto', 'skip', 'plan'].indexOf(current)) : 'auto'
   if (selected === undefined || (choose && io.isClosed)) return
   if (selected === 'plan') { selectPlan(host, io); return }
   if (selected === 'skip') { await enrollSkipPermissions(host, io, current === 'plan'); return }
   if (selected !== 'auto') { selectManual(host, io); io.write('Approval mode: Manual\n'); return }
-  // Leaving Plan for Auto is contingent on successful fresh enrollment. While
-  // consent is pending, Plan remains the task policy even if its dialog closes.
   const fromPlan = current === 'plan'
   if (fromPlan) host.setApprovalMode('manual')
   else selectManual(host, io)
@@ -278,51 +266,43 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
     io.write(`${fromPlan ? AUTO_REVIEW_UNAVAILABLE.replace('Using Manual;', 'Plan remains active;') : AUTO_REVIEW_UNAVAILABLE}\n`)
     return
   }
-  if (!host.reviewProvider && setupReviewer) await setupReviewer()
-  const reviewer = host.reviewProvider
-  if (!reviewer) { io.write('Choose an OpenAI or OpenRouter reviewer explicitly with /reviewer before enrolling Auto. DeepSeek chat does not inherit another account.\n'); return }
-  const deepSeekWeb = host.webProvider === 'deepseek'
-  const disclosure = autoReviewDisclosure(reviewer, deepSeekWeb, host.autoReviewThresholds)
-  const binding = host.approvalEnrollmentBinding
-  io.write(fromPlan ? 'Mode: Plan · Auto review requires fresh enrollment; cancel keeps Plan\n' : 'Approval mode: Manual\n')
-  const controller = new AbortController()
-  const dispose = io.onCancel(() => controller.abort())
+  const sessionId = host.session.id
+  const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
   try {
-    const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_auto_review', arguments: {
-      mode: 'auto', provider: reviewer, sessionId: host.session.id,
-      thresholds: resolveAutoReviewThreshold(reviewer, host.autoReviewThresholds),
-      reviewDataSharing: autoReviewSharingScope(reviewer, deepSeekWeb), ...(binding ? { enrollmentBinding: binding } : {})
-    } }, currentRevision: 'fresh Auto review enrollment',
-    description: disclosure }, controller.signal)
-    if (enrolled && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true && binding === host.approvalEnrollmentBinding) {
-      try {
-        if (fromPlan) host.setTaskMode('execute')
-        host.setApprovalMode('auto')
-      } catch (error) {
-        // A suspended ledger or unavailable enrollment cannot relax Plan's
-        // task policy after the human confirmation. No await/effect lies between
-        // these setters; restore the policy before propagating the failure.
-        if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
-        io.setTaskMode?.(host.taskMode ?? 'execute')
-        io.setApprovalMode?.(host.approvalMode)
-        throw error
-      }
-      io.setTaskMode?.('execute')
-      io.setApprovalMode?.('auto')
-      io.write('Approval mode: Auto review · enrolled for this conversation and selected account\n')
-    } else {
-      const changed = binding !== host.approvalEnrollmentBinding
-      // A stale dialog cannot override a newer explicit mode choice.
-      if (!changed) host.setApprovalMode('manual')
+    if (!host.reviewProvider && setupReviewer && !await setupReviewer()) return
+    if (controller.signal.aborted || io.isClosed || io.canAutoReview !== true || host.running || host.session.id !== sessionId) return
+    const reviewer = host.reviewProvider
+    if (!reviewer) { io.write('Choose an OpenAI or OpenRouter reviewer with /reviewer before enabling Auto.\n'); return }
+    try {
+      if (fromPlan) host.setTaskMode('execute')
+      host.setApprovalMode('auto')
+    } catch (error) {
+      // If Auto is unavailable, keep the previous Plan task policy.
+      if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
       io.setTaskMode?.(host.taskMode ?? 'execute')
       io.setApprovalMode?.(host.approvalMode)
-      const label = conversationModeLabel(host.taskMode, host.approvalMode)
-      io.write(changed ? `Mode: ${label}. Enrollment changed; open /mode for a fresh confirmation\n` : `Mode: ${label}\n`)
+      throw error
     }
+    io.setTaskMode?.('execute')
+    io.setApprovalMode?.('auto')
+    io.write(`Approval mode: Auto review · ${autoReviewDisclosure(reviewer, host.webProvider === 'deepseek')}\n`)
   } finally { dispose() }
 }
 
-export const SKIP_PERMISSIONS_DISCLOSURE = 'Skip permissions is session-only and skips ordinary approval prompts for enabled host-prepared local note/memory and workspace changes, public URL requests and configured paid web requests, trusted commands, and calls or resource reads on already-connected MCP servers. There is no human or AI review of those actions. Remote requests disclose their arguments and can have effects or costs. Trusted commands are unsandboxed: they run with your OS account’s file and network access, can act outside the workspace, and can read credential files your account can access. Existing hard denials, workspace/path and known-credential protections, tool validation, cancellation and session isolation remain; this does not grant OS privileges or add a sandbox. Skill installation, MCP setup/connections/sign-in and credential/trust administration still require human action. This enrollment is not saved; changing account, workspace or trust revokes it. Enable only for a task and environment you trust.'
+/** Restore a saved user choice on the new live host; transcripts never supply it. */
+export async function restoreConversationMode(host: CliHost, io: ChatIO, mode: ConversationMode,
+  setupReviewer?: () => Promise<boolean>): Promise<void> {
+  if ((mode === 'auto' || mode === 'skip') && (io.canAutoReview !== true || io.isClosed)) {
+    io.write(mode === 'auto' ? `${AUTO_REVIEW_UNAVAILABLE}\n` : 'Skip permissions requires a live interactive terminal. Using Manual.\n')
+    return
+  }
+  if (mode !== 'skip') { await selectApprovalMode(host, io, async () => mode, setupReviewer); return }
+  host.setApprovalMode('skip')
+  io.setApprovalMode?.('skip')
+  io.write('Approval mode: Skip permissions · restored saved mode\n')
+}
+
+export const SKIP_PERMISSIONS_DISCLOSURE = 'Skip permissions skips ordinary approval prompts for enabled host-prepared local note/memory and workspace changes, public URL requests and configured paid web requests, trusted commands, and calls or resource reads on already-connected MCP servers. There is no human or AI review of those actions. Remote requests disclose their arguments and can have effects or costs. Trusted commands are unsandboxed: they run with your OS account’s file and network access, can act outside the workspace, and can read credential files your account can access. Existing hard denials, workspace/path and known-credential protections, tool validation, cancellation and session isolation remain; this does not grant OS privileges or add a sandbox. Skill installation, MCP setup/connections/sign-in and credential/trust administration still require human action. This mode is remembered for future conversations and launches; live account, workspace and trust checks still apply. Enable only for a task and environment you trust.'
 
 async function enrollSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolean): Promise<void> {
   if (fromPlan) host.setApprovalMode('manual')
@@ -336,7 +316,7 @@ async function enrollSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolea
   try {
     const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_skip_permissions', arguments: {
       mode: 'skip', sessionId: host.session.id, enrollmentBinding: binding
-    } }, currentRevision: 'fresh session-only Skip permissions enrollment', description: SKIP_PERMISSIONS_DISCLOSURE }, controller.signal)
+    } }, currentRevision: 'fresh Skip permissions selection', description: SKIP_PERMISSIONS_DISCLOSURE }, controller.signal)
     const changed = binding !== host.approvalEnrollmentBinding
     if (enrolled && !changed && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true) {
       try {
@@ -348,7 +328,7 @@ async function enrollSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolea
         throw error
       }
       io.setTaskMode?.('execute'); io.setApprovalMode?.('skip')
-      io.write('Approval mode: Skip permissions · session-only; no human or AI review of ordinary actions\n')
+      io.write('Approval mode: Skip permissions · remembered; no human or AI review of ordinary actions\n')
     } else {
       if (!changed) host.setApprovalMode('manual')
       io.setTaskMode?.(host.taskMode); io.setApprovalMode?.(host.approvalMode)
@@ -357,7 +337,7 @@ async function enrollSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolea
   } finally { dispose() }
 }
 
-/** Manual -> freshly enrolled Auto -> Plan -> Manual. No task implicitly leaves Plan. */
+/** Manual -> Auto -> Skip permissions -> Plan -> Manual. */
 export async function cycleApprovalMode(host: CliHost, io: ChatIO, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   if (host.taskMode === 'plan') {
@@ -365,13 +345,17 @@ export async function cycleApprovalMode(host: CliHost, io: ChatIO, setupReviewer
     io.write('Approval mode: Manual\n')
     return
   }
-  if (host.approvalMode === 'auto' || host.approvalMode === 'skip') {
+  if (host.approvalMode === 'auto') {
+    await selectApprovalMode(host, io, async () => 'skip', setupReviewer)
+    return
+  }
+  if (host.approvalMode === 'skip') {
     selectPlan(host, io)
     return
   }
   await selectApprovalMode(host, io, undefined, setupReviewer)
 }
-/** Direct Plan/Manual choices require no enrollment; Auto still uses /mode's fresh confirmation. */
+/** Direct mode commands use the same selection flow as the picker and shortcut. */
 export async function runModeControl(host: CliHost, io: ChatIO, line: string, choose?: ModeChooser, setupReviewer?: () => Promise<boolean>): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   switch (line.trim()) {
@@ -775,7 +759,7 @@ export class TerminalIO implements ChatIO {
 }
 
 /** These controls are supplied by the launch owner, never exposed as model tools. */
-interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void>; autoThreshold?(line: string): Promise<void> }
+interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void>; autoThreshold?(line: string): Promise<void>; modeChanged?(): Promise<void> }
 
 export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.test(line.trim()) }
 
@@ -865,7 +849,7 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       continue
     }
     if (/^\/mode(?:\s|$)/.test(line.trim())) {
-      try { await runModeControl(host, io, line) }
+      try { await runModeControl(host, io, line); await controls.modeChanged?.() }
       catch (error) { io.write(`${error instanceof Error ? error.message : 'Approval mode selection failed'}\n`) }
       finally { host.invalidateContext(); io.setContext?.(undefined, false) }
       continue

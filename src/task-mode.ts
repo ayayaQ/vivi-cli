@@ -10,7 +10,7 @@ export type ConversationMode = ApprovalMode | 'plan'
 // Host-owned local capabilities only. Descriptions, MCP readOnly hints and
 // extension-supplied metadata cannot expand this permission set.
 const localReadTools = new Set<string>([
-  'request_user_input', 'calculate', 'current_time', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'mcp_list',
+  'request_user_input', 'calculate', 'current_time', 'session_status', 'note_read', 'list_memories', 'list_skills', 'read_skill', 'mcp_list',
   ...WORKSPACE_TOOL_NAMES
 ])
 export function isPlanTool(name: string): boolean { return localReadTools.has(name) }

@@ -28,16 +28,18 @@ import { ReadOnlyWorkspace } from './workspace.js'
 import { TrustedCommandWorkspace, captureCommandEnvironment } from './commands.js'
 import { FileSessionStore, environmentSecrets, isSessionId, newSession, redactSecrets } from './session.js'
 import type { CliProviderName, CliSession } from './session.js'
-import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMode } from './terminal.js'
+import { TerminalIO, isMcpCommand, runMcpCommand, runChatLoop, selectApprovalMode, restoreConversationMode } from './terminal.js'
 import type { ChatIO } from './terminal.js'
 import type { InteractiveIO } from './application.js'
 import type { Catalog, ModelEntry } from './models.js'
 import { ModelCatalog, hydrateModelCapabilities, modelAccessDenied, modelToolsEnabled, unknownModel, contextLimitsForModel } from './models.js'
 import type { CredentialStore } from './credentials.js'
+import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { ApprovalMode } from './auto-review.js'
 import { assertReviewTransportCurrent } from './auto-review.js'
 import { FileDecisionLedger } from './decision-ledger.js'
 import { PreferenceStore, DEFAULT_PREFERENCES } from './preferences.js'
+import { PromptHistoryStore } from './prompt-history.js'
 import { formatAutoReviewThreshold, parseAutoReviewThresholdPercent, resolveAutoReviewThreshold } from './auto-review-settings.js'
 import { McpConfigStore } from './mcp-config.js'
 import { McpManager } from './mcp-manager.js'
@@ -55,7 +57,7 @@ import type { ChatGptAuth } from './chatgpt-controls.js'
 import { isChatGptCliCommand, runChatGptCli } from './chatgpt-cli.js'
 
 export interface CliOptions {
-  /** Launch-only request to open enrollment; never a saved approval. */
+  /** Explicit launch mode override; interactive selections become the remembered preference. */
   approvalMode: ApprovalMode
   provider?: CliProviderName
   chatgptAccountId?: string
@@ -102,7 +104,7 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --provider NAME             openai (default), openrouter, deepseek or chatgpt
   --chatgpt-account ID         Exact ChatGPT account/workspace registration from vivi auth list
   --web-provider NAME         direct (keyless default), deepseek (explicit paid opt-in), disabled
-  --reviewer NAME             Explicit Auto reviewer: openai, openrouter or none (conversation only)
+  --reviewer NAME             Explicit Auto reviewer: openai, openrouter or none (remembered)
   --model MODEL               Required for a new session
   --reasoning LEVEL           default, disabled/none, minimal, low, medium, high, xhigh, max
   --reasoning-capabilities CSV Host-declared supported efforts; needed for nondefault reasoning
@@ -116,7 +118,7 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --jsonl                     Versioned JSONL automation; requires --prompt; noninteractive Manual only
   --output-schema PATH        Validate final JSON against a local schema (requires --jsonl)
   --no-stream                 Display accepted complete messages only
-  --approval-mode MODE        manual (default), auto or skip; fresh interactive enrollment required
+  --approval-mode MODE        manual, auto or skip; overrides the remembered mode
   --tui / --no-tui            OpenTUI full-screen / accessible line mode
   --tools / --no-tools        Declare tool support / use chat only
   --enable-notes              Enable session-only reviewed notes (default)
@@ -131,8 +133,8 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --help                      Show this help
 
 Credentials: API keys via environment or masked /provider setup; official ChatGPT sign-in via vivi auth login or /provider.
-ChatGPT never inherits an Auto reviewer; use /reviewer with a separately configured supported API credential.
-Skip permissions is explicit, launch/session-only and not an AI review. Hard denials remain; unsandboxed commands can act beyond the workspace.
+ChatGPT uses your saved Auto reviewer; configure it once with /reviewer and a supported API credential.
+All four modes and the Auto reviewer are remembered across conversations and launches. Skip permissions bypasses human and AI review. Hard denials remain; unsandboxed commands can act beyond the workspace.
 Full-screen UI requires Bun >=1.3.0; Node >=26.4 supports line/piped mode.
 Ctrl-C or Escape cancels an active turn; /exit quits; /session prints its name, id and usage; /rename NAME changes its name.
 Streaming is display-only. Notes never access other files; piped approval is denied.
@@ -144,7 +146,7 @@ Workspace tools omit symlinks and private/ignored files; text writes require rev
 /processes lists background jobs; /processes logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected background job; F7 stops all, including while the agent works.
 /memories lists, adds, edits, deletes, enables or disables saved memory.
 /mode selects Manual / Auto review / Skip permissions / Plan; /mode plan enters read-only planning and /mode manual returns to human-reviewed execution.
-/auto-threshold [90–100|default] saves this reviewer’s requirement cutoff (0.1 percentage-point steps); changes revoke Auto and need fresh consent.
+/auto-threshold [90–100|default] saves this reviewer’s requirement cutoff (0.1 percentage-point steps); changes disable Auto; select Auto again with /mode.
 Public fetch_url reads bounded public HTTPS pages through host review; no login, cookies, JavaScript, downloads or private/local targets.
 Auto review adds API charges; eligible current-request note/memory, scoped text creation/precise-edit and public URL GET tool calls can use it.
 /skills lists and inspects instruction-only skills; creation uses reviewed agent drafts.
@@ -417,6 +419,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
   let mcp: McpManager | undefined
   let oauth: McpOAuthControls | undefined
   let chatgptAuth: ChatGptAuth | undefined
+  env = { ...env }
   const secrets = environmentSecrets(env)
   const closeIO = (): boolean => {
     const closing = io
@@ -444,6 +447,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     if (interactive) {
       const { runApplication } = await import('./application.js')
       const tui = dependencies.tuiIO ?? await (await import('./tui.js')).OpenTuiIO.create({ stream: options.stream, secrets, statusEnvironment: env,
+        promptHistoryStore: new PromptHistoryStore(options.sessionDirectory),
         oneShot: options.prompt !== undefined })
       io = tui
       const status = await runApplication({ io: tui, options, args, env, secrets,
@@ -488,6 +492,11 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     let savedPreferences = structuredClone(DEFAULT_PREFERENCES)
     try { savedPreferences = await preferences.load() ?? savedPreferences }
     catch { thresholdPreferencesAvailable = false; io.write('Saved defaults could not be loaded; Auto enrollment is unavailable until /auto-threshold explicitly saves a valid setting\n') }
+    if (options.reviewer !== undefined && io.canAutoReview === true && !io.isClosed) {
+      const next = { ...savedPreferences, reviewer: options.reviewer,
+        ...(options.reviewer === 'none' && savedPreferences.mode === 'auto' ? { mode: 'manual' as const } : {}) }
+      await preferences.save(next); savedPreferences = next
+    }
     const skills = new InstalledSkillStore(options.sessionDirectory, { readOnlyRoots: options.skillsDirectories, secrets, notice: message => io!.write(`${message}\n`) })
     secretTargets = values => {
       memory.addSecrets(values); preferences.addSecrets(values); skills.addSecrets(values); workspace?.addSecrets(values); host?.refreshSecretFilters()
@@ -563,7 +572,19 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
         await host?.stopAllBackgroundCommands()
       }
     }) : rawProvider
-    const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
+    const reviewerPreference = options.reviewer ?? savedPreferences.reviewer
+    const selectedReviewer = reviewerPreference === 'none' ? undefined : reviewerPreference ?? (isReviewProvider(session.provider) ? session.provider : undefined)
+    const loadReviewerKey = async (reviewer: 'openai' | 'openrouter'): Promise<boolean> => {
+      const name = providerEnvironmentName(reviewer)
+      if (env[name]) return true
+      try {
+        const key = await (dependencies.credentials ?? createCredentialStore()).load(reviewer)
+        if (!key) return false
+        env[name] = validateApiKey(key); registerMcpSecrets([key, env[name]!])
+        return true
+      } catch { io!.write(`Configure the ${reviewer} API key before using Auto review\n`); return false }
+    }
+    if (selectedReviewer && io.canAutoReview === true) await loadReviewerKey(selectedReviewer)
     const webKey = env.DEEPSEEK_WEB_API_KEY
     const web: CliWebConfiguration = options.webProvider === 'deepseek' ? { provider: 'deepseek', revision: randomUUID(), apiKey: () => {
       if (!webKey) throw new Error('Set DEEPSEEK_WEB_API_KEY for the separately selected web provider')
@@ -582,7 +603,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       onReviewNotice: (message, context) => io!.reviewNotice ? io!.reviewNotice(message, context) : io!.write(`${message}\n`),
       ...(io.canAutoReview === true && selectedReviewer ? { decisionReview: {
         provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
-        ...(options.reviewer ? { explicitReviewer: true as const } : {}),
+        ...(reviewerPreference ? { explicitReviewer: true as const } : {}),
         ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: true,
         autoReviewThresholds: savedPreferences.autoReviewThresholds ?? {},
         accountRevision: () => accountRevision, isAvailable: () => accountCurrent && thresholdPreferencesAvailable && io?.canAutoReview === true && !io.isClosed
@@ -611,22 +632,44 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     io.setApprovalMode?.('manual')
     io.write(`Session: ${session.id}\nProvider: ${session.provider} | Model: ${session.model}\nApproval mode: Manual\n`)
     if (workspace) io.write(`Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch${enableTools ? '' : ' · tools unavailable for this model'}\nFiles read by tools are sent to the selected provider and saved in session history\n`)
-    if (options.approvalMode === 'auto') await selectApprovalMode(host, io)
-    else if (options.approvalMode === 'skip') {
-      if (io.canAutoReview !== true || io.isClosed) io.write('Skip permissions requires a live interactive terminal and fresh confirmation. Using Manual; piped and headless launches cannot enroll.\n')
-      else await selectApprovalMode(host, io, async () => 'skip')
+    const rememberMode = async (): Promise<void> => {
+      if (io!.canAutoReview !== true || io!.isClosed || !host) return
+      const mode = host.taskMode === 'plan' ? 'plan' as const : host.approvalMode
+      const reviewer = savedPreferences.reviewer ?? options.reviewer ?? (mode === 'auto' ? host.reviewProvider : undefined)
+      if (savedPreferences.mode === mode && savedPreferences.reviewer === reviewer) return
+      const next = { ...savedPreferences, mode, ...(reviewer ? { reviewer } : {}) }
+      await preferences.save(next); savedPreferences = next
+    }
+    if (args.includes('--approval-mode')) {
+      if (options.approvalMode === 'auto') await restoreConversationMode(host, io, 'auto')
+      else await selectApprovalMode(host, io, async () => options.approvalMode)
+      await rememberMode()
+    } else if (!automation && savedPreferences.mode) {
+      await restoreConversationMode(host, io, savedPreferences.mode)
     }
     const configureReviewer = async (line = ''): Promise<boolean> => {
       const name = line.trim().replace(/^\/reviewer\s*/, '')
-      if (name === 'none') { host!.setDecisionReview(undefined); io!.setApprovalMode?.('manual'); io!.write('Auto reviewer: none\n'); return false }
-      if (!isReviewProvider(name)) { io!.write(`Auto reviewer: ${host!.reviewProvider ?? 'none'}. Use /reviewer openai|openrouter|none; selection is for this conversation only.\n`); return false }
-      if (!env[providerEnvironmentName(name)]) { io!.write(`Set ${providerEnvironmentName(name)} before explicitly selecting that reviewer\n`); return false }
+      if (name === 'none') {
+        if (io!.canAutoReview !== true || io!.isClosed) return false
+        const mode = host!.taskMode === 'plan' ? 'plan' as const : 'manual' as const
+        const next = { ...savedPreferences, reviewer: 'none' as const, mode }
+        await preferences.save(next); savedPreferences = next
+        host!.setDecisionReview(undefined); io!.setApprovalMode?.('manual'); io!.write('Auto reviewer: none\n'); return false
+      }
+      if (!isReviewProvider(name)) { io!.write(`Auto reviewer: ${host!.reviewProvider ?? 'none'}. Use /reviewer openai|openrouter|none; selection is saved for future conversations.\n`); return false }
+      if (io!.canAutoReview !== true || io!.isClosed) return false
+      if (!await loadReviewerKey(name)) { io!.write(`Set ${providerEnvironmentName(name)} before selecting that reviewer\n`); return false }
+      const wasAuto = host!.approvalMode === 'auto'
+      const next = { ...savedPreferences, reviewer: name }
+      await preferences.save(next); savedPreferences = next
       const revision = randomUUID()
       host!.setDecisionReview({ provider: deferredDecisionProvider({ ...session, provider: name }, env, dependencies.decisionProviderFactory ?? decisionProviderForSession),
         explicitReviewer: true, ledger: new FileDecisionLedger(options.sessionDirectory, secrets), canAutoReview: io!.canAutoReview === true,
         autoReviewThresholds: savedPreferences.autoReviewThresholds ?? {},
         accountRevision: () => revision, isAvailable: () => thresholdPreferencesAvailable && io?.canAutoReview === true && !io.isClosed })
-      io!.setApprovalMode?.('manual'); io!.write(`Auto reviewer: ${name}. Use /mode for fresh enrollment.\n`); return true
+      io!.setApprovalMode?.('manual'); io!.write(`Auto reviewer: ${name} (saved)\n`)
+      if (wasAuto) await restoreConversationMode(host!, io!, 'auto')
+      return true
     }
     const configureWeb = async (line: string): Promise<void> => {
       const name = line.trim().replace(/^\/web\s*/, '')
@@ -663,11 +706,11 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
         throw error
       }
       savedPreferences = { ...savedPreferences, autoReviewThresholds: next }; thresholdPreferencesAvailable = true
-      io!.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Lower thresholds allow more uncertain proposals; hard blocks and human-only actions do not change. Auto enrollment revoked; use /mode for fresh consent.\n`)
+      io!.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Lower thresholds allow more uncertain proposals; hard blocks and human-only actions do not change. Auto disabled; select Auto again with /mode.\n`)
     }
     const result = await runChatLoop(host, io, options.prompt, {
       web: configureWeb, reviewer: async line => { await configureReviewer(line) },
-      autoThreshold: configureAutoThreshold,
+      autoThreshold: configureAutoThreshold, modeChanged: rememberMode,
       mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0

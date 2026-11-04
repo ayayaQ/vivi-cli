@@ -133,7 +133,7 @@ test('calculator and time are bounded, read-only builtins; notes are absent by d
   for (const expression of ['process.exit()', '1/0', '2**3', '1;2', '('.repeat(30) + '1' + ')'.repeat(30), '1'.repeat(257)]) {
     assert.throws(() => calculate(expression));
   }
-  assert.deepEqual(builtinTools().map((tool) => tool.name), ['calculate', 'current_time']);
+  assert.deepEqual(builtinTools().map((tool) => tool.name), ['calculate', 'session_status', 'current_time']);
   const { store } = await fixture(t);
   let round = 0;
   let results;
