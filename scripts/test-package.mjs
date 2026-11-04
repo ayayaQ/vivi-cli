@@ -319,7 +319,7 @@ assert.deepEqual(documentedOpenAIModel('o3-pro').efforts, [])
 assert.equal(documentedOpenAIModel('gpt-image-2').conversation, 'unsupported')
 assert.equal(calculate('3 * (4 + 2)'), 18)
 assert.equal(calculate, sharedCalculate, 'CLI must re-export the shared calculator, not a duplicate parser')
-assert.deepEqual(builtinTools().map(tool => tool.name), ['calculate', 'current_time'])
+assert.deepEqual(builtinTools().map(tool => tool.name), ['calculate', 'session_status', 'current_time'])
 assert.deepEqual(createBuiltinToolset().tools[0], createToolRegistry([calculatorExtension]).tools[0])
 const fixture = { id: 'packed-fixture', apiVersion: 1, tools: [{
   definition: { name: 'packed_fixture', description: 'Packed extension', parameters: { type: 'object' } },
