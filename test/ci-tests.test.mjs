@@ -57,6 +57,14 @@ test('current Windows and Bun retain native process boundaries and all OAuth/set
   }
 })
 
+test('history leases retain Windows and Bun coverage, and Windows exercises workspace durability', async () => {
+  const groups = await ciTestGroups()
+  for (const group of ['linux-node', 'windows-minimum', 'windows-current', 'bun-boundaries']) {
+    assert(groups[group].includes('./test/prompt-history.test.mjs'), `${group}: history lease runtime regression must run`)
+  }
+  assert(groups['windows-minimum'].includes('./test/harness-ergonomics.test.mjs'))
+})
+
 test('pending HTTP and five OAuth files enter all required runtime groups without workflow edits', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-ci-inventory-'))
   t.after(() => rm(directory, { recursive: true, force: true }))

@@ -11,7 +11,7 @@ import { ReadOnlyWorkspace } from '../dist/workspace.js'
 import { workspaceDiff, workspaceRevision, WORKSPACE_MUTATION_TOOL_NAMES } from '../dist/workspace-edit.js'
 import { FileDecisionLedger } from '../dist/decision-ledger.js'
 import { autoReviewSharingScope, AUTO_REVIEW_POLICY_REVISION, AUTO_REVIEW_SHARING_REVISION } from '../dist/auto-review.js'
-import { TerminalIO, autoReviewDisclosure, selectApprovalMode } from '../dist/terminal.js'
+import { TerminalIO, selectApprovalMode } from '../dist/terminal.js'
 import { routePreparedAction } from '@ayayaq/vivi/decisions'
 async function fixture(t, config = {}) {
   const directory = await fs.mkdtemp(join(tmpdir(), 'vivi-text-host-'))
@@ -83,7 +83,7 @@ test('Manual edit display metadata is the exact host-prepared diff, including un
   assert(approval.description.includes(`After SHA-256: ${workspaceRevision(Buffer.from(after))}`))
   assert.equal(await fs.readFile(join(subject.root, 'new.txt'), 'utf8'), before)
 })
-for (const providerId of ['openai', 'openrouter']) for (const name of WORKSPACE_MUTATION_TOOL_NAMES) {
+for (const providerId of ['openai', 'openrouter']) for (const name of ['workspace_create_text', 'workspace_edit_text']) {
   test(`${providerId} Auto prepares exact trusted ${name} effects, hashes and changed text`, async t => {
     const subject = await fixture(t, { providerId, name, auto: true, ...(name === 'workspace_edit_text' ? { initial: 'header\nold\nfooter\n' } : {}) })
     const result = mutationResult(await subject.host.send(name === 'workspace_create_text' ? 'Create new.txt with ordinary project text' : 'Replace old with new in new.txt'))
@@ -220,22 +220,21 @@ test('headless TerminalIO cannot approve a text write or enroll expanded Auto', 
   await selectApprovalMode(host, io)
   assert.equal(host.approvalMode, 'manual'); assert.equal(io.canAutoReview, false); assert.deepEqual(await fs.readdir(subject.root), [])
 })
-test('expanded fresh enrollment discloses exact local and URL data, named recipients, privacy and cost within a concise bound', () => {
+test('Auto sharing scope retains versioned workspace evidence and named recipients', () => {
   for (const provider of ['openai', 'openrouter']) {
-    const disclosure = autoReviewDisclosure(provider), sharing = autoReviewSharingScope(provider)
-    assert(disclosure.length < 1000)
-    assert.match(disclosure, /workspace text creation\/precise edits/); assert.match(disclosure, /paths, before and after/)
-    assert.match(disclosure, /private information/); assert.match(disclosure, /extra API charges/)
-    for (const required of ['full URL including path/query', 'destination', 'method', 'network limits', 'redirect scope', 'hostname to DNS', 'caller IP', 'server-side effects or costs', 'sensitive data']) assert(disclosure.includes(required), required)
-    assert.equal(sharing.revision, AUTO_REVIEW_SHARING_REVISION); assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v6')
+    const sharing = autoReviewSharingScope(provider)
+    assert.equal(sharing.revision, AUTO_REVIEW_SHARING_REVISION)
+    assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v6')
+    assert.deepEqual(sharing.recipients, provider === 'openai' ? ['OpenAI'] : ['OpenRouter', 'TypeSafe'])
     assert(sharing.data.some(item => item.includes('workspace-relative')))
   }
 })
+
 test('closed decision ledger accepts metadata-only records for both new mutation tools', async t => {
   const subject = await fixture(t, { auto: true })
   await subject.host.send('Create new.txt with ordinary project text')
   const ledger = new FileDecisionLedger(join(subject.directory, 'audit'))
-  for (const toolName of WORKSPACE_MUTATION_TOOL_NAMES) {
+  for (const toolName of ['workspace_create_text', 'workspace_edit_text']) {
     const original = subject.records.at(-1)
     await ledger.upsert({ ...original, id: crypto.randomUUID(), toolName })
   }

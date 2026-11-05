@@ -130,7 +130,7 @@ test('ChatGPT Auto requires separately explicit reviewer selection and never cop
         decisionProviderFactory: (session, env) => { reviewers++; assert.equal(session.provider, 'openai'); assert.equal(env.OPENAI_API_KEY, 'fixture-separate-reviewer'); assert(!JSON.stringify(env).includes('fixture-chatgpt-access'))
           return { id: 'openai', model: 'gpt-6-luna', async evaluate(request) { return { model: 'gpt-6-luna', answers: request.policy.checks.map(check => ({ name: check.name, type: 'predicate', probability: 1 })), usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } } } } } })
     assert.equal(status, 0); assert.equal(reviewers, explicit ? 1 : 0); assert.equal(auth.state.tokens.length, 0)
-    assert.equal(io.approvals[0].call.name, explicit ? 'enroll_auto_review' : 'note_set')
+    assert.deepEqual(io.approvals.map(request => request.call.name), explicit ? [] : ['note_set'])
   }
 })
 

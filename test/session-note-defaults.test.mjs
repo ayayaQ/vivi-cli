@@ -55,7 +55,7 @@ for (const allowed of [false, true]) {
         assert(!input.tools.some(tool => tool.name.includes('memor')))
         if (rounds === 1) return answer([noteCall])
         const result = JSON.parse(input.messages.find(message => message.kind === 'tool_result').content)
-        if (allowed) assert.deepEqual(result, { success: true, key: 'task', revision: 1 })
+        if (allowed) assert.deepEqual(result, { success: true, key: 'task', revision: 1, reviewSource: 'human' })
         else assert.equal(result.error.code, 'approval_denied')
         return answer()
       } }

@@ -26,7 +26,7 @@ async function fixture(width = 120) {
   return { setup, io, host, frame, settle, input: setup.mockInput }
 }
 
-test('native Skip confirmation has honest label and cancel default, then explicit allow enables session-only Skip', async () => {
+test('native Skip confirmation has honest label and cancel default, then explicit allow enables remembered Skip', async () => {
   const f = await fixture()
   const denied = runModeControl(f.host, f.io, '/mode skip')
   const warning = await f.settle()

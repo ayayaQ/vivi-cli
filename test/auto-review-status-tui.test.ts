@@ -135,11 +135,6 @@ async function application(callCount = 1, preliminaryTools = false, threshold?: 
     } })
   })
   cleanups.push(async () => { f.io.close(); await running; fetch.mockRestore(); await rm(directory, { recursive: true, force: true }) })
-  const mode = await next(); expect(mode.kind).toBe('choice')
-  await f.frame(); f.input.pressArrow('down'); f.input.pressEnter()
-  const enrollment = await next(); expect(enrollment.kind).toBe('approval')
-  if (enrollment.kind === 'approval') expect(enrollment.request.call.name).toBe('enroll_auto_review')
-  await f.frame(); f.input.pressArrow('right'); f.input.pressEnter()
   expect((await next()).kind).toBe('composer')
   const send = async (message: string): Promise<void> => { await f.frame(); await f.input.typeText(message); f.input.pressEnter() }
   const response = async (status: number, exact = 1): Promise<void> => {

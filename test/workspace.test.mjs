@@ -43,6 +43,25 @@ test('selected workspace exposes only list, text read, literal search and path g
   assert.equal((await run(registry, 'workspace_read', { path: 'package.json' })).data.content, '{"name":"fixture"}\n')
 })
 
+test('literal search documents and echoes effective case sensitivity', async t => {
+  const { directory, registry } = await fixture(t)
+  await fs.writeFile(join(directory, 'case.txt'), 'Skip\nSkip\nSkip\n')
+  const definition = registry.tools.find(tool => tool.name === 'workspace_search')
+  assert.match(definition.description, /Default caseSensitive true/)
+  assert.equal(definition.parameters.properties.caseSensitive.default, true)
+  const upper = (await run(registry, 'workspace_search', { query: 'SKIP' })).data
+  const mixed = await run(registry, 'workspace_search', { query: 'Skip' })
+  const explicit = await run(registry, 'workspace_search', { query: 'Skip', caseSensitive: true })
+  const insensitive = (await run(registry, 'workspace_search', { query: 'SKIP', caseSensitive: false })).data
+  assert.deepEqual(upper.matches, []); assert.equal(upper.caseSensitive, true)
+  assert.equal(mixed.data.matches.length, 3); assert.equal(mixed.data.caseSensitive, true)
+  assert.equal(mixed.result.content, explicit.result.content)
+  assert.deepEqual(insensitive.matches, mixed.data.matches); assert.equal(insensitive.caseSensitive, false)
+  assert.equal(upper.truncated, false); assert.equal(upper.incompleteReason, null)
+  assert.deepEqual(upper.incompleteReasons, []); assert.deepEqual(upper.unvisited, [])
+  assert.equal(upper.unvisitedTruncated, false); assert.equal(upper.suggestedNarrowing, null)
+})
+
 test('root and nested gitignore rules apply to every tool without overriding private exclusions', async t => {
   const { directory, registry } = await fixture(t)
   await fs.mkdir(join(directory, 'src'))
@@ -66,7 +85,7 @@ test('known private paths are excluded while ordinary project config remains rea
   }
   for (const name of ['.env.example', '.npmrc', 'credentials.json', 'auth.json', 'fixture.pem']) await fs.writeFile(join(directory, name), 'Private fixture')
   await fs.writeFile(join(directory, 'tsconfig.json'), '{}')
-  assert.deepEqual((await run(registry, 'workspace_list')).data.entries, [{ path: 'tsconfig.json', kind: 'file' }])
+  assert.deepEqual((await run(registry, 'workspace_list')).data.entries.map(({ path, kind }) => ({ path, kind })), [{ path: 'tsconfig.json', kind: 'file' }])
   assert.equal((await run(registry, 'workspace_read', { path: 'tsconfig.json' })).data.content, '{}')
   await assert.rejects(ReadOnlyWorkspace.open(join(directory, '.aws')), /Private credential/)
 })
@@ -88,11 +107,11 @@ test('active custom state directories are excluded by canonical path and existin
   await fs.writeFile(join(directory, 'readme.txt'), 'Ordinary sibling')
   const workspace = await ReadOnlyWorkspace.open(directory, [], [state])
   const registry = createToolRegistry([createWorkspaceExtension(workspace)])
-  assert.deepEqual((await run(registry, 'workspace_list')).data.entries, [{ path: 'readme.txt', kind: 'file' }])
+  assert.deepEqual((await run(registry, 'workspace_list')).data.entries.map(({ path, kind }) => ({ path, kind })), [{ path: 'readme.txt', kind: 'file' }])
   const refused = await run(registry, 'workspace_read', { path: 'local-state/transcript.json' })
   assert.equal(refused.result.isError, true); assert(!refused.result.content.includes(directory))
   await fs.rename(state, join(directory, 'moved-state'))
-  assert.deepEqual((await run(registry, 'workspace_list')).data.entries, [{ path: 'readme.txt', kind: 'file' }])
+  assert.deepEqual((await run(registry, 'workspace_list')).data.entries.map(({ path, kind }) => ({ path, kind })), [{ path: 'readme.txt', kind: 'file' }])
   await assert.rejects(ReadOnlyWorkspace.open(join(directory, 'moved-state'), [], [join(directory, 'moved-state')]), /outside.*private state/)
 })
 
@@ -103,11 +122,11 @@ test('a missing custom state directory is excluded before it is created', async 
   await fs.mkdir(state); await fs.writeFile(join(state, 'transcript.json'), '{}')
   await fs.writeFile(join(directory, 'readme.txt'), 'Ordinary sibling')
   const registry = createToolRegistry([createWorkspaceExtension(workspace)])
-  assert.deepEqual((await run(registry, 'workspace_list')).data.entries, [{ path: 'readme.txt', kind: 'file' }])
+  assert.deepEqual((await run(registry, 'workspace_list')).data.entries.map(({ path, kind }) => ({ path, kind })), [{ path: 'readme.txt', kind: 'file' }])
   assert.equal((await run(registry, 'workspace_read', { path: 'readme.txt' })).data.content, 'Ordinary sibling')
   assert.equal((await run(registry, 'workspace_read', { path: 'local-state/transcript.json' })).result.isError, true)
   await fs.rename(state, join(directory, 'moved-state'))
-  assert.deepEqual((await run(registry, 'workspace_list')).data.entries, [{ path: 'readme.txt', kind: 'file' }])
+  assert.deepEqual((await run(registry, 'workspace_list')).data.entries.map(({ path, kind }) => ({ path, kind })), [{ path: 'readme.txt', kind: 'file' }])
 })
 
 test('relative-path and argument contracts reject ambiguous inputs before reading', async t => {
@@ -161,6 +180,9 @@ test('entry, result and depth budgets report incomplete listings', async t => {
   await fs.writeFile(join(directory, 'readme.txt'), 'fixture\n'.repeat(60))
   const search = (await run(registry, 'workspace_search', { query: 'fixture', maxResults: 2, depth: 3 })).data
   assert.equal(search.matches.length, 2); assert.equal(search.truncated, true)
+  assert.equal(search.incompleteReason, 'result-limit')
+  assert(search.unvisited.some(item => item.path === 'readme.txt' && item.scope === 'remaining-lines'))
+  assert.match(search.suggestedNarrowing, /maxResults/)
   const list = (await run(registry, 'workspace_list', { maxResults: 1, depth: 3 })).data
   assert.equal(list.entries.length, 1); assert.equal(list.truncated, true)
 })
@@ -191,10 +213,79 @@ test('search file and aggregate byte budgets stop scans even when there are no m
   for (let index = 0; index < WORKSPACE_LIMITS.maximumFiles + 1; index++) await fs.writeFile(join(directory, `file-${index}.txt`), 'Ordinary fixture')
   const files = (await run(registry, 'workspace_search', { query: 'absent' })).data
   assert.equal(files.truncated, true); assert.equal(files.scannedFiles, WORKSPACE_LIMITS.maximumFiles)
+  assert.equal(files.incompleteReason, 'file-limit')
+  assert(files.unvisited.some(item => item.scope === 'file' && item.reason === 'file-limit'))
+  assert.match(files.suggestedNarrowing, /smaller subdirectories using path/)
   await fs.mkdir(join(directory, 'large-files'))
   for (let index = 0; index < 9; index++) await fs.writeFile(join(directory, 'large-files', `file-${index}.txt`), 'x'.repeat(WORKSPACE_LIMITS.maximumFileBytes))
   const bytes = (await run(registry, 'workspace_search', { path: 'large-files', query: 'absent' })).data
   assert.equal(bytes.truncated, true); assert.equal(bytes.scannedBytes, WORKSPACE_LIMITS.maximumScanBytes)
+  assert.equal(bytes.incompleteReason, 'byte-budget')
+  assert(bytes.unvisited.some(item => item.path.startsWith('large-files/') && item.scope === 'file'))
+  assert(bytes.unvisited.some(item => item.path === 'large-files' && item.scope === 'remaining-entries'))
+  assert.match(bytes.suggestedNarrowing, /smaller subdirectories using path/)
+})
+
+test('an empty search reports byte exhaustion even below the aggregate byte limit', async t => {
+  const { directory, registry } = await fixture(t)
+  // Nine equal files cannot fit in 2 MiB, but eight also leave unused capacity.
+  for (let index = 0; index < 9; index++) await fs.writeFile(join(directory, `file-${index}.txt`), 'x'.repeat(250000))
+  const search = (await run(registry, 'workspace_search', { query: 'absent' })).data
+  assert.equal(search.success, true); assert.deepEqual(search.matches, [])
+  assert.equal(search.truncated, true); assert.equal(search.incompleteReason, 'byte-budget')
+  assert.equal(search.scannedBytes, 2000000)
+  assert(search.scannedBytes < WORKSPACE_LIMITS.maximumScanBytes)
+  assert.deepEqual(search.incompleteReasons, ['byte-budget'])
+})
+
+test('depth-limited search reports bounded unvisited directory scopes', async t => {
+  const { directory, registry } = await fixture(t)
+  for (let index = 0; index < 20; index++) {
+    const child = join(directory, `child-${index}`)
+    await fs.mkdir(child); await fs.writeFile(join(child, 'match.txt'), 'needle')
+  }
+  const search = (await run(registry, 'workspace_search', { query: 'needle', depth: 1 })).data
+  assert.deepEqual(search.matches, []); assert.equal(search.incompleteReason, 'depth-limit')
+  assert.deepEqual(search.incompleteReasons, ['depth-limit'])
+  assert.equal(search.unvisited.length, 8); assert.equal(search.unvisitedTruncated, true)
+  assert(search.unvisited.every(item => item.path.startsWith('child-') && item.scope === 'descendants'))
+  assert.match(search.suggestedNarrowing, /increase depth/)
+  const retry = (await run(registry, 'workspace_search', { query: 'needle', path: search.unvisited[0].path })).data
+  assert.equal(retry.matches.length, 1); assert.equal(retry.truncated, false)
+})
+
+test('search output exhaustion preserves diagnostics within the result byte limit', async t => {
+  const { directory, registry } = await fixture(t)
+  const components = Array.from({ length: 5 }, (_, index) => `${index}-${'d'.repeat(148)}`)
+  const nested = join(directory, ...components)
+  await fs.mkdir(nested, { recursive: true })
+  await fs.writeFile(join(nested, `${'f'.repeat(145)}.txt`), `${'x'.repeat(512)}\n`.repeat(60))
+  const search = (await run(registry, 'workspace_search', { query: 'x'.repeat(200), depth: 8, maxResults: 50 })).data
+  assert.equal(search.success, true); assert.equal(search.truncated, true)
+  assert.equal(search.incompleteReason, 'output-budget')
+  assert(search.matches.length > 0 && search.matches.length < 50)
+  assert(search.unvisited.some(item => item.scope === 'remaining-lines' && item.reason === 'output-budget'))
+  assert.match(search.suggestedNarrowing, /lower maxResults/)
+})
+
+test('search retains its stopping point when prior depth omissions fill the sample', async t => {
+  const { directory, registry } = await fixture(t)
+  for (let index = 0; index < 10; index++) await fs.mkdir(join(directory, `child-${index}`))
+  await fs.writeFile(join(directory, 'last.txt'), 'needle\nneedle\n')
+  const original = fs.opendir
+  t.mock.method(fs, 'opendir', async (...args) => {
+    const stream = await original(...args), entries = []
+    for (let entry; (entry = await stream.read());) entries.push(entry)
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    stream.read = async () => entries.shift() ?? null
+    return stream
+  })
+  const search = (await run(registry, 'workspace_search', { query: 'needle', depth: 1, maxResults: 1 })).data
+  assert.equal(search.incompleteReason, 'result-limit')
+  assert.deepEqual(search.incompleteReasons, ['depth-limit', 'result-limit'])
+  assert.equal(search.unvisitedTruncated, true)
+  assert(search.unvisited.some(item => item.path === 'last.txt' && item.scope === 'remaining-lines'))
+  assert.match(search.suggestedNarrowing, /depth/); assert.match(search.suggestedNarrowing, /maxResults/)
 })
 
 test('excluded entries still consume the bounded enumeration budget', async t => {
@@ -203,6 +294,10 @@ test('excluded entries still consume the bounded enumeration budget', async t =>
   const list = (await run(registry, 'workspace_list')).data
   assert.equal(list.truncated, true); assert.equal(list.scannedEntries, WORKSPACE_LIMITS.maximumEntries)
   assert.deepEqual(list.entries, [])
+  const search = (await run(registry, 'workspace_search', { query: 'absent' })).data
+  assert.deepEqual(search.matches, []); assert.equal(search.incompleteReason, 'entry-limit')
+  assert.deepEqual(search.unvisited, [{ path: '.', scope: 'remaining-entries', reason: 'entry-limit' }])
+  assert(!JSON.stringify(search).includes('.env.fixture-'))
 })
 
 test('fresh reads notice root replacement and ordinary concurrent file changes', async t => {

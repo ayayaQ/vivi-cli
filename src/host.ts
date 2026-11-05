@@ -41,7 +41,7 @@ import { WORKSPACE_MUTATION_TOOL_NAMES, WorkspaceCommitError } from './workspace
 import { normalizeSessionTitle, sessionTitleFromPrompt, validSessionTitle } from './session-display.js'
 import { AutoReviewController, reviewDigest, reviewContainsSecret } from './auto-review.js'
 import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
-import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice } from './auto-review.js'
+import type { ApprovalMode, AutoReviewConfiguration, ReviewNotice, ReviewSource } from './auto-review.js'
 import type { JsonObject } from '@ayayaq/vivi'
 import type { PreparedActionMetadata } from '@ayayaq/vivi/decisions'
 import { createCommandExtension, COMMAND_GUIDANCE, COMMAND_TOOL_NAMES } from './commands.js'
@@ -303,7 +303,7 @@ export interface CliHostOptions {
   /** Dormant app factory keeps command-only environment errors out of read/chat startup. */
   commandWorkspaceFactory?(): Promise<TrustedCommandWorkspace>
   commandApproval?: { isAvailable(): boolean; accountRevision(): string }
-  /** Live chat-account binding for explicit session-only Skip permissions, not reviewer configuration. */
+  /** Live chat-account binding for Skip permissions, not reviewer configuration. */
   permissionApproval?: { isAvailable(): boolean; accountRevision(): string }
   /** Trusted, explicitly imported tool packs. Registration is captured once per turn. */
   extensions?: readonly ToolExtension[]
@@ -885,6 +885,7 @@ export class CliHost {
   private async executeWorkspaceMutation(call: ToolCall, signal: AbortSignal, ownerSignal: AbortSignal, instructionSnapshot: InstructionSnapshot | undefined): Promise<ToolResult> {
     const workspace = this.options.workspace, capturedCall = structuredClone(call)
     let commitAdmitted = false
+    let reviewSource: ReviewSource | undefined
     const observed = (result: ToolResult, status: CliToolReceipt['status'], effect: CliToolReceipt['effect']): ToolResult =>
       this.observeToolReceipt(capturedCall, result, { status, effect }, 'local-mutation', ownerSignal)
     try {
@@ -892,49 +893,62 @@ export class CliHost {
       if (!workspace || this.options.enableTools === false) throw new WorkspaceError('Workspace tools are unavailable for this turn')
       workspace.addSecrets(this.options.secrets ?? [])
       if (typeof capturedCall.arguments.path === 'string') await this.projectInstructions.assertMutation(capturedCall.arguments.path, instructionSnapshot, signal)
+      if (typeof capturedCall.arguments.destination === 'string') await this.projectInstructions.assertMutation(capturedCall.arguments.destination, instructionSnapshot, signal)
       const prepared = await workspace.prepareMutation(call.name, capturedCall.arguments, signal)
       await this.projectInstructions.assertMutation(prepared.path, instructionSnapshot, signal)
+      const assertInstructions = async (): Promise<void> => {
+        await this.projectInstructions.assertMutation(prepared.path, instructionSnapshot, signal)
+        if (prepared.destination) await this.projectInstructions.assertMutation(prepared.destination, instructionSnapshot, signal)
+      }
       if (reviewDigest(call) !== reviewDigest(capturedCall)) throw new WorkspaceError('Tool arguments changed during workspace preparation; request a fresh review')
       const resourceId = `cli-workspace:${this.workspaceScopeRevision}:${prepared.path}`
       // Only the changed literal/hunk leaves preparation. Full hashes bind the
       // entire reviewed file; commit preserves every byte outside this change.
       const affectedData = { path: prepared.path, before: prepared.beforeChange, after: prepared.afterChange,
+        ...(prepared.destination ? { destination: prepared.destination } : {}),
         beforeRevision: prepared.expectedRevision, afterRevision: prepared.revision, diff: prepared.diff }
+      const textMutation = prepared.kind === 'create' || prepared.kind === 'edit'
       const preparedAction = (): PreparedActionMetadata => ({ complete: true, effects: [{
         kind: 'write', resourceId, scope: 'workspace', affectedData,
-        review: this.options.workspace === workspace && this.options.enableTools !== false ? 'model-review' : 'manual'
+        review: textMutation && this.options.workspace === workspace && this.options.enableTools !== false ? 'model-review' : 'manual'
       }] })
       const revisions = (): JsonObject => ({ [resourceId]: prepared.expectedRevision,
+        ...(prepared.destination ? { [`cli-workspace:${this.workspaceScopeRevision}:${prepared.destination}`]: 'absent' } : {}),
         workspaceScopeRevision: this.workspaceScopeRevision, workspaceCurrent: this.options.workspace === workspace,
         toolsEnabled: this.options.enableTools !== false, toolsetRevision: this.toolsetRevision,
         rawCallDigest: reviewDigest(call), capturedCallDigest: reviewDigest(capturedCall),
         proposalDigest: reviewDigest(prepared), resultRevision: prepared.revision })
       const result = await this.reviews.execute({ approval: { call, currentRevision: prepared.expectedRevision, workspaceDiff: prepared.diff,
-        description: `${prepared.kind === 'create' ? 'Create' : 'Precisely edit'} workspace text file ${JSON.stringify(prepared.path)}.\n` +
-          'The complete diff below uses JSON-quoted lines, including exact newline/control escapes. A temporary sibling .vivi-stage-*.tmp file is used and removed; no backup copy is retained.\n' +
-          `Before SHA-256: ${prepared.expectedRevision}\nAfter SHA-256: ${prepared.revision}\n${prepared.diff}` },
-        eligible: true, skipEligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
+        description: `${({ create: 'Create workspace text file', edit: 'Precisely edit workspace text file', delete: 'Delete workspace text file', move: 'Move workspace text file', mkdir: 'Create workspace directory' })[prepared.kind]} ${JSON.stringify(prepared.path)}.\n` +
+          (textMutation ? 'The complete diff below uses JSON-quoted lines, including exact newline/control escapes. A temporary sibling .vivi-stage-*.tmp file is used and removed; no backup copy is retained.\n' : '') +
+          `Before ${textMutation ? 'SHA-256' : 'revision'}: ${prepared.expectedRevision}\nAfter ${textMutation ? 'SHA-256' : 'revision'}: ${prepared.revision}\n${prepared.diff}` },
+        eligible: textMutation, skipEligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
         resourceRevisions: revisions(), currentResourceRevisions: revisions,
         isActive: () => this.controller?.signal === ownerSignal && this.options.workspace === workspace && this.options.enableTools !== false
-      }, signal, async assertCurrent => {
+      }, signal, async (assertCurrent, source) => {
+        reviewSource = source
         workspace.addSecrets(this.options.secrets ?? [])
-        await this.projectInstructions.assertMutation(prepared.path, instructionSnapshot, signal)
+        await assertInstructions()
         commitAdmitted = true
         return workspace.commitMutation(prepared, signal, async () => {
           workspace.addSecrets(this.options.secrets ?? []); assertCurrent()
-          await this.projectInstructions.assertMutation(prepared.path, instructionSnapshot, signal)
+          await assertInstructions()
           assertCurrent()
         })
       }, result => result.revision)
-      return result ? observed({ content: JSON.stringify({ success: true, source: 'selected_workspace', untrusted: true, ...result }) }, 'succeeded', 'confirmed')
+      return result ? observed({ content: JSON.stringify({ success: true, source: 'selected_workspace', untrusted: true, ...result, reviewSource }) }, 'succeeded', 'confirmed')
         : observed({ content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'This workspace change was not approved' } }), isError: true }, signal.aborted ? 'cancelled' : 'denied', 'not_attempted')
     } catch (error) {
       if (error instanceof InstructionsRequiredError) return observed({ content: JSON.stringify({ success: false, source: 'selected_workspace',
         serverEffects: 'not_attempted', error: { code: 'instructions_required', message: redactSecrets(error.message, this.options.secrets ?? []) } }), isError: true }, 'denied', 'not_attempted')
+      if (error instanceof WorkspaceCommitError && error.result.sourceRemoved === false) return observed({ content: JSON.stringify({ success: false,
+        source: 'selected_workspace', untrusted: true, ...error.result, partial: true,
+        error: { code: 'workspace_move_partial', message: 'Move destination was created, but source removal was not confirmed. Inspect both paths before retrying' } }), isError: true }, 'failed', 'unknown')
       if (error instanceof WorkspaceCommitError) return observed({ content: JSON.stringify({ success: true,
-        source: 'selected_workspace', untrusted: true, ...error.result, durabilityUnconfirmed: true,
+        source: 'selected_workspace', untrusted: true, ...error.result, reviewSource, durabilityUnconfirmed: true,
         warning: error.message }) }, 'succeeded', 'confirmed')
-      return observed({ content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled' : 'workspace_change_failed',
+      return observed({ content: JSON.stringify({ success: false, error: { code: signal.aborted ? 'cancelled'
+        : error instanceof WorkspaceError && error.code !== 'workspace_read_failed' ? error.code : 'workspace_change_failed',
         message: error instanceof WorkspaceError ? redactSecrets(error.message, this.options.secrets ?? [])
           : 'Workspace change could not be confirmed. Read the file before retrying; filesystem details are withheld' } }), isError: true }, signal.aborted ? 'cancelled' : 'failed', commitAdmitted ? 'unknown' : 'not_attempted')
     }
@@ -1775,7 +1789,7 @@ export class CliHost {
     this.persistence = operation.then(() => undefined, () => undefined)
     return operation
   }
-  private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal, ownerSignal: AbortSignal): Promise<number | { readonly revision: number; readonly durabilityUnconfirmed: true } | undefined> {
+  private async reviewNote(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal, ownerSignal: AbortSignal): Promise<{ readonly revision: number; readonly reviewSource?: ReviewSource; readonly durabilityUnconfirmed?: true } | undefined> {
     const capturedBefore = structuredClone(before)
     const store = this.options.store
     const resourceId = (): string => `cli-session:${this.current.id}:note:${key}`
@@ -1789,21 +1803,22 @@ export class CliHost {
       toolsEnabled: this.options.enableTools !== false, toolsetRevision: this.toolsetRevision,
       beforeDigest: reviewDigest(capturedBefore), proposalDigest: reviewDigest({ key, value, expectedRevision: before.revision }) })
     let commitAdmitted = false
+    let reviewSource: ReviewSource | undefined
     try {
     const revision = await this.reviews.execute({ approval: { call, currentRevision: before.revision,
       description: `Set session note ${JSON.stringify(key)}.\nBefore: ${Object.hasOwn(capturedBefore.notes, key) ? JSON.stringify(capturedBefore.notes[key]) : '(new note)'}\nAfter: ${JSON.stringify(value)}` },
       eligible: true, skipEligible: true, inputData: affectedData, preparedAction: preparedAction(), currentPreparedAction: preparedAction,
       resourceRevisions: revisions(), currentResourceRevisions: revisions,
       isActive: () => this.controller?.signal === ownerSignal && (this.options.enableNotes ?? false) && this.options.enableTools !== false },
-    signal, assertCurrent => { commitAdmitted = true; return this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent) }, revision => revision)
+    signal, (assertCurrent, source) => { reviewSource = source; commitAdmitted = true; return this.commitNote(key, value, capturedBefore.revision, signal, assertCurrent) }, revision => revision)
     this.observeToolReceipt(call, revision === undefined
       ? { content: JSON.stringify({ success: false, error: { code: 'approval_denied', message: 'This note change was not approved' } }), isError: true }
-      : { content: JSON.stringify({ success: true, key, revision }) },
+      : { content: JSON.stringify({ success: true, key, revision, reviewSource }) },
       { status: revision === undefined ? signal.aborted ? 'cancelled' : 'denied' : 'succeeded', effect: revision === undefined ? 'not_attempted' : 'confirmed' }, 'local-mutation', ownerSignal)
-    return revision
+    return revision === undefined ? undefined : { revision, ...(reviewSource ? { reviewSource } : {}) }
     } catch (error) {
       if (error instanceof SessionCommitError) {
-        const saved = { revision: capturedBefore.revision + 1, durabilityUnconfirmed: true as const }
+        const saved = { revision: capturedBefore.revision + 1, ...(reviewSource ? { reviewSource } : {}), durabilityUnconfirmed: true as const }
         this.observeToolReceipt(call, { content: JSON.stringify({ success: true, key, ...saved }) }, { status: 'succeeded', effect: 'confirmed' }, 'local-mutation', ownerSignal)
         return saved
       }
@@ -2337,6 +2352,9 @@ export class CliHost {
           }
           let result = await toolset.executeTool(call, context.signal, {
           enableNotes,
+          readSessionStatus: () => ({ provider: this.current.provider, model: this.current.model,
+            ...(this.current.reasoning === undefined ? {} : { reasoning: this.current.reasoning }),
+            taskMode: this.taskMode, approvalMode: this.approvalMode, context: this.contextUsage ?? null }),
           readNotes: () => this.notes(),
           commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
           reviewNote: (call, before, key, value, signal) => this.reviewNote(call, before, key, value, signal, controller.signal),

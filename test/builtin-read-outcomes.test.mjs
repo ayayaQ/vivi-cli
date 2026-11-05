@@ -25,7 +25,7 @@ async function diskHost(t, calls, options = {}) {
   t.after(async () => { await host.shutdown(); await rm(directory, { recursive: true, force: true }) })
   return { host, store }
 }
-for (const [name, args] of [['calculate', { expression: '118 + .314702876223' }], ['current_time', { timezone: 'UTC' }], ['note_read', {}]]) {
+for (const [name, args] of [['calculate', { expression: '118 + .314702876223' }], ['current_time', { timezone: 'UTC' }], ['session_status', {}], ['note_read', {}]]) {
   test(`owned ${name} success has exact live, final and durable cold-replay evidence`, async t => {
     let host, observed
     const f = await diskHost(t, [call(name, args)], { enableNotes: true, onEvent(event) {

@@ -7,16 +7,42 @@ export const WORKSPACE_DIFF_COLORS = { addedBackground: '#173f2a', addedForegrou
   removedBackground: '#51252b', removedForeground: '#ffdce0' } as const
 type RowKind = 'added' | 'removed' | 'context' | 'header' | undefined
 
-/** Style only the host's generated JSON-quoted diff, never a lookalike in arbitrary text. */
-function rowKinds(content: string, diff: string): RowKind[] {
-  if (!content.endsWith(`\n${diff}`)) return []
+/** Escape terminal controls without quoting ordinary source text. */
+function visibleText(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069\ufeff]/g, char =>
+    char === '\t' ? '\\t' : char === '\r' ? '\\r' : char === '\n' ? '\\n'
+      : `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
+/** Present only a matching host-generated diff; retain the exact review data upstream. */
+export function workspaceDiffPresentation(description: string, diff: string): { path: string; content: string } | undefined {
+  if (!description.endsWith(`\n${diff}`)) return undefined
   const rows = diff.split('\n')
   if (!/^--- (?:\(new file\)|".*")$/.test(rows[0] ?? '') || !/^\+\+\+ ".*"$/.test(rows[1] ?? '') ||
     !/^@@ -\d+,\d+ \+\d+,\d+ @@ \(JSON-quoted lines\)$/.test(rows[2] ?? '') ||
-    rows.slice(3).some(row => !/^[ +\-]".*"$/.test(row))) return []
-  const prefix = content.slice(0, -diff.length).split('\n').length - 1
-  return [...Array<RowKind>(prefix).fill(undefined), ...rows.map((row, index): RowKind => index < 3 ? 'header'
-    : row[0] === '+' ? 'added' : row[0] === '-' ? 'removed' : 'context')]
+    rows.slice(3).some(row => !/^[ +\-]".*"$/.test(row))) return undefined
+  try {
+    const path: unknown = JSON.parse(rows[1]!.slice(4))
+    if (typeof path !== 'string' || (rows[0] !== '--- (new file)' && JSON.parse(rows[0]!.slice(4)) !== path)) return undefined
+    const content = [rows[2]!.replace(' (JSON-quoted lines)', '')]
+    for (const row of rows.slice(3)) {
+      const line: unknown = JSON.parse(row.slice(1))
+      if (typeof line !== 'string' || line.replace(/\n$/, '').includes('\n')) return undefined
+      content.push(row[0] + visibleText(line.replace(/\n$/, '')))
+      if (!line.endsWith('\n')) content.push('\\ No newline at end of file')
+    }
+    return { path: visibleText(path), content: content.join('\n') }
+  } catch { return undefined }
+}
+
+/** Style only the prepared display diff, never a lookalike in arbitrary text. */
+function rowKinds(content: string, diff: string): RowKind[] {
+  if (content !== diff) return []
+  const rows = diff.split('\n')
+  if (!/^@@ -\d+,\d+ \+\d+,\d+ @@$/.test(rows[0] ?? '') ||
+    rows.slice(1).some(row => !/^[ +\-]/.test(row) && row !== '\\ No newline at end of file')) return []
+  return rows.map((row, index): RowKind => index === 0 ? 'header'
+    : row[0] === '+' ? 'added' : row[0] === '-' ? 'removed' : 'context')
 }
 function rowColors(kind: RowKind): { fg: RGBA; bg: RGBA } | undefined {
   return kind === 'added' ? { fg: RGBA.fromHex(WORKSPACE_DIFF_COLORS.addedForeground), bg: RGBA.fromHex(WORKSPACE_DIFF_COLORS.addedBackground) }

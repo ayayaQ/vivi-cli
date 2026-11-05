@@ -9,6 +9,7 @@ import { main } from '../dist/main.js'
 import { CliHost } from '../dist/host.js'
 import { McpManager } from '../dist/mcp-manager.js'
 import { FileSessionStore } from '../dist/session.js'
+import { DEFAULT_PREFERENCES, PreferenceStore } from '../dist/preferences.js'
 
 const test = (name, fn) => nodeTest(name, { timeout: 15_000 }, fn)
 const reported = { inputTokens: 4, outputTokens: 2, totalTokens: 6 }
@@ -75,6 +76,14 @@ test('JSONL one-turn success has a pure ordered envelope, accepted text and repo
   const saved = await new FileSessionStore(f.directory).load(result.rows.at(-1).session_id)
   assert.equal(saved.history.at(-1).content, 'Accepted final')
   assert(!(await readdir(f.directory)).some(name => name.endsWith('.lock')), 'Terminal success follows writer lease release')
+})
+
+for (const mode of ['auto', 'skip', 'plan']) test(`JSONL stays Manual with saved ${mode} preferences`, async t => {
+  const f = await fixture(t), preferences = new PreferenceStore(f.directory)
+  await preferences.save({ ...DEFAULT_PREFERENCES, mode, reviewer: 'openai' })
+  const result = await run(f, { dependencies: { decisionProviderFactory() { assert.fail('Automation must not construct a reviewer') } } })
+  assert.equal(result.status, 0)
+  assert.equal((await preferences.load()).mode, mode)
 })
 
 test('JSONL resume explicitly uses the saved session while emitting only the new turn', async t => {

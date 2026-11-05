@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
+import type { ContextUsage, ToolCall, ToolDefinition, ToolResult } from '@ayayaq/vivi'
 import { createExtensionScope, type ExtensionCleanup, type ToolExtension, type ToolRegistry } from '@ayayaq/vivi/extensions'
 import { calculate, calculatorExtension } from '@ayayaq/vivi/extensions/calculator'
 import { WORKSPACE_TOOL_NAMES } from './workspace.js'
@@ -10,6 +10,7 @@ import { QUESTION_TOOL_NAME } from './questions.js'
 import { MCP_SETUP_TOOL_NAMES } from './mcp-setup-tools.js'
 import { isPlanTool, planModeRefusal } from './task-mode.js'
 import type { TaskMode } from './task-mode.js'
+import type { ReviewSource } from './auto-review.js'
 export { calculate }
 
 /** Closed set of host-owned reads/informational tools. Names alone are not execution evidence. */
@@ -20,11 +21,12 @@ export function isBuiltinReadTool(name: string): boolean {
 export type CliToolOutcomePolicy = 'local-read' | 'local-mutation' | 'command' | 'public-url' | 'mcp' | 'extension'
 /** Closed inventory. Adding an advertised owned tool requires an explicit evidence policy. */
 export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
-  calculate: 'local-read', current_time: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
+  calculate: 'local-read', current_time: 'local-read', session_status: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
   list_memories: 'local-read', create_memory: 'local-mutation', edit_memory: 'local-mutation', delete_memory: 'local-mutation',
   workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
   workspace_read_image: 'local-read',
   workspace_create_text: 'local-mutation', workspace_edit_text: 'local-mutation',
+  workspace_delete_file: 'local-mutation', workspace_move_file: 'local-mutation', workspace_mkdir: 'local-mutation',
   list_skills: 'local-read', read_skill: 'local-read', save_skill: 'local-mutation', request_user_input: 'local-read',
   command_start: 'command', command_poll: 'command', command_stop: 'command',
   command_list: 'command', command_logs: 'command', command_restart: 'command', fetch_url: 'public-url', web_search: 'public-url',
@@ -36,6 +38,14 @@ export function builtinToolOutcomePolicy(name: string): CliToolOutcomePolicy | u
 }
 
 export interface NoteSnapshot { revision: number; notes: Readonly<Record<string, string>> }
+export interface SessionStatusSnapshot {
+  provider: string
+  model: string
+  reasoning?: string
+  taskMode: TaskMode
+  approvalMode: 'manual' | 'auto' | 'skip'
+  context: ContextUsage | null
+}
 export interface ApprovalRequest {
   call: ToolCall
   description: string
@@ -46,10 +56,11 @@ export interface ApprovalRequest {
 export interface ToolHost {
   enableNotes: boolean
   readNotes(): NoteSnapshot
+  readSessionStatus?(): SessionStatusSnapshot
   commitNote(key: string, value: string, expectedRevision: number): Promise<number>
   approve(request: ApprovalRequest, signal: AbortSignal): Promise<boolean>
   /** Prepared note writes go through host-owned review/commit, never a replacement IO judge. */
-  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | { readonly revision: number; readonly durabilityUnconfirmed: true } | undefined>
+  reviewNote?(call: ToolCall, before: NoteSnapshot, key: string, value: string, signal: AbortSignal): Promise<number | { readonly revision: number; readonly reviewSource?: ReviewSource; readonly durabilityUnconfirmed?: true } | undefined>
   now?(): Date
 }
 const objectSchema = (properties: Record<string, unknown>, required: string[]): ToolDefinition['parameters'] =>
@@ -57,13 +68,15 @@ const objectSchema = (properties: Record<string, unknown>, required: string[]): 
 
 function hostTools(enableNotes = false): ToolDefinition[] {
   const tools: ToolDefinition[] = [
+    { name: 'session_status', description: 'Read current host-owned provider, model, reasoning, task mode, approval mode and effective request context usage. Null context means not measured; estimated usage is labelled. Read only; does not grant permission or change settings.',
+      parameters: objectSchema({}, []) },
     { name: 'current_time', description: 'Return the current time in a requested IANA timezone, default UTC.',
       parameters: objectSchema({ timezone: { type: 'string', maxLength: 100 } }, []) }
   ]
   if (enableNotes) tools.push(
     { name: 'note_read', description: 'Read this CLI session’s host-owned notes and revision. No filesystem access.',
       parameters: objectSchema({}, []) },
-    { name: 'note_set', description: 'Propose one session note change for host review. Use the latest note revision; never claim a save before its success result.',
+    { name: 'note_set', description: 'Propose one session note change for host review. Use the latest note revision; never claim a save before its success result. Success reviewSource identifies human or automatic approval, or skip (no review).',
       parameters: objectSchema({ key: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,40}$' },
         value: { type: 'string', maxLength: 4096 }, expectedRevision: { type: 'integer', minimum: 0 } },
       ['key', 'value', 'expectedRevision']) })
@@ -81,7 +94,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
 } {
   if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
   const scope = createExtensionScope({
-    reservedNames: ['current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
+    reservedNames: ['session_status', 'current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
       PUBLIC_URL_TOOL_NAME, 'web_search', QUESTION_TOOL_NAME, ...MCP_SETUP_TOOL_NAMES, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom
@@ -158,6 +171,11 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
   try {
     if (signal.aborted) return error('cancelled', 'Cancelled before tool execution')
     if (registry.has(call.name)) return await registry.executeTool(call, { signal })
+    if (call.name === 'session_status') {
+      exactArguments(call, [])
+      if (!host.readSessionStatus) return error('unavailable_tool', 'Session status is unavailable from this host')
+      return { content: JSON.stringify(host.readSessionStatus()) }
+    }
     if (call.name === 'current_time') {
       exactArguments(call, ['timezone'])
       const timezone = call.arguments.timezone ?? 'UTC'
@@ -194,7 +212,7 @@ async function executeHostTool(call: ToolCall, signal: AbortSignal, host: ToolHo
       if (signal.aborted) return error('cancelled', 'Cancelled before note change')
       // The host rechecks revision and durably commits before reporting success.
       const revision = await host.commitNote(key, value, expectedRevision)
-      return { content: JSON.stringify({ success: true, key, revision }) }
+      return { content: JSON.stringify({ success: true, key, revision, reviewSource: 'human' }) }
     }
     return error('unavailable_tool', 'Tool is unavailable')
   } catch (failure) {

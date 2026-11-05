@@ -71,7 +71,11 @@ test('files larger than judge budget support a small precise edit without exposi
 test('empty, absent, repeated and overlapping targets are refused without mutation', async t => {
   const { workspace, root } = await fixture(t); await fs.writeFile(join(root, 'file.txt'), 'aaaa repeat repeat')
   const hash = await revision(root, 'file.txt')
-  for (const before of ['', 'absent', 'repeat', 'aaa']) await assert.rejects(prepare(workspace, 'file.txt', before, 'changed', hash), /nonempty|exactly once/)
+  await assert.rejects(prepare(workspace, 'file.txt', '', 'changed', hash), /nonempty/)
+  await assert.rejects(prepare(workspace, 'file.txt', 'absent', 'changed', hash), error =>
+    error.code === 'target_not_found' && /not found.*read the latest file/.test(error.message))
+  for (const before of ['repeat', 'aaa']) await assert.rejects(prepare(workspace, 'file.txt', before, 'changed', hash), error =>
+    error.code === 'target_not_unique' && /exactly once.*unique/.test(error.message))
   await assert.rejects(prepare(workspace, 'file.txt', 'aaaa', 'aaaa', hash), /different/)
   assert.equal(await fs.readFile(join(root, 'file.txt'), 'utf8'), 'aaaa repeat repeat'); await noStages(root)
 })

@@ -58,17 +58,17 @@ test('cancelling paid web opt-in does not load or copy chat credentials', async 
   assert.equal(await f.run(io), 0); assert(!f.loads.includes('deepseek-web')); assert.equal(f.saves.length, 0)
   assert.equal(JSON.parse(await readFile(join(f.directory, 'preferences.json'))).webProvider, undefined)
 })
-test('separate secure web key and fresh paid Auto enrollment allow a search without redundant human action approval', async t => {
+test('separate secure web key and direct Auto selection allow a search without extra confirmation', async t => {
   const original = globalThis.fetch; t.after(() => { globalThis.fetch = original }); const sends = []
   globalThis.fetch = async (input, init) => { sends.push({ input, init }); return new Response(JSON.stringify({ results: [] })) }
   const f = await fixture(t, { vault: { 'deepseek-web': 'fixture-separate-web-key' }, generate(_input, round) {
     return round === 1 ? { content: '', toolCalls: [{ id: 'search-once', name: 'web_search', arguments: { query: 'ordinary topic' } }] } : { content: 'Done', toolCalls: [] }
   } })
   const io = ioFixture({ lines: ['/web', '/mode', 'Search ordinary topic', '/exit'], choices: ['deepseek', true, 'current', 'auto'], approvals: [true] })
-  assert.equal(await f.run(io), 0); assert.equal(sends.length, 1); assert.equal(io.requests.length, 1)
+  assert.equal(await f.run(io), 0); assert.equal(sends.length, 1); assert.equal(io.requests.length, 0)
   assert.equal(sends[0].init.headers.Authorization, 'Bearer fixture-separate-web-key'); assert.equal(f.reviews.length, 1)
-  assert.match(io.requests[0].description, /paid DeepSeek/); assert.match(io.requests[0].description, /not an enforceable/)
-  assert.equal(io.requests[0].call.arguments.reviewDataSharing.webRecipient, 'DeepSeek')
+  assert.match(io.output, /DeepSeek web requests are billed separately/)
+  assert.equal(f.reviews[0].snapshot.userRequest.approvedScope.reviewDataSharing.webRecipient, 'DeepSeek')
   assert(!io.output.includes('fixture-separate-web-key')); assert(!JSON.stringify(await new PreferenceStore(f.directory).load()).includes('fixture-separate-web-key'))
 })
 test('chat-key reuse for web requires a deliberate choice and storage choice', async t => {
@@ -79,14 +79,14 @@ test('chat-key reuse for web requires a deliberate choice and storage choice', a
   assert(io.choices.some(choice => choice.title === 'DeepSeek web key storage'))
   assert.equal(JSON.parse(await readFile(join(f.directory, 'preferences.json'))).webProvider, 'deepseek')
 })
-test('DeepSeek Auto setup explicitly chooses a supported reviewer and does not persist that choice', async t => {
+test('DeepSeek Auto setup saves the supported reviewer for future conversations', async t => {
   const f = await fixture(t, { provider: 'deepseek' })
   const io = ioFixture({ lines: ['/mode', '/exit'], choices: ['auto', 'openai', 'current'], approvals: [true] })
-  assert.equal(await f.run(io), 0); assert.equal(io.requests.length, 1)
-  assert.equal(io.requests[0].call.arguments.provider, 'openai'); assert.match(io.requests[0].description, /to OpenAI/)
+  assert.equal(await f.run(io), 0); assert.equal(io.requests.length, 0)
+  assert.match(io.output, /Approval mode: Auto review.*OpenAI/)
   const picker = io.choices.find(row => row.title.startsWith('Auto reviewer'))
   assert.deepEqual(picker.values.map(row => row.value), ['none', 'openai', 'openrouter'])
-  assert.equal(JSON.parse(await readFile(join(f.directory, 'preferences.json'))).reviewer, undefined)
+  assert.equal(JSON.parse(await readFile(join(f.directory, 'preferences.json'))).reviewer, 'openai')
   assert.equal(f.providers[0].session.provider, 'deepseek')
 })
 test('chat setup preserves independently selected web Disabled', async t => {
@@ -105,7 +105,7 @@ for (const initial of ['old-chat-account-key', undefined]) test(`explicit review
   const io = ioFixture({ lines: ['/reviewer', '/mode', 'Set a session note named tone to concise', '/reviewer', '/reviewer', '/mode', 'Set the session note named tone to clear', '/exit'],
     choices: ['openai', 'enter', 'temporary', 'auto', 'none', 'openai', 'current', 'auto'], approvals: [true, true] })
   assert.equal(await f.run(io), 0); assert.deepEqual(f.reviewKeys, ['entered-fixture-key', 'entered-fixture-key'])
-  assert.equal(f.reviews.length, 2); assert.equal(io.requests.length, 2)
+  assert.equal(f.reviews.length, 2); assert.equal(io.requests.length, 0)
   const current = io.choices.filter(row => row.title === 'openai reviewer key').at(-1).values.find(row => row.value === 'current')
   assert.match(current.description, /Explicit reviewer key/)
   assert.equal(f.providers[0].env.OPENAI_API_KEY, initial)

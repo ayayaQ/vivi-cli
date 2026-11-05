@@ -85,7 +85,7 @@ test('DeepSeek begins without Auto reviewer despite another account being presen
   const approvals = [], output = []
   await selectApprovalMode(host, { canAutoReview: true, approve: async request => { approvals.push(request); return true },
     write: text => output.push(text), onCancel: () => () => {} })
-  assert.equal(host.approvalMode, 'manual'); assert.equal(approvals.length, 0); assert.match(output.join(''), /reviewer explicitly/)
+  assert.equal(host.approvalMode, 'manual'); assert.equal(approvals.length, 0); assert.match(output.join(''), /reviewer with \/reviewer/)
   await host.shutdown()
 })
 test('native credential stores use separate DeepSeek chat and web slots', async () => {

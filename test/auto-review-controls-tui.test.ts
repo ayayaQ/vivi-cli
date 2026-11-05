@@ -47,22 +47,20 @@ async function fixture() {
     while (picker.getSelectedIndex() > 1) setup.mockInput.pressArrow('up')
     setup.mockInput.pressEnter()
     await tick(); await frame()
-    expect(text(setup.renderer.root)).toContain('Enable Auto review?')
-    // Selection continuations can open the confirmation during a render. Complete
-    // another input-drain tick and native frame before sending a fresh gesture.
-    await tick(); await frame()
+    expect(host.approvalMode).toBe('auto')
+    expect(text(setup.renderer.root)).not.toContain('Enable Auto review?')
   }
   return { io, setup, host, enrollmentIO, frame, enroll, selectAuto, input: setup.mockInput }
 }
 
-test('native mode picker defaults Manual, shows selected-account disclosure, and Manual requires no enrollment', async () => {
+test('native mode picker defaults Manual, briefly describes Auto, and Manual requires no approval', async () => {
   const f = await fixture(), selecting = f.enroll()
   await f.frame()
   const picker = f.setup.renderer.root.findDescendantById('vivi-picker') as SelectRenderable
   expect(picker.getSelectedIndex()).toBe(0)
   expect(picker.options.map(option => option.name)).toEqual(['Manual', 'Auto review', 'Skip permissions', 'Plan'])
   const contents = text(f.setup.renderer.root)
-  expect(contents).toContain('Check proposed note, memory, workspace text and public URL GET actions through your selected provider')
+  expect(contents).toContain('AI reviews eligible actions automatically; extra API charges may apply')
   expect(contents).not.toContain('Auto sends your current request')
   f.input.pressEnter()
   await selecting
@@ -70,77 +68,38 @@ test('native mode picker defaults Manual, shows selected-account disclosure, and
   expect(text(f.setup.renderer.root)).not.toContain('enroll_auto_review')
 })
 
-test('Auto picker selection cannot enroll before a fresh completed approval frame, and paste keeps deny selected', async () => {
-  const f = await fixture(), selecting = f.enroll()
-  await f.frame()
-  f.input.pressArrow('down'); f.input.pressEnter()
-  await Promise.resolve(); await Promise.resolve()
-  // The picker selection is not authority, nor is a queued/repeated confirmation.
-  f.input.pressArrow('right'); f.input.pressEnter()
-  await tick()
-  expect(f.host.approvalMode).toBe('manual')
-  f.setup.renderer.keyInput.emit('keypress', {
-    name: 'return', sequence: '\r', repeated: true, eventType: 'repeat', ctrl: false, meta: false,
-    shift: false, super: false, hyper: false, preventDefault() {}, stopPropagation() {}
-  })
-  expect(f.host.approvalMode).toBe('manual')
-  await f.frame()
-  expect(text(f.setup.renderer.root)).toContain('Enable Auto review?')
-  expect(text(f.setup.renderer.root)).toContain('to OpenAI for approval checks')
-  expect(text(f.setup.renderer.root)).toContain('including changes you didn’t request')
-  expect(text(f.setup.renderer.root)).toContain('extra API charges')
-  expect(text(f.setup.renderer.root)).toContain('full URL including path/query')
-  expect(text(f.setup.renderer.root)).toContain('network limits and redirect scope')
-  expect(text(f.setup.renderer.root)).toContain('GET may have server-side effects or costs')
-  expect(text(f.setup.renderer.root)).toContain('Cancel is the default')
-  expect(await f.frame()).toContain('› Cancel')
-  await f.input.pasteBracketedText('allow')
-  await f.frame()
-  expect(f.host.approvalMode).toBe('manual')
-  f.input.pressEnter()
-  await selecting
-  expect(f.host.approvalMode).toBe('manual')
-})
-
-test('only a fresh native approval enrolls Auto; reopening preserves it until re-enrollment begins, then closing revokes it', async () => {
+test('selecting Auto enables it immediately without opening an approval dialog', async () => {
   const f = await fixture(), selecting = f.enroll()
   await f.selectAuto()
-  f.input.pressTab()
-  expect(await f.frame()).toContain('› Enable Auto')
-  f.input.pressEnter()
   await selecting
   expect(f.host.approvalMode).toBe('auto')
-  expect(await f.frame()).toContain('Auto review')
+  const contents = await f.frame()
+  expect(contents).toContain('Auto review')
+  expect(contents).not.toContain('Enable Auto')
+  expect(text(f.setup.renderer.root)).not.toContain('Cancel is the default')
+  expect(f.setup.renderer.root.findDescendantById('vivi-picker')).toBeUndefined()
+})
+
+test('reselecting Auto keeps it enabled without a second confirmation', async () => {
+  const f = await fixture(), selecting = f.enroll()
+  await f.selectAuto(); await selecting
   const next = f.enroll()
+  await f.selectAuto(); await next
   expect(f.host.approvalMode).toBe('auto')
-  await f.selectAuto()
-  expect(f.host.approvalMode).toBe('manual')
-  f.io.close()
-  await next
-  expect(f.host.approvalMode).toBe('manual')
+  expect(text(f.setup.renderer.root)).not.toContain('Enable Auto review?')
 })
 
-test('cancelling the native picker preserves already enrolled Auto without another confirmation', async () => {
+test('cancelling the native picker preserves active Auto', async () => {
   const f = await fixture(), selecting = f.enroll()
-  await f.selectAuto(); f.input.pressTab(); await f.frame(); f.input.pressEnter(); await selecting
-  expect(f.host.approvalMode).toBe('auto')
+  await f.selectAuto(); await selecting
   const cancelling = f.enroll(); await f.frame(); f.input.pressEscape(); await cancelling
   expect(f.host.approvalMode).toBe('auto')
 })
 
-test('native enrollment Escape and cancellation leave Manual and no working timer', async () => {
-  for (const cancel of ['escape', 'cancel'] as const) {
-    const f = await fixture(), selecting = f.enroll()
-    await f.selectAuto()
-    if (cancel === 'escape') f.input.pressEscape()
-    else f.setup.renderer.keyInput.emit('keypress', {
-      name: 'c', sequence: '\x03', ctrl: true, meta: false, shift: false, super: false, hyper: false,
-      preventDefault() {}, stopPropagation() {}
-    })
-    await selecting
-    expect(f.host.approvalMode).toBe('manual')
-    expect(text(f.setup.renderer.root)).not.toContain('Working ·')
-  }
+test('closing the native picker leaves Manual', async () => {
+  const f = await fixture(), selecting = f.enroll()
+  await f.frame(); f.io.close(); await selecting
+  expect(f.host.approvalMode).toBe('manual')
 })
 
 test('a real native surface reports Auto unavailable after close, renderer failure or destruction', async () => {

@@ -4,7 +4,7 @@ import { RGBA, TextAttributes, TextRenderable, ScrollBoxRenderable } from '@open
 import type { CapturedSpan, Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import { OpenTuiIO, TUI_THEME } from '../src/tui.js'
-import { WORKSPACE_DIFF_COLORS, WorkspaceDiffRenderable } from '../src/tui-diff.js'
+import { WORKSPACE_DIFF_COLORS, WorkspaceDiffRenderable, workspaceDiffPresentation } from '../src/tui-diff.js'
 import { workspaceDiff, workspaceRevision } from '../src/workspace-edit.js'
 import type { ApprovalRequest } from '../src/tools.js'
 
@@ -37,6 +37,23 @@ function request(before: string | null, after: string, path = 'fixture.txt'): Ap
     currentRevision, workspaceDiff: diff,
     description: `Precisely edit workspace text file ${JSON.stringify(path)}.\nExact JSON-quoted review.\nBefore SHA-256: ${currentRevision}\nAfter SHA-256: ${workspaceRevision(Buffer.from(after))}\n${diff}` }
 }
+const display = (r: ApprovalRequest) => workspaceDiffPresentation(r.description, r.workspaceDiff!)!
+
+test('source quotes and backslashes stay literal while controls and missing final newlines remain visible', () => {
+  const r = request('const path = "C:\\old";\n', '\tconst path = "C:\\new";\x1b[31m\r\nlast line', 'source.ts')
+  expect(display(r)).toEqual({ path: 'source.ts', content: '@@ -1,1 +1,2 @@\n-const path = "C:\\old";\n' +
+    '+\\tconst path = "C:\\new";\\u001b[31m\\r\n+last line\n\\ No newline at end of file' })
+  expect(r.workspaceDiff).toContain('(JSON-quoted lines)')
+})
+
+test('malformed quoted rows and mismatched paths fall back to the original review', () => {
+  const r = request('old\n', 'new\n')
+  for (const diff of [r.workspaceDiff!.replace('"old\\n"', '"bad\\q"'),
+    r.workspaceDiff!.replace('--- "fixture.txt"', '--- "other.txt"'),
+    r.workspaceDiff!.replace('"old\\n"', '"two\\nlines\\n"')]) {
+    expect(workspaceDiffPresentation(`Review\n${diff}`, diff)).toBeUndefined()
+  }
+})
 function colored(span: CapturedSpan, kind: 'added' | 'removed'): boolean {
   return span.bg.equals(RGBA.fromHex(WORKSPACE_DIFF_COLORS[`${kind}Background`])) &&
     span.fg.equals(RGBA.fromHex(WORKSPACE_DIFF_COLORS[`${kind}Foreground`]))
@@ -49,38 +66,44 @@ function bodySpans(spans: CapturedSpan[], body: WorkspaceDiffRenderable): Captur
   })
 }
 for (const palette of palettes) {
-  test(`${palette.name}: exact approval uses full-width red/green bands with explicit contrasting text and unchanged markers`, async () => {
+  test(`${palette.name}: compact approval shows a filename and readable full-width red/green diff`, async () => {
     const f = await fixture(palette), r = request('header\nold\nfooter\n', 'header\nnew\nfooter\n')
     const answer = f.io.approve(r, new AbortController().signal); await f.frame()
-    expect(f.body().plainText).toBe(r.description)
-    expect(f.spans().some(span => span.text.includes('-"old\\n"') && colored(span, 'removed'))).toBe(true)
-    expect(f.spans().some(span => span.text.includes('+"new\\n"') && colored(span, 'added'))).toBe(true)
+    expect(f.body().plainText).toBe('@@ -1,3 +1,3 @@\n header\n-old\n+new\n footer')
+    const text = descendants(f.setup.renderer.root).filter(node => node instanceof TextRenderable)
+      .map(node => (node as TextRenderable).plainText).join('\n')
+    expect(text).toContain('fixture.txt')
+    for (const hidden of ['Before SHA-256:', 'After SHA-256:', r.currentRevision, 'Precisely edit', 'JSON-quoted', '--- ', '+++ ']) {
+      expect(text).not.toContain(hidden)
+    }
+    expect(f.spans().some(span => span.text.includes('-old') && colored(span, 'removed'))).toBe(true)
+    expect(f.spans().some(span => span.text.includes('+new') && colored(span, 'added'))).toBe(true)
     const rows = f.setup.captureSpans().lines
-    for (const [text, kind] of [['-"old\\n"', 'removed'], ['+"new\\n"', 'added']] as const) {
+    for (const [text, kind] of [['-old', 'removed'], ['+new', 'added']] as const) {
       const row = rows.find(row => row.spans.some(span => span.text.includes(text)))!
       expect(bodySpans(row.spans, f.body()).every(span => colored(span, kind))).toBe(true)
     }
-    const context = f.spans().find(span => span.text.includes('"header\\n"'))!
+    const context = f.spans().find(span => span.text.includes(' header'))!
     expect(context.bg.a).toBe(0); expect(context.fg.intent).toBe('default')
     expect(context.attributes & TextAttributes.DIM).toBe(TextAttributes.DIM)
-    for (const text of ['Before SHA-256:', 'After SHA-256:', '--- "fixture.txt"', '+++ "fixture.txt"', '@@ -1,3 +1,3 @@']) {
+    for (const text of ['@@ -1,3 +1,3 @@']) {
       const span = f.spans().find(span => span.text.includes(text))!
       expect(span).toBeDefined(); expect(span.bg.a).toBe(0); expect(span.fg.intent).toBe('default')
     }
-    expect(f.spans().find(span => span.text.includes('--- "fixture.txt"'))!.attributes & TextAttributes.BOLD).toBe(TextAttributes.BOLD)
+    expect(f.spans().find(span => span.text.includes('@@ -1,3 +1,3 @@'))!.attributes & TextAttributes.BOLD).toBe(TextAttributes.BOLD)
     const surface = f.setup.renderer.root.findDescendantById('vivi-transcript') as ScrollBoxRenderable
     expect(surface.backgroundColor.a).toBe(0)
     f.input.pressEscape(); expect(await answer).toBe(false)
   })
 }
 
-test('native selection copies the exact full multiline diff and retains contrasting selected cells', async () => {
+test('native selection copies the displayed multiline diff and retains contrasting selected cells', async () => {
   const f = await fixture(), r = request('same\nold\n', 'same\nnew\n')
   const answer = f.io.approve(r, new AbortController().signal); await f.frame()
-  const body = f.body(), lines = body.plainText.split('\n'), start = lines.findIndex(line => line.startsWith('--- '))
+  const body = f.body(), lines = body.plainText.split('\n'), start = 0
   await f.setup.mockMouse.drag(body.x, body.y + start, body.x + lines.at(-1)!.length, body.y + body.height - 1)
   await f.frame()
-  expect(f.setup.renderer.getSelection()!.getSelectedText()).toBe(r.workspaceDiff!)
+  expect(f.setup.renderer.getSelection()!.getSelectedText()).toBe(display(r).content)
   expect(f.spans().some(span => span.text.includes('old') && span.bg.equals(RGBA.fromHex(TUI_THEME.selectedBackground)) &&
     span.fg.equals(RGBA.fromHex(TUI_THEME.highlightForeground)))).toBe(true)
   f.setup.renderer.clearSelection(); await f.frame()
@@ -94,14 +117,14 @@ test('wrapped long Unicode, tabs and control escapes stay exact and colored on e
   const after = 'context\n' + '新👩‍💻é\tword '.repeat(20) + '\x1b[31m\r\n'
   const r = request(before, after, '文件🙂.txt'), answer = f.io.approve(r, new AbortController().signal)
   await f.frame()
-  expect(f.body().plainText).toBe(r.description)
-  expect(f.body().plainText).toContain('\\u001b[31m\\r\\n')
+  expect(f.body().plainText).toBe(display(r).content)
+  expect(f.body().plainText).toContain('\\u001b[31m\\r')
   const transcript = f.setup.renderer.root.findDescendantById('vivi-transcript') as ScrollBoxRenderable
   for (const [width, height] of [[40, 20], [80, 30], [28, 12], [100, 40]] as const) {
     f.setup.resize(width, height); await f.frame()
     const body = f.body()
-    expect(body.plainText).toBe(r.description)
-    const source = body.plainText.split('\n').findIndex(line => line.startsWith('+"'))
+    expect(body.plainText).toBe(display(r).content)
+    const source = body.plainText.split('\n').findIndex(line => line.startsWith('+'))
     const visual = body.getLineSources(0, body.height), row = visual.indexOf(source)
     transcript.scrollTo(body.y - transcript.y + transcript.scrollTop + row); await f.frame()
     const coloredRows = f.setup.captureSpans().lines.filter(line => line.spans.some(span => span.text.includes('新') || span.text.includes('word')))
@@ -116,7 +139,7 @@ test('wrapped long Unicode, tabs and control escapes stay exact and colored on e
 for (const [name, before, after] of [['empty creation', null, ''], ['addition only', '', '\nnew\n'], ['removal only', '\nold\n', '']] as const) {
   test(`${name}: empty lines and one-sided diffs preserve complete exact text`, async () => {
     const f = await fixture(), r = request(before, after), answer = f.io.approve(r, new AbortController().signal)
-    await f.frame(); expect(f.body().plainText).toBe(r.description)
+    await f.frame(); expect(f.body().plainText).toBe(display(r).content)
     const adds = f.spans().filter(span => colored(span, 'added') && span.text.trim())
     const removes = f.spans().filter(span => colored(span, 'removed') && span.text.trim())
     expect(adds.length > 0).toBe(after.length > 0); expect(removes.length > 0).toBe((before?.length ?? 0) > 0)
@@ -156,9 +179,9 @@ test('large exact pending review survives transcript pressure, scrolling and reb
   const r = request('old\n', Array.from({ length: 100 }, (_, i) => `new ${i} ` + 'value '.repeat(50)).join('\n') + '\n')
   const answer = f.io.approve(r, new AbortController().signal); await f.frame()
   f.io.write('ordinary activity '.repeat(4000)); await f.frame()
-  expect(f.body().plainText).toBe(r.description); expect(f.body().plainText).not.toContain('[display truncated]')
+  expect(f.body().plainText).toBe(display(r).content); expect(f.body().plainText).not.toContain('[display truncated]')
   const transcript = f.setup.renderer.root.findDescendantById('vivi-transcript') as ScrollBoxRenderable
-  transcript.scrollTo(0); await f.frame(); expect(f.setup.captureCharFrame()).toContain('Before SHA-256:')
+  transcript.scrollTo(0); await f.frame(); expect(f.setup.captureCharFrame()).toContain('fixture.txt')
   transcript.scrollTo(transcript.scrollHeight); await f.frame(); expect(f.setup.captureCharFrame()).toContain('new 99')
   await new Promise(resolve => setTimeout(resolve, 2)); await f.frame()
   f.input.pressEnter(); expect(await answer).toBe(false)
@@ -181,20 +204,20 @@ test('coloring retains the native Unicode glyph frame and exact copied content a
   for (const width of [28, 40, 80]) {
     const setup = await createTestRenderer({ width, height: 100, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
     try {
-      const options = { content: r.description, width: '100%' as const, wrapMode: 'word' as const, fg: RGBA.defaultForeground(),
+      const options = { content: display(r).content, width: '100%' as const, wrapMode: 'word' as const, fg: RGBA.defaultForeground(),
         selectionBg: TUI_THEME.selectedBackground, selectionFg: TUI_THEME.highlightForeground }
       const ordinary = new TextRenderable(setup.renderer, options)
       setup.renderer.root.add(ordinary); await setup.renderOnce(); await setup.renderOnce()
       const original = setup.captureCharFrame(), sources = ordinary.getLineSources(0, ordinary.height)
       ordinary.destroyRecursively()
-      const diff = new WorkspaceDiffRenderable(setup.renderer, options, r.workspaceDiff!)
+      const diff = new WorkspaceDiffRenderable(setup.renderer, options, display(r).content)
       setup.renderer.root.add(diff); await setup.renderOnce(); await setup.renderOnce()
       expect(setup.captureCharFrame()).toBe(original)
-      expect(diff.getLineSources(0, diff.height)).toEqual(sources); expect(diff.plainText).toBe(r.description)
+      expect(diff.getLineSources(0, diff.height)).toEqual(sources); expect(diff.plainText).toBe(display(r).content)
       const lastSource = diff.plainText.split('\n').length - 1
       const endRow = sources.lastIndexOf(lastSource)
       await setup.mockMouse.drag(0, 0, width - 1, endRow); await setup.renderOnce(); await setup.renderOnce()
-      expect(diff.getSelectedText()).toBe(r.description)
+      expect(diff.getSelectedText()).toBe(display(r).content)
     } finally { setup.renderer.destroy() }
   }
 })

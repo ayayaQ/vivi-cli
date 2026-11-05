@@ -21,7 +21,7 @@ import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
 import { bindBackgroundProcessControls, runProcessControl } from './process-controls.js'
-import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
+import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, restoreConversationMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
@@ -99,12 +99,12 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
   })), Math.max(0, levels.indexOf(base.reasoning)))
   return selected === undefined ? undefined : { ...base, reasoning: selected }
 }
-const COMMAND_HELP = `${USER_SHELL_DISCLOSURE}\nEnter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Tab completes slash commands above the composer.
-/provider sets up an OpenAI, OpenRouter or DeepSeek chat key; /web independently selects Direct, DeepSeek or Disabled; /reviewer explicitly selects this conversation’s supported Auto reviewer; /models opens the model picker; /effort selects supported reasoning.
+const COMMAND_HELP = `${USER_SHELL_DISCLOSURE}\nEnter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Up/Down browses the last 100 prompts across workspaces and launches, from the first/last composer row. Down restores your draft. Tab completes slash commands above the composer.
+/provider sets up an OpenAI, OpenRouter or DeepSeek chat key; /web independently selects Direct, DeepSeek or Disabled; /reviewer changes the saved Auto reviewer; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /notes changes the session-note default for new conversations.
 /memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
 /mode chooses Manual / Auto review / Skip permissions / Plan for this conversation. /mode plan enters read-only planning; /mode manual returns to human-reviewed execution.
-Shift+Tab cycles Manual / Auto review / Skip permissions / Plan in the idle composer and preserves your draft; entering Auto still needs confirmation.
+Shift+Tab cycles Manual / Auto review / Skip permissions / Plan in the idle composer and preserves your draft; selecting Auto enables it immediately.
 /processes lists background jobs; logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected job; F7 stops all, even while working or in a dialog.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval in Manual/Auto; explicitly enrolled Skip permissions skips ordinary prompts. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
@@ -223,6 +223,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     }
   }
   if (options.webProvider !== undefined) settings.webProvider = options.webProvider
+  if (options.reviewer !== undefined) settings.reviewer = options.reviewer
+  if (options.reviewer === 'none' && settings.mode === 'auto') settings.mode = 'manual'
   let webKey = env.DEEPSEEK_WEB_API_KEY
   let webGeneration = randomUUID()
   let reviewerGeneration = randomUUID()
@@ -234,7 +236,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   // Opaque launch-owned revisions never expose, derive from or persist credentials.
   let accountGeneration = randomUUID()
   let hostAccountGeneration: string | undefined
-  let launchModePending = options.approvalMode !== 'manual'
+  let launchModePending = args.includes('--approval-mode')
+  let preferredMode = args.includes('--approval-mode') ? options.approvalMode : settings.mode ?? 'manual'
   let activeSettings: TuiPreferences | undefined
   let release: (() => Promise<void>) | undefined
   let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
@@ -458,6 +461,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     const defaults = { ...next, ...(settings.webProvider ? { webProvider: settings.webProvider } : {}), enableNotes: changed.notes ? next.enableNotes : settings.enableNotes,
       enableMemory: changed.memory ? next.enableMemory : settings.enableMemory }
     if (settings.autoReviewThresholds) defaults.autoReviewThresholds = settings.autoReviewThresholds
+    if (settings.mode) defaults.mode = settings.mode
+    if (settings.reviewer) defaults.reviewer = settings.reviewer
     await preferences.save(defaults); settings = defaults
   }
   const configureProviderModel = async (): Promise<void> => {
@@ -547,34 +552,54 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     io.setApprovalMode?.('manual'); io.setContext?.(undefined, false)
     io.write(`Web provider: ${provider}. Unattended enrollment revoked; chat provider is ${host?.session.provider ?? settings.provider}.\n`)
   }
-  const configureReviewer = async (): Promise<boolean> => {
-    if (!host) { io.write('Choose a chat model before selecting this conversation’s reviewer\n'); return false }
-    const provider = await io.choose('Auto reviewer · this conversation only', [
-      { name: 'None', description: 'Manual and Plan remain available', value: 'none' as const },
-      { name: 'OpenAI', description: 'Fixed gpt-6-luna review model; explicit account selection', value: 'openai' as const },
-      { name: 'OpenRouter', description: 'Fixed typesafe/jev-1.13 reviewer; sends data to OpenRouter and TypeSafe', value: 'openrouter' as const }
-    ], host.reviewProvider === 'openai' ? 1 : host.reviewProvider === 'openrouter' ? 2 : 0)
+  const rememberMode = async (): Promise<void> => {
+    if (!host || io.canAutoReview !== true || io.isClosed) return
+    const mode = host.taskMode === 'plan' ? 'plan' as const : host.approvalMode
+    const reviewer = settings.reviewer ?? (mode === 'auto' ? host.reviewProvider : undefined)
+    if (settings.mode === mode && settings.reviewer === reviewer) { preferredMode = mode; return }
+    const next = { ...settings, mode, ...(reviewer ? { reviewer } : {}) }
+    await preferences.save(next)
+    settings = next; preferredMode = mode
+  }
+  const configureReviewer = async (useSaved = false): Promise<boolean> => {
+    if (!host) { io.write('Choose a chat model before selecting an Auto reviewer\n'); return false }
+    if (io.canAutoReview !== true || io.isClosed) { io.write('Auto reviewer setup requires a live interactive terminal\n'); return false }
+    const wasAuto = host.approvalMode === 'auto'
+    const provider = useSaved && settings.reviewer && settings.reviewer !== 'none' ? settings.reviewer
+      : await io.choose('Auto reviewer', [
+        { name: 'None', description: 'Manual and Plan remain available', value: 'none' as const },
+        { name: 'OpenAI', description: 'Fixed gpt-6-luna review model', value: 'openai' as const },
+        { name: 'OpenRouter', description: 'Fixed typesafe/jev-1.13 reviewer', value: 'openrouter' as const }
+      ], host.reviewProvider === 'openai' ? 1 : host.reviewProvider === 'openrouter' ? 2 : 0)
     if (!provider || io.isClosed) return false
-    if (provider === 'none') { host.setDecisionReview(undefined); io.setApprovalMode?.('manual'); io.write('Auto reviewer: none\n'); return false }
+    if (provider === 'none') {
+      const mode = host.taskMode === 'plan' ? 'plan' as const : 'manual' as const
+      const next = { ...settings, reviewer: 'none' as const, mode }
+      await preferences.save(next); settings = next; preferredMode = mode
+      host.setDecisionReview(undefined); io.setApprovalMode?.('manual'); io.write('Auto reviewer: none\n'); return false
+    }
     const reviewerKey = reviewerKeys.get(provider)
     const current = reviewerKey ?? await loadKey(provider)
-    const key = await chooseSecureKey(io, credentials, { slot: provider, title: `${provider} reviewer`,
-      ...(current ? { current, currentDescription: reviewerKey ? 'Explicit reviewer key selected during this launch' : 'Existing environment or OS provider key; explicitly choose it for review' } : {}),
-      storageDescription: 'Replaces this provider’s saved OS key and may change future chat launches; never plaintext settings', register })
+    const key = useSaved && current ? current : await chooseSecureKey(io, credentials, { slot: provider, title: `${provider} reviewer`,
+      ...(current ? { current, currentDescription: reviewerKey ? 'Explicit reviewer key selected during this launch' : 'Configured environment or OS provider key' } : {}),
+      storageDescription: 'Save this provider key for future launches; never plaintext settings', register })
     if (!key || io.isClosed) return false
+    const next = { ...settings, reviewer: provider }
+    await preferences.save(next); settings = next
     reviewerKeys.set(provider, key)
     reviewerGeneration = randomUUID()
     const generation = reviewerGeneration, selectedHost = host
     const reviewEnv = { ...env, [envName(provider)]: key }
-    const reviewSession = { ...host.session, provider }
-    host.setDecisionReview({ provider: deferredDecisionProvider(reviewSession, reviewEnv, input.decisionProviderFactory ?? decisionProviderForSession),
+    host.setDecisionReview({ provider: deferredDecisionProvider({ ...host.session, provider }, reviewEnv, input.decisionProviderFactory ?? decisionProviderForSession),
       explicitReviewer: true, ledger: decisions, canAutoReview: io.canAutoReview === true,
       autoReviewThresholds: settings.autoReviewThresholds ?? {},
       accountRevision: () => generation, isAvailable: () => thresholdPreferencesAvailable && io.canAutoReview === true && !io.isClosed && host === selectedHost && reviewerGeneration === generation })
     io.setApprovalMode?.('manual')
-    io.write(`Auto reviewer: ${provider}, this conversation only. Use /mode for fresh enrollment.\n`)
+    io.write(`Auto reviewer: ${provider} (saved)\n`)
+    if (wasAuto) await restoreConversationMode(host, io, 'auto')
     return true
   }
+  const setupReviewer = (): Promise<boolean> => configureReviewer(true)
   const configureAutoThreshold = async (line: string): Promise<void> => {
     const selectedHost = host, provider = selectedHost?.reviewProvider
     if (!selectedHost || !provider) { io.write('Choose this conversation’s Auto reviewer with /reviewer first\n'); return }
@@ -598,13 +623,17 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     // Revoke before persistence; failed settings writes cannot leave relaxed Auto authority.
     selectedHost.setAutoReviewThresholds(next); selectedHost.setApprovalMode('manual'); io.setApprovalMode?.('manual')
     const appliedBinding = selectedHost.approvalEnrollmentBinding
+    // A later /new or launch must not silently re-enroll a revoked Auto choice.
+    // Keep the in-memory choice revoked even when persistence fails.
+    if (preferredMode === 'auto') preferredMode = 'manual'
+    if (settings.mode === 'auto') settings = { ...settings, mode: 'manual' }
     try { await preferences.save({ ...settings, autoReviewThresholds: next }) }
     catch (error) {
       if (host === selectedHost && !selectedHost.running && selectedHost.approvalEnrollmentBinding === appliedBinding) selectedHost.setAutoReviewThresholds(previous)
       throw error
     }
     settings = { ...settings, autoReviewThresholds: next }; thresholdPreferencesAvailable = true
-    io.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Auto enrollment revoked; use /mode for fresh consent.\n`)
+    io.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Auto disabled; select Auto again with /mode.\n`)
   }
   const configureNotes = async (): Promise<void> => {
     const enableNotes = await io.choose('Session notes · new-conversation default', [
@@ -790,8 +819,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         maxRounds: settings.maxRounds }
       await loadKey(session.provider)
       if (io.isClosed) { await discardCandidate(); return false }
-      const selectedReviewer = options.reviewer === 'none' ? undefined : options.reviewer ?? (isReviewProvider(session.provider) ? session.provider : undefined)
-      if (options.reviewer && selectedReviewer) await loadKey(selectedReviewer)
+      const reviewerPreference = settings.reviewer
+      const reviewer = reviewerPreference === 'none' ? undefined : reviewerPreference ?? (isReviewProvider(session.provider) ? session.provider : undefined)
+      const reviewerKey = reviewer ? reviewerKeys.get(reviewer) ?? await loadKey(reviewer) : undefined
+      const selectedReviewer = reviewerPreference && !reviewerKey ? undefined : reviewer
+      const reviewEnv = selectedReviewer ? { ...env, [envName(selectedReviewer)]: reviewerKey } : env
       const images = new FileImageAssets(join(options.sessionDirectory, 'images'), session.id)
       effective.imageAssets = images
       effective.imageCapability = metadata?.vision ?? 'unknown'
@@ -824,8 +856,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         onMemoryNotice: message => io.write(`${message}\n`),
         onReviewNotice: (message, context) => io.reviewNotice ? io.reviewNotice(message, context) : io.write(`${message}\n`),
         ...(io.canAutoReview === true && selectedReviewer ? { decisionReview: {
-          provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, env, input.decisionProviderFactory ?? decisionProviderForSession),
-          ...(options.reviewer ? { explicitReviewer: true as const } : {}),
+          provider: deferredDecisionProvider({ ...session, provider: selectedReviewer }, reviewEnv, input.decisionProviderFactory ?? decisionProviderForSession),
+          ...(reviewerPreference ? { explicitReviewer: true as const } : {}),
           ledger: decisions, canAutoReview: true, accountRevision: () => accountGeneration,
           autoReviewThresholds: settings.autoReviewThresholds ?? {},
           isAvailable: () => accountAvailable() && thresholdPreferencesAvailable && io.canAutoReview === true && !io.isClosed
@@ -862,6 +894,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     io.setTaskMode?.(host.taskMode)
     io.setApprovalMode?.('manual')
     io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; unattended enrollment revoked\n' : 'Approval mode: Manual\n')
+    if (options.reviewer !== undefined && io.canAutoReview === true && !io.isClosed) await preferences.save(settings)
+    if (!launchModePending && !(selection.preservePlan && previousHost?.taskMode === 'plan') && preferredMode !== 'manual') {
+      try { await restoreConversationMode(host, io, preferredMode, setupReviewer) }
+      catch (error) { report(error) }
+    }
     // Native transcript setup clears earlier loading output. Keep stale-cache
     // disclosure visible after that rebuild and before the first provider turn.
     if (capabilityNotice) io.write(capabilityNotice)
@@ -898,10 +935,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) continue
       if (launchModePending && host) {
         launchModePending = false
-        if (options.approvalMode === 'skip') {
-          if (io.canAutoReview !== true || io.isClosed) io.write('Skip permissions requires a live interactive terminal and fresh confirmation. Using Manual; piped and headless launches cannot enroll.\n')
-          else await selectApprovalMode(host, io, async () => 'skip', configureReviewer)
-        } else await selectApprovalMode(host, io, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
+        await selectApprovalMode(host, io, async () => options.approvalMode, setupReviewer)
+        await rememberMode()
       } else if (launchModePending && io.canAutoReview !== true) {
         launchModePending = false
         io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
@@ -1043,7 +1078,8 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
             io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling unattended permissions again\n')
             continue
           }
-          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), configureReviewer)
+          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), setupReviewer)
+          await rememberMode()
           io.setContext?.(undefined, host.canCompact)
           continue
         }

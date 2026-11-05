@@ -105,7 +105,7 @@ test('explicit Skip enrollment warns once, needs no reviewer and is accurately l
   assert.equal(f.host.approvalMode, 'skip')
   assert.equal(f.io.requests.length, 1); assert.equal(f.io.requests[0].call.name, 'enroll_skip_permissions')
   assert.equal(f.io.requests[0].description, SKIP_PERMISSIONS_DISCLOSURE)
-  for (const wording of ['no human or AI review', 'paid web', 'already-connected MCP', 'unsandboxed', 'credential files', 'does not grant OS privileges', 'not saved']) {
+  for (const wording of ['no human or AI review', 'paid web', 'already-connected MCP', 'unsandboxed', 'credential files', 'does not grant OS privileges', 'remembered for future conversations and launches']) {
     assert(SKIP_PERMISSIONS_DISCLOSURE.toLowerCase().includes(wording.toLowerCase()), wording)
   }
   assert.equal(conversationModeLabel('execute', 'skip'), 'Skip permissions')

@@ -172,7 +172,7 @@ test('line launch protects an active custom state folder inside the workspace', 
   const code = await main(['--no-tui', '--model', 'fixture', '--tools', '--workspace', root, '--session-dir', state,
     '--prompt', 'List the selected project'], {}, { io, providerFactory: () => ({ async generate({ messages }) {
       if (++calls === 1) return { content: '', toolCalls: [call('workspace_list')] }
-      assert.deepEqual(JSON.parse(messages.at(-1).content).entries, [{ path: 'readme.txt', kind: 'file' }])
+      assert.deepEqual(JSON.parse(messages.at(-1).content).entries.map(({ path, kind }) => ({ path, kind })), [{ path: 'readme.txt', kind: 'file' }])
       return answer()
     } }) })
   assert.equal(code, 0)

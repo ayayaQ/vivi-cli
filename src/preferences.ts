@@ -10,6 +10,7 @@ import type { CliProviderName, FileSessionStore } from './session.js'
 import { sessionDisplayTitle } from './session-display.js'
 import { validateAutoReviewThresholdOverrides } from './auto-review-settings.js'
 import type { AutoReviewThresholdOverrides } from './auto-review-settings.js'
+import type { ConversationMode } from './task-mode.js'
 
 export const MAX_PREFERENCES_BYTES = 8 * 1024
 export const MAX_SESSION_PICKER_ITEMS = 100
@@ -17,8 +18,8 @@ export const MAX_SESSION_LIST_ENTRIES = 1000
 const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 const preferenceKeys = ['schemaVersion', 'provider', 'model', 'reasoning',
   'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'enableMemory', 'maxRounds'] as const
-const optionalPreferenceKeys = ['enableMemory', 'webProvider', 'autoReviewThresholds', 'chatgptAccountId'] as const
-const allowedPreferenceKeys = [...preferenceKeys, 'webProvider', 'autoReviewThresholds', 'chatgptAccountId'] as const
+const optionalPreferenceKeys = ['enableMemory', 'webProvider', 'autoReviewThresholds', 'chatgptAccountId', 'mode', 'reviewer'] as const
+const allowedPreferenceKeys = [...preferenceKeys, 'webProvider', 'autoReviewThresholds', 'chatgptAccountId', 'mode', 'reviewer'] as const
 
 /** Host preferences only. Credentials, transcripts, prompts and paths are never settings. */
 export interface TuiPreferences {
@@ -40,9 +41,13 @@ export interface TuiPreferences {
   webProvider?: 'direct' | 'deepseek' | 'disabled'
   /** Per-reviewer integer permille overrides only; absence retains provider defaults, never enrollment. */
   autoReviewThresholds?: AutoReviewThresholdOverrides
+  /** Last explicit user choice; live host availability still gates restoration. */
+  mode?: ConversationMode
+  /** Saved review backend selection, independent of chat. No credential here. */
+  reviewer?: 'openai' | 'openrouter' | 'none'
 }
 
-/** Shared launch defaults. Neither saved preferences nor these defaults enroll Auto review. */
+/** Fresh installs start in Manual; saved mode intent is restored by the launch owner. */
 export const DEFAULT_PREFERENCES: TuiPreferences = { schemaVersion: 1, provider: 'openai', model: '', reasoning: 'default',
   reasoningCapabilities: [], stream: true, enableNotes: true, enableMemory: false, enableTools: false, maxRounds: 25 }
 
@@ -134,6 +139,18 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     const descriptor = descriptors.autoReviewThresholds
     check(descriptor && descriptor.enumerable && 'value' in descriptor, 'invalid Auto review thresholds')
     preferences.autoReviewThresholds = validateAutoReviewThresholdOverrides(descriptor.value)
+  }
+  if (keys.includes('mode')) {
+    const descriptor = descriptors.mode
+    check(descriptor && descriptor.enumerable && 'value' in descriptor &&
+      ['manual', 'auto', 'skip', 'plan'].includes(descriptor.value), 'unsupported mode')
+    preferences.mode = descriptor.value
+  }
+  if (keys.includes('reviewer')) {
+    const descriptor = descriptors.reviewer
+    check(descriptor && descriptor.enumerable && 'value' in descriptor &&
+      ['openai', 'openrouter', 'none'].includes(descriptor.value), 'unsupported reviewer')
+    preferences.reviewer = descriptor.value
   }
   const encoded = JSON.stringify(preferences)
   check(!secretPresent(encoded, secrets), 'settings must not contain environment credentials')

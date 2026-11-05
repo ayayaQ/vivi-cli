@@ -2,13 +2,14 @@
 import { createHash } from 'node:crypto'
 import type { JsonObject } from '@ayayaq/vivi'
 
-export const WORKSPACE_MUTATION_TOOL_NAMES = Object.freeze(['workspace_create_text', 'workspace_edit_text'] as const)
+export const WORKSPACE_MUTATION_TOOL_NAMES = Object.freeze(['workspace_create_text', 'workspace_edit_text', 'workspace_delete_file', 'workspace_move_file', 'workspace_mkdir'] as const)
 export const WORKSPACE_MUTATION_LIMITS = Object.freeze({ maximumFileBytes: 256 * 1024, maximumDiffBytes: 48 * 1024 })
 export type WorkspaceMutationName = typeof WORKSPACE_MUTATION_TOOL_NAMES[number]
 /** Ephemeral exact preparation. Full file bytes are never persisted as recovery copies. */
 export interface WorkspaceMutation {
-  readonly kind: 'create' | 'edit'
+  readonly kind: 'create' | 'edit' | 'delete' | 'move' | 'mkdir'
   readonly path: string
+  readonly destination?: string
   readonly expectedRevision: string
   readonly revision: string
   readonly before: string | null
@@ -17,7 +18,12 @@ export interface WorkspaceMutation {
   readonly afterChange: string
   readonly diff: string
 }
-export interface WorkspaceCommitResult { readonly path: string; readonly revision: string }
+export interface WorkspaceCommitResult {
+  readonly path: string
+  readonly revision: string
+  readonly sourcePath?: string
+  readonly sourceRemoved?: boolean
+}
 /** Publication succeeded; reporting a failed mutation would invite an unsafe retry. */
 export class WorkspaceCommitError extends Error {
   readonly committed = true
@@ -53,12 +59,21 @@ export function workspaceDiff(path: string, before: string | null, after: string
 }
 export function validateWorkspaceMutation(name: string, arguments_: Readonly<JsonObject>): void {
   const edit = name === 'workspace_edit_text'
+  const remove = name === 'workspace_delete_file', move = name === 'workspace_move_file', mkdir = name === 'workspace_mkdir'
+  const allowed = edit ? ['path', 'expectedRevision', 'before', 'after']
+    : move ? ['path', 'destination', 'expectedRevision'] : remove ? ['path', 'expectedRevision'] : mkdir ? ['path'] : ['path', 'content']
   if (!WORKSPACE_MUTATION_TOOL_NAMES.includes(name as WorkspaceMutationName) ||
-    Object.keys(arguments_).some(key => !(edit ? ['path', 'expectedRevision', 'before', 'after'] : ['path', 'content']).includes(key))) {
+    Object.keys(arguments_).some(key => !allowed.includes(key))) {
     throw new Error('Unexpected workspace mutation argument')
   }
   if (typeof arguments_.path !== 'string') throw new Error('A workspace-relative file path is required')
-  for (const key of edit ? ['before', 'after'] : ['content']) {
+  if (move && (typeof arguments_.destination !== 'string' || arguments_.destination === arguments_.path)) {
+    throw new Error('Moving requires a different workspace-relative destination path')
+  }
+  if ((edit || move || remove) && (typeof arguments_.expectedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(arguments_.expectedRevision))) {
+    throw new Error('Use the latest SHA-256 revision from workspace_read')
+  }
+  for (const key of edit ? ['before', 'after'] : remove || move || mkdir ? [] : ['content']) {
     const value = arguments_[key]
     if (typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > WORKSPACE_MUTATION_LIMITS.maximumFileBytes ||
       Buffer.from(value).toString('utf8') !== value) throw new Error('Use bounded valid UTF-8 text without NUL bytes')

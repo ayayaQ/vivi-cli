@@ -194,6 +194,24 @@ read lines and 10 seconds. Budgets are checked between bounded filesystem calls;
 cancellation cannot interrupt an OS filesystem call already in progress, but its
 late result is discarded and handles are closed. There are no writes or replays.
 
+`workspace_search` performs literal, case-sensitive matching by default on every OS;
+`caseSensitive: false` ignores case, and results echo the effective `caseSensitive`.
+Default depth is 2 and maxResults is 20. A successful call can still be incomplete:
+`truncated: true` with empty matches never proves absence from the workspace.
+`incompleteReason` identifies the stopping limit (`byte-budget`, `file-limit`,
+`entry-limit`, `depth-limit`, `result-limit` or `output-budget`); `incompleteReasons`
+also includes earlier depth omissions. Complete searches return null and an empty
+array respectively. Byte exhaustion can occur below 2 MiB when the next file would
+exceed the budget. Policy-excluded, non-UTF-8 and files over 256 KiB are omitted.
+
+Search results include `suggestedNarrowing` and `unvisited`, a conservative sample
+of workspace-relative scopes: an unread `file`, `remaining-lines` in a partially
+searched file, directory `descendants` beyond depth, or `remaining-entries` in
+directories where enumeration stopped. The latter can contain unknown entries;
+the tool does not enumerate unseen files to build diagnostics. The sample is
+bounded to 8 records and 4 KiB, with `unvisitedTruncated` indicating omissions from
+the sample. Search output reserves space for these diagnostics within 56 KiB.
+
 Canonical roots, ancestor identities, final file identities and byte/timestamp
 snapshots are checked. Linux child opens use verified pinned directory handles;
 other platforms use canonical-path and identity rechecks, including Windows
