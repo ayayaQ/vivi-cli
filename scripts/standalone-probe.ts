@@ -409,7 +409,7 @@ try {
     answers: [{ id: 'style', answer: { kind: 'option', optionId: 'long' } }] })
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
   assert(setup.renderer.root.findDescendantById('vivi-approve'))
-  setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
+  setup.mockInput.pressArrow('down'); setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
   const cancelling = io.askQuestions({ ...nativeRequest, requestId: 'compiled-native-cancel' }, new AbortController().signal)
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
   setup.mockInput.pressEscape()

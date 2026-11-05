@@ -1390,10 +1390,7 @@ export class OpenTuiIO implements ChatIO {
       return
     }
     if (this.pending?.kind === 'question' && !(key.ctrl && key.name === 'c')) {
-      if (key.name === 'pageup' || key.name === 'pagedown') {
-        this.consume(key)
-        this.transcript.scrollTo(this.transcript.scrollTop + (key.name === 'pageup' ? -1 : 1) * Math.max(1, this.transcript.viewport.height - 1))
-      } else this.questionDialog?.handleKey(key)
+      this.questionDialog?.handleKey(key)
       return
     }
     if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
@@ -1967,7 +1964,7 @@ export class OpenTuiIO implements ChatIO {
           accent: TUI_THEME.lavender, background: TUI_THEME.background,
           selectedBackground: TUI_THEME.selectedBackground, selectedForeground: TUI_THEME.highlightForeground })
         this.shell.insertBefore(this.questionDialog.box, this.composerBox)
-        this.hintLine.content = '↑/↓ select · Enter choose · Tab actions · Ctrl+Enter submit · Esc cancel'
+        this.hintLine.content = '↑/↓ select · PgUp/PgDn read · Enter choose · Tab actions · Ctrl+Enter submit · Esc cancel'
         this.runStatus.setPhase('waiting_question')
         this.updateActionBar(); this.updateStatus('Questions need your answer · Submit when ready')
         signal.addEventListener('abort', abort, { once: true })

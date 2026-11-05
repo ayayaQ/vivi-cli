@@ -239,8 +239,9 @@ approve an action or enroll Auto review. Questions and action approvals share on
 input queue. Line mode, pipes and headless hosts omit this capability.
 Questions appear once in a focused dialog, with numbered choices and a highlighted
 selection. Descriptions sit below the labels when space allows; compact terminals
-keep them inline. Only relevant page controls are shown, and Submit sends the
-reviewed answers.
+keep them inline. Long question text and choices wrap in a scrollable body; use
+PageUp/PageDown or the mouse wheel to read them while the editor and actions stay
+visible. Only relevant page controls are shown, and Submit sends the reviewed answers.
 
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi

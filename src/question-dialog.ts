@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { BoxRenderable, TextareaRenderable, TextRenderable, StyledText, TextAttributes, decodePasteBytes, parseColor } from '@opentui/core'
+import { BoxRenderable, ScrollBoxRenderable, TextareaRenderable, TextRenderable, StyledText, TextAttributes, decodePasteBytes, parseColor } from '@opentui/core'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent } from '@opentui/core'
 import type { QuestionAnswer, QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import { MouseActivation } from './tui-mouse.js'
@@ -26,6 +26,7 @@ interface DialogOptions {
 /** A per-request native editor. Choices are drafts until the human presses Submit. */
 export class QuestionDialog {
   readonly box: BoxRenderable
+  private readonly body!: ScrollBoxRenderable
   private readonly heading!: TextRenderable
   private readonly choices!: BoxRenderable
   private readonly editorBox!: BoxRenderable
@@ -53,10 +54,13 @@ export class QuestionDialog {
     try {
       this.progress = new TextRenderable(renderer, { id: 'vivi-question-progress', height: 1,
         flexShrink: 0, fg: options.foreground, attributes: TextAttributes.DIM, wrapMode: 'none' })
-      this.heading = new TextRenderable(renderer, { id: 'vivi-question-heading', width: '100%',
-        height: 2, flexShrink: 0, fg: options.foreground, attributes: TextAttributes.BOLD, wrapMode: 'word' })
+      this.body = new ScrollBoxRenderable(renderer, { id: 'vivi-question-body', width: '100%',
+        height: 6, flexShrink: 0, scrollX: false, scrollY: true,
+        contentOptions: { width: '100%', flexDirection: 'column' } })
+      this.heading = new TextRenderable(renderer, { id: 'vivi-question-heading', width: Math.max(1, renderer.terminalWidth - 5),
+        height: 'auto', flexShrink: 0, fg: options.foreground, attributes: TextAttributes.BOLD, wrapMode: 'word' })
       this.choices = new BoxRenderable(renderer, { id: 'vivi-question-choices', width: '100%',
-        height: 4, flexShrink: 0, flexDirection: 'column' })
+        height: 'auto', flexShrink: 0, flexDirection: 'column' })
       this.editorBox = new BoxRenderable(renderer, { id: 'vivi-question-editor-box', width: '100%',
         height: 2, flexShrink: 0 })
       this.editor = new TextareaRenderable(renderer, { id: 'vivi-question-editor', width: '100%',
@@ -73,11 +77,12 @@ export class QuestionDialog {
       this.editorBox.add(this.editor)
       this.actions = new BoxRenderable(renderer, { id: 'vivi-question-actions', height: 1,
         flexShrink: 0, flexDirection: 'row', gap: 1 })
-      for (const child of [this.progress, this.heading, this.choices, this.editorBox, this.actions]) this.box.add(child)
+      this.body.add(this.heading); this.body.add(this.choices)
+      for (const child of [this.progress, this.body, this.editorBox, this.actions]) this.box.add(child)
       this.render()
     } catch (error) {
       // Construction may fail before a child is attached to the dialog root.
-      for (const node of [this.editor, this.editorBox, this.heading, this.choices, this.actions, this.progress, this.box]) {
+      for (const node of [this.editor, this.editorBox, this.heading, this.choices, this.actions, this.progress, this.body, this.box]) {
         if (node && !node.parent && !node.isDestroyed) { try { node.destroyRecursively() } catch { /* Finish detached-widget cleanup. */ } }
       }
       throw error
@@ -87,21 +92,24 @@ export class QuestionDialog {
   private live(): boolean { return !this.disposed && this.options.ready() && this.renderer.frameId > this.frame }
   private current(): Draft { return this.drafts[this.page]! }
   private consume(event: KeyEvent | PasteEvent): void { event.preventDefault(); event.stopPropagation() }
-  private button(id: string, label: string, action: () => void, selected = false, description?: string): TextRenderable {
+  private button(id: string, label: string, action: () => void, selected = false, description?: string, wrap = false): TextRenderable {
     const safe = this.options.safe(label, 1200).replace(/[\t\n]+/g, ' ')
     const color = selected ? this.options.selectedForeground : this.options.foreground
     const detail = description ? this.options.safe(description, 1200).replace(/[\t\n]+/g, ' ') : ''
     const content = detail ? new StyledText([{ __isChunk: true, text: safe, fg: parseColor(color) },
       { __isChunk: true, text: `${this.showDescriptions ? '\n     ' : ' · '}${detail}`, fg: parseColor(color), attributes: TextAttributes.DIM }]) : safe
-    const node = new TextRenderable(this.renderer, { id, content, width: '100%', height: detail && this.showDescriptions ? 2 : 1,
+    const node = new TextRenderable(this.renderer, { id, content, width: wrap ? Math.max(1, this.renderer.terminalWidth - 5) : '100%', height: wrap ? 'auto' : 1,
       flexShrink: 0, fg: color, bg: selected ? this.options.selectedBackground : this.options.background,
-      wrapMode: 'none', selectable: false })
-    node.onMouse = (event: MouseEvent): void => this.mouse.handle(event, node, id, this.context, this.live() && this.options.mouseReady(), action)
+      wrapMode: wrap ? 'word' : 'none', selectable: false })
+    node.onMouse = (event: MouseEvent): void => {
+      if (wrap && event.type === 'scroll') { this.mouse.clear(); return }
+      this.mouse.handle(event, node, id, this.context, this.live() && this.options.mouseReady(), action)
+    }
     return node
   }
   private addChoice(node: TextRenderable): void {
     const row = new BoxRenderable(this.renderer, { id: `${node.id}-row`, width: '100%',
-      height: node.plainText.includes('\n') ? 2 : 1, flexShrink: 0, backgroundColor: node.bg })
+      height: 'auto', flexShrink: 0, backgroundColor: node.bg })
     row.add(node)
     this.choices.add(row)
   }
@@ -153,11 +161,11 @@ export class QuestionDialog {
       const selected = this.focus === 'choices' && this.selected === index
       const marker = answer?.kind === 'option' && answer.optionId === option.id ? '● ' : ''
       this.addChoice(this.button(`vivi-question-option-${index}`, `${selected ? '›' : ' '} ${index + 1}. ${marker}${option.label}`,
-        () => this.choose(index), selected, option.description))
+        () => this.choose(index), selected, option.description, true))
     })
     const other = this.focus === 'choices' && this.selected === question.options.length
     this.addChoice(this.button('vivi-question-other', `${other ? '›' : ' '} ${question.options.length + 1}. ${answer?.kind === 'text' ? '● ' : ''}Type your own answer`,
-      () => this.choose(question.options!.length), other))
+      () => this.choose(question.options!.length), other, undefined, true))
   }
   private actionNames(): string[] { return ['Prev', 'Next', 'Skip', 'Submit', 'Cancel'] }
   private actionIndices(): number[] { return [...(this.page > 0 ? [0] : []), ...(this.page < this.drafts.length - 1 ? [1] : []), 2, 3, 4] }
@@ -218,6 +226,7 @@ export class QuestionDialog {
   private render(): void {
     this.context = {}; this.mouse.clear(); this.frame = this.renderer.frameId
     const question = this.request.questions[this.page]!, draft = this.current()
+    this.body.scrollTo(0)
     this.heading.content = this.options.safe(question.question, 1200)
     this.focus = !question.options || draft.answer?.kind === 'text' ? 'text' : 'choices'
     this.selected = draft.answer?.kind === 'option' ? question.options!.findIndex(option => option.id === (draft.answer as { kind: 'option'; optionId: string }).optionId) : 0
@@ -242,11 +251,16 @@ export class QuestionDialog {
     const fixed = 4 + choices
     const heading = Math.max(1, Math.min(headingLines + 1, 3, height - fixed - (this.editorBox.visible ? 1 : 0)))
     const editor = this.editorBox.visible ? Math.max(1, Math.min(4, height - fixed - heading)) : 0
-    this.heading.height = heading
-    this.choices.height = choices
+    // The body wraps at its actual viewport width (including wide Unicode) and
+    // can scroll independently; never clip the only copy of question metadata.
+    const body = Math.max(1, Math.min(height - 4 - editor, heading + choices))
+    // Give text a concrete wrap width: OpenTUI's percent-width text can retain
+    // its pre-scrollbar width and lose the final cell behind the viewport.
+    this.heading.width = Math.max(1, this.renderer.terminalWidth - 5)
+    this.body.height = body
     this.editorBox.height = Math.max(1, editor)
-    this.box.height = fixed + heading + editor
-    this.box.bottomTitle = this.renderer.terminalHeight <= 15 ? '↑↓ · Enter · Tab · Esc' : undefined
+    this.box.height = 4 + body + editor
+    this.box.bottomTitle = 'PgUp/PgDn scroll'
     this.renderChoices()
     this.renderActions()
   }
@@ -262,6 +276,9 @@ export class QuestionDialog {
     if (key.name === 'escape') { this.consume(key); this.options.finish({ requestId: this.request.requestId, status: 'cancelled' }); return }
     if (!this.live()) { this.consume(key); return }
     if (key.ctrl && ['return', 'kpenter'].includes(key.name) && !key.repeated && key.eventType !== 'repeat') { this.consume(key); this.activate(3); return }
+    if (['pageup', 'pagedown'].includes(key.name) && !key.ctrl && !key.meta && !key.super && !key.hyper) {
+      this.consume(key); this.body.scrollBy((key.name === 'pageup' ? -1 : 1) * Math.max(1, this.body.height - 1)); return
+    }
     if (key.name === 'tab' && !key.ctrl && !key.meta && !key.super && !key.hyper) {
       this.consume(key)
       const focuses: Focus[] = [...(this.request.questions[this.page]!.options ? ['choices' as const] : []), ...(this.current().answer?.kind === 'text' || !this.request.questions[this.page]!.options || this.editorBox.visible ? ['text' as const] : []), 'actions']
@@ -280,7 +297,10 @@ export class QuestionDialog {
       const current = this.focus === 'choices' ? this.selected : this.action
       const position = this.focus === 'choices' ? current : actions.indexOf(current)
       const next = key.name === 'home' ? 0 : key.name === 'end' ? count - 1 : (position + (['left', 'up'].includes(key.name) ? -1 : 1) + count) % count
-      if (this.focus === 'choices') this.selected = next
+      if (this.focus === 'choices') {
+        this.selected = next
+        this.body.scrollChildIntoView(next === count - 1 ? 'vivi-question-other' : `vivi-question-option-${next}`)
+      }
       else this.action = actions[next]!
       this.renderChoices(); this.renderActions(); return
     }

@@ -220,3 +220,53 @@ test('section navigation scrolls the selected action into view and wheel browsin
   const target = f.node(`vivi-control-section-row-${index}`)
   await f.mouse.click(target.x + target.width - 2, target.y); expect(await choosing).toBe(index)
 })
+
+test('short output hidden by compact layout opens readable details before returning to commands', async () => {
+  const f = await fixture(80, 16); f.io.setControlMode(true)
+  const notice = 'Choose a model before selecting approval mode'
+  f.io.write(`${notice}\n`)
+  const menu = f.io.choose('Conversation actions', choices)
+  expect(await f.arm()).toContain(notice)
+  expect(f.node('vivi-control-body').visible).toBe(true)
+  expect(f.node('vivi-transcript').getChildren()).toHaveLength(0)
+  f.input.pressEscape(); await f.arm()
+  expect(f.node('vivi-control-picker').visible).toBe(true)
+  f.input.pressEscape(); expect(await menu).toBeUndefined()
+})
+
+test('wrapped notices use details while fully visible notices need no extra acknowledgment', async () => {
+  const f = await fixture(40, 32); f.io.setControlMode(true)
+  const notice = 'The selected account changed. Use /new or /models before sending another message; no previous-account request was sent.'
+  f.io.write(`${notice}\n`)
+  const menu = f.io.choose('Conversation actions', choices)
+  await f.arm()
+  expect(f.node('vivi-control-body').visible).toBe(true)
+  expect(await f.frame()).toContain('previous-account request was')
+  f.input.pressEscape(); await f.arm(); f.input.pressEscape(); await menu
+  f.io.write('Setting saved\n')
+  const next = f.io.choose('Conversation actions', choices)
+  expect(await f.arm()).toContain('Setting saved')
+  expect(f.node('vivi-control-picker').visible).toBe(true)
+  f.input.pressEscape(); await next
+  await f.io.showControlOutput(true)
+  expect(f.node('vivi-control-body').visible).toBe(false)
+})
+
+test('oversized modal paste preserves the entire existing value instead of truncating its tail', async () => {
+  const f = await fixture(); f.io.setControlMode(true)
+  const text = f.io.askText('Edit settings', 'Keep this existing suffix'); await f.arm()
+  const query = f.node('vivi-control-query') as TextareaRenderable
+  query.gotoBufferHome()
+  f.setup.renderer.stdin.emit('data', Buffer.from(`\x1b[200~${'x'.repeat(65536)}\x1b[201~`))
+  await f.frame()
+  expect(query.plainText).toBe('Keep this existing suffix')
+  expect(await f.frame()).toContain('Paste ignored: input limit is 65536')
+  f.input.pressEnter(); expect(await text).toBe('Keep this existing suffix')
+  f.io.setControlMode(false); f.io.setControlMode(true)
+  const choosing = f.io.choose('Conversation actions', choices); await f.arm()
+  await f.input.typeText('context'); await f.frame()
+  f.setup.renderer.stdin.emit('data', Buffer.from(`\x1b[200~${'x'.repeat(200)}\x1b[201~`))
+  await f.frame()
+  expect((f.node('vivi-control-query') as TextareaRenderable).plainText).toBe('context')
+  f.input.pressEnter(); expect(await choosing).toBe('/context')
+})

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { BoxRenderable, ScrollBoxRenderable, SelectRenderable, SelectRenderableEvents, StyledText,
-  TextareaRenderable, TextAttributes, TextRenderable, RGBA, decodePasteBytes } from '@opentui/core'
+  TextareaRenderable, TextAttributes, TextRenderable, TextBuffer, TextBufferView, RGBA, decodePasteBytes } from '@opentui/core'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent } from '@opentui/core'
 import { matchingChoiceIndices } from './picker.js'
 import type { Choice, ControlDetails, SearchableOptions, SearchableSelection } from './picker.js'
@@ -24,6 +24,8 @@ export class ControlModal {
   private heading: TextRenderable
   private closeButton: TextRenderable
   private noticeLine: TextRenderable
+  private noticeBuffer: TextBuffer
+  private noticeView: TextBufferView
   private query: TextareaRenderable
   private picker: SelectRenderable
   private sectionList: ScrollBoxRenderable
@@ -54,6 +56,9 @@ export class ControlModal {
   private textRowCount = 2
 
   constructor(private renderer: CliRenderer, private options: ModalOptions) {
+    this.noticeBuffer = TextBuffer.create(renderer.widthMethod)
+    this.noticeView = TextBufferView.create(this.noticeBuffer)
+    this.noticeView.setWrapMode('word')
     this.overlay = new BoxRenderable(renderer, { id: 'vivi-control-overlay', position: 'absolute', left: 0, top: 0,
       width: '100%', height: '100%', zIndex: 100, justifyContent: 'center', alignItems: 'center',
       onMouse: event => this.backdrop(event) })
@@ -113,14 +118,23 @@ export class ControlModal {
   notice(text: string): void {
     this.notices = this.options.safe(`${this.notices}${text}`, 16384)
     this.noticeLine.content = this.notices.trim()
+    this.noticeBuffer.setText(this.notices.trim())
     this.noticeLine.visible = !!this.notices.trim()
     this.resize()
   }
-  get hasOutput(): boolean { return this.notices.length > 240 || this.notices.split('\n').length > 4 }
+  private noticeFits(mode: typeof this.mode = this.mode): boolean {
+    // Use target dimensions rather than the last rendered layout. A command can
+    // write and open its next picker in the same event-loop turn.
+    const width = Math.min(this.renderer.terminalWidth, Math.max(12, Math.min(80, this.renderer.terminalWidth - 4)))
+    const desiredHeight = mode === 'text' ? Math.max(10, this.textRowCount + 9) : 24
+    const height = Math.min(this.renderer.terminalHeight, Math.max(6, Math.min(desiredHeight, this.renderer.terminalHeight - 4)))
+    return height >= 16 && (this.noticeView.measureForDimensions(Math.max(1, width - 4), 16384)?.lineCount ?? 3) <= 2
+  }
+  get hasOutput(): boolean { return !!this.notices.trim() && !this.noticeFits('picker') }
   async showOutput(includeUnseen = false): Promise<void> {
     if (includeUnseen ? !this.notices.trim() || this.notices === this.shownNotices : !this.hasOutput) return
     const body = this.notices
-    this.notices = ''; this.shownNotices = ''; this.noticeLine.visible = false
+    this.notices = ''; this.shownNotices = ''; this.noticeLine.visible = false; this.noticeBuffer.setText('')
     await this.showDetails({ title: this.title, sections: [{ title: 'Details', body }] })
   }
   setTitle(title: string): void {
@@ -159,7 +173,7 @@ export class ControlModal {
     const selected = this.state.matches.indexOf(index)
     this.selectIndex(this.query.plainText && !remembered ? 0 : Math.max(0, selected))
     this.describe(); this.resize(); this.query.focus()
-    if (this.noticeLine.visible) this.shownNotices = this.notices
+    if (this.noticeLine.visible && this.noticeFits()) this.shownNotices = this.notices
     const value = await pending
     const query = this.lastQuery
     if (remembered) this.menuState = { query, index: this.lastIndex }
@@ -172,7 +186,7 @@ export class ControlModal {
     const pending = this.start(title, 'text')
     this.state = undefined; this.query.height = 4
     this.setText(initial); this.resize(); this.query.focus(); this.query.gotoBufferEnd()
-    if (this.noticeLine.visible) this.shownNotices = this.notices
+    if (this.noticeLine.visible && this.noticeFits()) this.shownNotices = this.notices
     const result = await pending
     return typeof result === 'string' ? result : undefined
   }
@@ -180,7 +194,7 @@ export class ControlModal {
     this.details = details
     const pending = this.start(details.title, 'details')
     this.drawDetails(); this.resize(); this.body.scrollTo(0)
-    if (this.noticeLine.visible) this.shownNotices = this.notices
+    if (this.noticeLine.visible && this.noticeFits()) this.shownNotices = this.notices
     await pending
     if (this.details === details) {
       this.details = undefined
@@ -354,8 +368,16 @@ export class ControlModal {
   handlePaste(event: PasteEvent): void {
     event.preventDefault(); event.stopPropagation(); this.mouse.clear()
     if (!this.options.ready() || this.mode === 'details') return
-    const text = this.options.safe(decodePasteBytes(event.bytes), this.mode === 'picker' ? 200 : 65536)
-    this.query.insertText(this.mode === 'picker' ? text.replace(/[\t\n]+/g, ' ') : text)
+    const limit = this.mode === 'picker' ? 200 : 65536
+    const decoded = decodePasteBytes(event.bytes).replace(/\r\n?/g, '\n')
+    const text = this.options.safe(this.mode === 'picker' ? decoded.replace(/[\t\n]+/g, ' ') : decoded, limit + 1)
+    if (text.length > limit - this.query.plainText.length) {
+      const message = `Paste ignored: input limit is ${limit} characters`
+      this.notice(`${message}\n`)
+      this.footer.content = message
+      return
+    }
+    this.query.insertText(text)
     this.inputChanged()
   }
   private pickMouse(event: MouseEvent): void {
@@ -398,6 +420,7 @@ export class ControlModal {
   }
   redact(): void {
     this.setText(this.query.plainText); this.noticeLine.content = this.options.safe(this.notices)
+    this.noticeBuffer.setText(this.options.safe(this.notices.trim()))
     this.heading.content = this.options.safe(this.title === 'Conversation actions' ? 'Commands' : `Settings / ${this.title}`, 1024)
     this.description.content = this.options.safe(this.description.plainText, 4096)
     if (this.state) this.filter(true)
@@ -416,5 +439,6 @@ export class ControlModal {
   close(): void {
     if (this.disposed) return
     this.cancel(); this.disposed = true; this.query.blur(); this.overlay.destroyRecursively()
+    this.noticeView.destroy(); this.noticeBuffer.destroy()
   }
 }

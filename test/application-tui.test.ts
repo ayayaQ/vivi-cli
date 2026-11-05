@@ -364,6 +364,7 @@ test('native fresh startup selects provider/model directly and skips broader set
   const setup = await createTestRenderer({ width: 100, height: 30, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  dismissControlOutput(io, setup)
   let running: Promise<number> | undefined
   let catalogs = 0, turns = 0
   try {
@@ -385,10 +386,13 @@ test('native fresh startup selects provider/model directly and skips broader set
       }
     })
     await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+    await modalInputReady(setup, 'Provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Use current key'))
+    await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Models · openai') && frame.includes('gpt-5.1'))
+    await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await ready(state => state.kind === 'composer')
     await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('/ menu'))
@@ -413,6 +417,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
   const ready = observeUI(io)
+  dismissControlOutput(io, setup)
   const vault = new Map<string, string>()
   const key = 'fake-native-key-never-network'
   let running: Promise<number> | undefined
@@ -444,6 +449,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     setup.mockInput.pressTab()
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+    await modalInputReady(setup, 'Provider')
     const afterProviderCancel = ready.nextComposer()
     setup.mockInput.pressEscape()
     await afterProviderCancel
@@ -451,8 +457,10 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     await setup.mockInput.typeText('/provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Responses API'))
+    await modalInputReady(setup, 'Provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('API key storage') && frame.includes('Fake secure vault'))
+    await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('API key') && frame.includes('Input hidden'))
     await setup.mockInput.pasteBracketedText(key)
@@ -461,6 +469,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     expect(setup.captureCharFrame()).toContain('•')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Models · openai') && frame.includes('gpt-5.1'))
+    await modalInputReady(setup)
     const afterModel = ready.nextComposer()
     setup.mockInput.pressEnter()
     await afterModel
@@ -469,6 +478,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     await setup.mockInput.typeText('/effort')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Reasoning effort'))
+    await modalInputReady(setup)
     const afterEffortCancel = ready.nextComposer()
     setup.mockInput.pressEscape()
     await afterEffortCancel
@@ -476,6 +486,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     await setup.mockInput.typeText('/effort')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Reasoning effort'))
+    await modalInputReady(setup)
     for (let index = 0; index < 4; index++) setup.mockInput.pressArrow('down')
     const afterEffort = ready.nextComposer()
     setup.mockInput.pressEnter()
@@ -515,6 +526,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
   const ready = observeUI(io)
+  dismissControlOutput(io, setup)
   const preferences = new PreferenceStore(directory)
   const defaults: TuiPreferences = { schemaVersion: 1, provider, model: 'saved-default-model', reasoning: 'default',
     reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: false, stream: true, maxRounds: 25 }

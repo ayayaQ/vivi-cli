@@ -31,7 +31,7 @@ test('Ctrl+P opens real settings subviews, returns to filtered commands and leav
   try {
     await new PreferenceStore(directory).save({ schemaVersion: 1, provider: 'openai', model: 'gpt-5.1', reasoning: 'default',
       reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: false, stream: false, maxRounds: 7 })
-    running = main(['--no-workspace'], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
+    running = main(['--no-workspace', '--no-skills'], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
       providerFactory: () => ({ async generate() { requests++; throw new Error('Settings must not generate a response') } }) })
     await started; await frame()
     const transcript = node('vivi-transcript'), initial = transcript.getChildren().length
@@ -89,7 +89,7 @@ test('direct slash commands and footer shortcuts share modal settings, preserve 
   try {
     await new PreferenceStore(directory).save({ schemaVersion: 1, provider: 'openai', model: 'gpt-5.1', reasoning: 'default',
       reasoningCapabilities: ['low', 'medium', 'high'], enableTools: false, enableNotes: false, enableMemory: false, stream: false, maxRounds: 7 })
-    running = main(['--no-workspace'], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
+    running = main(['--no-workspace', '--no-skills'], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
       credentials: { status: async () => ({ available: false, label: 'Offline vault' }), load: async () => undefined,
         save: async () => { throw new Error('No credential writes expected') } },
       catalog: { list: async () => ({ state: 'cached', models: [{ id: 'gpt-5.1', name: 'Fixture GPT', conversation: 'supported',
