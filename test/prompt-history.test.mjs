@@ -95,15 +95,22 @@ test('history refuses symlinked files and directories', { skip: process.platform
   await assert.rejects(new PromptHistoryStore(linked).load())
 })
 
-async function blockedWriter(t, directory) {
+async function blockedWriter(t, directory, forceGc = false) {
   // Pause the real save after it acquires the lease, before reading history.
   const { spawn } = await import('node:child_process')
   const child = spawn(process.execPath, ['--input-type=module', '-e', `
     import { PromptHistoryStore } from ${JSON.stringify(new URL('../dist/prompt-history.js', import.meta.url).href)};
     const store = new PromptHistoryStore(${JSON.stringify(directory)});
+    if (${forceGc} && typeof Bun !== 'undefined') {
+      setInterval(() => Bun.gc(true), 25).unref();
+    }
     store.load = async () => {
       process.stdout.write('locked\\n');
-      await new Promise(() => setInterval(() => {}, 1000));
+      await new Promise(resolve => {
+        // Keep the suspended save and its SQLite lease reachable until SIGKILL.
+        globalThis.releaseBlockedWriter = resolve;
+        setInterval(() => {}, 1000);
+      });
     };
     await store.append('interrupted');
   `], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -195,12 +202,14 @@ test('replacing the lease inode during a save aborts without removing the replac
 
 test('history times out rather than taking a live writer lease, then recovers', async t => {
   const f = await fixture(t)
-  const { child, exited } = await blockedWriter(t, f.directory)
+  const { child, exited } = await blockedWriter(t, f.directory, true)
   await assert.rejects(f.store.append('blocked'), error => {
     assert.match(error.message, /Prompt history (?:writer lease|journal setup) remained busy/)
     assert(error.cause, 'retain the native SQLite failure for diagnostics')
     return true
   })
+  assert.equal(child.exitCode, null, 'writer must remain alive while holding its lease')
+  assert.equal(child.signalCode, null, 'writer must not release its lease by exiting')
   child.kill('SIGKILL')
   await exited
   await f.store.append('recovered')
