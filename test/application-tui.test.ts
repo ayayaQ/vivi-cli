@@ -2,9 +2,10 @@
 import { expect, test } from 'bun:test'
 import { mkdtemp, mkdir, realpath, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { createTestRenderer } from '@opentui/core/testing'
-import { SelectRenderable, TextareaRenderable } from '@opentui/core'
+import type { TestRendererSetup } from '@opentui/core/testing'
+import { SelectRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import { OpenTuiIO } from '../src/tui.js'
 import type { CliProviderName, CliSession } from '../src/session.js'
 import type { Catalog, ModelEntry } from '../src/models.js'
@@ -15,6 +16,30 @@ import { FileSessionStore } from '../src/session.js'
 import { FileMemoryStore } from '../src/memory.js'
 import type { ApprovalRequest } from '../src/tools.js'
 
+/** These workflow tests dismiss informational output; approvals stay explicit. */
+function dismissControlOutput(io: OpenTuiIO, setup: TestRendererSetup): void {
+  const showOutput = io.showControlOutput.bind(io)
+  io.showControlOutput = async includeUnseen => {
+    const showing = showOutput(includeUnseen)
+    const body = setup.renderer.root.findDescendantById('vivi-control-body')
+    if (body?.visible && body.getChildren().length) {
+      await new Promise(resolve => setTimeout(resolve, 2))
+      await setup.renderOnce(); await setup.renderOnce(); setup.mockInput.pressEscape()
+    }
+    await showing
+  }
+}
+async function modalInputReady(setup: TestRendererSetup, title?: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+    const query = setup.renderer.root.findDescendantById('vivi-control-query') as TextareaRenderable | undefined
+    const heading = setup.renderer.root.findDescendantById('vivi-control-title') as TextRenderable | undefined
+    if (query?.focused && (!title || heading?.plainText === `Settings / ${title}`)) {
+      await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); return
+    }
+  }
+  throw new Error(`Modal input did not become ready: ${title ?? ''}`)
+}
 
 /** Observe application readiness, including async file IO, before asking the renderer for a frame. */
 function observeUI(io: OpenTuiIO) {
@@ -54,6 +79,7 @@ test('native memory manager reviews repeated writes, refreshes conflicts and mak
   const setup = await createTestRenderer({ width: 110, height: 36, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer), ready = observeUI(io), memory = new FileMemoryStore(directory)
+  dismissControlOutput(io, setup)
   type Phase = { kind: 'choice'; title: string; names: string[] } | { kind: 'text'; title: string }
     | { kind: 'approval'; request: ApprovalRequest }
   const phases: Phase[] = [], requests: ApprovalRequest[] = []
@@ -77,12 +103,14 @@ test('native memory manager reviews repeated writes, refreshes conflicts and mak
     const phase = await next(); expect(phase.kind).toBe('choice')
     if (phase.kind !== 'choice') throw new Error('Expected a native choice')
     const index = phase.names.indexOf(name); expect(index).toBeGreaterThanOrEqual(0)
-    await setup.renderOnce()
+    await modalInputReady(setup, phase.title)
     for (let offset = 0; offset < index; offset++) setup.mockInput.pressArrow('down')
     setup.mockInput.pressEnter()
   }
   const text = async (content?: string): Promise<void> => {
     const phase = await next(); expect(phase.kind).toBe('text')
+    if (phase.kind !== 'text') throw new Error('Expected modal text input')
+    await modalInputReady(setup, phase.title)
     if (content === undefined) setup.mockInput.pressEscape()
     else { setup.mockInput.pressKey('u', { ctrl: true }); await setup.mockInput.typeText(content); setup.mockInput.pressEnter() }
   }
@@ -90,7 +118,7 @@ test('native memory manager reviews repeated writes, refreshes conflicts and mak
     const phase = await next(); expect(phase.kind).toBe('approval')
     await setup.renderOnce(); await new Promise(resolve => setTimeout(resolve, 2))
     await beforeReply?.()
-    if (allow) setup.mockInput.pressArrow('right')
+    setup.mockInput.pressArrow(allow ? 'up' : 'down')
     setup.mockInput.pressEnter()
   }
   let running: Promise<number> | undefined
@@ -157,7 +185,7 @@ test('native surface runs saved-default chat, accepted Markdown, new session and
       }
     }) })
     await ready(state => state.kind === 'session')
-    await setup.waitForFrame(frame => frame.includes('openai / native-fake-model') && frame.includes('Menu  Models'))
+    await setup.waitForFrame(frame => frame.includes('openai / native-fake-model') && frame.includes('/ menu'))
     await setup.mockInput.typeText('first')
     setup.mockInput.pressEnter({ shift: true })
     await setup.mockInput.typeText('second')
@@ -168,7 +196,7 @@ test('native surface runs saved-default chat, accepted Markdown, new session and
     await setup.mockInput.typeText('/new')
     setup.mockInput.pressEnter()
     await ready(state => state.kind === 'session' && state.session.id !== ids[0])
-    await setup.waitForFrame(frame => frame.includes('Untitled conversation') && !frame.includes('The canonical response is visible'))
+    await setup.waitForFrame(frame => frame.startsWith('vivi') && !frame.includes('The canonical response is visible'))
     expect(setup.captureCharFrame()).not.toContain(ids[1]!)
     expect(setup.captureCharFrame()).not.toContain('The canonical response is visible')
     await setup.mockInput.typeText('/exit')
@@ -336,6 +364,7 @@ test('native fresh startup selects provider/model directly and skips broader set
   const setup = await createTestRenderer({ width: 100, height: 30, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  dismissControlOutput(io, setup)
   let running: Promise<number> | undefined
   let catalogs = 0, turns = 0
   try {
@@ -357,13 +386,16 @@ test('native fresh startup selects provider/model directly and skips broader set
       }
     })
     await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+    await modalInputReady(setup, 'Provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Use current key'))
+    await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Models · openai') && frame.includes('gpt-5.1'))
+    await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('Menu  Models'))
+    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('/ menu'))
     expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
     const afterSend = ready.nextComposer()
     await setup.mockInput.typeText('Hello'); setup.mockInput.pressEnter(); await afterSend
@@ -385,6 +417,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
   const ready = observeUI(io)
+  dismissControlOutput(io, setup)
   const vault = new Map<string, string>()
   const key = 'fake-native-key-never-network'
   let running: Promise<number> | undefined
@@ -409,22 +442,25 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
     setup.mockInput.pressEscape()
     await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes('fresh conversation') && !frame.includes('Responses API'))
+    await setup.waitForFrame(frame => frame.includes('What would you like to work on?') && !frame.includes('Responses API'))
     expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
     await setup.mockInput.typeText('/pro')
     await setup.waitForFrame(frame => frame.includes('Commands') && frame.includes('/provider'))
     setup.mockInput.pressTab()
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Provider') && frame.includes('OpenAI'))
+    await modalInputReady(setup, 'Provider')
     const afterProviderCancel = ready.nextComposer()
     setup.mockInput.pressEscape()
     await afterProviderCancel
-    await setup.waitForFrame(frame => frame.includes('Menu  Models') && !frame.includes('Responses API'))
+    await setup.waitForFrame(frame => frame.includes('/ menu') && !frame.includes('Responses API'))
     await setup.mockInput.typeText('/provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Responses API'))
+    await modalInputReady(setup, 'Provider')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('API key storage') && frame.includes('Fake secure vault'))
+    await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('API key') && frame.includes('Input hidden'))
     await setup.mockInput.pasteBracketedText(key)
@@ -433,14 +469,16 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     expect(setup.captureCharFrame()).toContain('•')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Models · openai') && frame.includes('gpt-5.1'))
+    await modalInputReady(setup)
     const afterModel = ready.nextComposer()
     setup.mockInput.pressEnter()
     await afterModel
-    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('Menu  Models') && !frame.includes('Models ·'))
+    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('/ menu') && !frame.includes('Models ·'))
     expect(vault.get('openai')).toBe(key)
     await setup.mockInput.typeText('/effort')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Reasoning effort'))
+    await modalInputReady(setup)
     const afterEffortCancel = ready.nextComposer()
     setup.mockInput.pressEscape()
     await afterEffortCancel
@@ -448,6 +486,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     await setup.mockInput.typeText('/effort')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes('Reasoning effort'))
+    await modalInputReady(setup)
     for (let index = 0; index < 4; index++) setup.mockInput.pressArrow('down')
     const afterEffort = ready.nextComposer()
     setup.mockInput.pressEnter()
@@ -487,6 +526,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
   const ready = observeUI(io)
+  dismissControlOutput(io, setup)
   const preferences = new PreferenceStore(directory)
   const defaults: TuiPreferences = { schemaVersion: 1, provider, model: 'saved-default-model', reasoning: 'default',
     reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: false, stream: true, maxRounds: 25 }
@@ -510,7 +550,8 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
       } }
     }
   })
-  const composer = (): TextareaRenderable => setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
+  const composer = (): TextareaRenderable => (setup.renderer.root.findDescendantById('vivi-control-query') ??
+    setup.renderer.root.findDescendantById('vivi-composer')) as TextareaRenderable
   const session = (): CliSession => {
     if (!current) throw new Error('Native catalog application has not opened its session')
     return current
@@ -518,7 +559,8 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
   const openModels = async (): Promise<void> => {
     await setup.mockInput.typeText('/models')
     setup.mockInput.pressEnter()
-    await setup.waitForFrame(frame => frame.includes(`Models · ${provider}`) && frame.includes('Type to search'))
+    await setup.waitForFrame(frame => frame.includes(`Models · ${provider}`) && frame.includes('Search models…'))
+    await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
   }
   const chat = async (text: string): Promise<void> => {
     expect(composer().plainText).toBe('')
@@ -526,7 +568,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
     await setup.mockInput.typeText(text)
     setup.mockInput.pressEnter()
     await afterSend
-    await setup.waitForFrame(frame => frame.includes('Native catalog answer') && frame.includes('Menu  Models'))
+    await setup.waitForFrame(frame => frame.includes('Native catalog answer') && frame.includes('/ menu'))
     expect(requests.at(-1)?.prompt).toBe(text)
     expect(composer().plainText).toBe('')
   }
@@ -537,7 +579,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
   }
   try {
     await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('Menu  Models'))
+    await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('/ menu'))
   } catch (error) { await close(); throw error }
   return { directory, setup, io, ready, preferences, defaults, sessions, requests, running, composer, session, openModels, chat, close }
 }
@@ -627,7 +669,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
         const afterCancel = app.ready.nextComposer()
         app.setup.mockInput.pressEscape()
         await afterCancel
-        await app.setup.waitForFrame(frame => frame.includes('Menu  Models') && !frame.includes('Models ·'))
+        await app.setup.waitForFrame(frame => frame.includes('/ menu') && !frame.includes('Models ·'))
         expect(app.session()).toEqual(originalSession)
         expect(await app.preferences.load()).toEqual(app.defaults)
         expect(await new FileSessionStore(app.directory).load(originalSession.id)).toEqual(originalSession)
@@ -697,23 +739,36 @@ test('native CLI keeps the canonical launch workspace visible through new conver
     })
     await ready(state => state.kind === 'composer')
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
-    expect(setup.captureCharFrame()).toContain('Files read by tools are sent to the selected provider')
+    expect(setup.captureCharFrame()).toContain(canonical.replace(homedir(), '~'))
+    expect(setup.captureCharFrame()).not.toContain('Files read by tools are sent to the selected provider')
+    expect(setup.captureCharFrame()).not.toContain('Approval mode:')
+    expect(setup.captureCharFrame()).not.toContain('Ready')
+    expect(setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren()).toHaveLength(0)
+    const details = ready.nextComposer()
+    await setup.mockInput.typeText('/session'); setup.mockInput.pressEnter()
+    await setup.waitForFrame(() => setup.renderer.root.findDescendantById('vivi-control-body')?.visible === true)
+    await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+    setup.mockInput.pressKey('end'); await setup.renderOnce()
+    const detailsText = setup.renderer.root.findDescendantById('vivi-control-body')!.getChildren()
+      .map(child => (child as TextRenderable).plainText ?? '').join('\n')
+    expect(detailsText).toContain('Files read by tools are sent to the selected provider')
+    expect(detailsText).toContain('Send is approval')
+    setup.mockInput.pressEscape(); await details
     const next = ready.nextComposer()
     await setup.mockInput.typeText('/new'); setup.mockInput.pressEnter()
     await next; await setup.renderOnce()
     expect(sessions).toBe(2)
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
+    expect(setup.captureCharFrame()).toContain(canonical.replace(homedir(), '~'))
     io.setDraft('openrouter')
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain(`Workspace: ${JSON.stringify(canonical)} · reviewed text edits`)
+    expect(setup.captureCharFrame()).toContain(canonical.replace(homedir(), '~'))
     io.addSecrets(['project'])
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain('[REDACTED]')
     expect(setup.captureCharFrame()).not.toContain(canonical)
     io.setWorkspace()
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain('Workspace: disabled')
+    expect(setup.captureCharFrame()).toContain('Workspace disabled')
     await setup.mockInput.typeText('/exit'); setup.mockInput.pressEnter()
     expect(await running).toBe(0)
   } finally {
@@ -722,11 +777,51 @@ test('native CLI keeps the canonical launch workspace visible through new conver
   }
 })
 
-test('native Menu and direct controls replace the settings wizard with independent cancellable defaults', async () => {
+test('native saved Auto mode opens a quiet composer and retains billing details in /session', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-quiet-auto-'))
+  const setup = await createTestRenderer({ width: 110, height: 36, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  Object.defineProperty(io, 'canAutoReview', { value: true }) // Offline interactive fixture only.
+  let running: Promise<number> | undefined
+  try {
+    await new PreferenceStore(directory).save({ schemaVersion: 1, provider: 'openai', model: 'gpt-5.1',
+      reasoning: 'default', reasoningCapabilities: [], enableTools: true, enableNotes: false,
+      enableMemory: false, stream: false, maxRounds: 7, mode: 'auto', reviewer: 'openai' })
+    running = main(['--no-workspace'], { VIVI_SESSION_DIR: directory, OPENAI_API_KEY: 'offline-unused-fixture' }, {
+      tuiIO: io,
+      providerFactory: () => ({ generate: async () => { throw new Error('Startup must not call a provider') } }),
+      decisionProviderFactory: () => { throw new Error('Startup must not call a reviewer') }
+    })
+    await ready(state => state.kind === 'composer'); await setup.renderOnce(); await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame.match(/Auto review/g)).toHaveLength(1)
+    expect(frame).not.toContain('Manual')
+    expect(frame).not.toContain('Approval mode:')
+    expect(setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren()).toHaveLength(0)
+    const details = ready.nextComposer()
+    await setup.mockInput.typeText('/session'); setup.mockInput.pressEnter()
+    await setup.waitForFrame(() => setup.renderer.root.findDescendantById('vivi-control-body')?.visible === true)
+    await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+    setup.mockInput.pressKey('end'); await setup.renderOnce()
+    const detailsText = setup.renderer.root.findDescendantById('vivi-control-body')!.getChildren()
+      .map(child => (child as TextRenderable).plainText ?? '').join('\n')
+    expect(detailsText).toContain('OpenAI reviews eligible actions automatically; extra API charges may apply')
+    setup.mockInput.pressEscape(); await details
+    await setup.mockInput.typeText('/exit'); setup.mockInput.pressEnter()
+    expect(await running).toBe(0)
+  } finally {
+    io.close(); await running?.catch(() => undefined); setup.renderer.destroy()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('native Menu and slash commands expose independent cancellable defaults', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-native-navigation-'))
   const setup = await createTestRenderer({ width: 110, height: 36, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer), ready = observeUI(io)
+  dismissControlOutput(io, setup)
   type ChoicePhase = { title: string; names: string[]; values: unknown[]; initial: number; descriptions: (string | undefined)[] }
   const phases: ChoicePhase[] = []
   let wake: ((phase: ChoicePhase) => void) | undefined
@@ -744,6 +839,7 @@ test('native Menu and direct controls replace the settings wizard with independe
   }
   const frame = async (): Promise<string> => { await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
   const click = async (id: string): Promise<void> => {
+    await new Promise(resolve => setTimeout(resolve, 2))
     await frame()
     const node = setup.renderer.root.findDescendantById(id)
     if (!node) throw new Error(`Missing navigation control ${id}`)
@@ -751,6 +847,7 @@ test('native Menu and direct controls replace the settings wizard with independe
   }
   const keyboardChoice = async (phase: ChoicePhase, value: unknown): Promise<void> => {
     const index = phase.values.indexOf(value); expect(index).toBeGreaterThanOrEqual(0)
+    await modalInputReady(setup, phase.title === 'Conversation actions' ? undefined : phase.title)
     await frame()
     for (let offset = phase.initial; offset !== index; offset += index > phase.initial ? 1 : -1) {
       setup.mockInput.pressArrow(index > phase.initial ? 'down' : 'up')
@@ -758,8 +855,9 @@ test('native Menu and direct controls replace the settings wizard with independe
     setup.mockInput.pressEnter()
   }
   const mouseChoice = async (index: number): Promise<void> => {
+    await modalInputReady(setup)
     await frame()
-    const node = setup.renderer.root.findDescendantById('vivi-picker') as SelectRenderable
+    const node = setup.renderer.root.findDescendantById('vivi-control-picker') as SelectRenderable
     const row = index * (node.showDescription ? 2 : 1)
     expect(row).toBeLessThan(node.height)
     await setup.mockMouse.click(node.x + 3, node.y + row)
@@ -782,8 +880,9 @@ test('native Menu and direct controls replace the settings wizard with independe
     await ready(state => state.kind === 'composer')
     await frame()
     expect(setup.renderer.root.findDescendantById('vivi-action-settings')).toBeUndefined()
-    for (const action of ['menu', 'models', 'effort', 'mode', 'memories', 'skills']) {
-      expect(setup.renderer.root.findDescendantById(`vivi-action-${action}`)?.visible).toBe(true)
+    expect(setup.renderer.root.findDescendantById('vivi-action-menu')?.visible).toBe(true)
+    for (const action of ['models', 'effort', 'mode', 'memories', 'skills']) {
+      expect(setup.renderer.root.findDescendantById(`vivi-action-${action}`)).toBeUndefined()
     }
 
     // The legacy command opens Menu and repeated Escape returns to this same composer.
@@ -801,10 +900,13 @@ test('native Menu and direct controls replace the settings wizard with independe
     await click('vivi-action-menu')
     const menu = await nextChoice()
     expect(menu.values).toContain('/provider'); expect(menu.values).toContain('/models'); expect(menu.values).toContain('/effort')
+    expect(menu.values).toContain('/memories'); expect(menu.values).toContain('/skills'); expect(menu.values).toContain('/session')
     await keyboardChoice(menu, '/notes')
     const notes = await nextChoice()
     expect(notes.title).toBe('Session notes · new-conversation default')
-    const afterNotesCancel = ready.nextComposer(); await click('vivi-back'); await afterNotesCancel
+    const afterNotesCancel = ready.nextComposer(); await click('vivi-control-back')
+    expect((await nextChoice()).title).toBe('Conversation actions')
+    setup.mockInput.pressEscape(); await afterNotesCancel
     expect((await new PreferenceStore(directory).load())?.enableNotes).toBe(true)
 
     // Keyboard completion reaches the same picker directly and affects only future sessions.
@@ -818,7 +920,7 @@ test('native Menu and direct controls replace the settings wizard with independe
     expect(launches).toEqual([{ notes: true, memory: false }])
 
     // Memory owns its future-launch default. Cancelling and revisiting never toggles this launch.
-    await click('vivi-action-memories')
+    await setup.mockInput.typeText('/memories'); setup.mockInput.pressEnter()
     const memories = await nextChoice()
     expect(memories.title).toBe('Persistent memories · disabled for this launch')
     const defaultIndex = memories.values.indexOf('default')

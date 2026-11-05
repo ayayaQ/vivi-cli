@@ -147,7 +147,7 @@ for (const cancel of ['deny', 'escape', 'ctrl-c', 'close', 'failure'] as const) 
   await f.choice('server:docs'); await f.choice('connect')
   expect((await f.next()).kind).toBe('approval')
   await tick(); await f.frame()
-  expect(await f.frame()).toContain('› Deny')
+  expect(await f.frame()).toContain('› Approve')
   expect(contents(f.setup.renderer.root)).toContain('runs its installed code with your OS permissions')
   expect(f.starts()).toBe(0)
   if (cancel === 'deny') {

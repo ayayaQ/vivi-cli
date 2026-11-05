@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import { TextareaRenderable } from '@opentui/core'
+import { ScrollBoxRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
@@ -32,6 +32,26 @@ function watch<T>(promise: Promise<T>) {
   return async () => { await Promise.resolve(); expect(settled).toBe(false) }
 }
 const signal = () => new AbortController().signal
+
+test('question appears once with a highlighted numbered row, separate descriptions and relevant actions', async () => {
+  const f = await fixture(), answer = f.io.askQuestions(request('display'), signal()), pending = watch(answer)
+  const displayed = await f.arm()
+  expect(displayed.match(/Which direction\?/g)).toHaveLength(1)
+  expect(f.node('vivi-transcript').getChildren()).toHaveLength(0)
+  const first = f.node('vivi-question-option-0') as TextRenderable
+  const second = f.node('vivi-question-option-1') as TextRenderable
+  expect(first.plainText).toContain('1. East\n')
+  expect(first.plainText).toContain('Go east')
+  expect(first.height).toBe(2)
+  expect(first.bg.a).toBeGreaterThan(0)
+  expect(second.bg.a).toBe(0)
+  expect(f.setup.captureSpans().lines[first.y]!.spans.some(span => span.bg.a > 0 && span.width > 20 && !span.text.trim())).toBe(true)
+  expect(f.node('vivi-question-prev').visible).toBe(false)
+  expect(f.node('vivi-question-next').visible).toBe(false)
+  await f.mouse.click(first.x + 5, first.y + 1); await pending(); await f.frame()
+  await f.click('vivi-question-submit')
+  expect(await answer).toEqual({ requestId: 'display', status: 'answered', answers: [{ id: 'direction', answer: { kind: 'option', optionId: 'east' } }] })
+})
 
 test('native choices are never default answers and only final Submit sends the selected option', async () => {
   const f = await fixture(), answer = f.io.askQuestions(request(), signal()), pending = watch(answer)
@@ -93,8 +113,8 @@ test('question and approval FIFO preserves a multiline unfinished chat draft in 
     if (questionFirst) { question = f.io.askQuestions(request(), signal()); review = f.io.approve(approval, signal()) }
     else { review = f.io.approve(approval, signal()); question = f.io.askQuestions(request(), signal()) }
     await f.arm()
-    if (questionFirst) { expect(f.node('vivi-questions')).toBeDefined(); f.input.pressEscape(); expect(await question).toEqual({ requestId: 'questions-1', status: 'cancelled' }); await f.arm(); f.input.pressEnter(); expect(await review).toBe(false) }
-    else { expect(f.setup.renderer.root.findDescendantById('vivi-questions')).toBeUndefined(); f.input.pressEnter(); expect(await review).toBe(false); await f.arm(); f.input.pressEscape(); await question }
+    if (questionFirst) { expect(f.node('vivi-questions')).toBeDefined(); f.input.pressEscape(); expect(await question).toEqual({ requestId: 'questions-1', status: 'cancelled' }); await f.arm(); f.input.pressArrow('down'); f.input.pressEnter(); expect(await review).toBe(false) }
+    else { expect(f.setup.renderer.root.findDescendantById('vivi-questions')).toBeUndefined(); f.input.pressArrow('down'); f.input.pressEnter(); expect(await review).toBe(false); await f.arm(); f.input.pressEscape(); await question }
     await f.frame(); await chatPending()
     expect((f.node('vivi-composer') as TextareaRenderable).plainText).toBe('unfinished 日本語\ndraft')
     f.input.pressEnter(); expect(await chat).toBe('unfinished 日本語\ndraft')
@@ -218,4 +238,52 @@ test('held Enter and rapid prior approval clicks cannot select a fresh question'
   f.input.pressEnter(); expect(await f.frame()).toContain('1/1 ready'); await pending()
   f.setup.renderer.stdin.emit('data', Buffer.from('\x1b[13;1:2u')); await pending()
   f.input.pressEnter(); expect((await answer).status).toBe('answered')
+})
+
+test('long question and option text remains readable by paging a wrapped body at narrow widths', async () => {
+  const f = await fixture(32, 16)
+  const question = { id: 'long', header: 'Details', question: `${'Read this important context. '.repeat(12)}QUESTION_END`, options: [
+    { id: 'first', label: `${'日本語 choice '.repeat(5)}LABEL_END`, description: `${'A detailed explanation. '.repeat(12)}DESCRIPTION_END` },
+    { id: 'second', label: 'Second option' },
+  ] }
+  const answer = f.io.askQuestions(request('long', [question]), signal()), pending = watch(answer)
+  let seen = await f.arm()
+  for (let page = 0; page < 80; page++) {
+    f.setup.renderer.stdin.emit('data', Buffer.from('\x1b[6~')); seen += await f.frame()
+    const submit = f.node('vivi-question-submit')
+    expect(submit.y + submit.height).toBeLessThanOrEqual(16)
+  }
+  expect(seen).toContain('QUESTION_END')
+  expect(seen).toContain('LABEL_END')
+  expect(seen).toContain('DESCRIPTION_END')
+  expect(f.node('vivi-transcript').getChildren()).toHaveLength(0)
+  await pending()
+  // Selection navigation reveals an off-screen option, without answering it.
+  f.input.pressKey('HOME'); await f.frame()
+  f.input.pressArrow('down'); expect(await f.frame()).toContain('Second option')
+  const body = f.node('vivi-question-body') as ScrollBoxRenderable
+  const beforeWheel = body.scrollTop
+  const second = f.node('vivi-question-option-1')
+  await f.mouse.scroll(second.x + 1, second.y, 'up'); await f.frame()
+  expect(body.scrollTop).toBeLessThan(beforeWheel)
+  await pending(); f.input.pressEnter(); f.input.pressEnter()
+  expect(await answer).toEqual({ requestId: 'long', status: 'answered', answers: [{ id: 'long', answer: { kind: 'option', optionId: 'second' } }] })
+})
+
+test('free-text question can be scrolled while its editor and actions stay accessible', async () => {
+  const f = await fixture(40, 16), answer = f.io.askQuestions(request('long-text', [{ id: 'text', header: 'Text',
+    question: `${'Long context with explicit lines.\n'.repeat(15)}CONTEXT_END` }]), signal())
+  await f.arm(); await f.input.pasteBracketedText('keep this answer')
+  let seen = ''
+  for (let page = 0; page < 40; page++) { f.setup.renderer.stdin.emit('data', Buffer.from('\x1b[6~')); seen += await f.frame() }
+  expect(seen).toContain('CONTEXT_END')
+  for (const [width, height] of [[100, 30], [32, 12]] as const) {
+    f.setup.resize(width, height); await f.frame()
+    const editor = f.node('vivi-question-editor') as TextareaRenderable
+    expect(editor.plainText).toBe('keep this answer')
+    expect(editor.y + editor.height).toBeLessThanOrEqual(height)
+    expect(f.node('vivi-question-submit').y).toBeLessThan(height)
+  }
+  f.input.pressEnter(); f.input.pressEnter()
+  expect((await answer).status).toBe('answered')
 })

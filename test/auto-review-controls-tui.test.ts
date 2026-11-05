@@ -60,7 +60,7 @@ test('native mode picker defaults Manual, briefly describes Auto, and Manual req
   expect(picker.getSelectedIndex()).toBe(0)
   expect(picker.options.map(option => option.name)).toEqual(['Manual', 'Auto review', 'Skip permissions', 'Plan'])
   const contents = text(f.setup.renderer.root)
-  expect(contents).toContain('AI reviews eligible actions automatically; extra API charges may apply')
+  expect(contents).toContain('OpenAI reviews eligible actions automatically; extra API charges may apply')
   expect(contents).not.toContain('Auto sends your current request')
   f.input.pressEnter()
   await selecting
@@ -154,9 +154,10 @@ test('native workspace diff is shown exactly with terminal controls escaped and 
   const contents = text(f.setup.renderer.root)
   expect(contents).toContain(diff)
   expect(contents).not.toContain('[display truncated]')
-  expect(await f.frame()).toContain('› Deny')
+  expect(await f.frame()).toContain('› Approve')
   await f.input.pasteBracketedText('allow')
   await tick(); await f.frame()
+  f.input.pressArrow('down')
   f.input.pressEnter()
   expect(await pending).toBe(false)
 })
@@ -211,18 +212,19 @@ for (const state of ['reviewing', 'needs_review', 'saving'] as const) {
 }
 
 
-test('native public URL approval displays the exact GET destination and defaults to deny', async () => {
+test('native public URL approval displays the exact GET destination and starts with approval selected', async () => {
   const f = await fixture()
   const pending = f.io.approve({ call: { id: 'public-url-approval', name: 'fetch_url',
     arguments: { url: 'https://example.com/docs?topic=color' } }, currentRevision: 'opaque-url-revision',
     description: 'Fetch public page with GET: https://example.com/docs?topic=color\nDestination hostname: example.com\nFull URL/path/query and caller IP are transmitted; GET may have server-side effects' }, new AbortController().signal)
   const contents = await f.frame()
-  expect(contents).toContain('Review this public URL request (default: deny)')
+  expect(contents).toContain('Review this public URL request')
   expect(contents).toContain('https://example.com/docs?topic=color')
-  expect(contents).toContain('› Deny')
+  expect(contents).toContain('› Approve')
   expect(contents).not.toContain('Review this change')
   await f.input.pasteBracketedText('allow')
   await tick(); await f.frame()
+  f.input.pressArrow('down')
   f.input.pressEnter()
   expect(await pending).toBe(false)
 })

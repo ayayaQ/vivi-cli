@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import type { Renderable, TextareaRenderable } from '@opentui/core'
+import type { Renderable, ScrollBoxRenderable, TextareaRenderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import { OpenTuiIO } from '../src/tui.js'
 
@@ -46,8 +46,10 @@ function expectLayout(f: Awaited<ReturnType<typeof fixture>>, frame: string, hei
   }
   const choices = f.node('vivi-question-choices')
   if (choices.visible) {
-    const other = f.node('vivi-question-other')
-    expect(other.y + other.height).toBeLessThanOrEqual(actions.y)
+    const body = f.node('vivi-question-body') as ScrollBoxRenderable
+    expect(body.viewport.y + body.viewport.height).toBeLessThanOrEqual(actions.y)
+    expect(body.viewport.y).toBeGreaterThanOrEqual(box.y + 1)
+    expect(body.viewport.overflow).toBe('hidden')
   }
   expect(box.y + box.height).toBeLessThanOrEqual(height)
   const model = f.node('vivi-model')
@@ -65,6 +67,12 @@ test('question actions stay inside their border and never paint onto the model/f
     if (workspace) f.io.setWorkspace('/offline-fixture')
     const controller = new AbortController(), answer = f.io.askQuestions({ requestId: 'layout', callId: 'layout', questions }, controller.signal)
     await new Promise(resolve => setTimeout(resolve, 2))
+    expectLayout(f, await f.frame(), height)
+    f.setup.mockInput.pressKey('END'); await f.frame()
+    const body = f.node('vivi-question-body') as ScrollBoxRenderable
+    const other = f.node('vivi-question-other')
+    expect(other.y).toBeGreaterThanOrEqual(body.viewport.y)
+    expect(other.y + other.height).toBeLessThanOrEqual(body.viewport.y + body.viewport.height)
     expectLayout(f, await f.frame(), height)
     controller.abort(); await answer; f.io.close()
   }

@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-export interface Choice<T> { name: string; description?: string; value: T; searchTerms?: readonly string[] }
+export interface Choice<T> { name: string; description?: string; value: T; searchTerms?: readonly string[]; section?: string }
 export interface SearchableOptions {
   query?: string
   initialIndex?: number
   refresh?: boolean
 }
 export type SearchableSelection<T> = { kind: 'selected'; value: T; query: string } | { kind: 'refresh'; query: string }
+export interface ControlDetails {
+  title: string
+  fields?: readonly { label: string; value: string }[]
+  sections?: readonly { title: string; body: string }[]
+  meter?: { label: string; value: number; capacity: number }
+}
 
 const normalize = (text: string): string => text.normalize('NFKC').toLowerCase().trim().replace(/\s+/gu, ' ')
 const words = (text: string): string => normalize(text).replace(/[\p{P}\p{S}]+/gu, ' ').trim().replace(/\s+/gu, ' ')

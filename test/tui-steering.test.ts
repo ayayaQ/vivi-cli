@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import { TextareaRenderable, TextRenderable } from '@opentui/core'
+import { BoxRenderable, TextareaRenderable, TextAttributes, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import { OpenTuiIO } from '../src/tui.js'
@@ -44,11 +44,58 @@ async function fixture(width = 100, height = 30, secrets: string[] = []) {
 const request = { call: { id: 'write-1', name: 'note_set', arguments: {} },
   currentRevision: 0, description: 'Save this exact reviewed change' }
 
+test('idle and working share composer geometry and one muted footer at wide and compact sizes', async () => {
+  for (const [width, height] of [[100, 30], [40, 12], [24, 12]] as const) {
+    const f = await fixture(width, height)
+    f.io.setSession(newSession({ provider: 'openai', model: 'fixture' }))
+    const idle = f.io.readLine('Message'); await f.arm()
+    const box = f.node('vivi-composer-box') as BoxRenderable
+    const idleY = box.y, idleHeight = box.height, inputHeight = f.composer.height, footerY = f.node('vivi-model').y
+    const stop = f.start(); expect(await idle).toBeUndefined()
+    let displayed = await f.arm()
+    const placeholder = f.setup.captureSpans().lines.flatMap(line => line.spans)
+      .find(span => span.text.includes('What would you like'))!
+    expect(placeholder.attributes & TextAttributes.DIM).toBe(TextAttributes.DIM)
+    expect(box.border).toEqual(['top', 'bottom'])
+    expect(displayed.split('\n')[box.y + box.height - 1]).toBe('─'.repeat(width))
+    expect(box.title).toBeUndefined()
+    expect(box.height).toBe(idleHeight)
+    expect(f.composer.height).toBe(inputHeight)
+    expect(box.y).toBe(idleY)
+    expect(f.node('vivi-model').y).toBe(footerY)
+    expect(f.node('vivi-steering-actions').y).toBe(footerY)
+    expect(f.node('vivi-hints').visible).toBe(false)
+    expect(displayed).toContain('Enter queues')
+    for (const text of ['Message while working', 'Interrupt & send', 'Undo latest', 'Ctrl+Shift+K']) expect(displayed).not.toContain(text)
+    f.composer.setText('Follow up'); await f.frame()
+    const interrupt = f.node('vivi-steering-interrupt') as TextRenderable
+    expect(interrupt.visible).toBe(true)
+    expect(interrupt.bg.a).toBe(0)
+    expect(interrupt.x + interrupt.width).toBeLessThanOrEqual(width)
+    expect(box.y).toBe(idleY)
+    expect(f.node('vivi-model').y).toBe(footerY)
+    await f.click('vivi-steering-interrupt')
+    expect(f.submitted).toEqual([{ content: 'Follow up', interrupt: true }])
+    await f.frame()
+    expect(f.node('vivi-steering-undo').visible).toBe(width >= 72)
+    expect(f.node('vivi-steering-clear').visible).toBe(width >= 72)
+    f.queue.clear(); f.update(); await f.frame()
+    expect(f.node('vivi-steering-undo').visible).toBe(false)
+    expect(f.node('vivi-steering-clear').visible).toBe(false)
+    f.io.runFinished('completed'); stop()
+    const next = f.io.readLine('Message'); displayed = await f.arm()
+    expect(box.y).toBe(idleY)
+    expect(f.node('vivi-model').y).toBe(footerY)
+    expect(displayed).not.toContain('Enter queues')
+    f.io.close(); expect(await next).toBeUndefined()
+  }
+})
+
 test('only opted-in agent turns keep the native composer editable and Enter queues FIFO duplicates', async () => {
   const f = await fixture(), stop = f.start()
   await f.arm()
   expect(f.node('vivi-actions').visible).toBe(false)
-  expect((await f.frame())).toContain('Interrupt & send')
+  expect((await f.frame())).toContain('Enter queues')
   for (let i = 0; i < 2; i++) { await f.input.typeText('same queued text'); f.input.pressEnter() }
   expect(f.queue.messages.map(message => message.content)).toEqual(['same queued text', 'same queued text'])
   expect(new Set(f.queue.messages.map(message => message.id)).size).toBe(2)
@@ -102,7 +149,7 @@ test('Ctrl+Enter and the discoverable Interrupt & send button explicitly request
     { content: 'mouse interrupt', interrupt: true }])
   expect(f.cancellations()).toBe(0)
   const display = await f.frame()
-  expect(display).toContain('Interrupt & send')
+  expect(display).toContain('Enter queues')
   expect(display).toContain('Queued · 2')
   expect(f.node('vivi-steering-actions').y + f.node('vivi-steering-actions').height).toBeLessThanOrEqual(12)
   expect(f.node('vivi-composer-box').y + f.node('vivi-composer-box').height).toBeLessThanOrEqual(12)
@@ -153,7 +200,7 @@ test('slash navigation and bounded queue rejections keep the draft and its owner
   stop()
 })
 
-test('approval remains deny-default and paste/undo cannot replay a suspended steering draft', async () => {
+test('approval keeps explicit confirmation and paste/undo cannot replay a suspended steering draft', async () => {
   const f = await fixture(), stop = f.start(); await f.arm()
   await f.input.typeText('queue me'); f.input.pressEnter()
   await f.input.typeText('unfinished allow')
@@ -240,7 +287,7 @@ test('queue previews are bounded, redact newly known secrets and remain responsi
   expect(await f.frame()).not.toContain('sk-do-not-display')
   for (const [width, height] of [[40, 12], [80, 20], [100, 30]] as const) {
     f.setup.resize(width, height); const display = await f.frame()
-    expect(display).toContain('Interrupt & send')
+    expect(display).not.toContain('Interrupt & send')
     expect(f.node('vivi-composer-box').y + f.node('vivi-composer-box').height).toBeLessThanOrEqual(height)
     expect(f.node('vivi-transcript').height).toBeGreaterThan(0)
     expect(f.node('vivi-steering-queue').height).toBeLessThanOrEqual(4)
