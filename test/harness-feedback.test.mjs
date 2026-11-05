@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import fs from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CliHost } from '../dist/host.js'
 import { newSession, SessionCommitError } from '../dist/session.js'
@@ -21,12 +21,23 @@ test('workspace read failures identify the cause without exposing filesystem det
   await fs.writeFile(join(root, 'invalid.txt'), Buffer.from([255]))
   await fs.writeFile(join(root, 'binary-nul.txt'), Buffer.from([0]))
   await fs.writeFile(join(root, 'large.txt'), 'x'.repeat(262145))
+  const canonicalRoot = await fs.realpath(root)
   const lstat = fs.lstat
+  const injected = []
   t.mock.method(fs, 'lstat', async (path, ...args) => {
-    if (String(path) === join(root, 'denied.txt')) {
+    // Linux reads through a pinned /proc/self/fd parent, not the original root.
+    // Resolve only the parent so nonexistent fault targets still match.
+    const name = basename(String(path))
+    const target = ['denied.txt', 'unknown.txt'].includes(name) &&
+      await fs.realpath(dirname(String(path))) === canonicalRoot
+    if (target && name === 'denied.txt') {
+      injected.push(name)
       throw Object.assign(new Error(`EACCES: private filesystem detail ${root}`), { code: 'EACCES' })
     }
-    if (String(path) === join(root, 'unknown.txt')) throw new Error(`private filesystem detail ${root}`)
+    if (target && name === 'unknown.txt') {
+      injected.push(name)
+      throw new Error(`private filesystem detail ${root}`)
+    }
     return lstat(path, ...args)
   })
   for (const [path, code, message] of [
@@ -40,6 +51,7 @@ test('workspace read failures identify the cause without exposing filesystem det
     assert.equal(result.isError, true); assert.equal(data.error.code, code); assert.match(data.error.message, message)
     assert(!result.content.includes(root)); assert(!result.content.includes('private filesystem detail'))
   }
+  assert.deepEqual(injected, ['denied.txt', 'unknown.txt'])
 })
 
 async function writer(t, { name = 'note_set', mode = 'manual', probability = 1, allow = true, durability = false } = {}) {

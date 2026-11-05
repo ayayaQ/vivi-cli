@@ -94,3 +94,111 @@ test('history refuses symlinked files and directories', { skip: process.platform
   await symlink(f.directory, linked)
   await assert.rejects(new PromptHistoryStore(linked).load())
 })
+
+async function blockedWriter(t, directory) {
+  // Pause the real save after it acquires the lease, before reading history.
+  const { spawn } = await import('node:child_process')
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { PromptHistoryStore } from ${JSON.stringify(new URL('../dist/prompt-history.js', import.meta.url).href)};
+    const store = new PromptHistoryStore(${JSON.stringify(directory)});
+    store.load = async () => {
+      process.stdout.write('locked\\n');
+      await new Promise(() => setInterval(() => {}, 1000));
+    };
+    await store.append('interrupted');
+  `], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', chunk => { stderr += chunk })
+  const exited = new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', resolve)
+  })
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited })
+  await new Promise((resolve, reject) => {
+    let output = ''
+    const timer = setTimeout(() => reject(new Error(`Writer did not acquire lease: ${stderr}`)), 15000)
+    child.stdout.on('data', chunk => {
+      output += chunk
+      if (output.includes('locked\n')) { clearTimeout(timer); resolve() }
+    })
+    exited.then(() => { clearTimeout(timer); reject(new Error(`Writer exited before acquiring lease: ${stderr}`)) }, reject)
+  })
+  return { child, exited }
+}
+
+test('a live history writer keeps its lease; killing it permits waiting writers to recover', async t => {
+  const f = await fixture(t)
+  await f.store.append('before crash')
+  const { child, exited } = await blockedWriter(t, f.directory)
+  const lease = join(f.directory, 'prompt-history-lease.sqlite')
+  const before = await stat(lease)
+  const { utimes } = await import('node:fs/promises')
+  await utimes(lease, new Date(0), new Date(0))
+  let finished = false
+  const pending = Promise.all(Array.from({ length: 6 }, (_, i) =>
+    new PromptHistoryStore(f.directory).append(`after crash ${i}`)))
+  pending.then(() => { finished = true }, () => { finished = true })
+  await new Promise(resolve => setTimeout(resolve, 150))
+  assert.equal(finished, false, 'a live writer must not be evicted, even with an old lock mtime')
+  assert.deepEqual(await f.store.load(), ['before crash'])
+  child.kill('SIGKILL')
+  await exited
+  await pending
+  const saved = await f.store.load()
+  assert.equal(saved.length, 7)
+  assert.equal(saved[0], 'before crash')
+  assert.equal(new Set(saved).size, 7)
+  const after = await stat(lease)
+  assert.equal(after.ino, before.ino, 'recovery must not unlink and recreate the lock inode')
+})
+
+test('history rejects unsafe lease files and SQLite sidecars', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t)
+  await mkdir(f.directory, { mode: 0o700 })
+  const external = join(f.root, 'external-lease')
+  await writeFile(external, '', { mode: 0o600 })
+  const lease = join(f.directory, 'prompt-history-lease.sqlite')
+  for (const candidate of [lease, lease + '-journal', lease + '-wal', lease + '-shm']) {
+    await symlink(external, candidate)
+    await assert.rejects(f.store.append('must not write'))
+    assert.equal(await readFile(external, 'utf8'), '')
+    await rm(candidate)
+  }
+  const { link, chmod } = await import('node:fs/promises')
+  await rm(lease, { force: true })
+  await link(external, lease)
+  await assert.rejects(f.store.append('must not write'))
+  await rm(lease)
+  await writeFile(lease, '', { mode: 0o600 })
+  await chmod(lease, 0o644)
+  await assert.rejects(f.store.append('must not write'))
+})
+
+test('replacing the lease inode during a save aborts without removing the replacement', async t => {
+  const f = await fixture(t)
+  await f.store.append('original')
+  const lease = join(f.directory, 'prompt-history-lease.sqlite')
+  const originalLoad = f.store.load.bind(f.store)
+  f.store.load = async () => {
+    const entries = await originalLoad()
+    // Windows prevents replacing a file held open by SQLite.
+    const { rename } = await import('node:fs/promises')
+    try { await rename(lease, lease + '.old') }
+    catch (error) { if (process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw new Error('replacement refused'); throw error }
+    await writeFile(lease, 'replacement', { mode: 0o600 })
+    return entries
+  }
+  await assert.rejects(f.store.append('must not write'))
+  assert.deepEqual(await originalLoad(), ['original'])
+  if (process.platform !== 'win32') assert.equal(await readFile(lease, 'utf8'), 'replacement')
+})
+
+test('history times out rather than taking a live writer lease, then recovers', async t => {
+  const f = await fixture(t)
+  const { child, exited } = await blockedWriter(t, f.directory)
+  await assert.rejects(f.store.append('blocked'), /locked|busy/i)
+  child.kill('SIGKILL')
+  await exited
+  await f.store.append('recovered')
+  assert.deepEqual(await f.store.load(), ['recovered'])
+})

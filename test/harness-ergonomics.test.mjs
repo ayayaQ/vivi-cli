@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import fs from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CliHost } from '../dist/host.js'
 import { newSession } from '../dist/session.js'
@@ -14,6 +14,9 @@ import { createDeepSeekWebExtension, DEEPSEEK_WEB_COST, DEEPSEEK_WEB_GUIDANCE } 
 const signal = () => new AbortController().signal
 const initial = '\ufefforiginal\r\n'
 const revision = workspaceRevision(Buffer.from(initial))
+async function isSourcePath(path, root) {
+  return basename(String(path)) === 'old.txt' && await fs.realpath(dirname(String(path))) === await fs.realpath(root)
+}
 async function fixture(t) {
   const root = await fs.mkdtemp(join(tmpdir(), 'vivi-ergonomics-'))
   t.after(() => fs.rm(root, { recursive: true, force: true }))
@@ -179,7 +182,7 @@ test('move exposes readable partial results when source unlink fails after exclu
   const prepared = await workspace.prepareMutation('workspace_move_file', entries.workspace_move_file, signal())
   const unlink = fs.unlink
   t.mock.method(fs, 'unlink', async (path, ...args) => {
-    if (String(path) === join(root, 'old.txt')) throw new Error('Unlink fixture failure')
+    if (await isSourcePath(path, root)) throw new Error('Unlink fixture failure')
     return unlink(path, ...args)
   })
   await assert.rejects(workspace.commitMutation(prepared, signal(), () => {}), error => {
@@ -194,6 +197,83 @@ test('move exposes readable partial results when source unlink fails after exclu
   }
 })
 
+for (const failure of ['file', 'destination-directory', 'source-directory', undefined]) {
+  test(`move syncs destination bytes and entry before source removal (${failure ?? 'success'})`,
+    { skip: failure?.endsWith('directory') && process.platform !== 'linux' }, async t => {
+    const { root, workspace } = await fixture(t)
+    const canonicalRoot = await fs.realpath(root)
+    const prepared = await workspace.prepareMutation('workspace_move_file', entries.workspace_move_file, signal())
+    const events = [], open = fs.open, unlink = fs.unlink
+    t.mock.method(fs, 'open', async (path, ...args) => {
+      const handle = await open(path, ...args), canonical = await fs.realpath(String(path))
+      const stage = canonical === join(canonicalRoot, 'sub/new.txt') ? 'file'
+        : canonical === join(canonicalRoot, 'sub') ? 'destination-directory' : canonical === canonicalRoot ? 'source-directory' : undefined
+      if (stage) {
+        const sync = handle.sync.bind(handle)
+        handle.sync = async () => {
+          events.push(stage)
+          if (stage === failure) throw new Error(`Simulated ${stage} sync failure`)
+          await sync()
+        }
+      }
+      return handle
+    })
+    t.mock.method(fs, 'unlink', async (path, ...args) => {
+      if (await isSourcePath(path, root)) events.push('source-unlink')
+      return unlink(path, ...args)
+    })
+    if (failure) {
+      await assert.rejects(workspace.commitMutation(prepared, signal(), () => {}), error => {
+        assert(error instanceof WorkspaceCommitError)
+        assert.equal(error.result.sourceRemoved, failure === 'source-directory')
+        return true
+      })
+    } else assert.equal((await workspace.commitMutation(prepared, signal(), () => {})).sourceRemoved, true)
+    assert.equal(await fs.readFile(join(root, 'sub/new.txt'), 'utf8'), initial)
+    if (failure && failure !== 'source-directory') {
+      assert.equal(await fs.readFile(join(root, 'old.txt'), 'utf8'), initial)
+      assert(!events.includes('source-unlink'))
+    } else {
+      await assert.rejects(fs.lstat(join(root, 'old.txt')), { code: 'ENOENT' })
+      assert(events.indexOf('file') < events.indexOf('source-unlink'))
+      if (process.platform === 'linux') {
+        assert(events.indexOf('file') < events.indexOf('destination-directory'))
+        assert(events.indexOf('destination-directory') < events.indexOf('source-unlink'))
+        assert(events.indexOf('source-unlink') < events.indexOf('source-directory'))
+      }
+    }
+    if (failure) assert(events.includes(failure), 'The intended sync failure must be injected')
+  })
+}
+
+for (const cause of ['source-policy', 'destination-policy', 'cancel', 'destination-change']) {
+  test(`move preserves source when ${cause} occurs during destination sync`, async t => {
+    const { root, workspace } = await fixture(t), canonicalRoot = await fs.realpath(root)
+    const controller = new AbortController(), open = fs.open
+    const prepared = await workspace.prepareMutation('workspace_move_file', entries.workspace_move_file, controller.signal)
+    let injected = false
+    t.mock.method(fs, 'open', async (path, ...args) => {
+      const handle = await open(path, ...args)
+      if (await fs.realpath(String(path)) === join(canonicalRoot, 'sub/new.txt')) {
+        const sync = handle.sync.bind(handle)
+        handle.sync = async () => {
+          await sync(); injected = true
+          if (cause.endsWith('policy')) await fs.writeFile(join(root, '.gitignore'), cause === 'source-policy' ? 'old.txt\n' : 'sub/new.txt\n')
+          if (cause === 'cancel') controller.abort()
+          if (cause === 'destination-change') await fs.writeFile(join(root, 'sub/new.txt'), 'concurrent destination edit')
+        }
+      }
+      return handle
+    })
+    await assert.rejects(workspace.commitMutation(prepared, controller.signal, () => {}), error => {
+      assert(error instanceof WorkspaceCommitError); assert.equal(error.result.sourceRemoved, false); return true
+    })
+    assert.equal(injected, true)
+    assert.equal(await fs.readFile(join(root, 'old.txt'), 'utf8'), initial)
+    assert.equal(await fs.readFile(join(root, 'sub/new.txt'), 'utf8'), cause === 'destination-change' ? 'concurrent destination edit' : initial)
+  })
+}
+
 for (const partial of [false, true]) {
   test(`move host preserves ${partial ? 'partial outcome evidence' : 'destination project guidance checks'} after approval`, async t => {
     const { root, workspace } = await fixture(t)
@@ -201,7 +281,7 @@ for (const partial of [false, true]) {
     if (partial) {
       const unlink = fs.unlink
       t.mock.method(fs, 'unlink', async (path, ...args) => {
-        if (String(path) === join(root, 'old.txt')) throw new Error('Unlink fixture failure')
+        if (await isSourcePath(path, root)) throw new Error('Unlink fixture failure')
         return unlink(path, ...args)
       })
     }
@@ -227,3 +307,28 @@ for (const partial of [false, true]) {
     } else await assert.rejects(fs.lstat(join(root, 'sub/new.txt')), { code: 'ENOENT' })
   })
 }
+
+test('move host preserves a successful move with unconfirmed source-directory durability', { skip: process.platform !== 'linux' }, async t => {
+  const { root, workspace } = await fixture(t), open = fs.open
+  const canonicalRoot = await fs.realpath(root)
+  let rounds = 0, injected = false
+  t.mock.method(fs, 'open', async (path, ...args) => {
+    const handle = await open(path, ...args)
+    if (await fs.realpath(String(path)) === canonicalRoot) handle.sync = async () => {
+      injected = true; throw new Error('Simulated source-directory sync failure')
+    }
+    return handle
+  })
+  const host = new CliHost({ workspace, session: newSession({ provider: 'openai', model: 'fixture' }), store: { async save() {} },
+    approve: async () => true, provider: { async generate() {
+      return ++rounds === 1 ? { content: '', toolCalls: [{ id: 'move', name: 'workspace_move_file', arguments: entries.workspace_move_file }] }
+        : { content: 'Done', toolCalls: [] }
+    } } })
+  t.after(() => host.shutdown())
+  const response = await host.send('Move old.txt to sub/new.txt')
+  const result = JSON.parse(response.history.find(message => message.kind === 'tool_result').content)
+  assert.equal(injected, true); assert.equal(result.success, true); assert.equal(result.sourceRemoved, true)
+  assert.equal(result.durabilityUnconfirmed, true); assert.equal(result.reviewSource, 'human')
+  assert.equal(await fs.readFile(join(root, 'sub/new.txt'), 'utf8'), initial)
+  await assert.rejects(fs.lstat(join(root, 'old.txt')), { code: 'ENOENT' })
+})

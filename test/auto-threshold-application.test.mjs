@@ -7,11 +7,11 @@ import { tmpdir } from 'node:os'
 import { main } from '../dist/main.js'
 import { DEFAULT_PREFERENCES, PreferenceStore } from '../dist/preferences.js'
 
-async function fixture(t, { surface = 'tui', lines = [], choices = [], texts = [], thresholds = { openai: 950, openrouter: 990 }, probability = 0.92, invalid = false, interactive = true, prompt } = {}) {
+async function fixture(t, { surface = 'tui', lines = [], choices = [], texts = [], thresholds = { openai: 950, openrouter: 990 }, probability = 0.92, invalid = false, interactive = true, prompt, mode } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-auto-threshold-app-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const preferences = new PreferenceStore(directory)
-  await preferences.save({ ...DEFAULT_PREFERENCES, provider: 'openai', model: 'gpt-5.1', enableTools: true, autoReviewThresholds: thresholds })
+  await preferences.save({ ...DEFAULT_PREFERENCES, provider: 'openai', model: 'gpt-5.1', enableTools: true, autoReviewThresholds: thresholds, ...(mode ? { mode } : {}) })
   if (invalid) await writeFile(join(directory, 'preferences.json'), '{invalid', { mode: 0o600 })
   const reviews = [], notices = [], approvals = [], modes = [], sessions = []
   let round = 0
@@ -117,4 +117,47 @@ for (const surface of ['tui', 'line']) test(`${surface} failed preference save r
   assert.equal(f.reviews[0].policy.checks[0].allowAt, 0.95)
   assert.equal(f.approvals.filter(request => request.call.name === 'enroll_auto_review').length, 0)
   assert.match(f.io.output, /Offline preference save failure/)
+})
+
+for (const surface of ['tui', 'line']) test(`${surface} threshold revocation survives relaunch without selecting Auto again`, async t => {
+  const lines = ['/auto-threshold 90', '/exit']
+  const f = await fixture(t, { surface, lines, mode: 'auto', probability: 1 })
+  assert.equal(await f.run(), 0)
+  assert.equal((await f.preferences.load()).mode, 'manual')
+  f.io.closed = false
+  lines.push('Set a note named tone to clear', '/exit')
+  assert.equal(await f.run(), 0)
+  assert.equal(f.reviews.length, 0)
+  assert.equal(f.approvals.filter(request => request.call.name === 'note_set').length, 1)
+})
+
+test('TUI threshold revocation survives /new without selecting Auto again', async t => {
+  const f = await fixture(t, { mode: 'auto', lines: ['/auto-threshold 90', '/new', 'Set a note named tone to clear', '/exit'], probability: 1 })
+  assert.equal(await f.run(), 0)
+  assert.equal((await f.preferences.load()).mode, 'manual')
+  assert.equal(f.reviews.length, 0)
+  assert.equal(f.approvals.filter(request => request.call.name === 'note_set').length, 1)
+})
+
+for (const surface of ['tui', 'line']) for (const mode of ['manual', 'plan', 'skip']) {
+  test(`${surface} threshold change preserves saved ${mode} preference`, async t => {
+    const f = await fixture(t, { surface, mode, lines: ['/auto-threshold 90', '/exit'] })
+    assert.equal(await f.run(), 0)
+    const saved = await f.preferences.load()
+    assert.equal(saved.mode, mode)
+    assert.deepEqual(saved.autoReviewThresholds, { openai: 900, openrouter: 990 })
+  })
+}
+
+test('TUI failed threshold save cannot restore revoked Auto through /new', async t => {
+  const f = await fixture(t, { mode: 'auto', lines: ['/auto-threshold 90', '/new', 'Set a note named tone to clear', '/exit'], probability: 1 })
+  const save = PreferenceStore.prototype.save
+  t.mock.method(PreferenceStore.prototype, 'save', function (settings) {
+    if (settings.autoReviewThresholds?.openai === 900) throw new Error('Offline preference save failure')
+    return save.call(this, settings)
+  })
+  assert.equal(await f.run(), 0)
+  assert.equal(f.reviews.length, 0)
+  assert.equal(f.approvals.filter(request => request.call.name === 'note_set').length, 1)
+  assert.deepEqual((await f.preferences.load()).autoReviewThresholds, { openai: 950, openrouter: 990 })
 })

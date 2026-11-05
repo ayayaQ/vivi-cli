@@ -476,13 +476,31 @@ export class ReadOnlyWorkspace {
           // Exclusive copy prevents overwrite and keeps both paths readable if source removal fails.
           await fs.copyFile(target, moved, constants.COPYFILE_EXCL)
           published = { path: mutation.destination!, revision: mutation.revision, sourcePath: mutation.path, sourceRemoved: false }
-          const copied = await this.readBytes(parent, destination.at(-1)!, WORKSPACE_MUTATION_LIMITS.maximumFileBytes, budget)
           const copiedInfo = await fs.lstat(moved)
+          const copied = await this.readBytes(parent, destination.at(-1)!, WORKSPACE_MUTATION_LIMITS.maximumFileBytes, budget)
+          // Verify and flush the destination bytes and its directory entry before
+          // removing the only other copy. Windows needs a writable flush handle;
+          // its directory durability remains unverified, as for text publication.
+          const copyHandle = await fs.open(moved, (process.platform === 'win32' ? constants.O_RDWR : constants.O_RDONLY) |
+            (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+          try {
+            check(unchanged(copiedInfo, await copyHandle.stat()), 'Move destination changed before sync; inspect both paths before retrying')
+            await copyHandle.sync()
+          } finally { await copyHandle.close() }
+          if (parent.handle) await parent.handle.sync()
           const sourceBytes = await this.readBytes(directory, parts.at(-1)!, WORKSPACE_MUTATION_LIMITS.maximumFileBytes, budget)
           const source = await fs.lstat(target)
           check(unchanged(original, source) && workspaceRevision(copied) === mutation.revision &&
             workspaceRevision(sourceBytes) === mutation.expectedRevision,
           'Move destination was created, but the source changed; inspect both paths before retrying')
+          // Sync can yield to policy changes, so re-admit both endpoints before
+          // the destructive step rather than checking directory identity alone.
+          await this.withPath(parts, true, budget, async current => {
+            check(sameEntry(current.info, directory.info), 'Workspace source parent changed before source removal')
+          })
+          await this.withPath(destination, true, budget, async current => {
+            check(sameEntry(current.info, parent.info), 'Workspace destination parent changed before source removal')
+          })
           await assertCurrent(); tick(budget)
           check(!containsSecret(mutation, this.knownSecrets), 'A newly known credential invalidated this workspace change')
           await this.verify(directory, budget); await this.verify(parent, budget)
@@ -490,7 +508,6 @@ export class ReadOnlyWorkspace {
             'Move paths changed before source removal; inspect both paths before retrying')
           await fs.unlink(target)
           published = { ...published, sourceRemoved: true }
-          if (parent.handle) await parent.handle.sync()
           if (directory.handle) await directory.handle.sync()
           return published
         })

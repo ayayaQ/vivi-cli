@@ -623,6 +623,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     // Revoke before persistence; failed settings writes cannot leave relaxed Auto authority.
     selectedHost.setAutoReviewThresholds(next); selectedHost.setApprovalMode('manual'); io.setApprovalMode?.('manual')
     const appliedBinding = selectedHost.approvalEnrollmentBinding
+    // A later /new or launch must not silently re-enroll a revoked Auto choice.
+    // Keep the in-memory choice revoked even when persistence fails.
+    if (preferredMode === 'auto') preferredMode = 'manual'
+    if (settings.mode === 'auto') settings = { ...settings, mode: 'manual' }
     try { await preferences.save({ ...settings, autoReviewThresholds: next }) }
     catch (error) {
       if (host === selectedHost && !selectedHost.running && selectedHost.approvalEnrollmentBinding === appliedBinding) selectedHost.setAutoReviewThresholds(previous)

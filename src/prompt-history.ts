@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { constants } from 'node:fs'
+import { closeSync, constants, openSync } from 'node:fs'
 import type { Stats } from 'node:fs'
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
@@ -10,6 +10,7 @@ const MAX_PROMPT_LENGTH = 65536
 // JSON can expand a UTF-16 code unit to six bytes.
 const MAX_HISTORY_BYTES = MAX_PROMPT_HISTORY * (MAX_PROMPT_LENGTH * 6 + 4) + 64
 interface Draft { text: string; cursor: number }
+interface LeaseDatabase { exec(sql: string): unknown; close(): void }
 
 /** Oldest first. Browsing edits are temporary and never mutate submitted history. */
 export class PromptHistory {
@@ -111,19 +112,61 @@ export class PromptHistoryStore {
     await mkdir(this.directory, { recursive: true, mode: 0o700 })
     const directory = await this.checkDirectory()
     if (!directory) throw new Error('Prompt history directory unavailable')
-    const lockPath = join(this.directory, 'prompt-history.json.lock')
-    const deadline = Date.now() + 2000
-    let lock
-    // Reload under a short writer lease so simultaneous harnesses retain each other's prompts.
-    for (;;) {
-      try { lock = await open(lockPath, 'wx', 0o600); break }
-      catch (error) {
-        if (!hasCode(error, 'EEXIST') || Date.now() >= deadline) throw error
-        await new Promise(resolve => setTimeout(resolve, 25))
+    const lockPath = join(this.directory, 'prompt-history-lease.sqlite')
+    // Keep this inode in place permanently: SQLite's native lock, not the file's
+    // existence, owns the lease. The OS releases it even if the process is killed.
+    // Do not yield between creation and close: closing an unrelated descriptor
+    // can release this process's POSIX locks held by another SQLite connection.
+    try { closeSync(openSync(lockPath, 'wx', 0o600)) }
+    catch (error) { if (!hasCode(error, 'EEXIST')) throw error }
+    const entry = await lstat(lockPath)
+    if (!privateFile(entry) || entry.nlink !== 1) throw new Error('Invalid prompt history lease')
+    let database: LeaseDatabase | undefined
+    let acquired = false
+    const checkLease = async (): Promise<void> => {
+      const current = await lstat(lockPath)
+      const parent = await this.checkDirectory()
+      if (!privateFile(current) || current.nlink !== 1 ||
+        current.dev !== entry.dev || current.ino !== entry.ino ||
+        !parent || parent.dev !== directory.dev || parent.ino !== directory.ino) {
+        throw new Error('Prompt history lease changed')
       }
     }
     const temporary = join(this.directory, `.prompt-history.${randomUUID()}.tmp`)
     try {
+      await checkLease()
+      for (const suffix of ['-journal', '-wal', '-shm']) {
+        let info
+        try { info = await lstat(lockPath + suffix) }
+        catch (error) { if (hasCode(error, 'ENOENT')) continue; throw error }
+        if (!privateFile(info) || info.nlink !== 1) throw new Error('Invalid prompt history lease sidecar')
+      }
+      if ('Bun' in globalThis) {
+        const specifier = 'bun:sqlite'
+        const module = await import(specifier) as { Database: new (path: string, options: { create: boolean; readwrite: boolean }) => LeaseDatabase }
+        database = new module.Database(lockPath, { create: false, readwrite: true })
+      } else {
+        const { DatabaseSync } = await import('node:sqlite')
+        database = new DatabaseSync(lockPath, { allowExtension: false, timeout: 0 })
+      }
+      // Never block the event loop: another store in this process may hold the
+      // lease while awaiting an fs operation. A live writer is never evicted.
+      database.exec('PRAGMA busy_timeout=0')
+      const deadline = Date.now() + 2000
+      for (;;) {
+        try {
+          database.exec('PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE')
+          acquired = true
+          break
+        } catch (error) {
+          const busy = error instanceof Error && (
+            ('errcode' in error && (error.errcode === 5 || error.errcode === 6)) ||
+            ('code' in error && (error.code === 'SQLITE_BUSY' || error.code === 'SQLITE_LOCKED')))
+          if (!busy || Date.now() >= deadline) throw error
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+      }
+      await checkLease()
       const entries = await this.load()
       if (entries.at(-1) === text) return
       entries.push(text)
@@ -132,13 +175,15 @@ export class PromptHistoryStore {
         await file.writeFile(`${JSON.stringify(entries.slice(-MAX_PROMPT_HISTORY))}\n`, 'utf8')
         await file.sync()
       } finally { await file.close() }
-      const current = await this.checkDirectory()
-      if (!current || current.dev !== directory.dev || current.ino !== directory.ino) throw new Error('Prompt history directory changed')
+      await checkLease()
       await rename(temporary, join(this.directory, 'prompt-history.json'))
     } finally {
       await unlink(temporary).catch(() => undefined)
-      await lock.close()
-      await unlink(lockPath)
+      try {
+        if (acquired) database?.exec('ROLLBACK')
+      } finally {
+        database?.close()
+      }
     }
   }
 }

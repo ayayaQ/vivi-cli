@@ -700,6 +700,8 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       else next[provider] = parseAutoReviewThresholdPercent(argument)
       host!.setAutoReviewThresholds(next); host!.setApprovalMode('manual'); io!.setApprovalMode?.('manual')
       const appliedBinding = host!.approvalEnrollmentBinding
+      // Persist revocation with the cutoff so a relaunch requires selecting Auto again.
+      if (savedPreferences.mode === 'auto') savedPreferences = { ...savedPreferences, mode: 'manual' }
       try { await preferences.save({ ...savedPreferences, autoReviewThresholds: next }) }
       catch (error) {
         if (!host!.running && host!.approvalEnrollmentBinding === appliedBinding) host!.setAutoReviewThresholds(previous)
