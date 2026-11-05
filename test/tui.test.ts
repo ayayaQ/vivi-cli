@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, spyOn, test } from 'bun:test'
-import { BoxRenderable, CliRenderEvents, CodeRenderable, parseColor, RGBA, SelectRenderable,
+import { BoxRenderable, CliRenderEvents, CodeRenderable, MarkdownRenderable, parseColor, RGBA, SelectRenderable,
   TextareaRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
@@ -71,7 +71,7 @@ test('autocomplete renders above composer, arrows cycle and Tab accepts without 
   await input.typeText('/m')
   const display = await frame()
   expect(display).toContain('› /models')
-  expect(display).toContain('/menu')
+  expect(display).toContain('/mode')
   const completions = setup.renderer.root.findDescendantById('vivi-completions')!
   const composerBox = setup.renderer.root.findDescendantById('vivi-composer-box')!
   expect(completions.y + completions.height).toBeLessThanOrEqual(composerBox.y)
@@ -400,7 +400,7 @@ test('pink and lavender colors are configured and present in native frame spans'
   const composerBox = setup.renderer.root.findDescendantById('vivi-composer-box') as BoxRenderable
   const completions = setup.renderer.root.findDescendantById('vivi-completions') as BoxRenderable
   const composer = setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
-  expect(header.fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
+  expect(header.fg.equals(TUI_THEME.foreground)).toBe(true)
   expect(composerBox.borderColor.equals(RGBA.fromHex('#f87ea2'))).toBe(true)
   expect(completions.borderColor.equals(RGBA.fromHex('#b08bfc'))).toBe(true)
   expect(composer.cursorColor.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
@@ -430,14 +430,15 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   const bodyId = cards[0]!.id.replace('vivi-tool-details-', 'vivi-tool-body-')
   expect(setup.renderer.root.findDescendantById(bodyId)!.getChildren()).toHaveLength(0)
   expect(output).not.toContain(`cli-session:${session.id}:history:2`)
-  expect(output).toContain('reasoning high')
+  expect(output).toContain('mock-model · high')
+  expect(output).not.toContain('reasoning high')
   expect(output).toContain('You')
-  expect(output).toContain('Assistant')
+  expect(output).not.toContain('Assistant')
   expect(output).toContain('A heading')
   expect(output).toContain('unverified · calculate')
   expect(output).toContain('Context unknown')
   expect(output).not.toContain('17 total')
-  expect(output).toContain('/new /resume /mode /memories /skills /mcp /menu /help /exit')
+  expect(output).not.toContain('/new /resume /mode /memories /skills /mcp /menu /help /exit')
   input.pressKey('o', { ctrl: true }); await frame()
   const expanded = renderedText(setup.renderer.root.findDescendantById(bodyId)!)
   expect(expanded).toContain(`cli-session:${session.id}:history:2`)
@@ -448,6 +449,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
 test('native header shows one effective-request occupancy and ignores cumulative round/turn/session usage', async () => {
   const { io, setup, frame } = await fixture({ width: 160, height: 24 })
   const session = newSession({ provider: 'openai', model: 'fake-cache-model' })
+  session.history = history('Accepted')
   session.usage = { inputTokens: 300000, outputTokens: 200000, totalTokens: 500000, cachedInputTokens: 0 }
   io.setSession(session)
   io.setContext({ inputTokens: 63000, estimated: true, contextWindow: 128000, outputReserveTokens: 4096 }, true)
@@ -466,12 +468,13 @@ test('native header shows one effective-request occupancy and ignores cumulative
 test('unknown capacity and new-model/reset state never borrow the prior context window', async () => {
   const { io, frame } = await fixture({ width: 40, height: 20 })
   const session = newSession({ provider: 'openai', model: 'compact-context' })
+  session.history = history('Accepted')
   io.setSession(session)
   io.setContext({ inputTokens: 1600, estimated: true, outputReserveTokens: 4096 }, false)
   expect(await frame()).toContain('Context ~1.6k/?')
   io.setDraft('openrouter')
-  expect(await frame()).toContain('Context unknown')
-  io.setSession(newSession({ provider: 'openrouter', model: 'smaller-context' }))
+  expect(await frame()).not.toContain('Context')
+  io.setSession({ ...newSession({ provider: 'openrouter', model: 'smaller-context' }), history: history('Accepted') })
   io.setContext({ inputTokens: 500, estimated: true, contextWindow: 8000, outputReserveTokens: 800 }, false)
   expect(await frame()).toContain('Context ~500/8k')
   expect(await frame()).not.toContain('128k')
@@ -545,8 +548,8 @@ test('Ctrl+J fallback inserts a newline in legacy and Kitty terminals without su
     expect(composer.plainText).toBe('first\n')
     await Promise.resolve()
     expect(submitted).toBe(false)
-    // Chat now uses this row for the bottom actions; help still documents Ctrl+J.
-    expect(await frame()).toContain('Menu  Models')
+    // Chat keeps one menu entry; help still documents Ctrl+J.
+    expect(await frame()).toContain('/ menu')
     await input.pasteBracketedText('second\nthird')
     input.pressEnter()
     expect(await line).toBe('first\nsecond\nthird')
@@ -727,14 +730,14 @@ test('Kitty repeat metadata cannot select or confirm an approval', async () => {
   void answer.then(() => { finished = true })
   await tick(); await frame()
   await input.pressKeys(['\x1b[9;1:2u', '\x1b[57351;1:2u'])
-  expect(await frame()).toContain('› Deny')
-  input.pressTab()
   expect(await frame()).toContain('› Approve')
+  input.pressTab()
+  expect(await frame()).toContain('› Deny')
   await input.pressKeys(['\x1b[13;1:2u', '\x1b[32;1:2u'])
   await Promise.resolve()
   expect(finished).toBe(false)
   input.pressKey(' ')
-  expect(await answer).toBe(true)
+  expect(await answer).toBe(false)
 })
 
 test('Windows held keys and native repeat counts cannot act on later approval dialogs', async () => {
@@ -752,24 +755,24 @@ test('Windows held keys and native repeat counts cannot act on later approval di
   await tick(); await frame()
   await key(9, 9, 1, 3)
   await key(39, 0)
-  expect(await frame()).toContain('› Deny')
+  expect(await frame()).toContain('› Approve')
   await key(9, 0, 0)
   await key(9, 9)
-  expect(await frame()).toContain('› Approve')
+  expect(await frame()).toContain('› Deny')
   await key(13, 13)
   await key(32, 32, 1, 3)
   await Promise.resolve()
   expect(firstFinished).toBe(false)
   await key(13, 0, 0)
   await key(13, 13)
-  expect(await first).toBe(true)
+  expect(await first).toBe(false)
 
   const second = io.approve(request, new AbortController().signal)
   let secondFinished = false
   void second.then(() => { secondFinished = true })
   await tick(); await frame()
   await key(39, 0)
-  expect(await frame()).toContain('› Deny')
+  expect(await frame()).toContain('› Approve')
   await key(39, 0, 0)
   await key(39, 0)
   expect(await frame()).toContain('› Approve')
@@ -1222,7 +1225,7 @@ test('approval clears pretyped input and queued Return, requires fresh selected 
   const display = await frame()
   expect(display).toContain('current revision 4')
   expect(display).toContain(request.description)
-  expect(display).toContain('default: deny')
+  expect(display).toContain('› Approve')
   let settled = false
   void approval.then(() => { settled = true })
   await Promise.resolve()
@@ -1242,6 +1245,7 @@ test('pasted approval cannot allow; blank, deny, abort, dismissal and close deny
   const denied = io.approve(request, new AbortController().signal)
   await tick(); await frame()
   await input.typeText('deny')
+  input.pressArrow('down')
   input.pressEnter()
   expect(await denied).toBe(false)
   const abortedController = new AbortController()
@@ -1261,6 +1265,7 @@ test('invalid approval text cannot carry forward into a later approval', async (
   const first = io.approve(request, new AbortController().signal)
   await tick(); await frame()
   await input.typeText('allowed')
+  input.pressArrow('down')
   input.pressEnter()
   input.pressEnter()
   expect(await first).toBe(false)
@@ -1269,7 +1274,7 @@ test('invalid approval text cannot carry forward into a later approval', async (
   const second = io.approve(request, new AbortController().signal)
   await tick(); await frame()
   input.pressEnter()
-  expect(await second).toBe(false)
+  expect(await second).toBe(true)
 })
 
 test('split streamed secrets never enter a captured frame, accepted response replaces preview', async () => {
@@ -1283,8 +1288,10 @@ test('split streamed secrets never enter a captured frame, accepted response rep
   }
   expect(await frame()).toContain('[REDACTED]')
   expect(await frame()).toContain('streaming preview (not accepted)')
+  expect(await frame()).not.toContain('Assistant')
   io.event({ type: 'assistant', message: { kind: 'assistant', content: 'Different accepted answer', toolCalls: [] } })
   expect(await frame()).toContain('Different accepted answer')
+  expect(await frame()).not.toContain('Assistant')
   expect(await frame()).not.toContain('streaming preview')
   expect(await frame()).not.toContain('A response:')
   io.result(result('Different accepted answer'))
@@ -1457,7 +1464,7 @@ test('switching sessions clears partial or error notices from the old conversati
   expect(display).toContain('second-model')
   expect(display).not.toContain('first-session partial')
   expect(display).not.toContain('response was not accepted')
-  expect(display).toContain('Ready')
+  expect(display).not.toContain('Ready')
 })
 
 test('Ctrl+C while idle exits and closes the active composer', async () => {
@@ -1549,7 +1556,7 @@ test('registering cancellation after close immediately aborts a late-starting op
   dispose()
 })
 
-test('long workspace paths stay on one right-aligned footer row and keep the composer visible after resize', async () => {
+test('long workspace paths stay on one welcome row and keep the composer visible after resize', async () => {
   const { io, setup, frame } = await fixture({ width: 180, height: 30 })
   io.setSession(newSession({ provider: 'openai', model: 'fixture' }))
   const reading = io.readLine('Message')
@@ -1561,12 +1568,13 @@ test('long workspace paths stay on one right-aligned footer row and keep the com
       const workspace = setup.renderer.root.findDescendantById('vivi-workspace') as TextRenderable
       const composer = setup.renderer.root.findDescendantById('vivi-composer-box')!
       const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
-      expect(workspace.plainText).toContain('Workspace:')
+      expect(workspace.plainText).not.toContain('Workspace:')
+      expect(workspace.plainText).not.toContain('reviewed text edits')
       expect(workspace.plainText).toContain('…')
       expect(workspace.plainText.split('\n')).toHaveLength(1)
-      expect(workspace.textAlign).toBe('right')
+      expect(workspace.textAlign).toBe('left')
       expect(workspace.x + workspace.width).toBe(width)
-      expect(workspace.y).toBeGreaterThanOrEqual(composer.y + composer.height)
+      expect(workspace.y).toBeLessThan(composer.y)
       expect(workspace.y + workspace.height).toBeLessThanOrEqual(height)
       expect(composer.y + composer.height).toBeLessThanOrEqual(height)
       expect(transcript.height).toBeGreaterThan(1)
@@ -1584,7 +1592,7 @@ test('workspace status keeps search results, editor and refresh hints visible in
   for (const [width, height] of [[40, 12], [70, 20], [110, 32]] as const) {
     setup.resize(width, height)
     const display = await frame()
-    expect(display).toContain('Workspace:')
+    expect(display.includes('/project/')).toBe(height >= 14)
     expect(display).toContain('model-599')
     expect(display).toContain('Ctrl+R refresh')
     expect(display).toContain('Enter choose')
@@ -1595,7 +1603,7 @@ test('workspace status keeps search results, editor and refresh hints visible in
   setup.resize(40, 12)
   io.event({ type: 'text_delta', text: 'Streaming fixture' })
   const streaming = await frame()
-  expect(streaming).toContain('Workspace:')
+  expect(streaming).not.toContain('/project/')
   expect(streaming).toContain('Ctrl+R refresh')
   expect(streaming).toContain('model-599')
   input.pressEnter(); expect(await selecting).toEqual({ kind: 'selected', value: 'selected-model', query: '' })
@@ -1624,7 +1632,8 @@ test('native transcript differentiates user, assistant and activity without chan
   expect(entries[0]!.backgroundColor.equals(RGBA.fromHex(TUI_THEME.userBackground))).toBe(true)
   expect(label(0).fg.equals(RGBA.fromHex(TUI_THEME.lavender))).toBe(true)
   expect(body(0).fg.equals(RGBA.fromHex(TUI_THEME.highlightForeground))).toBe(true)
-  expect(label(1).fg.equals(RGBA.fromHex(TUI_THEME.pink))).toBe(true)
+  expect(entries[1]!.getChildren()).toHaveLength(1)
+  expect(entries[1]!.getChildren()[0]).toBeInstanceOf(MarkdownRenderable)
   expect(entries[1]!.border).toBe(false)
   expect(label(3).fg.equals(parseColor(TUI_THEME.muted))).toBe(true)
   expect(body(3).fg.equals(parseColor(TUI_THEME.muted))).toBe(true)
@@ -1694,7 +1703,7 @@ test('review state, pending approvals and result errors remain prominent while s
   io.reviewNotice('Audit could not be saved'); await frame(); colors('Review warning', true)
   const pending = io.approve(request, new AbortController().signal)
   await tick(); await frame(); colors('Approval required · current revision 4', true)
-  input.pressEnter(); expect(await pending).toBe(false)
+  input.pressArrow('down'); input.pressEnter(); expect(await pending).toBe(false)
   io.result({ ...result('Failed', 'error'), error: new Error('Visible result error') }); await frame()
   colors('Error', true)
 })
@@ -1703,6 +1712,7 @@ test('title-only header and responsive metadata keep native controls separate fr
   const { io, setup, input, frame } = await fixture({ width: 160, height: 30 })
   const session = newSession({ provider: 'openrouter', model: 'fixture-model', reasoning: 'high' })
   session.title = 'Friendly title 日本語'; session.titleRevision = 1
+  session.history = history('Accepted')
   session.usage = { inputTokens: 10, outputTokens: 5, totalTokens: 18, cachedInputTokens: 0, cacheWriteInputTokens: 7 }
   io.setSession(session); io.setApprovalMode('auto'); io.setWorkspace('/fixture/project')
   const node = (id: string) => setup.renderer.root.findDescendantById(id)!
@@ -1718,18 +1728,18 @@ test('title-only header and responsive metadata keep native controls separate fr
     expect(text('vivi-tokens').textAlign).toBe('right')
     expect(text('vivi-tokens').x + text('vivi-tokens').width).toBe(width)
     expect(text('vivi-tokens').y).toBeLessThan(node('vivi-transcript').y)
-    expect(text('vivi-model').y + text('vivi-model').height).toBe(node('vivi-composer-box').y)
+    expect(text('vivi-model').y).toBe(node('vivi-composer-box').y + node('vivi-composer-box').height)
     expect(text('vivi-model').plainText).toContain('Auto review')
-    expect(text('vivi-workspace').y).toBeGreaterThanOrEqual(node('vivi-composer-box').y + node('vivi-composer-box').height)
+    expect(text('vivi-workspace').y).toBeLessThan(node('vivi-transcript').y)
     expect(text('vivi-workspace').x + text('vivi-workspace').width).toBe(width)
     expect(text('vivi-workspace').y + text('vivi-workspace').height).toBeLessThanOrEqual(30)
     const actions = node('vivi-actions')
-    if (width >= 48) {
+    if (width >= 24) {
       expect(actions.visible).toBe(true)
       for (const button of actions.getChildren()) {
         expect(button.x + button.width).toBeLessThanOrEqual(width)
-        if (button.y === text('vivi-workspace').y) expect(button.x + button.width).toBeLessThanOrEqual(text('vivi-workspace').x)
-        else expect(button.y).toBeLessThan(text('vivi-workspace').y)
+        expect(button.y).toBe(text('vivi-model').y)
+        expect(button.x).toBeGreaterThanOrEqual(text('vivi-model').x + text('vivi-model').width)
       }
       const menu = node('vivi-action-menu')
       await setup.mockMouse.click(menu.x + 1, menu.y)
@@ -1740,7 +1750,7 @@ test('title-only header and responsive metadata keep native controls separate fr
     }
   }
   io.setSession(newSession({ provider: 'openai', model: 'fixture' })); await frame()
-  expect(text('vivi-header').plainText).toContain('Untitled')
+  expect(text('vivi-header').plainText).toBe('vivi')
   expect(session.id).toMatch(/^[a-f0-9-]+$/)
 })
 
@@ -1776,6 +1786,7 @@ test('user borders wrap Unicode and long text without changing native scrolling,
 test('extremely narrow context labels never display a clipped number as a complete occupancy', async () => {
   const { io, setup, frame } = await fixture({ width: 20, height: 30 })
   const session = newSession({ provider: 'openai', model: 'fixture' })
+  session.history = history('Accepted')
   const tokens = () => setup.renderer.root.findDescendantById('vivi-tokens') as TextRenderable
   io.setSession(session)
   for (const [width, height] of [[20, 30], [30, 8], [20, 8]] as const) {

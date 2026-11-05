@@ -53,7 +53,7 @@ test('approval waits have a truthful separate label, accumulate total time and r
     await new Promise(resolve => setTimeout(resolve, 2)); await frame()
     expect(status()).toContain('Waiting for approval'); expect(status()).not.toContain('Working')
     runClock.advance(2400); expect(status()).toContain(approve ? '4s' : '2s')
-    if (approve) input.pressArrow('right')
+    input.pressArrow(approve ? 'up' : 'down')
     input.pressEnter(); expect(await waiting).toBe(approve)
     expect(status()).toContain('Working')
   }
@@ -85,7 +85,7 @@ test('manual approval outside a turn never starts an elapsed working timer', asy
   await new Promise(resolve => setTimeout(resolve, 2)); await frame()
   expect(status()).toContain('Approval required'); expect(status()).not.toContain('Completed'); expect(status()).not.toContain('Working')
   expect(runClock.timers.size).toBe(0)
-  input.pressEnter(); expect(await waiting).toBe(false)
+  input.pressArrow('down'); input.pressEnter(); expect(await waiting).toBe(false)
   expect(status()).toContain('Ready'); expect(status()).not.toContain('Approval required')
 })
 
@@ -138,7 +138,7 @@ test('working and waiting labels remain inside the compact footer after resize',
 })
 
 
-test('long session names fit a title-only header and model metadata stays above the composer', async () => {
+test('long session names fit a title-only header and model metadata stays below the composer', async () => {
   const { io, setup, frame } = await fixture()
   const session = { ...newSession({ provider: 'openai', model: 'fixture', reasoning: 'high' }), title: 'Readable '.repeat(8).trim(), titleRevision: 1 }
   io.setSession(session)
@@ -149,13 +149,13 @@ test('long session names fit a title-only header and model metadata stays above 
   expect(header.height).toBe(1)
   const model = setup.renderer.root.findDescendantById('vivi-model') as TextRenderable
   const composer = setup.renderer.root.findDescendantById('vivi-composer-box')!
-  expect(model.y + model.height).toBe(composer.y)
+  expect(model.y).toBe(composer.y + composer.height)
   io.setSession({ ...session, title: '名'.repeat(80) })
   setup.resize(40, 20); displayed = await frame()
   expect(displayed).toContain('openai / fixture'); expect(displayed).toContain('…')
   expect(header.plainText.split('\n')).toHaveLength(1)
   expect(header.plainText.length).toBeLessThanOrEqual(40)
-  expect(model.y + model.height).toBe(composer.y)
+  expect(model.y).toBe(composer.y + composer.height)
   expect(displayed).not.toContain(session.id)
 })
 

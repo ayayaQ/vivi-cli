@@ -957,7 +957,7 @@ try {
   assert.equal(await approve, true)
   const deny = io.approve(request, new AbortController().signal)
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce()
-  setup.mockInput.pressEnter()
+  setup.mockInput.pressArrow('down'); setup.mockInput.pressEnter()
   assert.equal(await deny, false)
   assert.equal(io.canAskQuestions, Boolean(process.stdin.isTTY && process.stdout.isTTY))
   const nativeRequest = { requestId: 'packed-native-question', callId: 'packed-native-call', questions: [
@@ -983,7 +983,7 @@ try {
     answers: [{ id: 'style', answer: { kind: 'option', optionId: 'long' } }] })
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
   assert(setup.renderer.root.findDescendantById('vivi-approve'))
-  setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
+  setup.mockInput.pressArrow('down'); setup.mockInput.pressEnter(); assert.equal(await queuedApproval, false)
   const cancelling = io.askQuestions({ ...nativeRequest, requestId: 'packed-native-cancel' }, new AbortController().signal)
   await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
   setup.mockInput.pressEscape()

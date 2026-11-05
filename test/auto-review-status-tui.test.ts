@@ -3,7 +3,7 @@ import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { TextRenderable, BoxRenderable, CliRenderEvents } from '@opentui/core'
+import { TextRenderable, MarkdownRenderable, BoxRenderable, CliRenderEvents } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import type { HistoryMessage } from '@ayayaq/vivi'
@@ -19,7 +19,7 @@ import type { ReviewNotice } from '../src/auto-review.js'
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
 function contents(node: Renderable): string {
-  return [node instanceof TextRenderable ? node.plainText : '',
+  return [node instanceof TextRenderable ? node.plainText : node instanceof MarkdownRenderable ? node.content : '',
     node instanceof BoxRenderable ? `${node.title ?? ''}` : '', ...node.getChildren().map(contents)].join('\n')
 }
 async function fixture() {
@@ -87,6 +87,7 @@ test('status fixture waits for a completed new frame before a fresh deny gesture
     resume(); await drawing
     expect(await ready).toContain('Review this change')
     expect(completedFrame).toBeGreaterThan(openedFrame)
+    f.input.pressArrow('down')
     f.input.pressEnter()
     expect(await answer).toBe(false)
   } finally {
@@ -152,7 +153,7 @@ async function application(callCount = 1, preliminaryTools = false, threshold?: 
     if (phase.kind !== 'approval') throw new Error('Expected native review')
     await f.frame()
     expect(f.transcript()).not.toContain('Reviewing create_memory')
-    if (action === 'approve') f.input.pressArrow('right')
+    f.input.pressArrow(action === 'approve' ? 'up' : 'down')
     if (action === 'cancel') f.input.pressEscape()
     else f.input.pressEnter()
     return phase.request
@@ -181,7 +182,7 @@ for (const action of ['approve', 'deny', 'cancel'] as const) test(`actual app HT
   expect(toolIndex).toBeGreaterThanOrEqual(0)
   expect(finalIndex).toBeLessThan(toolIndex)
   if (action !== 'cancel') {
-    const assistantIndex = text.lastIndexOf('Assistant')
+    const assistantIndex = text.lastIndexOf('Turn finished 1')
     expect(assistantIndex).toBeGreaterThanOrEqual(0)
     expect(toolIndex).toBeLessThan(assistantIndex)
   }

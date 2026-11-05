@@ -34,11 +34,16 @@ function watch<T>(promise: Promise<T>) {
 async function arm(frame: () => Promise<string>) { await tick(); await frame() }
 
 // These are real SGR terminal events through OpenTUI's native hit grid and parser.
-test('approval has explicit Deny/Approve buttons; fresh clicks approve or deny exactly once', async () => {
+test('approval places highlighted Approve above Deny; fresh clicks confirm exactly once', async () => {
   const f = await fixture()
   const first = f.io.approve(request, new AbortController().signal)
   await arm(f.frame)
-  expect(await f.frame()).toContain('› Deny')
+  expect(await f.frame()).toContain('› Approve')
+  const yes = f.node('vivi-approve'), no = f.node('vivi-deny')
+  expect(yes.y + yes.height).toBe(no.y)
+  expect(yes.x).toBe(no.x)
+  expect(yes.width).toBe(no.width)
+  expect(f.setup.captureSpans().lines[yes.y]!.spans.some(span => span.bg.a > 0 && span.width > 20 && !span.text.trim())).toBe(true)
   await f.click('vivi-approve')
   expect(await first).toBe(true)
   const second = f.io.approve({ ...request, description: 'Second proposal' }, new AbortController().signal)
@@ -48,17 +53,18 @@ test('approval has explicit Deny/Approve buttons; fresh clicks approve or deny e
   expect(f.node('vivi-picker-box').visible).toBe(false)
 })
 
-test('keyboard approval initially denies, requires deliberate selection, ignores typed allow and repeat Enter', async () => {
+test('keyboard approval starts at Approve; arrows select Deny and repeated Enter stays inert', async () => {
   const f = await fixture()
   const denied = f.io.approve(request, new AbortController().signal)
   await arm(f.frame)
   await f.input.typeText('allow')
+  f.input.pressArrow('down')
   f.input.pressEnter()
   expect(await denied).toBe(false)
   const allowed = f.io.approve(request, new AbortController().signal)
   const pending = watch(allowed)
   await arm(f.frame)
-  f.input.pressTab()
+  f.input.pressArrow('down'); f.input.pressArrow('up')
   expect(await f.frame()).toContain('› Approve')
   f.setup.renderer.stdin.emit('data', Buffer.from('\x1b[13;1:2u')) // Kitty repeat
   await pending()
@@ -67,7 +73,7 @@ test('keyboard approval initially denies, requires deliberate selection, ignores
   const next = f.io.approve(request, new AbortController().signal)
   await arm(f.frame)
   f.input.pressEnter()
-  expect(await next).toBe(false)
+  expect(await next).toBe(true)
 })
 
 test('approval never activates on a release, unrelated press, modifier click, drag or pointer exit', async () => {
@@ -121,7 +127,7 @@ test('pre-render/unarmed clicks, resize and abort cannot authorize a stale propo
   await f.mouse.release(yes.x + 1, yes.y)
   await stillPending()
   f.input.pressEnter()
-  expect(await second).toBe(false)
+  expect(await second).toBe(true)
 })
 
 test('a double click cannot carry approval into an immediately following request', async () => {
@@ -137,7 +143,7 @@ test('a double click cannot carry approval into an immediately following request
   await arm(f.frame)
   await watch(next!)()
   f.input.pressEnter()
-  expect(await next).toBe(false)
+  expect(await next).toBe(true)
 })
 
 test('default-font picker hit mapping matches rendered centered rows, descriptions and blank/scrollbar cells', async () => {
@@ -246,8 +252,8 @@ test('command completion clicks fill a draft without submitting and toolbar acti
   expect(await f.frame()).toContain('Finish or clear your draft')
   f.input.pressEscape()
   await f.frame()
-  await f.click('vivi-action-models')
-  expect(await draft).toBe('/models')
+  await f.click('vivi-action-menu')
+  expect(await draft).toBe('/menu')
 })
 
 test('text modal Confirm/Cancel work while secret Confirm still uses the hidden-only model', async () => {
@@ -290,7 +296,7 @@ test('compact terminals retain visible approval choices and keyboard-only picker
   const approval = f.io.approve(request, new AbortController().signal)
   await arm(f.frame)
   const display = await f.frame()
-  expect(display).toContain('› Deny')
+  expect(display).toContain('› Approve')
   expect(display).toContain('Approve')
   await f.click('vivi-deny')
   expect(await approval).toBe(false)
@@ -323,6 +329,7 @@ test('short approval dialogs keep both decision buttons inside the visible viewp
       expect(button.y + button.height).toBeLessThanOrEqual(height)
       expect(button.x + button.width).toBeLessThanOrEqual(width)
     }
+    expect(f.node('vivi-footer').y + f.node('vivi-footer').height).toBeLessThanOrEqual(height)
     await f.click('vivi-deny')
     expect(await answer).toBe(false)
     const line = f.io.readLine('Message')
@@ -348,11 +355,11 @@ test('a slow repeat within OpenTUI’s 500ms double-click window cannot approve 
   await f.click('vivi-approve')
   await watch(next!)()
   f.input.pressEnter()
-  expect(await next).toBe(false)
+  expect(await next).toBe(true)
 })
 
 
-test('leaving terminal focus interrupts approval gestures and resets keyboard selection to Deny', async () => {
+test('leaving terminal focus interrupts approval gestures and restores the initial selection', async () => {
   const f = await fixture()
   const answer = f.io.approve(request, new AbortController().signal)
   const pending = watch(answer)
@@ -365,9 +372,9 @@ test('leaving terminal focus interrupts approval gestures and resets keyboard se
   await f.frame()
   await f.mouse.release(yes.x + 1, yes.y)
   await pending()
-  expect(await f.frame()).toContain('› Deny')
+  expect(await f.frame()).toContain('› Approve')
   f.input.pressEnter()
-  expect(await answer).toBe(false)
+  expect(await answer).toBe(true)
 })
 
 
@@ -450,7 +457,7 @@ test('choice resize budgets the planned header rows before Yoga settles', async 
     await f.setup.renderOnce()
     const display = f.setup.captureCharFrame()
     expect(display).toContain('Option 0')
-    expect(display).toContain('Workspace:')
+    expect(display).toContain('/fixture/project')
     expect(display).toContain('↑/↓ select')
     const hints = f.node('vivi-hints')
     expect(hints.y + hints.height).toBeLessThanOrEqual(height)

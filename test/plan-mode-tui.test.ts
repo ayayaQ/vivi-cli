@@ -47,7 +47,7 @@ test('native idle Shift+Tab cycles Manual -> Auto -> Skip -> Plan -> Manual and 
     f.input.pressTab({ shift: true }); expect(await reading).toBe('/mode cycle')
     await cycleApprovalMode(f.host, f.io)
     expect(f.host.taskMode).toBe(expected); expect(f.host.approvalMode).toBe('manual')
-    expect(await f.frame()).toContain(expected === 'plan' ? 'reasoning default · Plan' : 'reasoning default · Manual')
+    expect(await f.frame()).toContain(expected === 'plan' ? 'offline · default · Plan' : 'offline · default · Manual')
   }
   const last = f.io.readLine('Message'); await f.frame()
   expect(f.composer.plainText).toBe('Unsent planning draft')

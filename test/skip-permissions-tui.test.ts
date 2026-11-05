@@ -26,13 +26,13 @@ async function fixture(width = 120) {
   return { setup, io, host, frame, settle, input: setup.mockInput }
 }
 
-test('native Skip confirmation has honest label and cancel default, then explicit allow enables remembered Skip', async () => {
+test('native Skip confirmation has honest label and approval selected first, then explicit allow enables remembered Skip', async () => {
   const f = await fixture()
   const denied = runModeControl(f.host, f.io, '/mode skip')
   const warning = await f.settle()
   expect(warning).toContain('Enable Skip permissions?')
   expect(warning).toContain('Cancel')
-  f.input.pressEnter(); await denied
+  f.input.pressArrow('down'); f.input.pressEnter(); await denied
   expect(f.host.approvalMode).toBe('manual')
   const enrolled = runModeControl(f.host, f.io, '/mode skip')
   await f.settle(); f.input.pressArrow('right'); f.input.pressEnter(); await enrolled
@@ -57,12 +57,12 @@ test('native picker selects Skip deliberately and cancelling from Plan preserves
   f.input.pressEnter(); expect(await next).toBe('Keep the unsent plan')
 })
 
-test('ChatGPT session header identifies plan use and its safe registration label; account and usage controls are discoverable', async () => {
+test('ChatGPT metadata identifies plan use and keeps account and usage controls discoverable', async () => {
   const f = await fixture(180)
   f.io.setSession(newSession({ provider: 'chatgpt', model: 'account-model', chatgptAccountId: 'a'.repeat(64) }))
   const frame = await f.frame()
-  expect(frame).toContain('Using ChatGPT plan')
-  expect(frame).toContain('account aaaaaaaaaaaa')
+  expect(frame).toContain('ChatGPT plan')
+  expect(frame).not.toContain('account aaaaaaaaaaaa')
   expect(SLASH_COMMANDS.some(item => item.command === '/account')).toBe(true)
   expect(SLASH_COMMANDS.some(item => item.command === '/usage')).toBe(true)
 })

@@ -20,7 +20,7 @@ async function fixture(width = 100, height = 30) {
 test('composer grows for newlines, shrinks after edits and keeps native undo and submit semantics', async () => {
   const f = await fixture(), reading = f.io.readLine('Message')
   await f.frame()
-  expect(f.composer.height).toBe(2)
+  expect(f.composer.height).toBe(1)
   for (const text of ['first', 'second', 'third', 'fourth']) {
     await f.input.typeText(text); f.input.pressKey('j', { ctrl: true })
   }
@@ -35,9 +35,9 @@ test('composer grows for newlines, shrinks after edits and keeps native undo and
   expect(f.composer.height).toBe(5)
   for (let i = 0; i < f.composer.plainText.length; i++) f.input.pressArrow('left', { shift: true })
   f.input.pressBackspace()
-  await f.frame(); expect(f.composer.height).toBe(2)
+  await f.frame(); expect(f.composer.height).toBe(1)
   f.input.pressEnter(); expect(await reading).toBe('')
-  await f.frame(); expect(f.composer.height).toBe(2)
+  await f.frame(); expect(f.composer.height).toBe(1)
 })
 
 test('composer measures wrapped Unicode cells and reflows height when the terminal resizes', async () => {
@@ -72,14 +72,15 @@ test('large multiline drafts stay bounded, keep the last line editable and fit c
   f.input.pressEnter(); expect((await reading)?.endsWith('line 99 tail')).toBe(true)
 })
 
-test('chat actions replace the shortcut footer below the composer and keep mouse and keyboard paths', async () => {
+test('one quiet menu entry shares the model footer and keeps mouse and keyboard paths', async () => {
   const f = await fixture(), first = f.io.readLine('Message')
   const display = await f.frame(), actions = f.node('vivi-actions'), box = f.node('vivi-composer-box')
   expect(actions.visible).toBe(true)
   expect(actions.y).toBe(box.y + box.height)
   expect(actions.y + actions.height).toBeLessThanOrEqual(30)
   expect(f.node('vivi-hints').visible).toBe(false)
-  expect(display).toContain('Menu  Models')
+  expect(display).toContain('/ menu')
+  expect(display).not.toContain('Models  Effort')
   expect(display).not.toContain('Enter send')
   const menu = f.node('vivi-action-menu')
   await f.setup.mockMouse.click(menu.x + 1, menu.y)
@@ -87,7 +88,7 @@ test('chat actions replace the shortcut footer below the composer and keep mouse
   const second = f.io.readLine('Message'); await f.frame()
   f.input.pressKey('p', { ctrl: true }); expect(await second).toBe('/menu')
   const third = f.io.readLine('Message'); await f.frame(); await f.input.typeText('draft')
-  const models = f.node('vivi-action-models'); await f.setup.mockMouse.click(models.x + 1, models.y)
+  const draftMenu = f.node('vivi-action-menu'); await f.setup.mockMouse.click(draftMenu.x + 1, draftMenu.y)
   expect(f.composer.plainText).toBe('draft')
   f.input.pressEnter(); expect(await third).toBe('draft')
 })
@@ -95,8 +96,8 @@ test('chat actions replace the shortcut footer below the composer and keep mouse
 test('footer actions leave completion and modal controls visible at small sizes', async () => {
   const f = await fixture(40, 12), reading = f.io.readLine('Message')
   await f.input.typeText('/m'); const display = await f.frame()
-  expect(f.node('vivi-actions').visible).toBe(false)
-  expect(f.node('vivi-hints').visible).toBe(true)
+  expect(f.node('vivi-actions').visible).toBe(true)
+  expect(f.node('vivi-hints').visible).toBe(false)
   expect(display).toContain('/models')
   expect(f.node('vivi-composer-box').y + f.node('vivi-composer-box').height).toBeLessThanOrEqual(12)
   f.input.pressEscape(); f.input.pressEnter(); expect(await reading).toBe('')
