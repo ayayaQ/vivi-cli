@@ -63,12 +63,16 @@ for (const palette of palettes) {
     const { io, setup, frame, composer, input } = await fixture(palette)
     await frame()
     expect(spans(setup).every(span => span.bg.a === 0)).toBe(true)
-    expect(ordinary(setup, 'Ready').attributes & TextAttributes.DIM).toBe(TextAttributes.DIM)
+    expect(setup.captureCharFrame()).not.toContain('Ready')
+    expect(ordinary(setup, 'choose a model').attributes & TextAttributes.DIM).toBe(TextAttributes.DIM)
     const line = io.readLine('Message')
+    await frame()
+    expect(ordinary(setup, 'What would you like to work on?').attributes & TextAttributes.DIM).toBe(TextAttributes.DIM)
     await input.typeText('Ordinary draft')
     for (const focused of [false, true]) {
       if (focused) composer.focus(); else composer.blur()
-      await frame(); ordinary(setup, 'Ordinary draft'); inheritedSurfaces(setup)
+      await frame(); inheritedSurfaces(setup)
+      expect(ordinary(setup, 'Ordinary draft').attributes & TextAttributes.DIM).toBe(0)
       expect(composer.backgroundColor.a).toBe(0)
       expect(composer.textColor.intent).toBe('default')
     }
@@ -86,7 +90,7 @@ for (const palette of palettes) {
     const user = spans(setup).find(span => span.text.includes('Highlighted user message') && span.bg.a > 0)!
     expect(user.bg.equals(RGBA.fromHex(TUI_THEME.userBackground))).toBe(true)
     expect(user.fg.equals(RGBA.fromHex(TUI_THEME.highlightForeground))).toBe(true)
-    expect(spans(setup).some(span => span.fg.equals(RGBA.fromHex(TUI_THEME.pink)))).toBe(true)
+    expect(setup.captureCharFrame()).not.toContain('Assistant')
     expect(spans(setup).some(span => span.fg.equals(RGBA.fromHex(TUI_THEME.lavender)))).toBe(true)
   })
 
@@ -126,7 +130,7 @@ for (const palette of palettes) {
       await frame(); inheritedSurfaces(setup)
       const approval = io.approve(request, new AbortController().signal)
       await frame(); ordinary(setup, 'Save ordinary approval details'); inheritedSurfaces(setup)
-      expect(spans(setup).some(span => span.text.includes('Deny') &&
+      expect(spans(setup).some(span => span.text.includes('Approve') &&
         span.bg.equals(RGBA.fromHex(TUI_THEME.selectedBackground)))).toBe(true)
       input.pressEscape(); expect(await approval).toBe(false)
       await frame(); inheritedSurfaces(setup)

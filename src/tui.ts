@@ -2,20 +2,21 @@
 import { conversationHistoryDigest, matchingConversationErrors } from './conversation-errors.js'
 import type { CliConversationError, CliConversationErrors } from './conversation-errors.js'
 import {
-  BoxRenderable, CliRenderEvents, CodeRenderable, createCliRenderer, decodePasteBytes, MarkdownRenderable,
-  RGBA, SelectRenderable, SelectRenderableEvents, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable, TextTableRenderable,
-  ScrollBoxRenderable, TreeSitterClient
+  BoxRenderable, CliRenderEvents, CodeRenderable, createCliRenderer, createClipboard, createHostClipboard,
+  createRendererClipboardAdapter, decodePasteBytes, MarkdownRenderable,
+  RGBA, SelectRenderable, SelectRenderableEvents, StyledText, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable, TextTableRenderable,
+  ScrollBoxRenderable, TreeSitterClient, resolveRenderLib
 } from '@opentui/core'
 import { mkdtempSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable } from '@opentui/core'
+import type { ClipboardService, CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable, Selection } from '@opentui/core'
 import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, ContextUsage } from '@ayayaq/vivi'
 import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
-import { parseUserShellInput } from './user-shell.js'
+import { parseUserShellInput, USER_SHELL_DISCLOSURE } from './user-shell.js'
 import type { ChatIO } from './terminal.js'
 import type { BackgroundProcessControls } from './process-controls.js'
 import type { SteeringControls, SteeringMessage } from './steering.js'
@@ -48,12 +49,15 @@ import { InputQueue } from './input-queue.js'
 import { QuestionDialog } from './question-dialog.js'
 import { PromptHistory } from './prompt-history.js'
 import type { PromptHistoryStore } from './prompt-history.js'
+import { ControlModal } from './control-modal.js'
+import type { ControlDetails } from './picker.js'
 
 export type { Choice } from './picker.js'
 export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
   promptHistory?: readonly string[]; promptHistoryStore?: PromptHistoryStore;
   /** Trusted production wiring or an offline test sink; omitted on directly constructed test surfaces. */
-  terminalTitle?: TerminalTitleSink; programStatus?: ProgramStatusSink; statusEnvironment?: NodeJS.ProcessEnv }
+  terminalTitle?: TerminalTitleSink; programStatus?: ProgramStatusSink; statusEnvironment?: NodeJS.ProcessEnv;
+  clipboard?: Pick<ClipboardService, 'writeText' | 'dispose'> }
 
 // Ordinary surfaces and text inherit the terminal palette. Dark localized
 // highlights need their own foreground, including native text selections.
@@ -172,9 +176,11 @@ function toolHeader(card: { readonly title: string; readonly status: string }, c
 }
 // OpenTUI 0.5.14 groups repeated clicks for 500ms; allow a frame-timing margin.
 const APPROVAL_REPEAT_WINDOW_MS = 600
-const STEERING_HINTS = 'Enter queue · Ctrl+Enter interrupt & send if supported · Alt+Backspace edit latest · Ctrl+Shift+K clear queue'
-const HINTS = 'Enter send · Ctrl+J line · ↑↓ history · /new /resume /mode /memories /skills /mcp /menu /help /exit'
-type InputKind = 'chat' | 'steering' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question'
+const COPY_TOAST_MS = 1200
+const HINTS = 'Enter send · Ctrl+J newline · / menu'
+const COMPOSER_PLACEHOLDER = new StyledText([{ __isChunk: true, text: 'What would you like to work on?',
+  fg: TUI_THEME.muted, attributes: TextAttributes.DIM }])
+type InputKind = 'chat' | 'steering' | 'text' | 'secret' | 'approval' | 'choice' | 'search' | 'question' | 'control'
 interface PendingInput {
   kind: InputKind
   armed: boolean
@@ -276,19 +282,25 @@ export class OpenTuiIO implements ChatIO {
   private processStopping = new Map<string, object>()
   private processTimer: ReturnType<typeof setInterval> | undefined
   private dialogActions: BoxRenderable | undefined
-  private approvalIndex = 0
+  private approvalIndex = 1
   private approvalMouseNotBefore = 0
   private readonly mouseActivation = new MouseActivation()
+  private readonly clipboard: OpenTuiOptions['clipboard']
   private pickerChangedFrame = 0
   private completionChangedFrame = 0
   private lastRenderedFrame = 0
   private transcript!: ScrollBoxRenderable
   private statusLine!: TextRenderable
+  private shellNotice!: TextRenderable
   private steeringQueueLine!: TextRenderable
   private steeringActions!: BoxRenderable
   private steering: SteeringInput | undefined
+  private steeringHasDraft = false
+  private steeringMessage: string | undefined
   private steeringQueue: readonly SteeringMessage[] = []
   private composerBox!: BoxRenderable
+  private copyToast!: TextRenderable
+  private copyToastTimer: ReturnType<typeof setTimeout> | undefined
   private composer!: TextareaRenderable
   private readonly promptHistory: PromptHistory
   private readonly promptHistoryStore: PromptHistoryStore | undefined
@@ -326,6 +338,7 @@ export class OpenTuiIO implements ChatIO {
   private dialogOwner = new AbortController()
   private activeDialog: object | undefined
   private questionDialog: QuestionDialog | undefined
+  private controls: ControlModal | undefined
   private suspendedChat: { pending: PendingInput; text: string; cursor: number; title: string } | undefined
   private closed = false
   private failure: Error | undefined
@@ -339,6 +352,10 @@ export class OpenTuiIO implements ChatIO {
   private workspaceStatus = false
   private sessionTitle = 'Untitled conversation'
   private sessionModel = 'vivi · choose a model with /models'
+  private sessionEffort = ''
+  private sessionPlan = false
+  private footerTargets: { start: number; end: number; command: string }[] = []
+  private footerChangedFrame = -1
   private sessionId: string | undefined
   private approvalMode: ApprovalMode = 'manual'
   private taskMode: TaskMode = 'execute'
@@ -358,16 +375,20 @@ export class OpenTuiIO implements ChatIO {
     // Native undo/deletion notifications can precede the new buffer contents.
     // Reconcile after a completed frame as well as at ordinary edit callbacks.
     this.updateChoiceLayout()
+    this.controls?.sync()
+    if (this.pending?.kind === 'steering' && this.steeringHasDraft !== !!this.composer.plainText.trim()) this.updateFooter()
     this.updateComposerLayout()
   }
   private readonly focusHandler = (): void => {
     this.mouseActivation.clear()
     this.questionDialog?.resetGesture()
+    this.controls?.resetGesture()
   }
   private readonly blurHandler = (): void => {
     this.mouseActivation.clear()
     this.questionDialog?.resetGesture()
-    if (this.pending?.kind === 'approval') { this.approvalIndex = 0; this.renderDialogActions() }
+    this.controls?.resetGesture()
+    if (this.pending?.kind === 'approval') { this.approvalIndex = 1; this.renderDialogActions() }
   }
   private readonly resizeHandler = (): void => {
     this.mouseActivation.clear()
@@ -382,11 +403,39 @@ export class OpenTuiIO implements ChatIO {
     this.refreshProcesses()
     this.updateComposerLayout()
     this.questionDialog?.resize()
+    this.controls?.resize()
     this.updateSteeringQueue()
     this.rebuild()
   }
   private readonly pasteHandler = (event: PasteEvent): void => {
     try { this.handlePaste(event) } catch (error) { this.errorHandler({ error }) }
+  }
+  private readonly selectionHandler = (selection: Selection): void => {
+    if (this.closed || selection.isDragging || !this.clipboard) return
+    const text = selection.getSelectedText()
+    if (!text) return
+    // OpenTUI emits SELECTION on mouse release, including word/line selections.
+    // Preserve the native text and highlight; clipboard failures must not end a session.
+    void (async () => {
+      try {
+        const result = await this.clipboard!.writeText(text, { destination: 'best-available' })
+        if (result.host.status === 'written' || result.terminal.status === 'attempted') {
+          this.showCopyToast()
+          return
+        }
+      } catch { /* Report clipboard failure without exposing selected text or backend errors. */ }
+      if (!this.closed) this.updateStatus('Could not copy selection; use your terminal copy controls')
+    })()
+  }
+  private showCopyToast(): void {
+    if (this.closed) return
+    if (this.copyToastTimer !== undefined) clearTimeout(this.copyToastTimer)
+    this.copyToast.visible = true
+    this.copyToastTimer = setTimeout(() => {
+      this.copyToastTimer = undefined
+      if (!this.closed) this.copyToast.visible = false
+    }, COPY_TOAST_MS)
+    this.copyToastTimer.unref()
   }
   private readonly signalHandler = (): void => this.cancelOrClose()
   private readonly exitHandler = (): void => this.close()
@@ -438,6 +487,7 @@ export class OpenTuiIO implements ChatIO {
     this.stream = options.stream ?? true
     this.promptHistory = new PromptHistory(options.promptHistory)
     this.promptHistoryStore = options.promptHistoryStore
+    this.clipboard = options.clipboard
     renderer.once(CliRenderEvents.DESTROY, this.destroyHandler)
     try {
       this.style = SyntaxStyle.fromStyles({
@@ -457,37 +507,48 @@ export class OpenTuiIO implements ChatIO {
       this.headerBox = new BoxRenderable(renderer, { id: 'vivi-header-box', height: 2, flexShrink: 0,
         width: '100%', flexDirection: 'column' })
       this.header = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-header', height: 1, flexShrink: 0,
-        content: this.sessionTitle, fg: TUI_THEME.pink, wrapMode: 'none' })
+        content: 'vivi', fg: TUI_THEME.foreground, wrapMode: 'none' })
       this.tokenLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-tokens', height: 1, flexShrink: 0,
         fg: TUI_THEME.muted, attributes: TextAttributes.DIM, textAlign: 'right', wrapMode: 'none' })
       this.headerBox.add(this.header); this.headerBox.add(this.tokenLine)
       this.modelLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-model', height: 1, flexShrink: 0,
-        width: '100%', fg: TUI_THEME.pink, wrapMode: 'none' })
+        width: '100%', fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'none', selectable: false,
+        onMouse: event => this.handleFooterMouse(event) })
       this.footer = new BoxRenderable(renderer, { id: 'vivi-footer', height: 1, flexShrink: 0,
         width: '100%', flexDirection: 'row' })
       this.workspaceLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-workspace', height: 1, flexShrink: 0,
-        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, textAlign: 'right', wrapMode: 'none', visible: false })
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'none', visible: false })
       this.actionBar = new BoxRenderable(renderer, { id: 'vivi-actions', height: 1, flexShrink: 0,
         flexDirection: 'row', visible: false })
-      for (const [label, command] of [['Menu', '/menu'], ['Models', '/models'], ['Effort', '/effort'],
-        ['Mode', '/mode'], ['Memory', '/memories'], ['Skills', '/skills']] as const) {
-        this.actionBar.add(this.mouseButton(`vivi-action-${command.slice(1)}`, label, () => {
+      {
+        const menu = this.mouseButton('vivi-action-menu', '/ menu', () => {
           const pending = this.pending
-          if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish(command)
+          if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish('/menu')
           else this.updateStatus('Finish or clear your draft before opening an action')
-        }))
+        })
+        menu.fg = TUI_THEME.muted
+        menu.bg = TUI_THEME.background
+        menu.attributes = TextAttributes.DIM
+        this.actionBar.add(menu)
       }
       this.transcript = new ScrollBoxRenderable(renderer, { id: 'vivi-transcript', flexGrow: 1,
         minHeight: 1, width: '100%', scrollX: false, scrollY: true, stickyScroll: true,
         stickyStart: 'bottom', contentOptions: { flexDirection: 'column', paddingX: 1 },
         viewportCulling: true })
       this.statusLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-status', width: '100%', height: 1, flexShrink: 0,
-        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'word', content: this.status })
-      this.composerBox = new BoxRenderable(renderer, { id: 'vivi-composer-box', height: 4,
-        flexShrink: 0, border: true, borderColor: TUI_THEME.pink, titleColor: TUI_THEME.pink,
-        title: 'Message', paddingX: 1 })
-      this.composer = new TextareaRenderable(renderer, { id: 'vivi-composer', width: '100%', height: 2,
-        wrapMode: 'word', placeholder: 'Message, !shell command or /menu', backgroundColor: TUI_THEME.background,
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'word', content: this.status, visible: false })
+      this.shellNotice = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-shell-notice', width: '100%',
+        flexShrink: 0, content: USER_SHELL_DISCLOSURE, fg: TUI_THEME.foreground, wrapMode: 'word', visible: false })
+      this.composerBox = new BoxRenderable(renderer, { id: 'vivi-composer-box', height: 3,
+        flexShrink: 0, border: ['top', 'bottom'], borderColor: TUI_THEME.pink, titleColor: TUI_THEME.pink,
+        paddingX: 1 })
+      this.copyToast = new TextRenderable(renderer, { id: 'vivi-copy-toast', content: ' Copied! ',
+        position: 'absolute', right: 0, top: -2, width: 9, height: 1, zIndex: 1,
+        fg: TUI_THEME.highlightForeground, bg: TUI_THEME.selectedBackground,
+        selectable: false, visible: false, wrapMode: 'none' })
+      this.composerBox.add(this.copyToast)
+      this.composer = new TextareaRenderable(renderer, { id: 'vivi-composer', width: '100%', height: 1,
+        wrapMode: 'word', placeholder: COMPOSER_PLACEHOLDER, backgroundColor: TUI_THEME.background,
         textColor: TUI_THEME.foreground, focusedBackgroundColor: TUI_THEME.background,
         focusedTextColor: TUI_THEME.foreground, placeholderColor: TUI_THEME.muted,
         ...TEXT_SELECTION, cursorColor: TUI_THEME.lavender,
@@ -519,7 +580,7 @@ export class OpenTuiIO implements ChatIO {
         titleColor: TUI_THEME.lavender, paddingX: 1 })
       this.steeringQueueLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-steering-queue',
         width: '100%', height: 1, flexShrink: 0, visible: false, fg: TUI_THEME.lavender, wrapMode: 'none' })
-      this.steeringActions = new BoxRenderable(renderer, { id: 'vivi-steering-actions', width: '100%',
+      this.steeringActions = new BoxRenderable(renderer, { id: 'vivi-steering-actions', width: 0,
         height: 1, flexShrink: 0, flexDirection: 'row', gap: 1, visible: false })
       this.processBar = new BoxRenderable(renderer, { id: 'vivi-processes', width: '100%', height: 1,
         flexShrink: 0, flexDirection: 'row', gap: 1, visible: false })
@@ -539,9 +600,9 @@ export class OpenTuiIO implements ChatIO {
           !this.closed && !!this.processControls && this.processBar.visible, action)
         this.processBar.add(button)
       }
-      this.footer.add(this.actionBar); this.footer.add(this.workspaceLine)
-      for (const child of [this.headerBox, this.transcript, this.statusLine, this.pickerBox,
-        this.completionBox, this.steeringQueueLine, this.modelLine, this.composerBox, this.steeringActions, this.processBar, this.footer, this.hintLine]) this.shell.add(child)
+      this.footer.add(this.modelLine); this.footer.add(this.actionBar); this.footer.add(this.steeringActions)
+      for (const child of [this.headerBox, this.workspaceLine, this.transcript, this.statusLine, this.pickerBox,
+        this.completionBox, this.steeringQueueLine, this.shellNotice, this.composerBox, this.processBar, this.footer, this.hintLine]) this.shell.add(child)
       this.updateHeader(); this.updateActionBar()
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
@@ -550,6 +611,7 @@ export class OpenTuiIO implements ChatIO {
       renderer.on(CliRenderEvents.FRAME, this.frameHandler)
       renderer.on(CliRenderEvents.BLUR, this.blurHandler)
       renderer.on(CliRenderEvents.FOCUS, this.focusHandler)
+      renderer.on(CliRenderEvents.SELECTION, this.selectionHandler)
       renderer.on(CliRenderEvents.RENDER_ERROR, this.errorHandler)
       renderer.on(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
       process.on('SIGINT', this.signalHandler)
@@ -561,7 +623,7 @@ export class OpenTuiIO implements ChatIO {
       // Construction can fail before a widget is attached to the renderer's root.
       // Destroy detached widgets too; renderer.destroy only owns attached children.
       for (const widget of [this.composer, this.secretMask, this.completionList, this.header,
-        this.transcript, this.statusLine, this.composerBox, this.completionBox,
+        this.transcript, this.statusLine, this.shellNotice, this.copyToast, this.composerBox, this.completionBox,
         this.pickerBox, this.hintLine, this.actionBar, this.tokenLine, this.headerBox,
         this.modelLine, this.workspaceLine, this.steeringQueueLine, this.steeringActions, this.processBar, this.footer, this.shell]) {
         if (widget && !widget.parent && !widget.isDestroyed) {
@@ -583,6 +645,7 @@ export class OpenTuiIO implements ChatIO {
     let terminalTitle: TerminalTitleController | undefined
     let programStatus: TerminalProgramStatus | undefined
     let io: OpenTuiIO | undefined
+    let clipboard: OpenTuiOptions['clipboard']
     const windowsInput = process.platform === 'win32' && process.stdin.isTTY
       ? createWindowsInputBridge(process.stdin, text => { process.stdout.write(text) }, () => {
         renderer?.emit(CliRenderEvents.HANDLER_ERROR, { error: new Error('Windows console input failed') })
@@ -601,12 +664,14 @@ export class OpenTuiIO implements ChatIO {
       const titleSink = options.terminalTitle ?? createTerminalTitleSink(title => renderer!.setTerminalTitle(title), process.stdout, process.env.TERM)
       terminalTitle = new TerminalTitleController(titleSink)
       programStatus = new TerminalProgramStatus(options.programStatus ?? createProgramStatusSink(process.stdout, options.statusEnvironment), !options.oneShot)
-      io = new OpenTuiIO(renderer, options, terminalTitle, programStatus)
+      clipboard = options.clipboard ?? createClipboard({ host: createHostClipboard(), terminal: createRendererClipboardAdapter(renderer) })
+      io = new OpenTuiIO(renderer, { ...options, clipboard }, terminalTitle, programStatus)
       if (historyUnavailable) io.updateStatus('Saved prompt history unavailable; history works for this launch')
       io.windowsInput = windowsInput
       windowsInput?.start()
       return io
     } catch (error) {
+      if (!io) void clipboard?.dispose().catch(() => undefined)
       try { windowsInput?.close() } finally {
         if (renderer && !renderer.isDestroyed) renderer.destroy()
         if (!renderer || renderer.isDestroyed) programStatus?.close()
@@ -621,6 +686,7 @@ export class OpenTuiIO implements ChatIO {
     return Boolean(process.stdin.isTTY && process.stdout.isTTY && !this.closed && !this.failed && !this.renderer.isDestroyed)
   }
   get canAskQuestions(): boolean { return this.canAutoReview }
+  readonly compactStartup = true
   setApprovalMode(mode: ApprovalMode): void { this.approvalMode = mode; this.updateHeader() }
   setTaskMode(mode: TaskMode): void { this.taskMode = mode; this.updateHeader() }
 
@@ -664,6 +730,7 @@ export class OpenTuiIO implements ChatIO {
     this.reviewNotices = this.reviewNotices.map(redactEntry)
     this.sessionTitle = this.safe(this.sessionTitle, 4096)
     this.sessionModel = this.safe(this.sessionModel, 4096)
+    this.sessionEffort = this.safe(this.sessionEffort, 256)
     this.updateHeader()
     this.composerBox.title = this.safe(this.composerBox.title ?? '', 4096)
     this.pickerBox.title = this.safe(this.pickerBox.title ?? '', 4096)
@@ -671,6 +738,7 @@ export class OpenTuiIO implements ChatIO {
       name: this.safe(option.name, 1024), description: this.safe(option.description, 2048) }))
     this.inputChanged()
     this.questionDialog?.redact()
+    this.controls?.redact()
     this.rebuild()
     this.updateSteeringQueue()
     this.updateStatus()
@@ -689,52 +757,88 @@ export class OpenTuiIO implements ChatIO {
   }
   private ready(pending = this.pending): boolean {
     return !!pending?.armed && !this.closed &&
-      (!['approval', 'question', 'steering'].includes(pending.kind) || this.lastRenderedFrame > pending.openedFrame)
+      (!['approval', 'question', 'steering', 'control'].includes(pending.kind) || this.lastRenderedFrame > pending.openedFrame)
   }
   private updateApprovalLayout(): void {
     if (this.closed) return
-    this.statusLine.height = 1
+    if (this.pending?.kind === 'approval') this.pickerBox.bottomTitle = this.renderer.terminalHeight < 10 ? '↑↓ · Enter · Esc' : undefined
     this.updateHeader()
-    this.updateFooter()
   }
   private updateActionBar(): void {
     if (this.closed) return
     if (this.actionBar) this.actionBar.visible = this.pending?.kind === 'chat' &&
-      !this.cancelCallbacks.size && !this.completions.length && this.renderer.terminalWidth >= 48 && this.renderer.terminalHeight >= 14
-    // Chat controls and workspace share a row where they fit. Modal shortcuts
-    // remain separate so a right-aligned path can never cover an action hitbox.
+      !this.cancelCallbacks.size && this.renderer.terminalWidth >= 24 && this.renderer.terminalHeight >= 6
+    // One menu entry shares the metadata row; dialogs retain their own shortcuts.
     this.updateFooter()
     this.updateComposerLayout()
   }
   private updateFooter(): void {
     if (this.closed || !this.footer) return
     const columns = Math.max(1, this.renderer.terminalWidth)
-    const buttons = this.actionBar.getChildren() as TextRenderable[]
-    const compact = columns < 72
-    for (const button of buttons) {
-      const label = button.plainText.trim()
-      button.content = compact ? label : ` ${label} `
-      button.width = label.length + (compact ? 0 : 2)
+    const steering = this.pending?.kind === 'steering' && this.steering !== undefined
+    const draft = this.composer.plainText.trim().length > 0
+    this.steeringHasDraft = draft
+    const queue = this.steeringQueue.length > 0
+    this.steeringActions.visible = steering && columns >= 24
+    const actions = this.steeringActions.getChildren() as TextRenderable[]
+    for (const action of actions) {
+      action.visible = action.id === 'vivi-steering-hint' ? (!draft && (!queue || columns < 72) || columns >= 100)
+        : action.id === 'vivi-steering-interrupt' ? draft : queue && columns >= 72
     }
-    const controls = this.actionBar.visible ? buttons.reduce((sum, button) => sum + button.plainText.trim().length + (compact ? 0 : 2), 0) + Math.max(0, buttons.length - 1) : 0
-    const stacked = this.workspaceStatus && controls > 0 && columns < controls + 21
-    this.footer.flexDirection = stacked ? 'column' : 'row'
-    this.footerRows = stacked ? 2 : 1
-    this.footer.height = this.footerRows
-    this.footer.visible = this.workspaceStatus || this.actionBar.visible
-    this.hintLine.visible = !this.actionBar.visible && !(this.workspaceStatus && this.renderer.terminalHeight < 10) && !(this.pending?.kind === 'question' && this.renderer.terminalHeight <= 15)
-    if (this.pending?.kind === 'question' && this.renderer.terminalHeight <= 15) this.footer.visible = false
-    this.actionBar.width = controls
-    this.workspaceLine.visible = this.workspaceStatus
-    const width = stacked ? columns : Math.max(1, columns - controls)
-    this.workspaceLine.width = width
-    const folder = this.workspaceDirectory === undefined ? 'disabled' :
-      `${fitStatusColumns(this.safe(JSON.stringify(this.workspaceDirectory)), Math.max(0, width - 23))} · reviewed text edits`
-    this.workspaceLine.content = fitStatusColumns(`Workspace: ${folder}`, width)
+    const visible = actions.filter(action => action.visible)
+    const steeringWidth = this.steeringActions.visible
+      ? visible.reduce((width, action) => width + statusTextColumns(action.plainText), 0) + Math.max(0, visible.length - 1) : 0
+    this.steeringActions.width = steeringWidth
+    const menuWidth = this.actionBar.visible ? 8 : 0
+    const controls = menuWidth + steeringWidth
+    this.footerRows = 1
+    this.footer.height = 1
+    this.footer.visible = this.pending?.kind !== 'question' || this.renderer.terminalHeight > 15
+    this.hintLine.visible = this.pending !== undefined && !this.actionBar.visible && this.pending.kind !== 'chat' && this.pending.kind !== 'steering' && this.pending.kind !== 'control' &&
+      !(this.pending.kind === 'question' && this.renderer.terminalHeight <= 15) &&
+      !(this.pending.kind === 'approval' && this.renderer.terminalHeight < 10)
+    this.actionBar.width = menuWidth
+    this.modelLine.visible = this.footer.visible
+    const width = Math.max(1, columns - controls)
+    this.modelLine.width = width
+    const mode = conversationModeLabel(this.taskMode, this.approvalMode)
+    const modelWidth = width - statusTextColumns(` · ${mode}`)
+    const metadata = `${this.sessionModel}${this.sessionEffort ? ` · ${this.sessionEffort}` : ''}${this.sessionPlan ? ' · ChatGPT plan' : ''}`
+    const displayed = modelWidth > 0 ? fitStatusColumns(metadata, modelWidth, true) : ''
+    const content = modelWidth > 0 ? `${displayed} · ${mode}` : fitStatusColumns(mode, width, true)
+    if (this.modelLine.plainText !== content) this.footerChangedFrame = this.renderer.frameId
+    this.modelLine.content = content
+    // Only the visible model and effort cells act as shortcuts. Separators,
+    // permission mode and unused space do not open settings.
+    const visibleWidth = this.footerColumns(displayed.replace(/…$/, ''))
+    const modelEnd = this.footerColumns(this.sessionModel)
+    const effortStart = modelEnd + this.footerColumns(' · ')
+    this.footerTargets = [{ start: 0, end: Math.min(modelEnd, visibleWidth), command: '/models' }]
+    if (this.sessionEffort) this.footerTargets.push({ start: effortStart,
+      end: Math.min(effortStart + this.footerColumns(this.sessionEffort), visibleWidth), command: '/effort' })
+  }
+  private footerColumns(text: string): number {
+    if (/^[\x20-\x7e]*$/.test(text)) return text.length
+    const lib = resolveRenderLib(), encoded = lib.encodeUnicode(text, this.renderer.widthMethod)
+    if (!encoded) return 0
+    try { return encoded.data.reduce((width, cell) => width + cell.width, 0) }
+    finally { lib.freeUnicode(encoded) }
+  }
+  private handleFooterMouse(event: MouseEvent): void {
+    const pending = this.pending
+    const cell = event.x - this.modelLine.x
+    const target = this.footerTargets.find(target => cell >= target.start && cell < target.end)
+    this.mouseActivation.handle(event, this.modelLine, `${target?.command}:${this.modelLine.plainText}`, pending,
+      !!target && pending?.kind === 'chat' && !this.cancelCallbacks.size && this.ready(pending) &&
+      this.lastRenderedFrame > this.footerChangedFrame, () => {
+        this.nextComposerDraft = this.composer.plainText
+        pending!.finish(target!.command)
+      })
   }
   private updateChoiceLayout(): void {
     if (this.pending?.kind !== 'choice' || !this.picker) return
-    const fixedRows = this.headerRows + 2 + Number(this.processBar.visible) + (this.footer.visible ? this.footerRows : 0) + (this.hintLine.visible ? 1 : 0)
+    const fixedRows = this.headerRows + Number(this.workspaceLine.visible) + 1 + Number(this.statusLine.visible) +
+      Number(this.processBar.visible) + (this.footer.visible ? this.footerRows : 0) + Number(this.hintLine.visible)
     const height = Math.max(3, Math.min(10, this.renderer.terminalHeight - fixedRows - 1,
       this.picker.options.length * 2 + 2 + (this.dialogActions ? 1 : 0)))
     this.pickerBox.height = height
@@ -745,17 +849,32 @@ export class OpenTuiIO implements ChatIO {
     if (!this.composer || !this.composerBox || this.closed) return
     const kind = this.pending?.kind
     const multiline = kind === 'chat' || kind === 'steering' || kind === 'text'
+    const shell = (kind === 'chat' || kind === 'steering') && parseUserShellInput(this.composer.plainText) !== undefined
+    if (this.shellNotice.visible !== shell) this.shellNotice.visible = shell
+    if (shell) {
+      const disclosure = this.renderer.terminalHeight < 20
+        ? 'Runs unsandboxed as your OS account. Send approves. Output is saved and sent to your provider. /session for details.'
+        : USER_SHELL_DISCLOSURE
+      if (this.shellNotice.plainText !== disclosure) this.shellNotice.content = disclosure
+    }
+    const simple = (kind === undefined || kind === 'chat' || kind === 'steering' || kind === 'control') && !shell
+    const border = this.composerBox.border
+    if (simple ? !Array.isArray(border) || border.length !== 2 || border[0] !== 'top' || border[1] !== 'bottom' : border !== true) {
+      this.composerBox.border = simple ? ['top', 'bottom'] : true
+    }
+    if (simple && this.composerBox.title !== undefined) this.composerBox.title = undefined
     // Measure wrapped terminal cells using the same native editor as the draft.
     // Its current viewport only counts visible lines, so measuring the complete
     // buffer is essential for both explicit newlines and long wrapped lines.
-    const width = Math.max(1, this.renderer.terminalWidth - 4) // border + padding
-    const measured = multiline ? this.composer.editorView.measureForDimensions(width, 65536)?.lineCount : 2
+    const width = Math.max(1, this.renderer.terminalWidth - (simple ? 2 : 4))
+    const measured = simple && !this.composer.plainText ? 1
+      : multiline || simple ? this.composer.editorView.measureForDimensions(width, 65536)?.lineCount : 2
     const otherRows = this.shell.getChildren().reduce((rows, child) => child.visible &&
       child !== this.transcript && child !== this.composerBox ? rows + Number(child.height) : rows, 0)
     // Keep a transcript viewport and leave bounded drafts scrollable. Tiny
-    // terminals can reduce the two-row idle composer to one editable row.
+    // terminals retain an editable row without reserving empty input lines.
     const maximum = Math.max(1, Math.min(10, this.renderer.terminalHeight - otherRows - 4))
-    const height = multiline ? Math.min(maximum, Math.max(2, measured ?? this.composer.lineCount)) : Math.min(2, maximum)
+    const height = multiline || simple ? Math.min(maximum, Math.max(simple || shell ? 1 : 2, measured ?? this.composer.lineCount)) : Math.min(2, maximum)
     if (this.composer.height !== height) this.composer.height = height
     if (this.composerBox.height !== height + 2) this.composerBox.height = height + 2
   }
@@ -778,20 +897,30 @@ export class OpenTuiIO implements ChatIO {
     if (!pending || pending.kind === 'chat' || pending.kind === 'question' || pending.kind === 'steering') return
     // Preserve room for the query in very small terminals; keyboard paths remain.
     if (pending.kind !== 'approval' && this.renderer.terminalHeight < (pending.kind === 'search' ? 20 : 16)) return
-    this.dialogActions = new BoxRenderable(this.renderer, { id: 'vivi-dialog-actions', height: 1,
-      flexShrink: 0, flexDirection: 'row', gap: 1 })
+    this.dialogActions = new BoxRenderable(this.renderer, { id: 'vivi-dialog-actions', height: pending.kind === 'approval' ? 2 : 1,
+      width: '100%', flexShrink: 0, flexDirection: pending.kind === 'approval' ? 'column' : 'row', gap: pending.kind === 'approval' ? 0 : 1 })
     const add = (id: string, label: string, activate: () => void): void => {
-      this.dialogActions!.add(this.mouseButton(id, label, activate))
+      const button = this.mouseButton(id, label, activate)
+      if (pending.kind === 'approval') {
+        const selected = id === (this.approvalIndex === 1 ? 'vivi-approve' : 'vivi-deny')
+        button.width = '100%'
+        button.fg = selected ? TUI_THEME.highlightForeground : TUI_THEME.foreground
+        button.bg = selected ? TUI_THEME.selectedBackground : TUI_THEME.background
+        const row = new BoxRenderable(this.renderer, { id: `${id}-row`, width: '100%', height: 1,
+          flexShrink: 0, backgroundColor: button.bg })
+        row.add(button)
+        this.dialogActions!.add(row)
+      } else this.dialogActions!.add(button)
     }
     if (pending.kind === 'approval') {
       const labels = pending.approvalLabels ?? { deny: 'Deny', allow: 'Approve' }
-      add('vivi-deny', `${this.approvalIndex === 0 ? '›' : ' '} ${labels.deny}`, () => pending.finish('deny'))
       add('vivi-approve', `${this.approvalIndex === 1 ? '›' : ' '} ${labels.allow}`, () => {
         // Mouse protocols have no cross-dialog click identity. Treat a rapid second
         // click as part of the first gesture, never approval of the next proposal.
         this.approvalMouseNotBefore = performance.now() + APPROVAL_REPEAT_WINDOW_MS
         pending.finish('allow')
       })
+      add('vivi-deny', `${this.approvalIndex === 0 ? '›' : ' '} ${labels.deny}`, () => pending.finish('deny'))
     } else {
       add('vivi-confirm', pending.kind === 'choice' || pending.kind === 'search' ? 'Choose' : 'Confirm', () => {
         if (pending.kind === 'choice') pending.finish(this.picker?.getSelectedIndex())
@@ -852,16 +981,18 @@ export class OpenTuiIO implements ChatIO {
     this.status = this.safe(status, 1024)
     const columns = Math.max(1, this.renderer.terminalWidth)
     const run = this.runStatus.label
-    const detail = this.status.startsWith('Tool running:') ? ` · ${this.status}` : ''
+    const detail = this.pending?.kind === 'steering' && this.steeringMessage ? ` · ${this.steeringMessage}`
+      : this.status.startsWith('Tool running:') ? ` · ${this.status}` : ''
     const summary = run === undefined ? this.status : `${run}${detail}`
     this.statusLine.content = fitStatusColumns(summary.replace(/[\t\n]+/g, ' '), columns)
+    this.statusLine.visible = summary !== 'Ready'
     this.updateHeader()
-    this.updateFooter()
+    this.updateComposerLayout()
     this.updateTerminalTitle()
   }
   private updateTerminalTitle(): void {
     if (this.closed) return
-    const input = this.pending !== undefined && ['text', 'secret', 'approval', 'choice', 'search', 'question'].includes(this.pending.kind)
+    const input = this.pending !== undefined && ['text', 'secret', 'approval', 'choice', 'search', 'question', 'control'].includes(this.pending.kind)
     this.programStatus.setBlocked(input ? this.pending!.kind === 'approval' ? 'permission'
       : this.pending!.kind === 'secret' ? 'auth' : 'question' : undefined)
     this.terminalTitle.update(this.sessionTitle, input ? 'input'
@@ -871,27 +1002,37 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || !this.headerBox) return
     const columns = Math.max(1, this.renderer.terminalWidth)
     const context = formatContextStatus(this.contextUsage)
-    const contextColumns = statusTextColumns(context)
+    const usage = this.contextUsage
+    const capacity = Math.min(usage?.maxInputTokens ?? Infinity,
+      usage?.contextWindow === undefined ? Infinity : usage.contextWindow - usage.outputReserveTokens)
+    const showContext = this.historyLength > 0 || (usage !== undefined && capacity > 0 && usage.inputTokens >= capacity * 0.8)
+    const contextColumns = showContext ? statusTextColumns(context) : 0
     // Keep the request occupancy in the top-right corner. Narrow terminals put
     // it on its own row rather than clipping a number or hiding unknown capacity.
-    const shared = columns >= contextColumns + 20 || this.renderer.terminalHeight < 14
+    const shared = !showContext || columns >= contextColumns + 20 || this.renderer.terminalHeight < 14
     const tokenWidth = Math.min(columns, contextColumns)
-    const titleWidth = shared ? Math.max(0, columns - tokenWidth - 1) : columns
-    const gap = shared && titleWidth > 0 ? 1 : 0
+    const titleWidth = shared ? Math.max(0, columns - tokenWidth - Number(showContext)) : columns
+    const gap = shared && titleWidth > 0 && showContext ? 1 : 0
     this.headerBox.flexDirection = shared ? 'row' : 'column'
     this.headerRows = shared ? 1 : 2
     this.headerBox.height = this.headerRows
     this.headerBox.gap = gap
     this.header.visible = titleWidth > 0
     this.header.width = titleWidth
-    this.header.content = fitStatusColumns(this.sessionTitle, titleWidth, true)
+    this.header.content = fitStatusColumns(this.sessionTitle === 'Untitled conversation' ? 'vivi' : this.sessionTitle, titleWidth, true)
     const contextWidth = shared ? Math.max(1, columns - titleWidth - gap) : columns
     this.tokenLine.width = contextWidth
+    this.tokenLine.visible = showContext
     this.tokenLine.content = contextColumns <= contextWidth ? context : contextWidth >= 9 ? 'Context ?' : '…'
-    const mode = conversationModeLabel(this.taskMode, this.approvalMode)
-    const modelWidth = columns - statusTextColumns(` · ${mode}`)
-    this.modelLine.visible = this.pending?.kind !== 'question' || this.renderer.terminalHeight > 15
-    this.modelLine.content = modelWidth > 0 ? `${fitStatusColumns(this.sessionModel, modelWidth, true)} · ${mode}` : fitStatusColumns(mode, columns, true)
+    this.workspaceLine.visible = this.workspaceStatus && this.renderer.terminalHeight >= 14 && this.pending?.kind !== 'question'
+    this.workspaceLine.width = columns
+    const directory = this.workspaceDirectory
+    const home = homedir()
+    const inHome = directory !== undefined && (process.platform === 'win32' ? directory.toLowerCase() : directory)
+      .startsWith((process.platform === 'win32' ? home.toLowerCase() : home) + (process.platform === 'win32' ? '\\' : '/'))
+    const folder = directory === home ? '~' : inHome ? `~${directory!.slice(home.length)}` : directory
+    this.workspaceLine.content = fitStatusColumns(this.safe(folder ?? 'Workspace disabled', 65536), columns)
+    this.updateFooter()
     this.updateTerminalTitle()
   }
   /** Only an actual agent turn opts into editable, owner-scoped steering. */
@@ -912,6 +1053,7 @@ export class OpenTuiIO implements ChatIO {
     if (draft) this.nextComposerDraft = this.safe(draft, MAX_INPUT)
     if (steering.timer !== undefined) clearTimeout(steering.timer)
     this.steering = undefined
+    this.steeringMessage = undefined
     this.mouseActivation.clear()
     if (editing) {
       this.pending = undefined
@@ -933,12 +1075,13 @@ export class OpenTuiIO implements ChatIO {
       finish: () => undefined }
     steering.pending = pending
     this.pending = pending
+    this.steeringMessage = undefined
     this.composerBox.visible = true
     this.composer.visible = true
     this.secretMask.visible = false
-    this.composerBox.title = 'Message while working'
+    this.composerBox.title = undefined
     this.composerBox.bottomTitle = undefined
-    this.hintLine.content = STEERING_HINTS
+    this.composer.placeholder = COMPOSER_PLACEHOLDER
     this.composer.setText(this.safe(steering.draft, MAX_INPUT))
     this.composer.gotoBufferEnd()
     this.composer.traits = {}
@@ -948,10 +1091,17 @@ export class OpenTuiIO implements ChatIO {
     const live = (activate: () => void): (() => void) => () => {
       if (this.steering === steering && this.pending === pending && this.ready(pending)) activate()
     }
+    this.steeringActions.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, id: 'vivi-steering-hint',
+      content: ' Enter queues ', width: 14, height: 1, flexShrink: 0, fg: TUI_THEME.muted,
+      attributes: TextAttributes.DIM, wrapMode: 'none' }))
     this.steeringActions.add(this.mouseButton('vivi-steering-interrupt', 'Interrupt & send', live(() => this.submitSteering(true))))
     this.steeringActions.add(this.mouseButton('vivi-steering-undo', 'Undo latest', live(() => this.editLatestSteering())))
     this.steeringActions.add(this.mouseButton('vivi-steering-clear', 'Clear', live(() => steering.controls.clear())))
-    this.steeringActions.visible = true
+    for (const action of this.steeringActions.getChildren() as TextRenderable[]) {
+      action.fg = TUI_THEME.muted
+      action.bg = TUI_THEME.background
+      action.attributes = TextAttributes.DIM
+    }
     this.updateActionBar()
     this.updateSteeringQueue()
     // A run or modal replacement drains the previous input batch before accepting
@@ -983,16 +1133,7 @@ export class OpenTuiIO implements ChatIO {
     this.steeringQueueLine.content = lines.map(line => fitStatusColumns(line, columns, true)).join('\n')
     this.steeringQueueLine.height = lines.length
     this.steeringQueueLine.visible = this.steeringQueue.length > 0
-    const undo = this.steeringActions.getChildren().find(child => child.id === 'vivi-steering-undo') as TextRenderable | undefined
-    const clear = this.steeringActions.getChildren().find(child => child.id === 'vivi-steering-clear')
-    if (undo) {
-      const label = columns < 40 ? 'Undo' : 'Undo latest'
-      undo.content = ` ${label} `
-      undo.width = label.length + 2
-      undo.visible = columns >= 34
-    }
-    if (clear) clear.visible = columns >= 34
-    this.steeringActions.visible = this.pending?.kind === 'steering' && this.steering !== undefined
+    this.updateFooter()
     this.updateComposerLayout()
   }
   private editLatestSteering(): void {
@@ -1034,7 +1175,7 @@ export class OpenTuiIO implements ChatIO {
     }
   }
   private steeringFeedback(message: string): void {
-    if (this.pending?.kind === 'steering') this.composerBox.bottomTitle = this.safe(message, 1024)
+    if (this.pending?.kind === 'steering') this.steeringMessage = this.safe(message, 1024)
     this.updateStatus(message)
   }
   steeringAccepted(content: string, initial = false): void {
@@ -1061,12 +1202,15 @@ export class OpenTuiIO implements ChatIO {
   }
   private inputChanged(): void {
     if (this.closed || this.changingInput) return
-    if (this.pending?.kind === 'steering') this.composerBox.bottomTitle = undefined
+    if (this.pending?.kind === 'steering' && this.steeringMessage !== undefined) {
+      this.steeringMessage = undefined
+      this.updateStatus()
+    }
     const raw = this.composer.plainText
     if (this.pending?.kind === 'chat' || this.pending?.kind === 'steering') {
       this.composerBox.title = parseUserShellInput(raw) !== undefined
         ? this.pending.kind === 'steering' ? 'Shell · queued after turn · Send approves unsandboxed' : 'Shell · Send approves unsandboxed'
-        : this.pending.kind === 'steering' ? 'Message while working' : 'Message'
+        : undefined
     }
     const safe = this.pending?.kind === 'search'
       ? this.safe(raw, MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
@@ -1206,6 +1350,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.clear()
     this.consume(event)
     if (this.diagnosticKey) return
+    if (this.pending?.kind === 'control') { this.controls?.handlePaste(event); return }
     if (this.pending?.kind === 'question') { this.questionDialog?.handlePaste(event); return }
     if (!this.pending?.armed || this.closed || this.pending.kind === 'choice' ||
       this.pending.kind === 'steering' && !this.ready()) return
@@ -1234,6 +1379,7 @@ export class OpenTuiIO implements ChatIO {
       if (!key.repeated && key.eventType !== 'repeat') this.stopProcess(key.name === 'f7')
       return
     }
+    if (this.pending?.kind === 'control') { this.controls?.handleKey(key); return }
     // This shortcut changes display details only, including while an approval is open.
     if (key.ctrl && key.name === 'o') {
       this.consume(key)
@@ -1266,8 +1412,8 @@ export class OpenTuiIO implements ChatIO {
           Math.max(1, this.transcript.viewport.height - 1)); return
       }
       if (!this.ready() || key.eventType === 'repeat' || key.repeated || key.ctrl || key.meta || key.super || key.hyper) return
-      if (['left', 'up', 'home'].includes(key.name)) this.approvalIndex = 0
-      else if (['right', 'down', 'end'].includes(key.name)) this.approvalIndex = 1
+      if (['up', 'home', 'right'].includes(key.name)) this.approvalIndex = 1
+      else if (['down', 'end', 'left'].includes(key.name)) this.approvalIndex = 0
       else if (key.name === 'tab') this.approvalIndex = 1 - this.approvalIndex
       else if (['return', 'kpenter', 'linefeed', 'space'].includes(key.name) && !key.shift) {
         this.pending.finish(this.approvalIndex === 1 ? 'allow' : 'deny'); return
@@ -1386,7 +1532,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private submit(): void {
     const pending = this.pending
-    if (!pending?.armed || pending.kind === 'choice' || this.closed) return
+    if (!pending?.armed || pending.kind === 'choice' || pending.kind === 'control' || this.closed) return
     if (pending.kind === 'steering') { this.submitSteering(false); return }
     // Native onSubmit and stale editor events must obey the same turn lock as keys.
     if (this.cancelCallbacks.size && pending.kind === 'chat') return
@@ -1454,8 +1600,9 @@ export class OpenTuiIO implements ChatIO {
     this.composer.visible = kind !== 'secret'
     this.secretMask.visible = kind === 'secret'
     this.composerBox.title = this.safe(title, 4096)
+    this.composer.placeholder = kind === 'chat' ? COMPOSER_PLACEHOLDER : ''
     this.hintLine.content = kind === 'chat' ? HINTS : kind === 'approval'
-      ? `←/→ or Tab select · Enter confirm · Click ${approvalLabels?.deny ?? 'Deny'} / ${approvalLabels?.allow ?? 'Approve'} · Escape cancels`
+      ? '↑/↓ select · Enter confirm · Esc cancel'
       : kind === 'search' ? 'Type to search · ↑/↓ select · PgUp/PgDn · Home/End'
       : kind === 'choice' ? '↑/↓ select · Enter or click choose · Escape back'
       : kind === 'secret' ? 'Input hidden · Enter confirm · Escape back · Ctrl+U clear'
@@ -1506,7 +1653,7 @@ export class OpenTuiIO implements ChatIO {
       this.inputQueue.setBlocked(kind !== 'chat' && kind !== 'approval')
       this.updateTerminalTitle()
       this.updateSteeringQueue()
-      this.approvalIndex = 0
+      this.approvalIndex = 1
       this.updateApprovalLayout()
       this.updateActionBar()
       this.renderDialogActions()
@@ -1531,6 +1678,50 @@ export class OpenTuiIO implements ChatIO {
     })
   }
   private nextComposerDraft = ''
+  setControlMode(active: boolean, title?: string): void {
+    if (this.closed) return
+    if (!active) {
+      this.controls?.close(); this.controls = undefined; this.shell.opacity = 1
+      return
+    }
+    if (this.controls) return
+    this.controls = new ControlModal(this.renderer, { safe: (text, limit) => this.safe(text, limit),
+      ready: () => this.pending?.kind === 'control' && this.ready(), completedFrame: () => this.lastRenderedFrame,
+      foreground: TUI_THEME.foreground, accent: TUI_THEME.lavender, selection: TUI_THEME.selectedBackground,
+      selectedForeground: TUI_THEME.highlightForeground })
+    this.controls.setTitle(title ?? 'Conversation actions')
+    this.shell.opacity = 0.35
+  }
+  async showControlDetails(details: ControlDetails): Promise<void> {
+    await this.controlInput(modal => modal.showDetails(details))
+  }
+  async showControlOutput(includeUnseen = false): Promise<void> {
+    if (!this.controls || !includeUnseen && !this.controls.hasOutput) return
+    await this.controlInput(modal => modal.showOutput(includeUnseen))
+  }
+  private async controlInput<T>(run: (modal: ControlModal) => Promise<T>): Promise<T | undefined> {
+    const modal = this.controls
+    if (!modal || this.closed) return undefined
+    this.pending?.finish(undefined)
+    const pending: PendingInput = { kind: 'control', armed: false, openedFrame: this.renderer.frameId, finish: () => modal.cancel() }
+    this.pending = pending
+    this.updateTerminalTitle()
+    const timer = setTimeout(() => { if (this.pending === pending && !this.closed) pending.armed = true }, 0)
+    try { return await run(modal) }
+    finally {
+      clearTimeout(timer)
+      if (this.pending === pending) this.pending = undefined
+      this.updateTerminalTitle()
+    }
+  }
+  private suspendControls(): () => void {
+    const modal = this.controls
+    if (!modal) return () => undefined
+    modal.overlay.visible = false; this.shell.opacity = 1
+    return () => {
+      if (this.controls === modal && !this.closed) { modal.overlay.visible = true; this.shell.opacity = 0.35 }
+    }
+  }
   setComposerDraft(content: string): void {
     if (this.closed) return
     if (content.length > 65536) throw new Error('Skill draft request exceeds composer limit')
@@ -1543,17 +1734,29 @@ export class OpenTuiIO implements ChatIO {
     return typeof value === 'string' ? value : undefined
   }
   async askText(title: string, initial = ''): Promise<string | undefined> {
+    if (this.controls) {
+      if (this.controls.hasOutput) await this.showControlOutput()
+      return this.controlInput(modal => modal.text(title, initial))
+    }
     const value = await this.openInput('text', title, initial)
     return typeof value === 'string' ? value : undefined
   }
   async askSecret(title: string): Promise<string | undefined> {
-    const value = await this.openInput('secret', title)
-    return typeof value === 'string' ? value : undefined
+    const restore = this.suspendControls()
+    try {
+      const value = await this.openInput('secret', title)
+      return typeof value === 'string' ? value : undefined
+    } finally { restore() }
   }
   async choose<T>(title: string, choices: readonly Choice<T>[], initialIndex = 0): Promise<T | undefined> {
     if (this.failure) throw this.failure
     if (this.closed || this.pending?.kind === 'question' || choices.length === 0) return undefined
     if (choices.length > MAX_ENTRIES) throw new Error('A picker supports at most 256 choices')
+    if (this.controls) {
+      if (this.controls.hasOutput) await this.showControlOutput()
+      const result = await this.controlInput(modal => modal.choose(title, choices, title === 'Conversation actions' ? {} : { initialIndex }))
+      return result?.kind === 'selected' ? result.value : undefined
+    }
     const selection = this.openInput('choice', title)
     this.pickerChangedFrame = this.renderer.frameId
     this.pickerBox.title = this.safe(title, 4096)
@@ -1588,6 +1791,10 @@ export class OpenTuiIO implements ChatIO {
   async chooseSearchable<T>(title: string, choices: readonly Choice<T>[], options: SearchableOptions = {}): Promise<SearchableSelection<T> | undefined> {
     if (this.failure) throw this.failure
     if (this.closed || this.pending?.kind === 'question') return undefined
+    if (this.controls) {
+      if (this.controls.hasOutput) await this.showControlOutput()
+      return this.controlInput(modal => modal.choose(title, choices, options))
+    }
     // Display is viewport-bounded, but every catalog entry remains reachable/searchable.
     const query = this.safe(options.query ?? '', MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
     const selection = this.openInput('search', 'Search models', query)
@@ -1637,6 +1844,7 @@ export class OpenTuiIO implements ChatIO {
     const publicUrl = request.call.name === 'fetch_url'
     const skillSave = request.call.name === 'save_skill'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
+    const restoreControls = this.suspendControls()
     this.showTool(request.call.id, 'approval_required', 'not_attempted', 'Exact action needs human review')
     const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
     this.activeApproval = approval
@@ -1646,13 +1854,13 @@ export class OpenTuiIO implements ChatIO {
     this.appendEntry({ category: 'activity', attention: true, label: workspace ? workspace.path : enrollment ? enrollmentLabel : `Approval required · ${scope}`,
       content: this.safe(workspace?.content ?? request.description), markdown: false, approval: approval.token,
       ...(workspace ? { workspaceDiff: workspace.content } : {}) })
-    const title = enrollment ? `${enrollmentLabel} (default: cancel)` : publicUrl
-      ? 'Review this public URL request (default: deny)' : skillSave ? 'Save skill? (default: deny)' : 'Review this change (default: deny)'
-    this.updateStatus(enrollment ? `${enrollmentLabel} · Cancel is the default` : `Approval required${workspace ? '' : ` · ${scope}`} · denial is the default`)
+    const title = enrollment ? enrollmentLabel : publicUrl
+      ? 'Review this public URL request' : skillSave ? 'Save skill?' : 'Review this change'
+    this.updateStatus(enrollment ? enrollmentLabel : `Approval required${workspace ? '' : ` · ${scope}`}`)
     const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Skip' }
       : skillSave ? { deny: 'Deny', allow: 'Save skill' } : undefined)
     this.pickerBox.title = title
-    this.pickerBox.height = 3
+    this.pickerBox.height = 4
     this.pickerBox.visible = true
     this.runStatus.setPhase('waiting_approval')
     try {
@@ -1664,6 +1872,7 @@ export class OpenTuiIO implements ChatIO {
       if (this.activeApproval === approval) this.activeApproval = undefined
       this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
       if (!this.closed && !this.runStatus.running) this.updateStatus('Ready')
+      restoreControls()
     }
   }
   private queueDialog<T>(signal: AbortSignal, cancelled: () => T, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -1746,19 +1955,19 @@ export class OpenTuiIO implements ChatIO {
       if (this.dialogActions) { this.dialogActions.destroyRecursively(); this.dialogActions = undefined }
       this.updateActionBar(); this.updateHeader(); this.updateSteeringQueue()
       try {
-        this.appendEntry({ category: 'activity', label: 'Questions · answers do not authorize actions', markdown: false,
-          content: this.safe(request.questions.map((question, index) => `${index + 1}. ${question.header}: ${question.question}${question.options ? '\n' + question.options.map(option => `${option.label}${option.description ? ' · ' + option.description : ''}`).join('\n') : ''}`).join('\n\n')) })
         this.questionDialog = new QuestionDialog(this.renderer, request, {
           safe: (text, limit) => this.safe(text, limit), clean: stripControls, ready: () => this.pending === pending && this.ready(pending),
           mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
-          // Keep one transcript row, status, and every visible shell footer.
-          availableHeight: () => this.renderer.terminalHeight - this.headerRows - 2 - Number(this.modelLine.visible)
+          // Keep transcript context, status, and every visible shell footer.
+          availableHeight: () => this.renderer.terminalHeight - this.headerRows -
+            (this.renderer.terminalHeight > 15 ? 3 : 2) - Number(this.workspaceLine.visible)
             - Number(this.processBar.visible) - (this.footer.visible ? this.footerRows : 0) - Number(this.hintLine.visible)
             - (this.steeringQueueLine.visible ? this.steeringQueueLine.height : 0),
           status: text => this.updateStatus(text), finish, foreground: TUI_THEME.foreground,
-          accent: TUI_THEME.lavender, background: TUI_THEME.background })
-        this.shell.insertBefore(this.questionDialog.box, this.modelLine)
-        this.hintLine.content = '↑/↓ choose · Enter saves · Tab actions · Ctrl+Enter Submit · Escape cancels questions'
+          accent: TUI_THEME.lavender, background: TUI_THEME.background,
+          selectedBackground: TUI_THEME.selectedBackground, selectedForeground: TUI_THEME.highlightForeground })
+        this.shell.insertBefore(this.questionDialog.box, this.composerBox)
+        this.hintLine.content = '↑/↓ select · Enter choose · Tab actions · Ctrl+Enter submit · Esc cancel'
         this.runStatus.setPhase('waiting_question')
         this.updateActionBar(); this.updateStatus('Questions need your answer · Submit when ready')
         signal.addEventListener('abort', abort, { once: true })
@@ -1793,6 +2002,7 @@ export class OpenTuiIO implements ChatIO {
   }
   runFinished(outcome: RunOutcome, continuing = false): void {
     if (this.closed) return
+    this.steeringMessage = undefined
     this.invalidateDialogs()
     this.mouseActivation.clear()
     if (this.pending?.kind === 'steering') {
@@ -1927,7 +2137,7 @@ export class OpenTuiIO implements ChatIO {
     const bodyAttributes = activity && !entry.attention ? TextAttributes.DIM : 0
     const box = new BoxRenderable(this.renderer, { flexDirection: 'column', flexShrink: 0, width: '100%', marginBottom: entry.tool ? 0 : 1,
       ...(user ? { backgroundColor: TUI_THEME.userBackground, border: ['left'], borderColor: TUI_THEME.lavender, paddingLeft: 1 } : {}) })
-    if (!entry.tool) box.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, content: entry.label, fg: headerColor, attributes: activity && !entry.attention ? TextAttributes.DIM : 0, flexShrink: 0, wrapMode: 'word' }))
+    if (!entry.tool && entry.label) box.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, content: entry.label, fg: headerColor, attributes: activity && !entry.attention ? TextAttributes.DIM : 0, flexShrink: 0, wrapMode: 'word' }))
     if (entry.tool) {
       const key = entry.tool.key, collapsed = !this.expandedTools.has(key)
       const card = cliToolCardView(entry.tool.encoded, collapsed, entry.tool.detailBytes ?? 8192, this.secrets, entry.tool)
@@ -2063,7 +2273,7 @@ export class OpenTuiIO implements ChatIO {
       earliestIndex = index
       const message = history[index]!
       const label = message.kind === 'message' ? message.role === 'user' ? 'You' : 'System'
-        : message.kind === 'assistant' ? 'Assistant' : `Tool ${message.name} · ${message.isError ? 'error result' : 'result'}`
+        : message.kind === 'assistant' ? '' : `Tool ${message.name} · ${message.isError ? 'error result' : 'result'}`
       const safeLabel = this.safe(label, 4096)
       if (message.kind === 'tool_result') {
         let encoded: string
@@ -2186,7 +2396,8 @@ export class OpenTuiIO implements ChatIO {
     this.contextUsage = undefined
     this.canCompact = false
     this.sessionTitle = 'Untitled conversation'
-    this.sessionModel = `vivi · ${provider} · choose a model with /models`
+    this.sessionModel = `${provider} · choose a model with /models`
+    this.sessionEffort = ''; this.sessionPlan = false
     this.updateHeader()
     this.clearStream()
     this.entries = []
@@ -2240,15 +2451,18 @@ export class OpenTuiIO implements ChatIO {
     }
     this.sessionId = session.id
     this.sessionTitle = this.safe(sessionDisplayTitle(session), 4096)
-    this.sessionModel = this.safe(`${session.provider} / ${session.model} · reasoning ${session.reasoning ?? 'default'}${session.provider === 'chatgpt' ? ` · Using ChatGPT plan · account ${session.chatgptAccountId?.slice(0, 12) ?? 'unavailable'}` : ''}`, 4096)
+    this.sessionModel = this.safe(`${session.provider} / ${session.model}`, 4096)
+    this.sessionEffort = this.safe(session.reasoning ?? 'default', 256)
+    this.sessionPlan = session.provider === 'chatgpt'
+    this.historyLength = session.history.length
     this.updateHeader()
 
-    this.historyLength = session.history.length
     this.entries = [...this.transcriptEntries(session.history), ...this.resultNotices]
     this.rebuild()
     this.updateStatus()
   }
   write(text: string): void {
+    if (text && this.controls?.overlay.visible) { this.controls.notice(text); return }
     if (text) this.appendEntry({ category: 'activity', label: 'vivi', content: this.safe(text.trimEnd()), markdown: false })
   }
   reviewNotice(message: string, context?: ReviewNotice): void {
@@ -2306,7 +2520,7 @@ export class OpenTuiIO implements ChatIO {
     if (!this.partialBox) {
       this.partialBox = new BoxRenderable(this.renderer, { id: 'vivi-partial', flexDirection: 'column',
         flexShrink: 0, width: '100%', marginBottom: 1 })
-      this.partialBox.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, content: 'Assistant · streaming preview (not accepted)', fg: TUI_THEME.pink }))
+      this.partialBox.add(new TextRenderable(this.renderer, { ...TEXT_SELECTION, content: 'streaming preview (not accepted)', fg: TUI_THEME.pink }))
       this.partial = this.markdown('', true)
       this.partialBox.add(this.partial)
       this.transcript.add(this.partialBox)
@@ -2330,7 +2544,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus('Receiving response · partial display only')
     } else if (event.type === 'assistant') {
       this.clearStream()
-      if (event.message.content) this.appendEntry({ category: 'assistant', label: 'Assistant', content: event.message.content, markdown: true })
+      if (event.message.content) this.appendEntry({ category: 'assistant', label: '', content: event.message.content, markdown: true })
       const index = this.liveHistoryIndex++
       for (const [ordinal, call] of event.message.toolCalls.entries()) {
         // Canonical results occupy ordered batch slots even when cancellation
@@ -2416,6 +2630,8 @@ export class OpenTuiIO implements ChatIO {
     if (this.steering) this.releaseSteering(this.steering)
     this.steeringQueue = []
     this.closed = true
+    if (this.copyToastTimer !== undefined) clearTimeout(this.copyToastTimer)
+    this.copyToastTimer = undefined
     if (this.processTimer !== undefined) clearInterval(this.processTimer)
     this.processTimer = undefined; this.processControls = undefined; this.processStopping = new Map()
     this.inputQueue.close()
@@ -2424,6 +2640,7 @@ export class OpenTuiIO implements ChatIO {
     this.runStatus.reset()
     // Pending input is settled before the native widgets disappear.
     this.pending?.finish(undefined)
+    this.controls?.close(); this.controls = undefined
     for (const callback of [...this.cancelCallbacks]) {
       try { callback() } catch { /* Cleanup must finish even if host cancellation fails. */ }
     }
@@ -2434,6 +2651,8 @@ export class OpenTuiIO implements ChatIO {
     this.renderer.off(CliRenderEvents.FRAME, this.frameHandler)
     this.renderer.off(CliRenderEvents.BLUR, this.blurHandler)
     this.renderer.off(CliRenderEvents.FOCUS, this.focusHandler)
+    this.renderer.off(CliRenderEvents.SELECTION, this.selectionHandler)
+    void this.clipboard?.dispose().catch(() => undefined)
     this.renderer.off(CliRenderEvents.RENDER_ERROR, this.errorHandler)
     this.renderer.off(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
     process.off('SIGINT', this.signalHandler)

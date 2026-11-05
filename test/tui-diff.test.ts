@@ -184,7 +184,7 @@ test('large exact pending review survives transcript pressure, scrolling and reb
   transcript.scrollTo(0); await f.frame(); expect(f.setup.captureCharFrame()).toContain('fixture.txt')
   transcript.scrollTo(transcript.scrollHeight); await f.frame(); expect(f.setup.captureCharFrame()).toContain('new 99')
   await new Promise(resolve => setTimeout(resolve, 2)); await f.frame()
-  f.input.pressEnter(); expect(await answer).toBe(false)
+  f.input.pressArrow('down'); f.input.pressEnter(); expect(await answer).toBe(false)
 })
 
 test('localized foreground/background pairs exceed 7:1 text contrast', () => {

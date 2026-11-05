@@ -12,15 +12,17 @@ async function fixture() {
   const frame = async () => { await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
   return { io, setup, frame }
 }
-test('skills completion and native action button have keyboard/mouse parity without bypassing a draft', async () => {
+test('skills completion remains available alongside the menu without bypassing a draft', async () => {
   expect(getSlashCommandCompletions('/sk').map(item => item.command)).toEqual(['/skills'])
   const f = await fixture(), reading = f.io.readLine('Message')
   await f.frame()
-  const button = f.setup.renderer.root.findDescendantById('vivi-action-skills')!
-  await f.setup.mockMouse.click(button.x + 1, button.y)
+  await f.setup.mockInput.typeText('/sk'); f.setup.mockInput.pressTab()
+  expect((f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('/skills')
+  f.setup.mockInput.pressEnter()
   expect(await reading).toBe('/skills')
   const next = f.io.readLine('Message')
   await f.setup.mockInput.typeText('Unsent text'); await f.frame()
+  const button = f.setup.renderer.root.findDescendantById('vivi-action-menu')!
   await f.setup.mockMouse.click(button.x + 1, button.y)
   const composer = f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable
   expect(composer.plainText).toBe('Unsent text')
@@ -40,20 +42,20 @@ test('creation request returns as editable composer text and requires fresh send
   const next = f.io.readLine('Message'); await f.frame(); expect(composer.plainText).toBe('')
   f.io.close(); expect(await next).toBeUndefined()
 })
-test('40-column footer retains compact hints rather than clipping fixed action buttons', async () => {
+test('40-column footer retains the menu alongside compact metadata', async () => {
   const setup = await createTestRenderer({ width: 40, height: 24, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' });
   const io = new OpenTuiIO(setup.renderer); instances.push(io);
   const reading = io.readLine('Message');
   await setup.renderOnce(); await setup.renderOnce();
-  expect(setup.renderer.root.findDescendantById('vivi-actions')!.visible).toBe(false);
-  expect(setup.captureCharFrame()).toContain('Enter send');
+  expect(setup.renderer.root.findDescendantById('vivi-actions')!.visible).toBe(true);
+  expect(setup.captureCharFrame()).toContain('/ menu');
   io.close(); expect(await reading).toBeUndefined();
 });
 
 
 
-test('native Save skill review shows exact text, defaults to deny and requires an explicit save click', async () => {
+test('native Save skill review shows exact text, starts with approval selected and requires an explicit save click', async () => {
   const f = await fixture()
   const request = { call: { id: 'native-save-skill', name: 'save_skill', arguments: { name: 'brief-summary', content: 'Exact reviewed SKILL.md', expectedRevision: null } },
     currentRevision: 'new installed skill', description: 'After exact source: "Exact reviewed SKILL.md"\nAvailable next turn' }
@@ -62,7 +64,7 @@ test('native Save skill review shows exact text, defaults to deny and requires a
   const first = await f.frame()
   expect(first).toContain('Save skill?')
   expect(first).toContain('Exact reviewed SKILL.md')
-  f.setup.mockInput.pressEnter()
+  f.setup.mockInput.pressArrow('down'); f.setup.mockInput.pressEnter()
   expect(await denied).toBe(false)
   const saving = f.io.approve({ ...request, call: { ...request.call, id: 'native-save-skill-2' } }, new AbortController().signal)
   await new Promise(resolve => setTimeout(resolve, 2))

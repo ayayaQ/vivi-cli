@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import { TextareaRenderable } from '@opentui/core'
+import { TextareaRenderable, TextRenderable } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
@@ -32,6 +32,26 @@ function watch<T>(promise: Promise<T>) {
   return async () => { await Promise.resolve(); expect(settled).toBe(false) }
 }
 const signal = () => new AbortController().signal
+
+test('question appears once with a highlighted numbered row, separate descriptions and relevant actions', async () => {
+  const f = await fixture(), answer = f.io.askQuestions(request('display'), signal()), pending = watch(answer)
+  const displayed = await f.arm()
+  expect(displayed.match(/Which direction\?/g)).toHaveLength(1)
+  expect(f.node('vivi-transcript').getChildren()).toHaveLength(0)
+  const first = f.node('vivi-question-option-0') as TextRenderable
+  const second = f.node('vivi-question-option-1') as TextRenderable
+  expect(first.plainText).toContain('1. East\n')
+  expect(first.plainText).toContain('Go east')
+  expect(first.height).toBe(2)
+  expect(first.bg.a).toBeGreaterThan(0)
+  expect(second.bg.a).toBe(0)
+  expect(f.setup.captureSpans().lines[first.y]!.spans.some(span => span.bg.a > 0 && span.width > 20 && !span.text.trim())).toBe(true)
+  expect(f.node('vivi-question-prev').visible).toBe(false)
+  expect(f.node('vivi-question-next').visible).toBe(false)
+  await f.mouse.click(first.x + 5, first.y + 1); await pending(); await f.frame()
+  await f.click('vivi-question-submit')
+  expect(await answer).toEqual({ requestId: 'display', status: 'answered', answers: [{ id: 'direction', answer: { kind: 'option', optionId: 'east' } }] })
+})
 
 test('native choices are never default answers and only final Submit sends the selected option', async () => {
   const f = await fixture(), answer = f.io.askQuestions(request(), signal()), pending = watch(answer)
@@ -93,8 +113,8 @@ test('question and approval FIFO preserves a multiline unfinished chat draft in 
     if (questionFirst) { question = f.io.askQuestions(request(), signal()); review = f.io.approve(approval, signal()) }
     else { review = f.io.approve(approval, signal()); question = f.io.askQuestions(request(), signal()) }
     await f.arm()
-    if (questionFirst) { expect(f.node('vivi-questions')).toBeDefined(); f.input.pressEscape(); expect(await question).toEqual({ requestId: 'questions-1', status: 'cancelled' }); await f.arm(); f.input.pressEnter(); expect(await review).toBe(false) }
-    else { expect(f.setup.renderer.root.findDescendantById('vivi-questions')).toBeUndefined(); f.input.pressEnter(); expect(await review).toBe(false); await f.arm(); f.input.pressEscape(); await question }
+    if (questionFirst) { expect(f.node('vivi-questions')).toBeDefined(); f.input.pressEscape(); expect(await question).toEqual({ requestId: 'questions-1', status: 'cancelled' }); await f.arm(); f.input.pressArrow('down'); f.input.pressEnter(); expect(await review).toBe(false) }
+    else { expect(f.setup.renderer.root.findDescendantById('vivi-questions')).toBeUndefined(); f.input.pressArrow('down'); f.input.pressEnter(); expect(await review).toBe(false); await f.arm(); f.input.pressEscape(); await question }
     await f.frame(); await chatPending()
     expect((f.node('vivi-composer') as TextareaRenderable).plainText).toBe('unfinished 日本語\ndraft')
     f.input.pressEnter(); expect(await chat).toBe('unfinished 日本語\ndraft')

@@ -117,7 +117,7 @@ test('long, invalid, hostile and unknown-kind data cannot hide warnings or activ
   expect((f.setup.renderer.root.findDescendantById('vivi-composer') as import('@opentui/core').TextareaRenderable).plainText).toBe('ordinary draft')
   f.input.pressEnter(); expect(await reply).toBe('ordinary draft')
 })
-for (const action of ['deny', 'allow', 'cancel'] as const) test(`actual host/native ${action} remains deny-default under repeated collapse interactions`, async () => {
+for (const action of ['deny', 'allow', 'cancel'] as const) test(`actual host/native ${action} keeps explicit confirmation under repeated collapse interactions`, async () => {
   const f = await fixture(80, 36)
   let rounds = 0, request: ApprovalRequest | undefined
   const stored: { session?: ReturnType<typeof newSession> } = {}
@@ -144,11 +144,11 @@ for (const action of ['deny', 'allow', 'cancel'] as const) test(`actual host/nat
     f.input.pressKey('o', { ctrl: true }); f.input.pressKey('o', { ctrl: true }); f.input.pressKey('o', { ctrl: true }); await f.frame()
     expect(f.body(reviewed).getChildren()).toHaveLength(0)
     expect(f.headers().at(-1)!.plainText).toContain('approval required')
-    expect((f.setup.renderer.root.findDescendantById('vivi-deny') as TextRenderable).plainText).toContain('› Deny')
+    expect((f.setup.renderer.root.findDescendantById('vivi-approve') as TextRenderable).plainText).toContain('› Approve')
     const allow = f.setup.renderer.root.findDescendantById('vivi-approve')!
     if (action === 'allow') { if (turn === 0) await f.setup.mockMouse.click(allow.x + 1, allow.y); else { f.input.pressArrow('right'); f.input.pressEnter() } }
     else if (action === 'cancel') f.input.pressEscape()
-    else f.input.pressEnter()
+    else { f.input.pressArrow('down'); f.input.pressEnter() }
     const result = await running; f.io.result(result); f.io.setSession(host.session); await f.frame()
     expect(host.session.noteRevision).toBe(action === 'allow' ? turn + 1 : 0)
     expect(f.body(f.headers().at(-1)!).getChildren()).toHaveLength(0)
@@ -210,8 +210,8 @@ test('detail key repeats/releases and stale mouse gestures cannot select or conf
   expect(settled).toBe(false)
   f.input.pressKey('o', { ctrl: true }); await f.frame()
   expect(contents(f.transcript())).toContain('Exact owned fake approval')
-  expect((f.setup.renderer.root.findDescendantById('vivi-deny') as TextRenderable).plainText).toContain('› Deny')
-  f.input.pressEnter(); expect(await answer).toBe(false)
+  expect((f.setup.renderer.root.findDescendantById('vivi-approve') as TextRenderable).plainText).toContain('› Approve')
+  f.input.pressArrow('down'); f.input.pressEnter(); expect(await answer).toBe(false)
 })
 
 test('live requests retain canonical provenance and completed reads use exact host receipt provenance', async () => {
@@ -359,7 +359,7 @@ test('pending exact review cannot displace its current presentation warning/sour
     expect(text).toContain('d'.repeat(60 * 1024 - 1))
     setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
     expect(contents(setup.renderer.root.findDescendantById('vivi-transcript')!)).toContain('approval required')
-    setup.mockInput.pressEnter(); expect(await answer).toBe(false)
+    setup.mockInput.pressArrow('down'); setup.mockInput.pressEnter(); expect(await answer).toBe(false)
   } finally { io.close() }
 })
 for (const length of [60000, 65536]) test(`admitted ${length}-character final response retains text and multiple current tool safety/source rows`, async () => {
@@ -387,8 +387,8 @@ for (const length of [60000, 65536]) test(`admitted ${length}-character final re
     expect(text).toContain('External effects are unreported. Do not infer that no effects occurred.')
     expect(text).toContain(`cli-session:${session.id}:history:2`)
     expect(text).toContain(`cli-session:${session.id}:history:4`)
-    expect(text).toContain('z'.repeat(60000))
-    if (length === 65536) expect(text).toContain('[display truncated]')
+    expect(text).toContain('z'.repeat(length))
+    expect(text).not.toContain('[display truncated]')
     setup.mockInput.pressKey('o', { ctrl: true }); await setup.renderOnce(); await setup.renderOnce()
     const collapsed = contents(setup.renderer.root.findDescendantById('vivi-transcript')!)
     expect(collapsed).toContain(`cli-session:${session.id}:history:2`)
@@ -588,7 +588,7 @@ test('a live local-read expansion survives result and canonical refresh without 
   expect(contents(f.body(header))).toContain(host.toolPresentationEvidence.projection!.outcomes[0]!.source.reference)
   expect(contents(f.body(header))).toContain('Result:')
   expect(contents(f.transcript())).toContain('Finished the time check')
-  expect(contents(f.transcript()).match(/Assistant/g)).toHaveLength(1)
+  expect(contents(f.transcript())).not.toContain('Assistant')
   f.input.pressKey('o', { ctrl: true }); await f.frame()
   expect(f.headers()[0]!.plainText).toBe('▸ current_time')
   expect(contents(f.transcript())).not.toContain('External effects')

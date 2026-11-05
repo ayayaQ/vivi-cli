@@ -146,6 +146,28 @@ picker shows names and local dates such as Today or Yesterday, with the model
 and session ID still available. Older unnamed sessions use a display-only
 first-message fallback; browsing them does not rewrite saved files.
 
+The full-screen welcome shows vivi, a shortened workspace path, and one muted
+model/mode row below the input. Click `/ menu` or press Ctrl+P for actions;
+click the model or effort in that row to open its settings, keeping your draft.
+`/session` includes the full workspace, provider, permission and data-handling
+details. Context occupancy appears after the first turn, or earlier when the
+effective input reaches 80% of its capacity. Idle Ready text and routine startup
+notices stay hidden. Entering a `!` shell script shows its execution disclosure
+beside the input before submission.
+
+Ctrl+P opens a centered, searchable command palette over the dimmed conversation.
+Type to filter actions, use arrows or the mouse wheel to browse, and Enter or click
+to open one. Actions are grouped under Models & providers, Conversation, Tools &
+context, Permissions, and Application. Muted headings are skipped by keyboard
+navigation, and search hides sections without matches. Settings pickers and text
+forms stay in the overlay. Context and session details, help, usage, and longer
+settings output open scrollable detail views; Escape or Back returns to the menu
+with its search preserved. Escape from
+the main menu returns to the composer. Direct settings slash commands open the
+same modal views and return to the composer when closed. Informational command
+output stays in scrollable modal details. Credential entry and exact action
+approvals retain their dedicated input and review surfaces.
+
 The full-screen status shows an animated Working indicator and total elapsed
 turn time, including time spent waiting for approval. Waiting for approval and
 Cancelling have separate labels. The timer stops when the turn settles or the UI
@@ -215,6 +237,10 @@ Choose an option, write an answer, skip, or cancel; review the answers and selec
 Submit to send them. Questions work in Manual, Auto review and Plan, and never
 approve an action or enroll Auto review. Questions and action approvals share one
 input queue. Line mode, pipes and headless hosts omit this capability.
+Questions appear once in a focused dialog, with numbered choices and a highlighted
+selection. Descriptions sit below the labels when space allows; compact terminals
+keep them inline. Only relevant page controls are shown, and Submit sends the
+reviewed answers.
 
 Some terminals send the same input for Enter and Shift+Enter, so the application
 cannot distinguish them from that byte alone. For a native Windows TTY, vivi
@@ -251,6 +277,11 @@ Ctrl+Enter (if reported) or **Interrupt & send** queues the draft and requests
 cancellation, then waits for owned cleanup before continuing. Cancellation cannot
 undo completed writes, requests or command effects. Physical modifier reporting
 is unverified; the button does not depend on it.
+The working composer keeps the idle input's thin top and bottom borders and growing height.
+`Enter queues` and muted actions share the model/mode footer: Interrupt & send
+appears with a draft, while Undo latest and Clear appear with queued input when
+space allows. Alt+Backspace edits the latest pending message and Ctrl+Shift+K
+clears the queue, including on compact terminals.
 
 Escape or Ctrl+C stops the turn but retains queued input. `/queue send` continues,
 `/queue undo` edits the latest pending message in the full-screen composer, and
@@ -265,27 +296,34 @@ Ctrl+R to refresh the catalog, and Escape to go back.
 
 ### Mouse controls
 
-The full-screen UI accepts terminal-reported mouse clicks. Click Menu, Models,
-Effort, Mode, Memory or Skills below the composer to open an action when the draft
-is empty. Click a picker row to choose its exact value; the wheel moves through
+The full-screen UI accepts terminal-reported mouse clicks. Click `/ menu` below
+the composer to open actions for models, effort, mode, memory, skills and session
+details when the draft is empty. Click a picker row to choose its exact value; the wheel moves through
 picker options or scrolls the transcript. Clicking a slash-command suggestion
 fills the composer without sending it. Dialogs have Choose/Confirm, Back/Cancel
 and, where available, Refresh buttons. Smaller terminals hide optional action
 bars to preserve space; the same commands, Enter and Escape still work.
 
-Approval prompts show separate Deny and Approve buttons. Deny starts selected.
-Use arrows or Tab to select, then Enter to confirm, or click the desired button.
+Approval prompts show vertical choices with Approve first and initially selected.
+Use Up/Down or Tab to select, then Enter to confirm, or click the desired row.
 Typing or pasting `allow` cannot approve in the full-screen UI. Escape, abort and
 close deny. A click must start and finish on the same displayed request and
 button without dragging; rapid repeated approval clicks cannot accept the next
 request. Line mode continues to require its fresh typed `allow` response.
 
+Drag to select text in the transcript or composer; releasing the left mouse
+button copies nonempty selections to the clipboard. A brief “Copied!” toast
+appears above the composer on the right. Double-click word and
+triple-click line selections copy too. Vivi uses the local system clipboard,
+or the terminal's OSC 52 clipboard protocol for remote sessions and as a fallback.
+Terminal clipboard permissions and multiplexer settings can affect copying.
+
 Mouse reporting varies by terminal and multiplexer. [Windows Terminal supports
 VT mouse input](https://learn.microsoft.com/en-us/windows/terminal/selection);
 this implementation still needs interactive validation on your actual terminal.
 In Windows Terminal, hold Shift to select text using the terminal instead of
-sending mouse input to the application. Clipboard behavior and the OS pointer
-are controlled by your terminal, not vivi. All actions remain keyboard-accessible.
+sending mouse input to the application; those selections use the terminal's
+copy controls. The OS pointer is controlled by your terminal. All actions remain keyboard-accessible.
 
 Model capabilities use the shared endpoint-aware normalizer with the CLI's existing
 documented OpenAI Responses facts. OpenRouter metadata describes its Chat Completions
@@ -556,9 +594,11 @@ The CLI uses the current working directory where you launch vivi as its selected
 workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
 disable workspace access for that launch. These flags cannot be combined. Relative
 paths are resolved from the launch directory, not the installed CLI or private
-profile folder. The active canonical folder is shown at startup in both interfaces.
-The full-screen status keeps it visible through conversation changes; long paths
-are shortened there. Use `/session` in the full-screen UI to see the full folder.
+profile folder. The selected folder is shown at startup in both interfaces.
+The full-screen header keeps it visible through conversation changes, using `~`
+for the home directory and shortening long paths. Compact terminals and question
+dialogs hide that row to preserve input space. Use `/session` in the full-screen
+UI to see the full canonical folder.
 Its root is never saved as a preference or restored from a session; a resumed
 conversation uses the current launch’s folder. The model cannot select or switch
 folders. For an unverified model, also declare its tool support with `--tools`;
@@ -803,7 +843,7 @@ provider; instructions and imported UTF-8 text resources load progressively thro
 
 The bundled read-only `skill-creator` can draft an instruction-only skill, then propose
 `save_skill`. Interactive Execute mode shows the exact before/after SKILL.md source,
-canonical name and SHA-256 revisions for a deny-default human review. Auto and Skip permissions still
+canonical name and SHA-256 revisions for an explicit human review. Auto and Skip permissions still
 require that same human review; the automatic reviewer cannot approve skill saves.
 Plan, noninteractive launches and models without tools cannot save. A successful save
 becomes discoverable on the next turn; the current turn keeps its fixed catalog.

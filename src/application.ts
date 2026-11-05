@@ -21,7 +21,7 @@ import type { CliProviderName, CliSession } from './session.js'
 import { formatUsage } from './usage.js'
 import type { ChatIO } from './terminal.js'
 import { bindBackgroundProcessControls, runProcessControl } from './process-controls.js'
-import { compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, restoreConversationMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
+import { autoReviewDisclosure, compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, restoreConversationMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
 import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
@@ -34,7 +34,7 @@ import { ModelCatalog, unknownModel, documentedOpenAIModel, modelAccessDenied, h
 import type { Catalog, ModelEntry } from './models.js'
 import { createCredentialStore, validateApiKey } from './credentials.js'
 import type { CredentialStore } from './credentials.js'
-import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
+import type { Choice, ControlDetails, SearchableOptions, SearchableSelection } from './picker.js'
 import { FileDecisionLedger } from './decision-ledger.js'
 import { McpConfigStore } from './mcp-config.js'
 import { McpManager } from './mcp-manager.js'
@@ -59,6 +59,9 @@ export interface InteractiveIO extends ChatIO {
   setComposerDraft?(content: string): void
   setSession(session: CliSession): void
   setWorkspace?(directory?: string): void
+  setControlMode?(active: boolean, title?: string): void
+  showControlDetails?(details: ControlDetails): Promise<void>
+  showControlOutput?(includeUnseen?: boolean): Promise<void>
 }
 export interface ApplicationOptions {
   io: InteractiveIO
@@ -112,7 +115,7 @@ Shift+Tab cycles Manual / Auto review / Skip permissions / Plan in the idle comp
 /mcp manages trusted installed server connections; each launch starts disabled. Remote tool calls/resources need human approval in Manual/Auto; enrolled Skip applies only to already-connected servers.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
 /context shows effective-request tokens, capacity and output reserve; /compact summarizes older provider context while keeping the full local transcript.\n/menu opens actions (/settings is a legacy alias); /session shows the current ID and usage; /exit quits.
-Mouse: click action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Deny by default.
+Mouse: drag-select text to copy on release; click the footer model or effort for settings, action buttons, picker rows, tool headers and dialog choices; wheel scrolls. Tool details start collapsed. Ctrl+O toggles the latest call. Approvals select Approve by default and require confirmation.
 Enter while working queues a message; Ctrl+Enter or Interrupt & send cancels first, then sends after cleanup. Modifier reporting varies by terminal.
 /queue shows retained input; /queue send sends it; /queue undo edits the latest; /queue clear removes pending input.
 Escape or Ctrl-C cancels a running turn and retains queued input. Ctrl-C while idle exits.
@@ -893,10 +896,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     io.setContext?.(host.contextUsage, host.canCompact)
     io.setTaskMode?.(host.taskMode)
     io.setApprovalMode?.('manual')
-    io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; unattended enrollment revoked\n' : 'Approval mode: Manual\n')
+    if (!io.compactStartup) io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; unattended enrollment revoked\n' : 'Approval mode: Manual\n')
     if (options.reviewer !== undefined && io.canAutoReview === true && !io.isClosed) await preferences.save(settings)
     if (!launchModePending && !(selection.preservePlan && previousHost?.taskMode === 'plan') && preferredMode !== 'manual') {
-      try { await restoreConversationMode(host, io, preferredMode, setupReviewer) }
+      try { await restoreConversationMode(host, io, preferredMode, setupReviewer, !io.compactStartup) }
       catch (error) { report(error) }
     }
     // Native transcript setup clears earlier loading output. Keep stale-cache
@@ -904,29 +907,36 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     if (capabilityNotice) io.write(capabilityNotice)
     if (host.session.provider === 'chatgpt') {
       const account = (await chatgptAuth.listAccounts()).find(account => account.id === host!.session.chatgptAccountId)
-      if (account) io.write(chatGptPlanStatus(account))
+      if (account && !io.compactStartup) io.write(chatGptPlanStatus(account))
     }
     return true
   }
   let workspaceNoticePending = true
+  let reopenControls = false
   try {
-    if (activeSkills) io.write(`${SKILLS_DISCLOSURE}\n`)
-    if (activeMemory) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
+    if (activeSkills && !io.compactStartup) io.write(`${SKILLS_DISCLOSURE}\n`)
+    if (activeMemory && !io.compactStartup) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
     // Every launch begins in a clean composer, even before the first provider setup.
     if (!settings.model) {
       if (io.setDraft) io.setDraft(settings.provider)
       else if (settings.provider !== 'chatgpt' || settings.chatgptAccountId) io.setSession(newSession({ provider: settings.provider,
         ...(settings.provider === 'chatgpt' && settings.chatgptAccountId ? { chatgptAccountId: settings.chatgptAccountId } : {}), model: 'Choose a model with /models' }))
     }
-    if (!settings.model) io.write('vivi · fresh conversation · use /provider to set up, then /models and /effort\n')
+    if (!settings.model && !io.compactStartup) io.write('vivi · fresh conversation · use /provider to set up, then /models and /effort\n')
     // Offer the existing minimal setup once per unconfigured interactive launch.
     // Cancellation returns to a clean composer; explicit commands can retry.
     if (!settings.model && !options.resume && options.prompt === undefined && !io.isClosed) {
+      io.setControlMode?.(true, 'Provider')
       try { await configureProviderModel() } catch (error) { report(error) }
+      finally {
+        try { await io.showControlOutput?.(true) }
+        finally { io.setControlMode?.(false) }
+      }
     }
     for (;;) {
       if (io.isClosed) { if (io.failed) await io.readLine(''); return 0 }
       if (selected) {
+        if (reopenControls) { reopenControls = false; io.setControlMode?.(false) }
         try { await openSession(selected) } catch (error) { report(error); if (options.prompt !== undefined) return 1 }
         // A failed shutdown may have partially revoked its owner. Do not run again.
         if (sessionCleanupFailed) return 1
@@ -935,16 +945,16 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) continue
       if (launchModePending && host) {
         launchModePending = false
-        await selectApprovalMode(host, io, async () => options.approvalMode, setupReviewer)
+        await selectApprovalMode(host, io, async () => options.approvalMode, setupReviewer, !io.compactStartup)
         await rememberMode()
       } else if (launchModePending && io.canAutoReview !== true) {
         launchModePending = false
         io.write(`${AUTO_REVIEW_UNAVAILABLE}\n`)
       }
-      // Session/draft setup rebuilds the native transcript; disclose after that, before any turn.
+      // Line-mode launch details follow session setup. Native details live in /session.
       if (workspaceNoticePending) {
         workspaceNoticePending = false
-        if (workspace) io.write(`${USER_SHELL_DISCLOSURE}\nWorkspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
+        if (workspace && !io.compactStartup) io.write(`${USER_SHELL_DISCLOSURE}\nWorkspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
       }
       if (options.prompt !== undefined) {
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
@@ -964,12 +974,14 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0
         } finally { dispose() }
       }
-      let line = await io.readLine('Message')
+      let line = reopenControls ? '/menu' : await io.readLine('Message')
       if (io.isClosed) continue
       if (line === undefined || line.trim() === '/exit') return 0
       let command = line.trim()
       if (command === '/menu' || command === '/settings') {
-        const action = await io.choose('Conversation actions', [
+        io.setControlMode?.(true)
+        if (reopenControls) await io.showControlOutput?.()
+        const actions = [
           { name: 'Continue conversation', value: 'continue' }, { name: 'Chat provider', value: '/provider' },
           { name: 'ChatGPT accounts', description: 'Choose account/workspace or sign out', value: '/account' },
           { name: 'ChatGPT usage', description: CHATGPT_USAGE_URL, value: '/usage' },
@@ -979,6 +991,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Choose model', value: '/models' }, { name: 'Reasoning effort', value: '/effort' },
           { name: 'New conversation', value: '/new' }, { name: 'Resume conversation', value: '/resume' },
           { name: 'Rename conversation', value: '/rename' },
+          { name: 'Session details', description: 'Workspace, provider, permissions and data handling', value: '/session' },
           ...(host ? [{ name: 'Context details', description: 'Request occupancy, capacity and output reserve', value: '/context' }] : []),
           ...(host?.canCompact ? [{ name: 'Compact context', description: 'Summarize older provider context; retain the full transcript', value: '/compact' }] : []),
           { name: 'Mode', description: 'Manual / Auto review / Skip permissions / Plan', value: '/mode' },
@@ -990,10 +1003,29 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           { name: 'Project instructions', value: '/instructions' },
           { name: 'MCP connections', description: 'Trusted installed servers; human-reviewed tools and resource reads', value: '/mcp' },
           { name: 'Help', value: '/help' }, { name: 'Quit', value: '/exit' }
-        ])
-        if (!action || action === 'continue') continue
+        ]
+        const sections = [
+          { name: 'Models & providers', commands: ['/models', '/effort', '/provider', '/account', '/usage', '/web'] },
+          { name: 'Conversation', commands: ['/new', '/resume', '/rename', '/session', '/context', '/compact'] },
+          { name: 'Tools & context', commands: ['/instructions', '/skills', '/memories', '/notes', '/mcp', '/processes'] },
+          { name: 'Permissions', commands: ['/mode', '/reviewer', '/auto-threshold', '/commands'] },
+          { name: 'Application', commands: ['/help', '/exit'] }
+        ]
+        const menuActions = io.setControlMode ? sections.flatMap(section => section.commands.flatMap(value =>
+          actions.filter(action => action.value === value).map(action => ({ ...action, section: section.name })))) : actions
+        const action = await io.choose('Conversation actions', menuActions)
+        if (!action || action === 'continue') { reopenControls = false; io.setControlMode?.(false); continue }
         if (action === '/exit') return 0
+        reopenControls = io.setControlMode !== undefined
         command = action; line = action
+      }
+      // Direct slash commands use the same settings surfaces as the palette,
+      // but return to the composer rather than reopening the command list.
+      const directControls = !!io.setControlMode && !reopenControls && command.startsWith('/') &&
+        !['/new', '/compact', '/queue send', '/mode cycle'].includes(command)
+      if (directControls) {
+        const name = command.split(/\s/)[0]!.slice(1)
+        io.setControlMode?.(true, name.charAt(0).toUpperCase() + name.slice(1))
       }
       try {
         if (host && /^\/queue(?:\s|$)/.test(line.trim())) {
@@ -1024,7 +1056,12 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         }
         if (command === '/web') { await configureWeb(); continue }
         if (command === '/account') { await configureChatGptAccount(); continue }
-        if (command === '/usage') { io.write(`Manage ChatGPT usage: ${CHATGPT_USAGE_URL}\n`); continue }
+        if (command === '/usage') {
+          if ((reopenControls || directControls) && io.showControlDetails) await io.showControlDetails({ title: 'ChatGPT usage',
+            sections: [{ title: 'Manage your plan', body: CHATGPT_USAGE_URL }] })
+          else io.write(`Manage ChatGPT usage: ${CHATGPT_USAGE_URL}\n`)
+          continue
+        }
         if (command === '/reviewer') { await configureReviewer(); continue }
         if (/^\/auto-threshold(?:\s|$)/.test(command)) { await configureAutoThreshold(command); continue }
         if (command === '/provider') {
@@ -1086,21 +1123,51 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (command === '/compact') {
           if (host && host.session.provider === 'chatgpt' && hostAccountGeneration !== accountGeneration) { io.write('The selected ChatGPT account changed. Use /new or /models before compacting; no request was sent.\n'); continue }
           if (!host) { io.write('Choose a provider and model before compacting context\n'); continue }
+          reopenControls = false; io.setControlMode?.(false)
           await compactChatContext(host, io)
           continue
         }
         if (command === '/context') {
           if (!host) { io.write('Choose a model before measuring context\n'); continue }
           await refreshChatContext(host, io)
-          io.write(`${formatContextDetails(host.contextUsage, knownModels.get(modelKey(host.session.provider, host.session.model, host.session.chatgptAccountId)))}\n`)
+          const usage = host.contextUsage
+          const model = knownModels.get(modelKey(host.session.provider, host.session.model, host.session.chatgptAccountId))
+          if ((reopenControls || directControls) && io.showControlDetails) await io.showControlDetails({ title: 'Context',
+            ...(usage?.contextWindow ? { meter: { label: usage.estimated ? 'Estimated input' : 'Input', value: usage.inputTokens, capacity: usage.contextWindow } } : {}),
+            fields: [{ label: 'Model', value: host.session.model }, { label: 'Input tokens', value: usage ? usage.inputTokens.toLocaleString() : 'Not measured' },
+              { label: 'Capacity', value: usage?.contextWindow?.toLocaleString() ?? 'Unknown' },
+              { label: 'Output reserve', value: usage?.outputReserveTokens?.toLocaleString() ?? 'Unknown' }],
+            sections: [{ title: 'Request details', body: formatContextDetails(usage, model) }] })
+          else io.write(`${formatContextDetails(usage, model)}\n`)
           continue
         }
-        if (command === '/help') { io.write(COMMAND_HELP); continue }
+        if (command === '/help') {
+          if ((reopenControls || directControls) && io.showControlDetails) await io.showControlDetails({ title: 'Help', sections: [{ title: 'Commands and shortcuts', body: COMMAND_HELP }] })
+          else io.write(COMMAND_HELP)
+          continue
+        }
         if (command === '/session') {
           const session = host?.session
-          io.write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n${formatContextSummaryUsage(session)}${formatContextDetails(host!.contextUsage, knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)))}\n`
+          const output: string[] = []
+          const write = (text: string): void => { output.push(text) }
+          write(session ? `Session: ${session.id}\nName: ${sessionDisplayTitle(session)}\nMode: ${conversationModeLabel(host!.taskMode, host!.approvalMode)}\nSession tokens: ${formatUsage(session.usage)}\n${formatContextSummaryUsage(session)}${formatContextDetails(host!.contextUsage, knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)))}\n`
             : 'Fresh conversation has no saved session until a model is selected\n')
-          io.write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
+          write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
+          if (session) write(`Provider: ${session.provider}\nModel: ${session.model}\nReasoning: ${session.reasoning ?? 'default'}\n`)
+          if (session?.provider === 'chatgpt') {
+            const account = (await chatgptAuth.listAccounts()).find(account => account.id === session.chatgptAccountId)
+            if (account) write(chatGptPlanStatus(account))
+          }
+          if (host?.reviewProvider) write(`Auto reviewer: ${host.reviewProvider} · ${autoReviewDisclosure(host.reviewProvider, host.webProvider === 'deepseek')}\n`)
+          if (workspace) write(`Files read by tools are sent to the selected provider and saved in session history\n${USER_SHELL_DISCLOSURE}\n`)
+          if (activeMemory) write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
+          if (activeSkills) write(`${SKILLS_DISCLOSURE}\n`)
+          if ((reopenControls || directControls) && io.showControlDetails) await io.showControlDetails({ title: 'Session',
+            fields: [{ label: 'Conversation', value: session ? sessionDisplayTitle(session) : 'New conversation' },
+              { label: 'Model', value: session ? `${session.provider} / ${session.model}` : 'Choose a model' },
+              { label: 'Workspace', value: workspace?.directory ?? 'Disabled' }],
+            sections: [{ title: 'Session and permissions', body: output.join('') }] })
+          else io.write(output.join(''))
           continue
         }
         if (command.startsWith('/')) { io.write('Unknown slash command. Use /help or Tab completion\n'); continue }
@@ -1112,8 +1179,15 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         try { const result = await sendChatTurn(host, io, line, controller.signal); io.result(result) }
         finally { dispose(); io.setSession(host.session) }
       } catch (error) { report(error) }
+      finally {
+        if (directControls) {
+          try { await io.showControlOutput?.(true) }
+          finally { io.setControlMode?.(false) }
+        }
+      }
     }
   } finally {
+    io.setControlMode?.(false)
     releaseProcesses?.()
     await discardCandidate()
     if (sessionCleanupFailed) {

@@ -41,7 +41,7 @@ test('working, approval, cancellation and settled turn states use stable short p
     currentRevision: 0, description: 'Review exact action' }, new AbortController().signal)
   await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
   expect(f.titles.at(-1)).toBe('[!] vivi · Untitled conversation')
-  f.input.pressEnter(); expect(await approving).toBe(false)
+  f.input.pressArrow('down'); f.input.pressEnter(); expect(await approving).toBe(false)
   expect(f.titles.at(-1)).toBe('[~] vivi · Untitled conversation')
   f.input.pressEscape(); expect(f.titles.at(-1)).toBe('[~] vivi · Untitled conversation')
   f.io.runFinished('cancelled'); dispose()

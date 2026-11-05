@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { BoxRenderable, TextareaRenderable, TextRenderable, decodePasteBytes } from '@opentui/core'
+import { BoxRenderable, TextareaRenderable, TextRenderable, StyledText, TextAttributes, decodePasteBytes, parseColor } from '@opentui/core'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent } from '@opentui/core'
 import type { QuestionAnswer, QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
 import { MouseActivation } from './tui-mouse.js'
@@ -19,6 +19,8 @@ interface DialogOptions {
   foreground: string | import('@opentui/core').RGBA
   accent: string
   background: string
+  selectedBackground: string
+  selectedForeground: string
 }
 
 /** A per-request native editor. Choices are drafts until the human presses Submit. */
@@ -40,18 +42,19 @@ export class QuestionDialog {
   private disposed = false
   private context: object = {}
   private frame = 0
+  private showDescriptions = false
 
   constructor(private readonly renderer: CliRenderer, readonly request: QuestionRequest,
     private readonly options: DialogOptions) {
     this.drafts = request.questions.map(() => ({ text: '' }))
     this.box = new BoxRenderable(renderer, { id: 'vivi-questions', width: '100%', height: 12,
       flexShrink: 0, flexDirection: 'column', border: true, borderColor: options.accent,
-      titleColor: options.accent, title: 'Questions · answers only', bottomTitle: 'Tab · Enter · ^Enter Submit · Esc', paddingX: 1 })
+      titleColor: options.accent, title: request.questions.length === 1 ? 'Question' : 'Questions', paddingX: 1 })
     try {
       this.progress = new TextRenderable(renderer, { id: 'vivi-question-progress', height: 1,
-        flexShrink: 0, fg: options.accent, wrapMode: 'none' })
+        flexShrink: 0, fg: options.foreground, attributes: TextAttributes.DIM, wrapMode: 'none' })
       this.heading = new TextRenderable(renderer, { id: 'vivi-question-heading', width: '100%',
-        height: 2, flexShrink: 0, fg: options.foreground, wrapMode: 'word' })
+        height: 2, flexShrink: 0, fg: options.foreground, attributes: TextAttributes.BOLD, wrapMode: 'word' })
       this.choices = new BoxRenderable(renderer, { id: 'vivi-question-choices', width: '100%',
         height: 4, flexShrink: 0, flexDirection: 'column' })
       this.editorBox = new BoxRenderable(renderer, { id: 'vivi-question-editor-box', width: '100%',
@@ -84,15 +87,27 @@ export class QuestionDialog {
   private live(): boolean { return !this.disposed && this.options.ready() && this.renderer.frameId > this.frame }
   private current(): Draft { return this.drafts[this.page]! }
   private consume(event: KeyEvent | PasteEvent): void { event.preventDefault(); event.stopPropagation() }
-  private button(id: string, label: string, action: () => void): TextRenderable {
+  private button(id: string, label: string, action: () => void, selected = false, description?: string): TextRenderable {
     const safe = this.options.safe(label, 1200).replace(/[\t\n]+/g, ' ')
-    const node = new TextRenderable(this.renderer, { id, content: safe, width: '100%', height: 1,
-      flexShrink: 0, fg: this.options.accent, wrapMode: 'none', selectable: false })
+    const color = selected ? this.options.selectedForeground : this.options.foreground
+    const detail = description ? this.options.safe(description, 1200).replace(/[\t\n]+/g, ' ') : ''
+    const content = detail ? new StyledText([{ __isChunk: true, text: safe, fg: parseColor(color) },
+      { __isChunk: true, text: `${this.showDescriptions ? '\n     ' : ' · '}${detail}`, fg: parseColor(color), attributes: TextAttributes.DIM }]) : safe
+    const node = new TextRenderable(this.renderer, { id, content, width: '100%', height: detail && this.showDescriptions ? 2 : 1,
+      flexShrink: 0, fg: color, bg: selected ? this.options.selectedBackground : this.options.background,
+      wrapMode: 'none', selectable: false })
     node.onMouse = (event: MouseEvent): void => this.mouse.handle(event, node, id, this.context, this.live() && this.options.mouseReady(), action)
     return node
   }
+  private addChoice(node: TextRenderable): void {
+    const row = new BoxRenderable(this.renderer, { id: `${node.id}-row`, width: '100%',
+      height: node.plainText.includes('\n') ? 2 : 1, flexShrink: 0, backgroundColor: node.bg })
+    row.add(node)
+    this.choices.add(row)
+  }
   private setFocus(focus: Focus): void {
     this.focus = focus
+    if (focus === 'actions' && !this.actionIndices().includes(this.action)) this.action = this.page < this.drafts.length - 1 ? 1 : 3
     if (focus === 'choices' && this.request.questions[this.page]!.options) this.editorBox.visible = false
     if (focus === 'text') this.editorBox.visible = true
     if (focus === 'text' && this.editorBox.visible) this.editor.focus()
@@ -125,7 +140,7 @@ export class QuestionDialog {
     const question = this.request.questions[this.page]!
     const answered = this.drafts.filter(draft => draft.answer).length
     const answer = this.current().answer
-    this.progress.content = this.options.safe(`${this.page + 1}/${this.drafts.length} · ${question.header} · ${answered}/${this.drafts.length} ready${answer ? answer.kind === 'skipped' ? ' · Skipped' : ' · Answer saved' : ''}`, 200)
+    this.progress.content = this.options.safe(`Question ${this.page + 1}/${this.drafts.length} · ${question.header} · ${answered}/${this.drafts.length} ready${answer ? answer.kind === 'skipped' ? ' · Skipped' : ' · Answer saved' : ''}`, 200)
   }
   private renderChoices(): void {
     this.mouse.clear()
@@ -135,12 +150,17 @@ export class QuestionDialog {
     if (!question.options) return
     const answer = this.current().answer
     question.options.forEach((option, index) => {
-      const marker = answer?.kind === 'option' && answer.optionId === option.id ? '●' : '○'
-      this.choices.add(this.button(`vivi-question-option-${index}`, `${this.focus === 'choices' && this.selected === index ? '›' : ' '} ${marker} ${option.label}${option.description ? ` · ${option.description}` : ''}`, () => this.choose(index)))
+      const selected = this.focus === 'choices' && this.selected === index
+      const marker = answer?.kind === 'option' && answer.optionId === option.id ? '● ' : ''
+      this.addChoice(this.button(`vivi-question-option-${index}`, `${selected ? '›' : ' '} ${index + 1}. ${marker}${option.label}`,
+        () => this.choose(index), selected, option.description))
     })
-    this.choices.add(this.button('vivi-question-other', `${this.focus === 'choices' && this.selected === question.options.length ? '›' : ' '} ${answer?.kind === 'text' ? '●' : '○'} Other / write an answer`, () => this.choose(question.options!.length)))
+    const other = this.focus === 'choices' && this.selected === question.options.length
+    this.addChoice(this.button('vivi-question-other', `${other ? '›' : ' '} ${question.options.length + 1}. ${answer?.kind === 'text' ? '● ' : ''}Type your own answer`,
+      () => this.choose(question.options!.length), other))
   }
   private actionNames(): string[] { return ['Prev', 'Next', 'Skip', 'Submit', 'Cancel'] }
+  private actionIndices(): number[] { return [...(this.page > 0 ? [0] : []), ...(this.page < this.drafts.length - 1 ? [1] : []), 2, 3, 4] }
   private renderActions(): void {
     this.mouse.clear()
     for (const child of this.actions.getChildren()) child.destroyRecursively()
@@ -150,8 +170,9 @@ export class QuestionDialog {
     const names = compact ? ['‹', '›', 'Skip', 'Submit', 'Cancel'] : this.actionNames()
     names.forEach((name, index) => {
       const label = `${this.focus === 'actions' && this.action === index ? '›' : ' '}${name}`
-      const button = this.button(`vivi-question-${this.actionNames()[index]!.toLowerCase()}`, label, () => this.activate(index, true))
+      const button = this.button(`vivi-question-${this.actionNames()[index]!.toLowerCase()}`, label, () => this.activate(index, true), this.focus === 'actions' && this.action === index)
       button.width = label.length
+      button.visible = this.actionIndices().includes(index)
       this.actions.add(button)
     })
   }
@@ -211,14 +232,22 @@ export class QuestionDialog {
     const height = Math.max(5, Math.min(14, this.options.availableHeight()))
     // Reserve both borders, progress and the action row. Renderable height getters
     // still describe the previous layout until Yoga runs, so use the new sizes.
-    const choices = this.choices.visible ? this.request.questions[this.page]!.options!.length + 1 : 0
+    const question = this.request.questions[this.page]!
+    const count = this.choices.visible ? question.options!.length + 1 : 0
+    const width = Math.max(1, this.renderer.terminalWidth - 4)
+    const headingLines = Math.max(1, Math.min(3, Math.ceil([...this.options.safe(question.question, 1200)].length / width)))
+    const descriptions = this.choices.visible ? question.options!.filter(option => option.description).length : 0
+    this.showDescriptions = descriptions > 0 && height >= 4 + count + headingLines + descriptions
+    const choices = count + (this.showDescriptions ? descriptions : 0)
     const fixed = 4 + choices
-    const heading = Math.max(1, Math.min(3, height - fixed - (this.editorBox.visible ? 1 : 0)))
+    const heading = Math.max(1, Math.min(headingLines + 1, 3, height - fixed - (this.editorBox.visible ? 1 : 0)))
     const editor = this.editorBox.visible ? Math.max(1, Math.min(4, height - fixed - heading)) : 0
     this.heading.height = heading
     this.choices.height = choices
     this.editorBox.height = Math.max(1, editor)
     this.box.height = fixed + heading + editor
+    this.box.bottomTitle = this.renderer.terminalHeight <= 15 ? '↑↓ · Enter · Tab · Esc' : undefined
+    this.renderChoices()
     this.renderActions()
   }
   handlePaste(event: PasteEvent): void {
@@ -246,11 +275,13 @@ export class QuestionDialog {
     this.consume(key)
     if (key.ctrl || key.meta || key.super || key.hyper || key.repeated || key.eventType === 'repeat') return
     if (['left', 'up', 'right', 'down', 'home', 'end'].includes(key.name)) {
-      const count = this.focus === 'choices' ? this.request.questions[this.page]!.options!.length + 1 : 5
+      const actions = this.actionIndices()
+      const count = this.focus === 'choices' ? this.request.questions[this.page]!.options!.length + 1 : actions.length
       const current = this.focus === 'choices' ? this.selected : this.action
-      const next = key.name === 'home' ? 0 : key.name === 'end' ? count - 1 : (current + (['left', 'up'].includes(key.name) ? -1 : 1) + count) % count
+      const position = this.focus === 'choices' ? current : actions.indexOf(current)
+      const next = key.name === 'home' ? 0 : key.name === 'end' ? count - 1 : (position + (['left', 'up'].includes(key.name) ? -1 : 1) + count) % count
       if (this.focus === 'choices') this.selected = next
-      else this.action = next
+      else this.action = actions[next]!
       this.renderChoices(); this.renderActions(); return
     }
     if (['return', 'kpenter', 'linefeed', 'space'].includes(key.name) && !key.shift) {
