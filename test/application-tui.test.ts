@@ -41,8 +41,72 @@ async function modalInputReady(setup: TestRendererSetup, title?: string): Promis
   throw new Error(`Modal input did not become ready: ${title ?? ''}`)
 }
 
+/** Test-only view of the same input gate used by ControlModal. Focus alone is not readiness. */
+type ControlInputState = {
+  pending?: { kind: string; armed: boolean; openedFrame: number }
+  lastRenderedFrame: number
+}
+function controlInputState(io: OpenTuiIO): ControlInputState { return io as unknown as ControlInputState }
+async function controlInputReady(io: OpenTuiIO, setup: TestRendererSetup): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+    const { pending, lastRenderedFrame } = controlInputState(io)
+    const query = setup.renderer.root.findDescendantById('vivi-control-query') as TextareaRenderable | undefined
+    if (query?.focused && pending?.kind === 'control' && pending.armed && lastRenderedFrame > pending.openedFrame) return
+  }
+  throw new Error('Control input did not become armed after a completed frame')
+}
+
+test('control input readiness waits for runtime arming and a newer completed frame', async () => {
+  const setup = await createTestRenderer({ width: 110, height: 32, kittyKeyboard: true,
+    exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer)
+  let choosing: Promise<unknown> | undefined
+  let waiting: Promise<void> | undefined
+  const renderOnce = setup.renderOnce
+  try {
+    io.setControlMode(true, 'Fixture')
+    choosing = io.chooseSearchable('Fixture', [{ name: 'Fixture model', value: 'fixture-model' }])
+    await controlInputReady(io, setup)
+    const state = controlInputState(io), pending = state.pending!
+    expect(pending.kind).toBe('control')
+    expect((setup.renderer.root.findDescendantById('vivi-control-query') as TextareaRenderable).focused).toBe(true)
+    pending.armed = false
+    let holdFrame = false, resolved = false, renderCount = 0
+    let observeRenders: (() => void) | undefined
+    setup.renderOnce = async () => {
+      await renderOnce()
+      if (holdFrame) state.lastRenderedFrame = pending.openedFrame
+      if (++renderCount === 6) observeRenders?.()
+    }
+    const nextSixRenders = (): Promise<void> => {
+      renderCount = 0
+      return new Promise(resolve => { observeRenders = resolve })
+    }
+    let observed = nextSixRenders()
+    waiting = controlInputReady(io, setup).then(() => { resolved = true })
+    await Promise.race([observed, waiting])
+    expect(resolved).toBe(false)
+    holdFrame = true
+    state.lastRenderedFrame = pending.openedFrame
+    pending.armed = true
+    observed = nextSixRenders()
+    await Promise.race([observed, waiting])
+    expect(resolved).toBe(false)
+    holdFrame = false
+    await waiting
+    expect(resolved).toBe(true)
+  } finally {
+    setup.renderOnce = renderOnce
+    const pending = controlInputState(io).pending
+    if (pending?.kind === 'control') pending.armed = true
+    await waiting?.catch(() => undefined)
+    io.close(); await choosing; setup.renderer.destroy()
+  }
+})
+
 /** Observe application readiness, including async file IO, before asking the renderer for a frame. */
-function observeUI(io: OpenTuiIO) {
+function observeUI(io: OpenTuiIO, setup?: TestRendererSetup) {
   type State = { kind: 'composer'; index: number } | { kind: 'session'; session: CliSession }
   const reached: State[] = []
   let composerCount = 0
@@ -59,18 +123,27 @@ function observeUI(io: OpenTuiIO) {
   }
   const setSession = io.setSession.bind(io)
   io.setSession = session => { setSession(session); notify({ kind: 'session', session }) }
-  const waitFor = (predicate: (state: State) => boolean): Promise<State> => {
+  const waitFor = (predicate: (state: State) => boolean, label = 'application readiness'): Promise<State> => {
     const state = reached.find(predicate)
     if (state) return Promise.resolve(state)
     return new Promise((resolve, reject) => {
       const waiter = { predicate, resolve: (state: State): void => { clearTimeout(timer); resolve(state) } }
-      const timer = setTimeout(() => { pending.delete(waiter); reject(new Error('Application readiness condition did not arrive within 5 seconds')) }, 5000)
+      const timer = setTimeout(() => {
+        pending.delete(waiter)
+        const runtime = controlInputState(io)
+        const heading = setup?.renderer.root.findDescendantById('vivi-control-title') as TextRenderable | undefined
+        const query = setup?.renderer.root.findDescendantById('vivi-control-query') as TextareaRenderable | undefined
+        reject(new Error(`Application readiness condition did not arrive within 5 seconds: ${label}; ` +
+          `composer=${composerCount}; pending=${runtime.pending?.kind ?? 'none'}; armed=${runtime.pending?.armed ?? false}; ` +
+          `completedFrame=${runtime.lastRenderedFrame}; openedFrame=${runtime.pending?.openedFrame ?? 'none'}` +
+          (setup ? `; modal=${JSON.stringify(heading?.plainText ?? '')}; query=${JSON.stringify(query?.plainText ?? '')}; focused=${query?.focused ?? false}` : '')))
+      }, 5000)
       pending.add(waiter)
     })
   }
-  return Object.assign(waitFor, { nextComposer: (): Promise<State> => {
+  return Object.assign(waitFor, { nextComposer: (label = 'next composer'): Promise<State> => {
     const previous = composerCount
-    return waitFor(state => state.kind === 'composer' && state.index > previous)
+    return waitFor(state => state.kind === 'composer' && state.index > previous, label)
   } })
 }
 
@@ -525,7 +598,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
   const setup = await createTestRenderer({ width: 110, height: 32, kittyKeyboard: true,
     exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
   const io = new OpenTuiIO(setup.renderer)
-  const ready = observeUI(io)
+  const ready = observeUI(io, setup)
   dismissControlOutput(io, setup)
   const preferences = new PreferenceStore(directory)
   const defaults: TuiPreferences = { schemaVersion: 1, provider, model: 'saved-default-model', reasoning: 'default',
@@ -560,11 +633,11 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
     await setup.mockInput.typeText('/models')
     setup.mockInput.pressEnter()
     await setup.waitForFrame(frame => frame.includes(`Models · ${provider}`) && frame.includes('Search models…'))
-    await new Promise(resolve => setTimeout(resolve, 2)); await setup.renderOnce(); await setup.renderOnce()
+    await controlInputReady(io, setup)
   }
   const chat = async (text: string): Promise<void> => {
     expect(composer().plainText).toBe('')
-    const afterSend = ready.nextComposer()
+    const afterSend = ready.nextComposer(`${provider}: chat response for ${JSON.stringify(text)}`)
     await setup.mockInput.typeText(text)
     setup.mockInput.pressEnter()
     await afterSend
@@ -578,7 +651,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
     finally { setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
   }
   try {
-    await ready(state => state.kind === 'composer')
+    await ready(state => state.kind === 'composer', `${provider}: initial composer`)
     await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('/ menu'))
   } catch (error) { await close(); throw error }
   return { directory, setup, io, ready, preferences, defaults, sessions, requests, running, composer, session, openModels, chat, close }
@@ -625,7 +698,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
         await app.setup.mockInput.typeText(query)
         await app.setup.waitForFrame(frame => frame.includes(model.id))
         expect(app.composer().plainText).toBe(query)
-        const afterModel = app.ready.nextComposer()
+        const afterModel = app.ready.nextComposer(`${provider}: composer after model selection`)
         app.setup.mockInput.pressEnter()
         await afterModel
         await app.setup.waitForFrame(frame => frame.includes(`${provider} / ${model.id}`) && !frame.includes('Models ·'))
@@ -666,7 +739,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
         await app.openModels()
         await app.setup.mockInput.typeText(query)
         await app.setup.renderOnce()
-        const afterCancel = app.ready.nextComposer()
+        const afterCancel = app.ready.nextComposer(`${provider}: composer after search cancellation`)
         app.setup.mockInput.pressEscape()
         await afterCancel
         await app.setup.waitForFrame(frame => frame.includes('/ menu') && !frame.includes('Models ·'))
@@ -687,6 +760,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
       await app.setup.waitForFrame(frame => frame.includes('No matching models'))
       app.setup.mockInput.pressKey('r', { ctrl: true })
       await app.setup.waitForFrame(frame => frame.includes('Models ·') && frame.includes(refreshed.id))
+      await controlInputReady(app.io, app.setup)
       expect(app.composer().plainText).toBe(query)
       expect(app.session().id).toBe(originalSession.id)
       expect(await app.preferences.load()).toEqual(app.defaults)
@@ -695,7 +769,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
         ...(provider === 'openrouter' ? [{ provider, refresh: false }] : []),
         { provider, refresh: false }, { provider, refresh: false }, { provider, refresh: false }, { provider, refresh: true }
       ])
-      const afterModel = app.ready.nextComposer()
+      const afterModel = app.ready.nextComposer(`${provider}: composer after refreshed model selection`)
       app.setup.mockInput.pressEnter()
       await afterModel
       await app.setup.waitForFrame(frame => frame.includes(`${provider} / ${refreshed.id}`) && !frame.includes('Models ·'))
