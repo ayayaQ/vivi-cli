@@ -91,6 +91,31 @@ test('ChatGPT catalog uses visible slugs and labels in server order without stat
   assert.throws(() => parseChatGPTModelCatalog({ data: [{ id: 'api-key-schema' }] }), /format/)
 })
 
+test('ChatGPT documents only exact SiwC text and streaming support without granting other capabilities or availability', () => {
+  const ids = ['future-model', 'gpt-6.1-sol', 'gpt-6.1-sol-future', 'GPT-6.1-SOL', 'openai/gpt-6.1-sol', 'gpt-5']
+  const models = parseChatGPTModelCatalog({ models: ids.map(slug => ({ slug, display_name: 'Account label', visibility: 'list',
+    tools: true, vision: true, reasoning: { supported_efforts: ['high'] }, context_window: 123456 })) })
+  assert.deepEqual(models.map(model => model.id), ids)
+  for (const model of models) {
+    const expected = model.id === 'gpt-6.1-sol' ? 'supported' : 'unknown'
+    assert.equal(model.conversation, expected); assert.equal(model.streaming, expected)
+    assert.equal(model.modelCapabilities.chat, expected); assert.equal(model.modelCapabilities.stream, expected)
+    assert.equal(model.tools, 'unknown'); assert.equal(model.modelCapabilities.tools, 'unknown')
+    assert.equal(model.vision, undefined); assert.equal(model.modelCapabilities.vision, 'unknown')
+    assert.equal(model.reasoning, 'unknown'); assert.deepEqual(model.efforts, [])
+    assert.equal(model.modelCapabilities.reasoning.support, 'unknown')
+    assert.equal(model.modelCapabilities.reasoning.requirement, 'unknown')
+    assert.equal(model.contextWindow, undefined); assert.equal(model.modelCapabilities.contextWindow, undefined)
+    assert.equal(model.name, 'Account label')
+    if (expected === 'supported') assert.deepEqual(model.modelCapabilities.sources, [{ kind: 'official-model-documentation',
+      url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-05' }])
+    else assert.deepEqual(model.modelCapabilities.sources, [])
+  }
+  const unlisted = parseChatGPTModelCatalog({ models: [{ slug: 'gpt-6.1-sol', visibility: 'hide' }, { slug: 'future-model', visibility: 'list' }] })
+  assert.deepEqual(unlisted.map(model => model.id), ['future-model'])
+  assert.throws(() => parseChatGPTModelCatalog({ models: [] }), /No selectable/)
+})
+
 test('ChatGPT model cache is registration-bound, refreshable and does not retain credentials', async () => {
   const requests = []
   const catalog = new ChatGPTModelCatalog({ accessToken: async id => `fixture-${id}`, fetch: async (url, init) => {

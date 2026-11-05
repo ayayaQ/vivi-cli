@@ -13,6 +13,7 @@ import { unknownModel } from '../dist/models.js'
 import { ChatGptAuthError } from '../dist/chatgpt-auth.js'
 import { bindChatGptAccount, chooseChatGptAccount } from '../dist/chatgpt-controls.js'
 import { ChatGPTInferenceError } from '../dist/chatgpt-provider.js'
+import { parseChatGPTModelCatalog } from '../dist/chatgpt-models.js'
 import { ProviderRequestError } from '@ayayaq/vivi/providers/openai'
 import { parseChatGptCliArguments } from '../dist/chatgpt-cli.js'
 const A = 'a'.repeat(64), B = 'b'.repeat(64)
@@ -89,6 +90,24 @@ test('TUI account/workspace switch creates isolated history and current account 
     assert(catalog.calls.includes(A)); if (!cancel) assert(catalog.calls.includes(B))
     assert.equal(auth.state.signIns.length, 0)
     for (const file of await readdir(directory)) if (file.endsWith('.json')) assert(!(await readFile(join(directory, file), 'utf8')).includes('fixture-chatgpt-access'))
+  }
+})
+
+test('ChatGPT picker skips the documented text warning but preserves unknown-model and tool choices', async t => {
+  for (const model of ['gpt-6.1-sol', 'future-model']) {
+    const directory = await fixture(t), auth = authFixture(), used = []
+    await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, provider: 'chatgpt', chatgptAccountId: A, model })
+    const catalog = { async list(provider, selected) {
+      assert.equal(provider, 'chatgpt'); assert.equal(selected, A)
+      return { state: 'fresh', models: parseChatGPTModelCatalog({ models: [{ slug: model, display_name: 'Selected account choice', visibility: 'list' }] }) }
+    } }
+    const io = ioFixture(['/models', 'Hello', '/exit'], model === 'gpt-6.1-sol' ? [model, false] : [model, true, false])
+    assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io, catalog, chatgptAuth: auth,
+      providerFactory: (session, options) => ({ async generate(input) { used.push({ session, options, tools: input.tools }); return { content: 'Done', toolCalls: [] } } }) }), 0)
+    assert.equal(io.choices.filter(choice => /Text conversation compatibility is unverified/.test(choice.title)).length, model === 'gpt-6.1-sol' ? 0 : 1)
+    assert.equal(io.choices.filter(choice => /Function-tool support is not advertised/.test(choice.title)).length, 1)
+    assert.equal(used.length, 1); assert.equal(used[0].session.model, model); assert.equal(used[0].session.chatgptAccountId, A)
+    assert.deepEqual(used[0].tools, []); assert.deepEqual(auth.state.tokens, [])
   }
 })
 
