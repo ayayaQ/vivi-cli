@@ -196,9 +196,31 @@ test('replacing the lease inode during a save aborts without removing the replac
 test('history times out rather than taking a live writer lease, then recovers', async t => {
   const f = await fixture(t)
   const { child, exited } = await blockedWriter(t, f.directory)
-  await assert.rejects(f.store.append('blocked'), /locked|busy/i)
+  await assert.rejects(f.store.append('blocked'), error => {
+    assert.match(error.message, /Prompt history (?:writer lease|journal setup) remained busy/)
+    assert(error.cause, 'retain the native SQLite failure for diagnostics')
+    return true
+  })
   child.kill('SIGKILL')
   await exited
   await f.store.append('recovered')
   assert.deepEqual(await f.store.load(), ['recovered'])
+})
+
+test('history writer lease does not require upgrading past another connection shared lock', async t => {
+  const f = await fixture(t)
+  await f.store.append('initial')
+  const lease = join(f.directory, 'prompt-history-lease.sqlite')
+  const { Database } = 'Bun' in globalThis ? await import('bun:sqlite') : { Database: (await import('node:sqlite')).DatabaseSync }
+  const reader = new Database(lease)
+  reader.exec('BEGIN; SELECT * FROM sqlite_schema')
+  try {
+    await Promise.all(Array.from({ length: 6 }, (_, i) => new PromptHistoryStore(f.directory).append(`writer ${i}`)))
+    const saved = await f.store.load()
+    assert.equal(saved.length, 7)
+    assert.equal(new Set(saved).size, 7)
+  } finally {
+    reader.exec('ROLLBACK')
+    reader.close()
+  }
 })

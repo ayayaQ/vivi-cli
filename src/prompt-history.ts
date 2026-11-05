@@ -153,16 +153,27 @@ export class PromptHistoryStore {
       // lease while awaiting an fs operation. A live writer is never evicted.
       database.exec('PRAGMA busy_timeout=0')
       const deadline = Date.now() + 2000
+      let journalConfigured = false
       for (;;) {
         try {
-          database.exec('PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE')
+          if (!journalConfigured) {
+            database.exec('PRAGMA journal_mode=DELETE')
+            journalConfigured = true
+          }
+          // A RESERVED writer lock is sufficient: history lives in the JSON
+          // file. EXCLUSIVE also requires every reader to release its shared
+          // lock, an unnecessary upgrade that can starve competing waiters.
+          database.exec('BEGIN IMMEDIATE')
           acquired = true
           break
         } catch (error) {
           const busy = error instanceof Error && (
             ('errcode' in error && (error.errcode === 5 || error.errcode === 6)) ||
             ('code' in error && (error.code === 'SQLITE_BUSY' || error.code === 'SQLITE_LOCKED')))
-          if (!busy || Date.now() >= deadline) throw error
+          if (!busy) throw error
+          if (Date.now() >= deadline) {
+            throw new Error(`Prompt history ${journalConfigured ? 'writer lease' : 'journal setup'} remained busy`, { cause: error })
+          }
           await new Promise(resolve => setTimeout(resolve, 25))
         }
       }
