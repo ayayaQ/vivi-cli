@@ -99,7 +99,8 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
   const levels = ['default', ...base.reasoningCapabilities]
   const selected = await io.choose(`Reasoning effort · ${base.model}`, levels.map(value => ({
     name: value === 'none' ? 'None (disable reasoning)' : value === 'default' ? 'Provider default' : value,
-    description: value === 'default' ? base.reasoningCapabilities.length ? 'Use this model’s default behavior' : 'Specific efforts unavailable: capability metadata is unknown or absent' : 'Supported by this model', value
+    description: value === 'default' ? base.reasoningCapabilities.length ? 'Use this model’s default behavior' : 'Specific efforts unavailable: capability metadata is unknown or absent'
+      : base.provider === 'chatgpt' ? 'Documented model effort; account/workspace policy can still reject it' : 'Supported by this model', value
   })), Math.max(0, levels.indexOf(base.reasoning)))
   return selected === undefined ? undefined : { ...base, reasoning: selected }
 }
@@ -304,9 +305,15 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed || controller.signal.aborted) return false
       const result = hydrated.catalog!
       let notice = ''
-      for (const model of result.models) knownModels.set(modelKey(settings.provider, model.id), model)
       const model = hydrated.model
       if (settings.provider === 'chatgpt' && !result.models.some(model => model.id === settings.model)) throw new Error('This model is not listed for the selected ChatGPT account. Choose a current model with /models')
+      if (settings.provider === 'chatgpt' && args.includes('--reasoning') && options.reasoning && options.reasoning !== 'default') {
+        const supported = model.reasoning === 'supported' ? model.efforts : options.reasoningCapabilities
+        if (!supported.includes(options.reasoning as ReasoningEffort)) {
+          throw new Error('Selected reasoning requires supported model metadata or explicit --reasoning-capabilities from your model’s supported efforts')
+        }
+      }
+      for (const entry of result.models) knownModels.set(modelKey(settings.provider, entry.id), entry)
       knownModels.set(modelKey(settings.provider, model.id), model)
       const previous = settings
       settings = settingsForModel(settings, model)
@@ -1166,7 +1173,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           if ((reopenControls || directControls) && io.showControlDetails) await io.showControlDetails({ title: 'Context',
             ...(usage?.contextWindow ? { meter: { label: usage.estimated ? 'Estimated input' : 'Input', value: usage.inputTokens, capacity: usage.contextWindow } } : {}),
             fields: [{ label: 'Model', value: host.session.model }, { label: 'Input tokens', value: usage ? usage.inputTokens.toLocaleString() : 'Not measured' },
-              { label: 'Capacity', value: usage?.contextWindow?.toLocaleString() ?? 'Unknown' },
+              { label: usage?.limitSource?.kind === 'host' ? 'Working budget' : 'Capacity', value: usage?.contextWindow?.toLocaleString() ?? 'Unknown' },
               { label: 'Output reserve', value: usage?.outputReserveTokens?.toLocaleString() ?? 'Unknown' }],
             sections: [{ title: 'Request details', body: formatContextDetails(usage, model) }] })
           else io.write(`${formatContextDetails(usage, model)}\n`)

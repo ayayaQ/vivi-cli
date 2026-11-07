@@ -107,7 +107,7 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --reviewer NAME             Explicit Auto reviewer: openai, openrouter or none (remembered)
   --model MODEL               Required for a new session
   --reasoning LEVEL           default, disabled/none, minimal, low, medium, high, xhigh, max
-  --reasoning-capabilities CSV Host-declared supported efforts; needed for nondefault reasoning
+  --reasoning-capabilities CSV Host-declared efforts; reviewed ChatGPT models need no declaration
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
@@ -274,7 +274,9 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
   }
   if (options.reasoning !== undefined && options.reasoning !== 'default' &&
     !efforts.includes(options.reasoning as ReasoningEffort)) throw new Error('Invalid reasoning level')
-  if (options.reasoning && options.reasoning !== 'default' &&
+  // ChatGPT support is checked after selected-account discovery and reviewed
+  // metadata enrichment. Parsing a slug is never evidence of account access.
+  if (options.provider !== 'chatgpt' && options.reasoning && options.reasoning !== 'default' &&
     !options.reasoningCapabilities.includes(options.reasoning as ReasoningEffort)) {
     throw new Error('Selected reasoning requires explicit --reasoning-capabilities from your model’s supported efforts')
   }
@@ -555,6 +557,10 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       ...(session.provider === 'chatgpt' ? { chatgptAuth } : {}),
       reasoningCapabilities: metadata.reasoning === 'supported' ? [...metadata.efforts] : options.reasoningCapabilities,
       stream: metadata.streaming === 'unsupported' ? false : options.stream }
+    if (session.provider === 'chatgpt' && session.reasoning && session.reasoning !== 'default' &&
+      !effective.reasoningCapabilities.includes(session.reasoning as ReasoningEffort)) {
+      throw new Error('Selected reasoning requires supported model metadata or explicit --reasoning-capabilities from your model’s supported efforts')
+    }
     const images = new FileImageAssets(join(options.sessionDirectory, 'images'), session.id)
     effective.imageAssets = images
     effective.imageCapability = metadata.vision ?? 'unknown'

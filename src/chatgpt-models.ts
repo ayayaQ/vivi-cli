@@ -5,6 +5,33 @@ import { unknownChatGPTCapabilities } from './chatgpt-provider.js'
 
 const MAX_BYTES = 4 * 1024 * 1024
 const MAX_MODELS = 5000
+const reviewedOn = '2026-11-07'
+const modelDocumentation = 'https://developers.openai.com/api/docs/models/gpt-6.1-sol'
+const signInDocumentation = 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference'
+
+/** Reviewed exact-slug metadata is separate from account availability. Never
+ * import the API-key registry's context window or infer aliases/future models. */
+function reviewedModel(id: string): ModelEntry {
+  const model = unknownModel(id), capabilities = unknownChatGPTCapabilities(id)
+  model.modelCapabilities = capabilities
+  if (id !== 'gpt-6.1-sol') return model
+  capabilities.chat = model.conversation = 'supported'
+  capabilities.stream = model.streaming = 'supported'
+  model.efforts = ['low', 'medium', 'high', 'xhigh', 'max']
+  model.reasoning = 'supported'; model.reasoningMandatory = true
+  capabilities.reasoning = { support: 'supported', disable: 'unsupported', effortSelection: 'supported',
+    efforts: [...model.efforts], requirement: 'required' }
+  capabilities.sources = [{ kind: 'official-model-documentation', url: signInDocumentation, reviewedOn },
+    { kind: 'official-model-documentation', url: modelDocumentation, reviewedOn }]
+  // Codex/Work documents a 500K default; Codex reserves 5% of its raw window.
+  // https://github.com/openai/codex/blob/5226f2fb4bcbc4aa3ec1863b6ba0bd2c4ddb0486/codex-rs/protocol/src/openai_models.rs#L568-L589
+  // Choose the resulting 475K as local working policy, not evidence of this
+  // subscription-sharing route's/account's actual limit. Vivi's own output
+  // reserve and compaction threshold still apply inside this budget.
+  model.contextBudget = { tokens: 475_000,
+    source: { kind: 'official-model-documentation', url: modelDocumentation, reviewedOn } }
+  return model
+}
 class ChatGPTModelCatalogError extends Error {}
 const field = (value: unknown, name: string): unknown => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
@@ -28,18 +55,10 @@ export function parseChatGPTModelCatalog(input: unknown): ModelEntry[] {
     const id = field(entry, 'slug')
     if (field(entry, 'visibility') !== 'list' || !identifier(id) || seen.has(id)) continue
     seen.add(id)
-    const capabilities = unknownChatGPTCapabilities(id)
-    // The SiwC guide demonstrates text input/output and SSE for this exact slug.
-    // Do not import API-key tools, vision, reasoning or capacity assumptions.
-    if (id === 'gpt-6.1-sol') {
-      capabilities.chat = 'supported'; capabilities.stream = 'supported'
-      capabilities.sources = [{ kind: 'official-model-documentation',
-        url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-05' }]
-    }
-    models.push({ ...unknownModel(id), name: label(field(entry, 'display_name'), id),
-      conversation: capabilities.chat, streaming: capabilities.stream, modelCapabilities: capabilities,
-      source: capabilities.chat === 'supported'
-        ? 'Selected ChatGPT account model catalog; text and streaming documented by the Sign in with ChatGPT guide'
+    const model = reviewedModel(id)
+    models.push({ ...model, name: label(field(entry, 'display_name'), id),
+      source: model.conversation === 'supported'
+        ? 'Selected ChatGPT account model catalog; reviewed text, streaming and reasoning documentation; local context budget (account limits unverified)'
         : 'Selected ChatGPT account model catalog; capabilities not advertised' })
   }
   if (!models.length) throw new ChatGPTModelCatalogError('No selectable models were returned for this ChatGPT account')

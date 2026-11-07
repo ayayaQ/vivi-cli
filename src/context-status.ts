@@ -14,17 +14,19 @@ function shortTokens(value: number): string {
 /** Header values describe one effective request; cumulative usage lives in /session. */
 export function formatContextStatus(usage?: ContextUsage): string {
   if (!usage) return 'Context unknown'
-  return `Context ${usage.estimated ? '~' : ''}${shortTokens(usage.inputTokens)}/${usage.contextWindow === undefined ? '?' : shortTokens(usage.contextWindow)}`
+  return `Context${usage.limitSource?.kind === 'host' ? ' budget' : ''} ${usage.estimated ? '~' : ''}${shortTokens(usage.inputTokens)}/${usage.contextWindow === undefined ? '?' : shortTokens(usage.contextWindow)}`
 }
 export function formatContextDetails(usage?: ContextUsage, model?: ModelEntry): string {
-  const source = usage?.limitSource ?? model?.contextLimitsSource
+  const budget = usage?.limitSource?.kind === 'host' || !usage && model?.contextBudget !== undefined
+  const source = usage?.limitSource ?? (budget ? model?.contextBudget?.source : model?.contextLimitsSource)
   return [formatContextStatus(usage),
     usage ? `Input: ${usage.inputTokens} tokens${usage.estimated ? ' (estimated effective request, including current guidance and tools)' : ' (effective request)'}` : 'Input: not measured yet',
-    `Capacity: ${usage?.contextWindow ?? 'unknown'}`,
+    `Capacity: ${budget ? model?.contextWindow ?? 'unknown (not advertised for this account/route)' : usage?.contextWindow ?? model?.contextWindow ?? 'unknown'}`,
+    ...(budget ? [`Working budget: ${usage?.contextWindow ?? model?.contextBudget?.tokens ?? 'unknown'} tokens (local policy, not a confirmed subscription limit; includes output reserve)`] : []),
     ...(usage?.maxInputTokens === undefined ? [] : [`Endpoint input limit: ${usage.maxInputTokens} tokens`]),
     `Output reserve: ${usage?.outputReserveTokens ?? 'unknown'} tokens`,
     ...(model?.maxOutputTokens === undefined ? [] : [`Provider maximum output: ${model.maxOutputTokens} tokens`]),
-    ...(source ? [`Limits: ${source.kind} · ${source.url} · reviewed ${source.reviewedOn}`] : ['Limits: metadata unavailable; capacity is not inferred from the model name']),
+    ...(source ? [`${budget ? 'Budget basis' : 'Limits'}: ${source.kind} · ${source.url} · reviewed ${source.reviewedOn}`] : ['Limits: metadata unavailable; capacity is not inferred from the model name']),
     ...(usage?.limitSource?.fetchedAt ? [`Catalog: ${usage.limitSource.freshness ?? 'unknown'} · fetched ${usage.limitSource.fetchedAt}`] :
       model?.contextMetadata ? [`Catalog: ${model.contextMetadata.state} · fetched ${model.contextMetadata.fetchedAt}`] : []),
     'Compaction changes only the provider view; the complete local transcript and exact tool evidence are retained',

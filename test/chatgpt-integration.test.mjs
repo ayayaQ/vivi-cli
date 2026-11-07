@@ -78,6 +78,79 @@ test('line ChatGPT launch requires chosen saved registration and listed model; n
   }
 })
 
+test('line ChatGPT startup hydrates documented reasoning without a manual capability flag and labels its context budget', async t => {
+  const directory = await fixture(t), auth = authFixture(), contexts = [], io = ioFixture([], [], false)
+  io.setContext = usage => contexts.push(usage)
+  const catalog = { async list(provider, id) {
+    assert.equal(provider, 'chatgpt'); assert.equal(id, A)
+    return { state: 'fresh', models: parseChatGPTModelCatalog({ models: [{ slug: 'gpt-6.1-sol', visibility: 'list' }] }) }
+  } }
+  let used
+  assert.equal(await main(['--no-workspace', '--no-tui', '--provider', 'chatgpt', '--chatgpt-account', A,
+    '--model', 'gpt-6.1-sol', '--reasoning', 'high', '--session-dir', directory, '--prompt', '/context'], {}, {
+    io, chatgptAuth: auth, catalog, providerFactory: (session, options) => {
+      used = { session, options }; return { async generate() { assert.fail('context measurement must not call inference') } }
+    }
+  }), 0)
+  assert.equal(used.session.reasoning, 'high')
+  assert.deepEqual(used.options.reasoningCapabilities, ['low', 'medium', 'high', 'xhigh', 'max'])
+  assert.equal(used.options.imageModelCapabilities.contextWindow, undefined)
+  assert(contexts.some(usage => usage?.contextWindow === 475000 && usage.limitSource.kind === 'host'))
+  assert.match(io.output, /Context budget ~/); assert.match(io.output, /Capacity: unknown/)
+  assert.match(io.output, /Working budget: 475000/); assert.deepEqual(auth.state.tokens, [])
+})
+
+test('ChatGPT effort selection and model switching hydrate reviewed metadata without leaking the budget into unknown models', async t => {
+  const directory = await fixture(t), auth = authFixture(), uses = [], contexts = []
+  await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, provider: 'chatgpt', chatgptAccountId: A, model: 'gpt-6.1-sol' })
+  const io = ioFixture(['/effort', 'First', '/context', '/models', 'Second', '/context', '/exit'], ['max', 'future-model', true, false])
+  io.setContext = usage => contexts.push(usage)
+  const catalog = { async list(provider, id) {
+    assert.equal(provider, 'chatgpt'); assert.equal(id, A)
+    return { state: 'fresh', models: parseChatGPTModelCatalog({ models: ['gpt-6.1-sol', 'future-model'].map(slug => ({ slug, visibility: 'list' })) }) }
+  } }
+  assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io, chatgptAuth: auth, catalog,
+    providerFactory: (session, options) => ({ async generate() { uses.push({ model: session.model, reasoning: session.reasoning, efforts: options.reasoningCapabilities }); return { content: 'Done', toolCalls: [] } } }) }), 0)
+  assert.deepEqual(uses.map(use => [use.model, use.reasoning]), [['gpt-6.1-sol', 'max'], ['future-model', 'default']])
+  assert.deepEqual(uses[0].efforts, ['low', 'medium', 'high', 'xhigh', 'max']); assert.deepEqual(uses[1].efforts, [])
+  assert(contexts.some(usage => usage?.contextWindow === 475000)); assert.equal(contexts.at(-1).contextWindow, undefined)
+  assert.match(io.output, /Working budget: 475000/); assert.match(io.output, /Context ~\d+\/?\?/)
+  assert.deepEqual(auth.state.tokens, [])
+})
+
+test('ChatGPT explicit startup efforts are validated after account discovery in line and TUI flows', async t => {
+  const cases = [
+    { model: 'gpt-6.1-sol', reasoning: 'high', ok: true },
+    { model: 'gpt-6.1-sol', reasoning: 'none', ok: false },
+    { model: 'gpt-6.1-sol', reasoning: 'none', declaration: 'none', ok: false },
+    { model: 'future-model', reasoning: 'high', ok: false },
+    { model: 'future-model', reasoning: 'high', declaration: 'high', ok: true },
+    { model: 'gpt-6.1-sol', reasoning: 'high', listed: 'future-model', ok: false }
+  ]
+  for (const tui of [false, true]) for (const entry of cases) {
+    const directory = await fixture(t), auth = authFixture(), io = ioFixture(['Hello', '/exit'], [], tui), uses = [], discoveries = []
+    const catalog = { async list(provider, id) {
+      discoveries.push(id); assert.equal(provider, 'chatgpt')
+      return { state: 'fresh', models: parseChatGPTModelCatalog({ models: [{ slug: entry.listed ?? entry.model, visibility: 'list' }] }) }
+    } }
+    const args = ['--no-workspace', '--provider', 'chatgpt', '--chatgpt-account', A,
+      '--model', entry.model, '--reasoning', entry.reasoning, '--session-dir', directory,
+      ...(!tui ? ['--no-tui', '--prompt', 'Hello'] : []), ...(entry.declaration ? ['--reasoning-capabilities', entry.declaration] : [])]
+    const status = await main(args, {}, { ...(tui ? { tuiIO: io } : { io }), catalog, chatgptAuth: auth,
+      providerFactory: session => {
+        assert(entry.ok, 'unsupported or unlisted selection must fail before provider construction')
+        uses.push(session.reasoning)
+        return { async generate() { return { content: 'Done', toolCalls: [] } } }
+      } })
+    // A rejected TUI startup stays open for explicit /models recovery and exits
+    // normally; it must never silently normalize the flag and send a request.
+    assert.equal(status, entry.ok || tui ? 0 : 1, `${tui ? 'TUI' : 'line'}: ${JSON.stringify(entry)}: ${io.output}`)
+    assert.deepEqual(uses, entry.ok ? [entry.reasoning] : [])
+    assert.deepEqual(discoveries, [A]); assert.deepEqual(auth.state.tokens, [])
+    if (!entry.ok) assert.match(io.output, entry.listed ? /not listed/ : /Selected reasoning requires/)
+  }
+})
+
 test('TUI account/workspace switch creates isolated history and current account catalog; canceled selection keeps active account', async t => {
   for (const cancel of [false, true]) {
     const directory = await fixture(t), auth = authFixture(), catalog = catalogFixture(), uses = []

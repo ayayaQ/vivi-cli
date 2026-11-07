@@ -68,7 +68,7 @@ const objectSchema = (properties: Record<string, unknown>, required: string[]): 
 
 function hostTools(enableNotes = false): ToolDefinition[] {
   const tools: ToolDefinition[] = [
-    { name: 'session_status', description: 'Read current host-owned provider, model, reasoning, task mode, approval mode and effective request context usage. Null context means not measured; estimated usage is labelled. Read only; does not grant permission or change settings.',
+    { name: 'session_status', description: 'Read current host-owned provider, model, reasoning, task mode, approval mode and effective request context usage. Null context means not measured; estimated usage is labelled. A context window with limitSource.kind host is a local working budget, not confirmed provider capacity. Read only; does not grant permission or change settings.',
       parameters: objectSchema({}, []) },
     { name: 'current_time', description: 'Return the current time in a requested IANA timezone, default UTC.',
       parameters: objectSchema({ timezone: { type: 'string', maxLength: 100 } }, []) }

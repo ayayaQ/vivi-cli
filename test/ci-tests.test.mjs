@@ -104,7 +104,7 @@ test('CI runner rejects unknown groups and propagates failed test subprocesses',
 test('PR smoke groups preserve runtime boundaries without repeating broad suites', async () => {
   const groups = await ciTestGroups()
   assert.deepEqual(groups['linux-current'], [
-    'automation-main', 'automation-output', 'chatgpt-auth', 'chatgpt-integration', 'chatgpt-provider', 'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
+    'automation-main', 'automation-output', 'chatgpt-auth', 'chatgpt-integration', 'chatgpt-model-metadata', 'chatgpt-provider', 'command-process', 'installed-skills', 'launcher', 'mcp-http', 'mcp-lifecycle',
     'mcp-oauth-native', 'mcp-oauth-store', 'output-schema', 'platform-acceptance'
   ].map(name => `./test/${name}.test.mjs`))
   for (const name of ['automation-main', 'automation-output', 'output-schema']) {

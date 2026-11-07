@@ -96,6 +96,17 @@ test('context stays quiet before the first turn, appears near capacity, and rese
   expect(await f.frame()).not.toContain('Context')
 })
 
+test('subscription host budget remains explicitly labelled in the native context footer', async () => {
+  const f = await fixture()
+  const session = newSession({ provider: 'chatgpt', model: 'gpt-6.1-sol', chatgptAccountId: 'a'.repeat(64) })
+  session.history = [{ kind: 'message', role: 'user', content: 'First turn' }]
+  f.io.setSession(session)
+  f.io.setContext({ inputTokens: 400000, estimated: true, contextWindow: 475000, outputReserveTokens: 4096,
+    limitSource: { kind: 'host', url: 'https://developers.openai.com/api/docs/models/gpt-6.1-sol', reviewedOn: '2026-11-07' } })
+  expect(await f.frame()).toContain('Context budget ~400k/475k')
+  expect((f.node('vivi-tokens') as TextRenderable).plainText).toBe('Context budget ~400k/475k')
+})
+
 test('shell details appear beside live shell input and disappear on edit or modal replacement', async () => {
   const f = await fixture()
   const reading = f.io.readLine('Message')
