@@ -512,7 +512,8 @@ export class CliHost {
     const eventId = this.records.anchorEventId
     if (eventId && !this.current.recordAnchor && this.records.view.durability === 'disk') {
       const next = validateSession({ ...this.current, schemaVersion: this.current.schemaVersion === 3 ? 3 : 2, recordAnchor: { version: 1, eventId } })
-      await this.checkpoint(next)
+      try { await this.checkpoint(next) }
+      catch (error) { if (error instanceof SessionCommitError) this.current = next; throw error }
       this.current = next
     }
   }
@@ -2308,7 +2309,21 @@ export class CliHost {
       }
       // Keep untouched conversations in memory. Once the first prompt is saved,
       // anchor its pre-turn history before beginning the canonical run journal.
-      if (firstPrompt) await this.initializeRecords(previous)
+      if (firstPrompt) {
+        try { await this.initializeRecords(previous) }
+        catch (error) {
+          // The prompt is already durable. Retain this observed pre-model failure
+          // so a later send or resume does not encounter an unmatched empty anchor.
+          try {
+            await this.records.begin(this.toolsetRevision, this.current)
+            await this.records.settle(this.toolsetRevision, { status: 'error', history: structuredClone(this.current.history),
+              content: '', rounds: 0, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+              error: { code: 'event_error', message: 'Session record anchor could not be saved; no model request was sent' }
+            }, this.current, this.safeMcpRows())
+          } catch { /* Shadow recovery cannot replace the original checkpoint failure. */ }
+          throw error
+        }
+      }
       await this.records.begin(this.toolsetRevision, this.current)
       const result = await runAgent({
         provider: guardedProvider, messages: this.current.history, context, getContextPrefix: getInstructionPrefix,

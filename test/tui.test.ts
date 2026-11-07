@@ -52,6 +52,7 @@ test('slash command helpers match only the sole starting token', () => {
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
+  expect(getSlashCommandCompletions('/mode').map(({ command }) => command)).toEqual(['/mode', '/models'])
   expect(getSlashCommandCompletions('/provider').map(({ command }) => command)).toEqual(['/provider'])
   expect(getSlashCommandCompletions('/commands').map(({ command }) => command)).toEqual(['/commands'])
   expect(getSlashCommandCompletions('/processes').map(({ command }) => command)).toEqual(['/processes'])
@@ -111,6 +112,16 @@ test('Enter submits the highlighted slash completion and preserves newline short
     expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('/ex\n')
     input.pressEnter(); expect(await line).toBe('/ex\n')
   }
+})
+
+test('Enter preserves an exact command prefix unless another completion is explicitly selected', async () => {
+  const { io, input, frame } = await fixture()
+  let line = io.readLine('Message')
+  await input.typeText('/mode'); await frame(); input.pressEnter()
+  expect(await line).toBe('/mode')
+  line = io.readLine('Message')
+  await input.typeText('/mode'); await frame(); input.pressArrow('down'); input.pressEnter()
+  expect(await line).toBe('/models')
 })
 
 test('autocomplete leaves ordinary text, arguments, unknown commands and askText alone', async () => {

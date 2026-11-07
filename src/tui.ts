@@ -126,7 +126,8 @@ export type SlashCommand = typeof SLASH_COMMANDS[number]
 
 /** Complete only the whole, first slash token. Ordinary text and arguments are untouched. */
 export function getSlashCommandCompletions(input: string, canCompact = true): readonly SlashCommand[] {
-  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact)) : []
+  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact))
+    .sort((a, b) => Number(b.command === input) - Number(a.command === input)) : []
 }
 
 const MAX_INPUT = 65536
