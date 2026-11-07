@@ -4,7 +4,7 @@ This repository contains the application host and terminal UI. The shared agent 
 canonical history helpers and provider implementations come from `@ayayaq/vivi`.
 
 The current package remains private and versioned `0.1.0-dev.0`. It depends on
-the exact immutable npm release `@ayayaq/vivi@0.17.0`, with the registry tarball URL
+the exact immutable npm release `@ayayaq/vivi@0.17.1`, with the registry tarball URL
 and SHA-512 integrity recorded by npm in the lockfile. Do not accept a same-version
 artifact containing different bytes. The packed CLI bundles the installed shared
 dependency, including its source, LICENSE, NOTICE, attribution records and exact transitive `yaml@2.9.1` ISC parser, so the shared core needs no separate registry request. OpenTUI and its native platform
@@ -12,16 +12,21 @@ dependencies remain registry dependencies; offline installs need a populated npm
 
 ## Shared registry dependency
 
-The published shared vivi `0.17.0` registry archive was verified byte-for-byte against
+The published shared vivi `0.17.1` registry archive was verified byte-for-byte against
 the reviewed release artifact. The package check requires that reviewed SHA-512
 integrity, an exact registry version and matching installed dependency metadata.
 It also checks the bundled core's source, license, attribution and runtime/type exports.
-The verified registry tarball is 452,430 bytes (430 files), SHA-256
-`f709f18cc262f0b6c56170cb4d5fa47ab196b1039833aa0795e61598b55b49a0`.
-Registry `latest` was verified as `0.17.0`, published 2026-11-01T16:03:54.061Z.
+The verified registry tarball is 483,563 bytes (442 files), SHA-256
+`32c51fbbc39a8b51e631abeb92776c8642069e0844387413321eb95f7c3782f6`.
+Registry `latest` was verified as `0.17.1`, published 2026-11-07T10:33:55.400Z.
 The installed package checks exercise detached OpenAI request projection and sanitized
 error details, the native DeepSeek chat adapter and the independent web provider through
 ESM, CommonJS and strict TypeScript consumers using offline fixtures.
+Installed ESM/CommonJS consumers also verify explicit SSE negotiation, fragmented SSE
+with missing or incorrect media types, and immutable sanitized non-SSE diagnostics
+(including HTTP status and media type). The ChatGPT host fixtures cover both display
+modes, usage recovery, terminal validation and no replay. These are offline checks,
+not evidence that the reported live ChatGPT session has been reproduced or fixed.
 Chat reasoning history and web source URLs/provenance retain their shared contracts.
 The shared MCP catalog, preparation and result projection helpers are consumed
 from the registry. Its exact `yaml@2.9.1` dependency and unchanged
@@ -310,7 +315,7 @@ authorized operations.
 
 ## Agent Skills adoption checks
 
-Skills use the pinned published vivi 0.17.0 extension. Its generic save callbacks
+Skills use the pinned published vivi 0.17.1 extension. Its generic save callbacks
 support the host implementation. A separately
 reviewed core comment clarification describes storage-neutral SKILL.md transactions and
 explicit unknown outcomes; it creates no new runtime-version or npm-publication gate.
@@ -367,7 +372,7 @@ server interoperability remains separate evidence.
 ## ChatGPT integration dependency gate
 
 The ChatGPT route consumes the request-projection hook and optional safe error details
-from the exact published `@ayayaq/vivi@0.17.0` dependency. The npm-generated lock and
+from the exact published `@ayayaq/vivi@0.17.1` dependency. The npm-generated lock and
 package acceptance checks require its reviewed registry SHA-512 integrity; local core
 links or same-version replacement bytes do not establish acceptance. Authentication,
 account storage and approval modes remain CLI-owned. Mocked package and lifecycle

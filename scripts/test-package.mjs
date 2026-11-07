@@ -18,8 +18,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'vivi-cli-consumer-'))
 // npm ci's tarball cache alone may not contain packuments needed to install an archive.
 const cache = process.env.VIVI_TEST_NPM_CACHE ?? join(temporary, 'npm-cache')
 const coreName = '@ayayaq/vivi'
-const coreVersion = '0.17.0'
-const coreIntegrity = 'sha512-inMbmRN+0RGtZZKtjhq9TsmwNJHVlqo4TyKsKSGD6wtPGQUBXI18U4kTk5AV6V4ehKoWx9RD5WrBpZv8M/i/Jw=='
+const coreVersion = '0.17.1'
+const coreIntegrity = 'sha512-eNqVR0KjClUSAXsGG8wP4rz+mkQ1r7OZ6m61GOajWorcKr4wm4VPP6DmxswZnqytKADY0n+xky5J8vEmR10LYA=='
 const yamlVersion = '2.9.1'
 const yamlIntegrity = 'sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw=='
 const corePath = 'node_modules/@ayayaq/vivi'
@@ -56,7 +56,7 @@ try {
   assert.equal(resolved.protocol, 'https:', 'Shared core must resolve from the HTTPS npm registry')
   assert.equal(resolved.hostname, 'registry.npmjs.org', 'Shared core must resolve from the npm registry')
   assert.match(resolved.pathname, /^\/@ayayaq\/vivi\/-\/[^/]+\.tgz$/, 'Unexpected shared core registry artifact')
-  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.17.0 release bytes')
+  assert.equal(coreLock.integrity, coreIntegrity, 'Shared core lock must match the reviewed 0.17.1 release bytes')
   assert.equal(coreLock.dependencies.yaml, yamlVersion, 'Shared YAML parser must retain its exact reviewed version')
   assert.equal(lock.packages['node_modules/yaml'].integrity, yamlIntegrity, 'YAML parser integrity must remain unchanged')
   for (const field of ['version', 'resolved', 'integrity']) {
@@ -703,6 +703,31 @@ try {
   const require = createRequire(import.meta.url)
   // The installed registry core must provide both new host compatibility contracts.
   for (const module of [{ createOpenAIProvider, ProviderRequestError }, require('@ayayaq/vivi/providers/openai')]) {
+    const frame = value => 'data: ' + JSON.stringify(value) + '\\n\\n'
+    const completed = { type: 'response.completed', response: { status: 'completed', output: [
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Packed SSE', annotations: [] }] }
+    ] } }
+    for (const contentType of [undefined, 'application/json']) {
+      const streaming = module.createOpenAIProvider({ model: 'packed-sse', apiKey: 'packed-only-key', stream: true,
+        fetch: async (_url, init) => {
+          assert.equal(new Headers(init.headers).get('accept'), 'text/event-stream')
+          const bytes = new TextEncoder().encode(frame(completed)); let offset = 0
+          return new Response(new ReadableStream({ pull(controller) {
+            if (offset === bytes.length) controller.close()
+            else controller.enqueue(bytes.slice(offset, ++offset))
+          } }), { headers: contentType ? { 'content-type': contentType } : {} })
+        } })
+      assert.equal((await streaming.generate({ messages: [], tools: [] }, new AbortController().signal)).content, 'Packed SSE')
+    }
+    const nonSse = module.createOpenAIProvider({ model: 'packed-sse', apiKey: 'packed-only-key', stream: true, errorDetails: true,
+      fetch: async () => new Response(JSON.stringify({ error: { code: 'safe_code', param: 'model', message: 'private-packed-response' } }),
+        { headers: { 'content-type': 'application/json; private=hidden', 'x-request-id': 'req_packed_mime' } }) })
+    await assert.rejects(nonSse.generate({ messages: [], tools: [] }, new AbortController().signal), error => {
+      assert(error instanceof module.ProviderRequestError); assert.equal(error.status, 200)
+      assert.deepEqual(error.details, { code: 'safe_code', param: 'model', requestId: 'req_packed_mime', bodyShape: 'error', contentType: 'application/json' })
+      assert(Object.isFrozen(error.details)); assert.doesNotMatch(error.message + JSON.stringify(error), /private-packed-response|packed-only-key|hidden/)
+      return true
+    })
     let credentials = 0, sends = 0
     const efforts = [], tools = [{ name: 'packed_projection', description: 'Offline projection',
       parameters: { type: 'object', properties: { value: { type: 'string' } } } }]
@@ -874,6 +899,8 @@ const options: OpenAIProviderOptions = { model: 'types-only', apiKey: 'fake', er
   transformRequest(body) { delete body.max_output_tokens; return body } }
 const projected = createOpenAIProvider(options)
 function diagnostic(error: ProviderRequestError): Readonly<ProviderErrorDetails> | undefined {
+  const mediaType: string | undefined = error.details?.contentType
+  void mediaType
   // @ts-expect-error captured diagnostics are immutable
   error.details!.code = 'changed'
   return error.details
