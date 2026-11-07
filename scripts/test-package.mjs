@@ -705,7 +705,7 @@ try {
   for (const module of [{ createOpenAIProvider, ProviderRequestError }, require('@ayayaq/vivi/providers/openai')]) {
     const frame = value => 'data: ' + JSON.stringify(value) + '\\n\\n'
     const completed = { type: 'response.completed', response: { status: 'completed', output: [
-      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Packed SSE', annotations: [] }] }
+      { type: 'message', id: 'packed_message', role: 'assistant', content: [{ type: 'output_text', text: 'Packed SSE', annotations: [] }] }
     ] } }
     for (const contentType of [undefined, 'application/json']) {
       const streaming = module.createOpenAIProvider({ model: 'packed-sse', apiKey: 'packed-only-key', stream: true,
