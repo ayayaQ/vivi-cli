@@ -16,7 +16,8 @@ const identifier = (value: unknown): value is string => typeof value === 'string
 const label = (value: unknown, fallback: string): string => typeof value === 'string' && value.length > 0 && value.length <= 300 &&
   !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(value) ? value : fallback
 
-/** ChatGPT's account-specific schema is not API-key GET /models. Preserve server ordering. */
+/** ChatGPT's account-specific schema is not API-key GET /models. Preserve server ordering.
+ * Documentation can establish a route capability, never account availability. */
 export function parseChatGPTModelCatalog(input: unknown): ModelEntry[] {
   const entries = field(input, 'models')
   if (!Array.isArray(entries) || entries.length > MAX_MODELS) throw new ChatGPTModelCatalogError('ChatGPT model catalog has an unsupported format or size')
@@ -27,8 +28,19 @@ export function parseChatGPTModelCatalog(input: unknown): ModelEntry[] {
     const id = field(entry, 'slug')
     if (field(entry, 'visibility') !== 'list' || !identifier(id) || seen.has(id)) continue
     seen.add(id)
+    const capabilities = unknownChatGPTCapabilities(id)
+    // The SiwC guide demonstrates text input/output and SSE for this exact slug.
+    // Do not import API-key tools, vision, reasoning or capacity assumptions.
+    if (id === 'gpt-6.1-sol') {
+      capabilities.chat = 'supported'; capabilities.stream = 'supported'
+      capabilities.sources = [{ kind: 'official-model-documentation',
+        url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-05' }]
+    }
     models.push({ ...unknownModel(id), name: label(field(entry, 'display_name'), id),
-      modelCapabilities: unknownChatGPTCapabilities(id), source: 'Selected ChatGPT account model catalog; capabilities not advertised' })
+      conversation: capabilities.chat, streaming: capabilities.stream, modelCapabilities: capabilities,
+      source: capabilities.chat === 'supported'
+        ? 'Selected ChatGPT account model catalog; text and streaming documented by the Sign in with ChatGPT guide'
+        : 'Selected ChatGPT account model catalog; capabilities not advertised' })
   }
   if (!models.length) throw new ChatGPTModelCatalogError('No selectable models were returned for this ChatGPT account')
   return models

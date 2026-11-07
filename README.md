@@ -60,10 +60,13 @@ vivi auth logout --chatgpt-account ACCOUNT_ID
 
 Use the exact registration ID from `auth list`; account/workspace registrations
 remain separate even with the same email. `/models` shows the signed-in account's
-catalog in server order. Model capabilities remain unknown unless advertised or
-explicitly declared for this launch; no model availability or reasoning effort is
-inferred from the login. In line mode, `--tools` explicitly declares function-tool
-support, and nondefault reasoning still needs `--reasoning-capabilities`.
+catalog in server order. Text and streaming support for the exact `gpt-6.1-sol`
+slug is documented in the [Sign in with ChatGPT guide](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference),
+but it is offered only when listed for the selected account. Other model capabilities
+remain unknown unless advertised or explicitly declared for this launch; no model
+availability or reasoning effort is inferred from the login. In line mode,
+`--tools` explicitly declares function-tool support, and nondefault reasoning still
+needs `--reasoning-capabilities`.
 
 Official dynamic registration uses Vivi's own issued client ID, PKCE and verified
 OIDC identity. No legacy Codex client IDs, shared `auth.json`, or ChatGPT private
