@@ -4,16 +4,19 @@ import { BoxRenderable, ScrollBoxRenderable, SelectRenderable, SelectRenderableE
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent } from '@opentui/core'
 import { matchingChoiceIndices } from './picker.js'
 import type { Choice, ControlDetails, SearchableOptions, SearchableSelection } from './picker.js'
-import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
+import { MenuWheel, ModalScrollBoxRenderable, MouseActivation, pickerIndexAt, pickerHoverRegion } from './tui-mouse.js'
+import type { MouseHover } from './tui-mouse.js'
 
 interface ModalOptions {
   safe(text: string, limit?: number): string
   ready(): boolean
   completedFrame(): number
+  hover: MouseHover
   foreground: RGBA
   accent: string
   selection: string
   selectedForeground: string
+  rowBackground: string
 }
 type Picker = { choices: readonly Choice<unknown>[]; matches: number[]; query: string; refresh: boolean; sectioned: boolean }
 
@@ -43,6 +46,7 @@ export class ControlModal {
   private details: ControlDetails | undefined
   private finish: ((value: unknown) => void) | undefined
   private mouse = new MouseActivation()
+  private wheel = new MenuWheel()
   private token: object = {}
   private changedFrame = 0
   private changing = false
@@ -63,7 +67,8 @@ export class ControlModal {
       width: '100%', height: '100%', zIndex: 100, justifyContent: 'center', alignItems: 'center',
       onMouse: event => this.backdrop(event) })
     this.panel = new BoxRenderable(renderer, { id: 'vivi-control-panel', width: 76, height: 22,
-      flexDirection: 'column', flexShrink: 0, paddingX: 2, paddingY: 1, backgroundColor: RGBA.defaultBackground() })
+      flexDirection: 'column', flexShrink: 0, border: true, borderStyle: 'rounded', borderColor: options.accent,
+      paddingX: 1, paddingY: 0, backgroundColor: RGBA.defaultBackground() })
     this.overlay.add(this.panel)
     const header = new BoxRenderable(renderer, { height: 1, width: '100%', flexShrink: 0, flexDirection: 'row', marginBottom: 1 })
     this.heading = new TextRenderable(renderer, { id: 'vivi-control-title', flexGrow: 1, minWidth: 0,
@@ -87,17 +92,34 @@ export class ControlModal {
       focusedTextColor: options.foreground, selectedBackgroundColor: options.selection,
       selectedTextColor: options.selectedForeground, onMouse: event => this.pickMouse(event) })
     this.picker.focusable = false
+    // Paint bands after native text rendering, before the independent hover layer.
+    const renderPicker = this.picker.render
+    const band = RGBA.fromHex(options.rowBackground)
+    this.picker.render = (buffer, deltaTime) => {
+      renderPicker.call(this.picker, buffer, deltaTime)
+      if (!this.picker.visible || this.title !== 'Resume a local session' || this.mode !== 'picker' || !this.state?.matches.length) return
+      const left = Math.max(0, this.picker.screenX)
+      const right = Math.min(buffer.width, this.picker.screenX + this.picker.width - Number(this.picker.showScrollIndicator))
+      const background = buffer.buffers.bg
+      for (let row = 0; row < this.picker.height; row++) {
+        const index = pickerIndexAt(this.picker, this.picker.x, this.picker.y + row)
+        const y = this.picker.screenY + row
+        if (index === undefined || index % 2 !== 0 || index === this.picker.getSelectedIndex() || y < 0 || y >= buffer.height) continue
+        for (let x = left; x < right; x++) background.set(band.buffer, (y * buffer.width + x) * 4)
+      }
+    }
     this.picker.on(SelectRenderableEvents.SELECTION_CHANGED, () => { this.mouse.clear(); this.describe() })
-    this.sectionList = new ScrollBoxRenderable(renderer, { id: 'vivi-control-sections', width: '100%', height: 12,
+    this.sectionList = new ModalScrollBoxRenderable(renderer, { id: 'vivi-control-sections', width: '100%', height: 12,
       flexShrink: 0, visible: false, scrollX: false, scrollY: true, viewportCulling: true,
       contentOptions: { flexDirection: 'column' }, onMouse: event => {
+        if (event.type === 'scroll') options.hover.clear()
         event.preventDefault(); event.stopPropagation(); this.mouse.clear()
         if (event.type === 'scroll' && options.ready()) this.scrollSections(event)
       } })
     this.sectionList.focusable = false
     this.description = new TextRenderable(renderer, { id: 'vivi-control-description', width: '100%', height: 2,
       flexShrink: 0, fg: options.foreground, attributes: TextAttributes.DIM, wrapMode: 'word', marginTop: 1 })
-    this.body = new ScrollBoxRenderable(renderer, { id: 'vivi-control-body', width: '100%', flexGrow: 1,
+    this.body = new ModalScrollBoxRenderable(renderer, { id: 'vivi-control-body', width: '100%', flexGrow: 1,
       minHeight: 1, scrollX: false, scrollY: true, visible: false, contentOptions: { flexDirection: 'column' } })
     this.footerBar = new BoxRenderable(renderer, { id: 'vivi-control-actions', width: '100%', height: 1,
       flexShrink: 0, flexDirection: 'row', gap: 1, marginTop: 1 })
@@ -110,6 +132,12 @@ export class ControlModal {
       height: 1, fg: options.foreground, selectable: false, onMouse: event => this.mouse.handle(event, this.confirmButton,
         'confirm', this.token, options.ready() && (this.mode !== 'picker' || options.completedFrame() > this.changedFrame), () => this.submit()) })
     this.footerBar.add(this.footer); this.footerBar.add(this.refreshButton); this.footerBar.add(this.confirmButton)
+    options.hover.bind(this.closeButton, () => options.ready())
+    options.hover.bind(this.refreshButton, () => options.ready() && !!this.state?.refresh)
+    options.hover.bind(this.confirmButton, () => options.ready() && (this.mode !== 'picker' ||
+      options.completedFrame() > this.changedFrame && !!this.state?.matches.length))
+    options.hover.bind(this.picker, () => options.ready() && options.completedFrame() > this.changedFrame,
+      point => pickerHoverRegion(this.picker, point))
     for (const child of [header, this.noticeLine, this.query, this.picker, this.sectionList, this.description, this.body, this.footerBar]) this.panel.add(child)
     renderer.root.add(this.overlay)
     this.resize()
@@ -143,6 +171,7 @@ export class ControlModal {
   }
   cancel(): void { this.finish?.(undefined) }
   private start(title: string, mode: typeof this.mode): Promise<unknown> {
+    this.wheel.reset()
     this.cancel(); this.mode = mode; this.setTitle(title); this.token = {}; this.mouse.clear()
     this.changedFrame = this.renderer.frameId
     this.query.visible = mode !== 'details'; this.picker.visible = mode === 'picker'
@@ -165,7 +194,8 @@ export class ControlModal {
       sectioned: choices.some(choice => choice.section !== undefined) }
     this.state = state
     this.query.height = 1
-    this.query.placeholder = new StyledText([{ __isChunk: true, text: title.startsWith('Models ·') ? 'Search models…' : 'Search commands…',
+    this.query.placeholder = new StyledText([{ __isChunk: true, text: title.startsWith('Models ·') ? 'Search models…'
+      : title === 'Resume a local session' ? 'Search sessions…' : 'Search commands…',
       fg: this.options.foreground, attributes: TextAttributes.DIM }])
     this.setText(options.query ?? remembered?.query ?? '')
     this.filter(true)
@@ -253,9 +283,13 @@ export class ControlModal {
       state.matches = sections.flatMap(section => state.matches.filter(index => (state.choices[index]!.section ?? 'Other') === section))
     }
     this.picker.visible = !state.sectioned; this.sectionList.visible = state.sectioned
+    const leading = state.choices.map(choice => this.options.safe(choice.leadingText ?? '', 32))
+    const leadingWidth = leading.reduce((width, text) => Math.max(width, text.length), 0)
     this.picker.options = state.matches.length ? state.matches.map(index => ({
-      name: this.options.safe(state.choices[index]!.name, 1024), description: '', value: index
-    })) : [{ name: this.title.startsWith('Models ·') ? 'No matching models' : 'No matching commands', description: '', value: -1 }]
+      name: `${leadingWidth ? `${leading[index]!.padEnd(leadingWidth)}  ` : ''}${this.options.safe(state.choices[index]!.name, 1024)}`,
+      description: '', value: index
+    })) : [{ name: this.title.startsWith('Models ·') ? 'No matching models'
+      : this.title === 'Resume a local session' ? 'No matching sessions' : 'No matching commands', description: '', value: -1 }]
     if (state.sectioned) { this.sectionSelection = 0; this.drawSections(); this.sectionList.scrollTo(0) }
     this.selectIndex(0); this.describe()
   }
@@ -296,15 +330,15 @@ export class ControlModal {
         } })
       const label = new TextRenderable(this.renderer, { content: `  ${this.options.safe(choice.name, 1024)}`,
         width: '100%', height: 1, fg: this.options.foreground, selectable: false, wrapMode: 'none' })
+      this.options.hover.bind(label, () => this.options.ready() && this.options.completedFrame() > this.changedFrame)
       row.add(label); this.sectionList.add(row); this.sectionRows.set(position, { row, label })
     })
     if (!state.matches.length) this.sectionList.add(new TextRenderable(this.renderer, { content: 'No matching commands',
       height: 1, fg: this.options.foreground, attributes: TextAttributes.DIM }))
   }
   private scrollSections(event: MouseEvent): void {
-    const delta = Math.max(1, Math.min(10, event.scroll?.delta ?? 1))
-    if (event.scroll?.direction === 'up') this.sectionList.scrollBy(-delta)
-    else if (event.scroll?.direction === 'down') this.sectionList.scrollBy(delta)
+    const step = this.wheel.step(event.scroll?.direction)
+    if (step) this.sectionList.scrollBy(step)
     this.scrollSelection = false
   }
   private revealSectionSelection(): void {
@@ -333,6 +367,7 @@ export class ControlModal {
     }
   }
   handleKey(key: KeyEvent): void {
+    this.wheel.reset()
     if (!this.finish) { key.preventDefault(); key.stopPropagation(); return }
     if (key.name === 'escape' || key.ctrl && key.name === 'c') { key.preventDefault(); key.stopPropagation(); this.cancel(); return }
     if (!this.options.ready() || key.eventType === 'repeat' && ['return', 'kpenter'].includes(key.name) || key.repeated && ['return', 'kpenter'].includes(key.name)) {
@@ -366,6 +401,7 @@ export class ControlModal {
     else if (key.name === 'tab' || key.ctrl && !['a', 'b', 'e', 'f', 'h', 'k', 'w', 'z', 'y', 'left', 'right', 'home', 'end', 'backspace', 'delete', '-', '.'].includes(key.name)) { key.preventDefault(); key.stopPropagation() }
   }
   handlePaste(event: PasteEvent): void {
+    this.wheel.reset()
     event.preventDefault(); event.stopPropagation(); this.mouse.clear()
     if (!this.options.ready() || this.mode === 'details') return
     const limit = this.mode === 'picker' ? 200 : 65536
@@ -383,9 +419,9 @@ export class ControlModal {
   private pickMouse(event: MouseEvent): void {
     event.preventDefault(); event.stopPropagation()
     if (event.type === 'scroll' && this.state && this.options.ready()) {
-      const delta = Math.max(1, Math.min(10, event.scroll?.delta ?? 1))
-      if (event.scroll?.direction === 'up') this.picker.moveUp(delta)
-      else if (event.scroll?.direction === 'down') this.picker.moveDown(delta)
+      const step = this.wheel.step(event.scroll?.direction)
+      if (step < 0) this.picker.moveUp()
+      else if (step > 0) this.picker.moveDown()
       return
     }
     const index = pickerIndexAt(this.picker, event.x, event.y)
@@ -394,10 +430,12 @@ export class ControlModal {
       () => { this.picker.setSelectedIndex(index!); this.finish?.(this.state!.matches[index!]) })
   }
   private backdrop(event: MouseEvent): void {
+    if (event.type === 'scroll') this.options.hover.clear()
     if (event.x >= this.panel.x && event.x < this.panel.x + this.panel.width && event.y >= this.panel.y && event.y < this.panel.y + this.panel.height) return
     this.mouse.handle(event, this.overlay, 'outside', this.token, this.options.ready(), () => this.cancel())
   }
   resize(): void {
+    this.wheel.reset()
     this.mouse.clear(); this.changedFrame = this.renderer.frameId
     const width = Math.max(12, Math.min(80, this.renderer.terminalWidth - 4))
     this.textRowCount = this.textRows()
@@ -405,8 +443,7 @@ export class ControlModal {
     const height = Math.max(6, Math.min(desiredHeight, this.renderer.terminalHeight - 4))
     this.panel.width = Math.min(this.renderer.terminalWidth, width)
     this.panel.height = Math.min(this.renderer.terminalHeight, height)
-    this.panel.paddingTop = height >= 10 ? 1 : 0
-    this.panel.paddingBottom = height >= 10 ? 1 : 0
+    this.query.marginBottom = height >= 10 ? 1 : 0
     this.noticeLine.visible = !!this.notices.trim() && height >= 16
     this.description.visible = this.mode === 'picker' && height >= 14
     this.picker.height = Math.max(1, height - 9 - Number(this.noticeLine.visible) * 2 - Number(this.description.visible) * 3)
@@ -435,7 +472,7 @@ export class ControlModal {
     if (this.state && this.query.plainText !== this.state.query || this.mode === 'text' && this.textRows() !== this.textRowCount) this.inputChanged()
     this.revealSectionSelection()
   }
-  resetGesture(): void { this.mouse.clear() }
+  resetGesture(): void { this.mouse.clear(); this.wheel.reset() }
   close(): void {
     if (this.disposed) return
     this.cancel(); this.disposed = true; this.query.blur(); this.overlay.destroyRecursively()

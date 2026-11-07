@@ -516,13 +516,14 @@ test('one-shot main returns distinct failure and cancellation exit statuses', as
 
 test('custom session stores also recover pending tools without executing them', async () => {
   const session = newSession(settings);
-  session.history = [{ kind: 'assistant', content: '', toolCalls: [call('pending-custom', 'note_set', {
+  session.history = [{ kind: 'message', role: 'user', content: 'Remember the task' },
+    { kind: 'assistant', content: '', toolCalls: [call('pending-custom', 'note_set', {
     key: 'task', value: 'bad', expectedRevision: 0,
   })] }];
   let saved;
   const store = { load: async () => structuredClone(session), save: async (value) => { saved = structuredClone(value); } };
   const host = await CliHost.resume({ store, id: session.id, provider: { generate: async () => answer() }, enableNotes: true });
-  assert.equal(JSON.parse(saved.history[1].content).error.code, 'interrupted');
+  assert.equal(JSON.parse(saved.history[2].content).error.code, 'interrupted');
   assert.deepEqual(host.session.notes, {});
   validateHistory(saved.history);
 });

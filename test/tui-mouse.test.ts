@@ -5,7 +5,7 @@ import type { Renderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
 import type { TestRendererSetup } from '@opentui/core/testing'
 import { OpenTuiIO } from '../src/tui.js'
-import { pickerIndexAt } from '../src/tui-mouse.js'
+import { MenuWheel, pickerIndexAt } from '../src/tui-mouse.js'
 
 const fixtures: OpenTuiIO[] = []
 afterEach(() => { for (const io of fixtures.splice(0)) io.close() })
@@ -32,6 +32,21 @@ function watch<T>(promise: Promise<T>) {
   return async () => { await Promise.resolve(); expect(settled).toBe(false) }
 }
 async function arm(frame: () => Promise<string>) { await tick(); await frame() }
+
+test('settings wheel bursts are limited to one step per 75ms, with immediate first steps and reversals', () => {
+  let now = 0
+  const wheel = new MenuWheel(() => now)
+  expect(wheel.step('down')).toBe(1)
+  for (now = 1; now < 75; now++) expect(wheel.step('down')).toBe(0)
+  expect(wheel.step('down')).toBe(1)
+  now = 80; expect(wheel.step('up')).toBe(-1)
+  now = 100; expect(wheel.step('up')).toBe(0)
+  now = 155; expect(wheel.step('up')).toBe(-1)
+  expect(wheel.step('left')).toBe(0); expect(wheel.step('right')).toBe(0)
+  expect(wheel.step(undefined)).toBe(0)
+  wheel.reset(); expect(wheel.step('up')).toBe(-1)
+  now = 1000; expect(wheel.step('up')).toBe(-1)
+})
 
 // These are real SGR terminal events through OpenTUI's native hit grid and parser.
 test('approval places highlighted Approve above Deny; fresh clicks confirm exactly once', async () => {
@@ -174,7 +189,7 @@ test('pickers support row click, wheel navigation, Choose/Back and preserve type
   let picker = f.node('vivi-picker') as SelectRenderable
   await f.mouse.scroll(picker.x + 3, picker.y, 'down')
   await f.frame()
-  expect(picker.getSelectedIndex()).toBeGreaterThan(0)
+  expect(picker.getSelectedIndex()).toBe(1)
   const chosen = picker.getSelectedIndex()
   await f.click('vivi-confirm')
   expect(await first).toBe(choices[chosen]!.value)

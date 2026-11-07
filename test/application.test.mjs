@@ -511,6 +511,7 @@ test('app-wide memory opt-in survives new, model, other-provider resume and prov
   await new PreferenceStore(directory).save({ ...base, model: 'gpt-5.1', enableMemory: true })
   await seedMemory(directory)
   const original = newSession({ provider: 'openrouter', model: 'original-other-model' })
+  original.history = [{ kind: 'message', role: 'user', content: 'Earlier conversation' }]
   await new FileSessionStore(directory).save(original)
   const io = fakeIO(['gpt-5', original.id, 'openrouter', 'current', 'gpt-5'], [],
     ['First', '/new', 'Second', '/models', 'Third', '/resume', 'Fourth', '/provider', 'Fifth', '/exit'])

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import fs, { mkdtemp, readFile, rm } from 'node:fs/promises'
+import fs, { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CliHost } from '../dist/host.js'
 import { FileSessionStore, newSession, SessionCommitError, validateSession } from '../dist/session.js'
 import { listSessions } from '../dist/preferences.js'
-import { formatSessionDate, normalizeSessionTitle, sessionDisplayTitle, sessionTitleFromPrompt,
+import { formatSessionDate, formatSessionRelativeTime, normalizeSessionTitle, sessionDisplayTitle, sessionTitleFromPrompt,
   validSessionTitle } from '../dist/session-display.js'
 import { RunStatus, formatRunElapsed } from '../dist/run-status.js'
 import { runChatLoop, sendChatTurn } from '../dist/terminal.js'
@@ -89,13 +89,28 @@ test('first accepted prompt names once, with no extra provider request, through 
 })
 
 test('explicit naming before first prompt survives automatic naming and unrelated notes/usage/history', async t => {
-  const { store } = await fixture(t), host = await CliHost.create({ store, settings, provider })
+  const { directory, store } = await fixture(t), host = await CliHost.create({ store, settings, provider })
+  assert.deepEqual(await readdir(directory), [])
   const before = host.session
   await host.renameSession('My project', 0)
   assert.deepEqual(host.session.history, before.history); assert.deepEqual(host.session.notes, before.notes)
   assert.deepEqual(host.session.usage, before.usage); assert.equal(host.session.noteRevision, before.noteRevision)
+  await host.refreshContext()
+  assert.deepEqual(await readdir(directory), [])
   await host.send('Different prompt')
   assert.equal(host.session.title, 'My project'); assert.equal(host.session.titleRevision, 1)
+  assert.equal((await store.load(host.session.id)).title, 'My project')
+})
+
+test('opening and replacing conversations without a user message leaves no saved sessions', async t => {
+  const { directory, store } = await fixture(t)
+  const display = io(['/new', '/mode plan', '/new', '/exit'])
+  assert.equal(await main(['--no-workspace', '--no-skills', '--model', 'fixture'], { VIVI_SESSION_DIR: directory }, {
+    tuiIO: display, ...services, providerFactory: () => ({ generate: async () => { throw new Error('No user message was sent') } })
+  }), 0)
+  assert.equal(display.sessions.length, 3)
+  assert.deepEqual(await listSessions(store), [])
+  assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.json') || name === 'conversation-records'), [])
 })
 
 test('legacy titles are view-only in picker and are never overwritten by later runs', async t => {
@@ -116,9 +131,9 @@ test('stale concurrent renames, invalid names and credential input cannot corrup
   const host = new CliHost({ store, session: saved, provider, secrets: ['fixture-credential'] })
   const first = host.renameSession('First', 0), stale = host.renameSession('Second', 0)
   await first; await assert.rejects(stale, /name changed/)
-  assert.equal(host.session.title, 'First'); assert.equal(snapshots.length, 1)
+  assert.equal(host.session.title, 'First'); assert.equal(snapshots.length, 0)
   for (const name of ['\n\t', 'x'.repeat(81), 'Use fixture-credential']) await assert.rejects(host.renameSession(name, 1))
-  assert.equal(host.session.title, 'First'); assert.equal(snapshots.length, 1)
+  assert.equal(host.session.title, 'First'); assert.equal(snapshots.length, 0)
 })
 
 test('failed initial prompt/name persistence rolls back; rename failures retain the last successful title', async () => {
@@ -161,6 +176,11 @@ test('friendly dates use locale and local calendar days across midnight, DST and
   assert.match(formatSessionDate('2026-10-06T10:58:00Z', { ...options, locales: 'fr-FR' }), /^Aujourd.hui 3:58$/)
   assert.equal(formatSessionDate('2026-10-06T10:58:00Z', { ...options, locales: 'en-GB' }), 'Today 3:58')
   assert.equal(formatSessionDate('invalid\x1bdate', options), 'Unknown date')
+  for (const [seconds, expected] of [[0, 'now'], [59, 'now'], [60, '1m ago'], [2280, '38m ago'],
+    [3600, '1h ago'], [86400, '1d ago'], [172800, '2d ago'], [31536000, '1y ago'], [-60, 'now']]) {
+    assert.equal(formatSessionRelativeTime(new Date(options.now.getTime() - seconds * 1000).toISOString(), options.now), expected)
+  }
+  assert.equal(formatSessionRelativeTime('invalid', options.now), 'Unknown')
   assert.equal(formatSessionDate('2026-10-06T10:58:00Z', { ...options, timeZone: 'Invalid/Zone' }), 'Unknown date')
 })
 
@@ -216,6 +236,7 @@ test('interactive rename modal can cancel and rename, survives later prompts, an
   assert.deepEqual(display.states, ['working', 'completed', 'working', 'completed'])
   const picker = display.choices.find(value => value.title === 'Resume a local session')
   assert.equal(picker.values.find(value => value.value === legacy.id).name, 'Find this legacy conversation')
+  assert.equal(picker.values.find(value => value.value === legacy.id).leadingText, 'now')
   assert.match(picker.values.find(value => value.value === legacy.id).description, /^Today /)
   assert(!picker.values.find(value => value.value === legacy.id).description.includes(legacy.updatedAt))
   assert.match(display.output, /Name: Inline name/)
@@ -234,8 +255,9 @@ test('an already admitted rename settles before a concurrent turn accepts its pr
   let entered, release
   const started = new Promise(resolve => { entered = resolve }), blocked = new Promise(resolve => { release = resolve })
   const initial = newSession(settings), snapshots = [], seen = []
+  initial.history = [{ kind: 'message', role: 'user', content: 'Earlier accepted prompt' }]
   const store = { load: async () => structuredClone(snapshots.at(-1) ?? initial), async save(value) {
-    if (value.title === 'Renamed first' && value.history.length === 0) { entered(); await blocked }
+    if (value.title === 'Renamed first' && value.history.length === 1) { entered(); await blocked }
     snapshots.push(structuredClone(value))
   } }
   const host = new CliHost({ store, session: initial, provider: { async generate({ messages }) { seen.push(messages); return answer } } })
@@ -244,8 +266,8 @@ test('an already admitted rename settles before a concurrent turn accepts its pr
   await new Promise(resolve => setImmediate(resolve)); assert.equal(seen.length, 0)
   release(); await naming; assert.equal((await sending).status, 'completed')
   assert.equal(host.session.title, 'Renamed first')
-  assert.equal(seen[0][0].content, 'Accepted user prompt')
-  assert.equal(snapshots.at(-1).history[0].content, 'Accepted user prompt')
+  assert.equal(seen[0].filter(message => message.role === 'user').at(-1).content, 'Accepted user prompt')
+  assert.equal(snapshots.at(-1).history.filter(message => message.role === 'user').at(-1).content, 'Accepted user prompt')
 })
 
 
@@ -253,7 +275,10 @@ for (const action of ['rename', 'first prompt']) {
   test(`${action} post-rename directory sync failure preserves committed metadata and shows durability uncertainty`, { skip: process.platform === 'win32' }, async t => {
     const { store } = await fixture(t)
     let calls = 0
-    const host = await CliHost.create({ store, settings, provider: { async generate() { calls++; return answer } } })
+    const session = newSession(settings)
+    if (action === 'rename') session.history = [{ kind: 'message', role: 'user', content: 'Earlier accepted prompt' }]
+    const host = new CliHost({ store, session, provider: { async generate() { calls++; return answer } } })
+    await host.initialize()
     const original = fs.open
     t.mock.method(fs, 'open', async (path, ...args) => {
       const handle = await original(path, ...args)
@@ -272,6 +297,7 @@ for (const action of ['rename', 'first prompt']) {
     t.mock.restoreAll(); syncBuiltinESMExports()
     await host.send('Continue after warning')
     assert.equal(host.session.title, action === 'rename' ? 'Committed name' : 'Committed first prompt')
-    assert.equal(host.session.history[0].content, action === 'rename' ? 'Continue after warning' : 'Committed first prompt')
+    assert.equal(host.session.history.filter(message => message.role === 'user').at(action === 'rename' ? -1 : 0).content,
+      action === 'rename' ? 'Continue after warning' : 'Committed first prompt')
   })
 }

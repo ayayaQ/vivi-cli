@@ -315,17 +315,31 @@ test('preference stores and session listing refuse symlinked directories', async
   assert.deepEqual(await readdir(actual), []);
 });
 
+function startedSession(settings) {
+  const session = newSession(settings);
+  session.history = [{ kind: 'message', role: 'user', content: 'Started conversation' }];
+  return session;
+}
+
+test('session picker hides legacy empty sessions even when they have a name', async (t) => {
+  const { sessions } = await fixture(t);
+  const empty = newSession(settings), named = { ...newSession(settings), title: 'Only renamed', titleRevision: 1 };
+  const started = startedSession(settings);
+  await sessions.save(empty); await sessions.save(named); await sessions.save(started);
+  assert.deepEqual((await listSessions(sessions)).map(session => session.id), [started.id]);
+});
+
 test('session picker emits bounded title metadata, newest first, with live lock flags and no extra transcript or notes', async (t) => {
   const { sessions } = await fixture(t);
   const older = newSession(settings); older.updatedAt = '2024-01-01T00:00:00.000Z';
   older.history = [{ kind: 'message', role: 'user', content: 'private-transcript' }]; older.notes = { private: 'private-note' };
-  const newer = newSession({ provider: 'openrouter', model: 'vendor/model', reasoning: 'high' });
+  const newer = startedSession({ provider: 'openrouter', model: 'vendor/model', reasoning: 'high' });
   newer.updatedAt = '2025-01-01T00:00:00.000Z';
   await sessions.save(older); await sessions.save(newer);
   const release = await sessions.acquire(newer.id);
   const listed = await listSessions(sessions);
   assert.deepEqual(listed, [
-    { id: newer.id, title: 'Untitled conversation', provider: newer.provider, model: newer.model, reasoning: 'high', updatedAt: newer.updatedAt, locked: true },
+    { id: newer.id, title: 'Started conversation', provider: newer.provider, model: newer.model, reasoning: 'high', updatedAt: newer.updatedAt, locked: true },
     { id: older.id, title: 'private-transcript', provider: older.provider, model: older.model, updatedAt: older.updatedAt, locked: false },
   ]);
   assert.ok(!JSON.stringify(listed).includes('private-note')); assert.ok(!JSON.stringify(listed).includes('history'));
@@ -335,16 +349,16 @@ test('session picker emits bounded title metadata, newest first, with live lock 
 
 test('session picker skips malformed, public, oversized, mismatched, symlink and unsafe identifier files', async (t) => {
   const { directory, sessions } = await fixture(t);
-  const valid = newSession(settings); await sessions.save(valid);
+  const valid = startedSession(settings); await sessions.save(valid);
   const malformed = newSession(settings);
   await writeFile(join(directory, `${malformed.id}.json`), '{broken', { mode: 0o600 });
   const oversized = newSession(settings);
   await writeFile(join(directory, `${oversized.id}.json`), 'x'.repeat(MAX_SESSION_BYTES + 1), { mode: 0o600 });
   const mismatched = newSession(settings);
   await writeFile(join(directory, `${mismatched.id}.json`), JSON.stringify(valid), { mode: 0o600 });
-  const publicSession = newSession(settings); await sessions.save(publicSession);
+  const publicSession = startedSession(settings); await sessions.save(publicSession);
   await chmod(join(directory, `${publicSession.id}.json`), 0o644);
-  const unsafeModel = newSession({ ...settings, model: 'terminal\u001b[31m' }); await sessions.save(unsafeModel);
+  const unsafeModel = startedSession({ ...settings, model: 'terminal\u001b[31m' }); await sessions.save(unsafeModel);
   const link = newSession(settings);
   await symlink(join(directory, `${valid.id}.json`), join(directory, `${link.id}.json`));
   await writeFile(join(directory, 'not-a-session.json'), JSON.stringify(valid), { mode: 0o600 });
@@ -356,7 +370,7 @@ test('session picker skips malformed, public, oversized, mismatched, symlink and
 
 test('session picker treats unexpected lock objects conservatively and does not follow them', async (t) => {
   const { directory, sessions } = await fixture(t);
-  const session = newSession(settings); await sessions.save(session);
+  const session = startedSession(settings); await sessions.save(session);
   await symlink(join(directory, 'missing'), join(directory, `${session.id}.json.lock`));
   assert.equal((await listSessions(sessions))[0].locked, true);
 });
@@ -364,7 +378,7 @@ test('session picker treats unexpected lock objects conservatively and does not 
 test('session picker bounds result counts and rejects invalid limits without scanning', async (t) => {
   const { directory, sessions } = await fixture(t);
   const all = Array.from({ length: MAX_SESSION_PICKER_ITEMS + 7 }, (_, index) => {
-    const session = newSession(settings); session.updatedAt = new Date(Date.UTC(2020, 0, index + 1)).toISOString(); return session;
+    const session = startedSession(settings); session.updatedAt = new Date(Date.UTC(2020, 0, index + 1)).toISOString(); return session;
   });
   await Promise.all(all.map((session) => writeFile(join(directory, `${session.id}.json`), JSON.stringify(session), { mode: 0o600 })));
   const listed = await listSessions(sessions);

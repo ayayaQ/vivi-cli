@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-export interface Choice<T> { name: string; description?: string; value: T; searchTerms?: readonly string[]; section?: string }
+export interface Choice<T> { name: string; description?: string; value: T; searchTerms?: readonly string[]; section?: string;
+  /** Compact ASCII metadata in an aligned column before the label. */
+  leadingText?: string }
 export interface SearchableOptions {
   query?: string
   initialIndex?: number

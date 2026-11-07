@@ -465,7 +465,7 @@ test('actual CLI drains detached progress rejection after provider failure while
   assert.deepEqual(persisted.history, [{ kind: 'message', role: 'user', content: prompt }])
   assert.deepEqual(persisted.history, host.session.history)
   assert.deepEqual(persisted.usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 })
-  assert.equal(store.snapshots.length, 3, 'Initialization, prompt and unchanged canonical terminal state are checkpointed')
+  assert.equal(store.snapshots.length, 2, 'Prompt and unchanged canonical terminal state are checkpointed without saving empty initialization')
 })
 
 for (const action of ['shutdown', 'drainMcp']) {

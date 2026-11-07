@@ -9,7 +9,7 @@ import { CliHost } from '../dist/host.js'
 import { CLI_CONVERSATION_LIMITS, replayCliConversationDocument } from '../dist/conversation-records.js'
 import { createMcpSchemaValidator } from '../dist/mcp-schema.js'
 import { validateMcpOutcomes } from '../dist/mcp-outcomes.js'
-import { newSession, validateSession } from '../dist/session.js'
+import { newSession, SessionCommitError, validateSession } from '../dist/session.js'
 
 // CLI-20: the actual CLI host and installed shared runner own all conversation work.
 // Providers, storage and MCP transport evidence are inert, in-memory owned fixtures.
@@ -690,6 +690,74 @@ test('actual CLI does not elevate MCP-shaped custom JSON into host-owned effect 
   assert.match(replay.projection.outcomes[0].source.reference, /^cli-extension:/)
 })
 
+for (const continuation of ['live', 'resume']) for (const committed of [false, true]) {
+  test(`first prompt anchor checkpoint failure ${committed ? 'after' : 'before'} replacement preserves replay through ${continuation} continuation`, async t => {
+    let failAnchor = true
+    const backingStore = canonicalStore()
+    const store = { ...backingStore, async save(session, options) {
+      if (failAnchor && session.recordAnchor) {
+        failAnchor = false
+        if (committed) {
+          await backingStore.save(session, options)
+          throw new SessionCommitError(new Error('Owned first anchor directory sync failed'))
+        }
+        throw new Error('Owned first anchor checkpoint failed')
+      }
+      await backingStore.save(session, options)
+    } }
+    const subject = await fixture(t, { store })
+    assert.equal(subject.store.snapshots.length, 0)
+    assert.equal(subject.records.writes.length, 0)
+    await assert.rejects(subject.host.send('Accepted before the anchor failure'), committed ? SessionCommitError : /first anchor checkpoint failed/)
+    assert.equal(subject.generations(), 0, 'The failed anchor checkpoint must not dispatch a model request')
+    assert.equal(subject.store.snapshots.length, committed ? 2 : 1)
+    const canonical = await subject.store.load(subject.host.session.id)
+    assert.deepEqual(canonical.history, [{ kind: 'message', role: 'user', content: 'Accepted before the anchor failure' }])
+    assert.equal(canonical.schemaVersion, committed ? 2 : 1)
+    assert.equal(subject.host.session.schemaVersion, canonical.schemaVersion, 'A committed anchor must also remain in memory')
+    const stored = await subject.records.read(subject.host.session.id)
+    const failed = replayCliConversationDocument(stored.value)
+    assert.equal(subject.host.conversationRecords.state, 'shadow')
+    assert.deepEqual(messages(failed.projection), canonical.history)
+    assert.equal(failed.runs[0].state, 'settled')
+    assert.equal(failed.projection.runs[0].status, 'error')
+    assert.equal(failed.projection.runs[0].rounds, 0)
+
+    let host = subject.host
+    if (continuation === 'resume') {
+      await host.shutdown()
+      host = await CliHost.resume({ id: canonical.id, store: subject.store, conversationStore: subject.records,
+        provider: { async generate() { return answer('Continued after resume') } } })
+      t.after(() => host.shutdown())
+      assert.equal(host.conversationRecords.state, 'shadow')
+      assert.deepEqual(host.conversationRecords.projection, failed.projection)
+    }
+    const result = await host.send('Continue after the storage failure')
+    assert.equal(result.status, 'completed')
+    await assertPaired(t, { ...subject, host, live: continuation === 'live' ? subject.live : [] }, result)
+    assert.equal(host.conversationRecords.runs.length, 2)
+    const firstAnchor = subject.store.snapshots.findIndex(session => session.recordAnchor)
+    assert(firstAnchor >= 0)
+    assert(subject.store.snapshots.slice(firstAnchor).every(session => session.schemaVersion === 2), 'Later checkpoints never downgrade the accepted anchor')
+    assert.deepEqual(subject.notices, [])
+  })
+}
+
+test('first prompt anchor failure retains its original error if the shadow failure journal is unavailable', async t => {
+  const failure = new Error('Owned first anchor checkpoint failed')
+  const subject = await fixture(t, {
+    onSave(session) { if (session.recordAnchor) throw failure },
+    onWrite(document) { if (document.runs.length) throw new Error('Owned shadow journal write failed') }
+  })
+  await assert.rejects(subject.host.send('Accepted despite unavailable journals'), error => error === failure)
+  assert.equal(subject.generations(), 0)
+  assert.deepEqual((await subject.store.load(subject.host.session.id)).history,
+    [{ kind: 'message', role: 'user', content: 'Accepted despite unavailable journals' }])
+  assert.equal(subject.host.conversationRecords.state, 'unavailable')
+  assert.equal(subject.notices.length, 1)
+  assert.match(subject.notices[0], /shadow stopped/)
+})
+
 test('actual CLI failed canonical MCP checkpoint retains stronger exact ledger evidence and old committed cursor', async t => {
   const outcomes = outcomeStore(), mcp = syntheticMcp()
   let failCheckpoint = true
@@ -697,8 +765,8 @@ test('actual CLI failed canonical MCP checkpoint retains stronger exact ledger e
     onSave(session) { if (failCheckpoint && toolResults(session.history).length) throw new Error('Owned canonical result checkpoint failed') },
     generate(_value, _signal, _options, round) { return round === 1 ? answer('', [mcp.call('failed-checkpoint-call')]) : answer('No second send expected') }
   })
-  const previous = subject.host.conversationRecords.committedSequence
   await assert.rejects(subject.host.send('Retain exact evidence if canonical storage fails'), /checkpoint failed|cleanup also failed|callback failed/)
+  const previous = subject.records.writes[0].records.at(-1).sequence
   assert.equal(mcp.invocations.length, 1)
   const retained = await outcomes.load(subject.host.session.id)
   assert.equal(retained.length, 1); assert.equal(retained[0].state, 'settled')

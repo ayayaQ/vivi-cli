@@ -5,7 +5,7 @@ import { lstat, mkdir, open, opendir, rename, unlink } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
-import { isSessionId } from './session.js'
+import { isSessionId, sessionHasUserMessage } from './session.js'
 import type { CliProviderName, FileSessionStore } from './session.js'
 import { sessionDisplayTitle } from './session-display.js'
 import { validateAutoReviewThresholdOverrides } from './auto-review-settings.js'
@@ -273,6 +273,7 @@ export async function listSessions(store: FileSessionStore, limit = MAX_SESSION_
       if (!isSessionId(id)) continue
       try {
         const session = await store.load(id)
+        if (!sessionHasUserMessage(session)) continue
         // Model IDs are identifiers, never terminal control sequences or transcript previews.
         if (/[\u0000-\u001f\u007f-\u009f]/.test(session.model)) continue
         let locked = true

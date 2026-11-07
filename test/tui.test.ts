@@ -52,6 +52,7 @@ test('slash command helpers match only the sole starting token', () => {
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
+  expect(getSlashCommandCompletions('/mode').map(({ command }) => command)).toEqual(['/mode', '/models'])
   expect(getSlashCommandCompletions('/provider').map(({ command }) => command)).toEqual(['/provider'])
   expect(getSlashCommandCompletions('/commands').map(({ command }) => command)).toEqual(['/commands'])
   expect(getSlashCommandCompletions('/processes').map(({ command }) => command)).toEqual(['/processes'])
@@ -91,6 +92,36 @@ test('autocomplete renders above composer, arrows cycle and Tab accepts without 
   expect(submitted).toBe(false)
   input.pressEnter()
   expect(await line).toBe('/menu')
+})
+
+test('Enter submits the highlighted slash completion and preserves newline shortcuts', async () => {
+  const { io, setup, input, frame } = await fixture()
+  let line = io.readLine('Message')
+  await input.typeText('/ex'); await frame(); input.pressEnter()
+  expect(await line).toBe('/exit')
+  line = io.readLine('Message')
+  await input.typeText('/m'); await frame(); input.pressArrow('down'); input.pressEnter()
+  expect(await line).toBe('/mode')
+  line = io.readLine('Message')
+  await frame()
+  setup.renderer.stdin.emit('data', Buffer.from('/ex\r'))
+  expect(await line).toBe('/exit')
+  for (const modifiers of [{ shift: true }, { meta: true }]) {
+    line = io.readLine('Message')
+    await input.typeText('/ex'); await frame(); input.pressEnter(modifiers)
+    expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('/ex\n')
+    input.pressEnter(); expect(await line).toBe('/ex\n')
+  }
+})
+
+test('Enter preserves an exact command prefix unless another completion is explicitly selected', async () => {
+  const { io, input, frame } = await fixture()
+  let line = io.readLine('Message')
+  await input.typeText('/mode'); await frame(); input.pressEnter()
+  expect(await line).toBe('/mode')
+  line = io.readLine('Message')
+  await input.typeText('/mode'); await frame(); input.pressArrow('down'); input.pressEnter()
+  expect(await line).toBe('/models')
 })
 
 test('autocomplete leaves ordinary text, arguments, unknown commands and askText alone', async () => {
@@ -419,7 +450,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   session.usage = { inputTokens: 9, outputTokens: 8, totalTokens: 17 }
   io.setSession(session)
   const output = await frame()
-  expect(output).toContain('openai / mock-model')
+  expect(output).toContain('openai · mock-model')
   expect((setup.renderer.root.findDescendantById('vivi-header') as TextRenderable).plainText).not.toContain(session.id)
   const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
   const cards = transcript.getChildren().flatMap(entry => entry.getChildren())

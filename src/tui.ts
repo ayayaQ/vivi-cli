@@ -28,7 +28,7 @@ import { inputProbe } from './input-diagnostic.js'
 import type { InputDiagnosticReport, InputProbe } from './input-diagnostic.js'
 import type { Choice, SearchableOptions, SearchableSelection } from './picker.js'
 import { formatContextStatus } from './context-status.js'
-import { MouseActivation, pickerIndexAt } from './tui-mouse.js'
+import { MouseActivation, MouseHover, pickerIndexAt, pickerHoverRegion } from './tui-mouse.js'
 import { RunStatus } from './run-status.js'
 import type { RunClock, RunOutcome } from './run-status.js'
 import { sessionDisplayTitle } from './session-display.js'
@@ -53,7 +53,7 @@ import { ControlModal } from './control-modal.js'
 import type { ControlDetails } from './picker.js'
 
 export type { Choice } from './picker.js'
-export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; secrets?: readonly string[]; runClock?: RunClock;
+export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; loading?: boolean; secrets?: readonly string[]; runClock?: RunClock;
   promptHistory?: readonly string[]; promptHistoryStore?: PromptHistoryStore;
   /** Trusted production wiring or an offline test sink; omitted on directly constructed test surfaces. */
   terminalTitle?: TerminalTitleSink; programStatus?: ProgramStatusSink; statusEnvironment?: NodeJS.ProcessEnv;
@@ -63,7 +63,7 @@ export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; secrets?:
 // highlights need their own foreground, including native text selections.
 export const TUI_THEME = { pink: '#f87ea2', lavender: '#b08bfc', background: 'transparent',
   foreground: RGBA.defaultForeground(), highlightForeground: '#e4e4e7',
-  selectedBackground: '#3d2946', userBackground: '#24212d',
+  selectedBackground: '#3d2946', hoverBackground: '#56395f', userBackground: '#24212d', rowBackground: '#24212d',
   muted: RGBA.defaultForeground(), attention: '#fbbf24' } as const
 const TEXT_SELECTION = { selectionBg: RGBA.fromHex(TUI_THEME.selectedBackground),
   selectionFg: RGBA.fromHex(TUI_THEME.highlightForeground) } as const
@@ -126,7 +126,8 @@ export type SlashCommand = typeof SLASH_COMMANDS[number]
 
 /** Complete only the whole, first slash token. Ordinary text and arguments are untouched. */
 export function getSlashCommandCompletions(input: string, canCompact = true): readonly SlashCommand[] {
-  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact)) : []
+  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact))
+    .sort((a, b) => Number(b.command === input) - Number(a.command === input)) : []
 }
 
 const MAX_INPUT = 65536
@@ -259,6 +260,11 @@ function stripControls(text: string): string {
 
 /** Imperative OpenTUI surface. Only the host's history is an accepted transcript. */
 export class OpenTuiIO implements ChatIO {
+  private loadingBox!: BoxRenderable
+  private loadingLine!: TextRenderable
+  private loadingMessage: string | undefined
+  private loadingFrame = 0
+  private loadingTimer: ReturnType<typeof setInterval> | undefined
   private secrets: readonly string[]
   private readonly stream: boolean
   private style: SyntaxStyle | undefined
@@ -285,6 +291,7 @@ export class OpenTuiIO implements ChatIO {
   private approvalIndex = 1
   private approvalMouseNotBefore = 0
   private readonly mouseActivation = new MouseActivation()
+  private readonly hover: MouseHover
   private readonly clipboard: OpenTuiOptions['clipboard']
   private pickerChangedFrame = 0
   private completionChangedFrame = 0
@@ -302,7 +309,7 @@ export class OpenTuiIO implements ChatIO {
   private copyToast!: TextRenderable
   private copyToastTimer: ReturnType<typeof setTimeout> | undefined
   private composer!: TextareaRenderable
-  private readonly promptHistory: PromptHistory
+  private promptHistory: PromptHistory
   private readonly promptHistoryStore: PromptHistoryStore | undefined
   private secretMask!: TextRenderable
   // Secret characters never enter an editable/renderable buffer or its undo history.
@@ -351,7 +358,8 @@ export class OpenTuiIO implements ChatIO {
   private workspaceDirectory: string | undefined
   private workspaceStatus = false
   private sessionTitle = 'Untitled conversation'
-  private sessionModel = 'vivi · choose a model with /models'
+  private sessionProvider = 'vivi'
+  private sessionModel = 'choose a model with /models'
   private sessionEffort = ''
   private sessionPlan = false
   private footerTargets: { start: number; end: number; command: string }[] = []
@@ -368,6 +376,7 @@ export class OpenTuiIO implements ChatIO {
   private finishDiagnostic: (() => void) | undefined
 
   private readonly keyHandler = (key: KeyEvent): void => {
+    this.hover.clear()
     try { this.handleKey(key) } catch (error) { this.errorHandler({ error }) }
   }
   private readonly frameHandler = (event: { frameId: number }): void => {
@@ -380,17 +389,21 @@ export class OpenTuiIO implements ChatIO {
     this.updateComposerLayout()
   }
   private readonly focusHandler = (): void => {
+    this.hover.clear()
     this.mouseActivation.clear()
     this.questionDialog?.resetGesture()
     this.controls?.resetGesture()
   }
   private readonly blurHandler = (): void => {
+    this.hover.clear()
     this.mouseActivation.clear()
     this.questionDialog?.resetGesture()
     this.controls?.resetGesture()
     if (this.pending?.kind === 'approval') { this.approvalIndex = 1; this.renderDialogActions() }
   }
   private readonly resizeHandler = (): void => {
+    this.renderLoading()
+    this.hover.clear()
     this.mouseActivation.clear()
     this.updateActionBar()
     this.updateApprovalLayout()
@@ -437,7 +450,7 @@ export class OpenTuiIO implements ChatIO {
     }, COPY_TOAST_MS)
     this.copyToastTimer.unref()
   }
-  private readonly signalHandler = (): void => this.cancelOrClose()
+  private readonly signalHandler = (): void => { if (this.loadingMessage !== undefined) this.close(); else this.cancelOrClose() }
   private readonly exitHandler = (): void => this.close()
   private readonly processExitHandler = (): void => {
     this.close()
@@ -480,6 +493,7 @@ export class OpenTuiIO implements ChatIO {
   constructor(private readonly renderer: CliRenderer, options: OpenTuiOptions = {}, terminalTitle?: TerminalTitleController,
     programStatus?: TerminalProgramStatus) {
     if (renderer.isDestroyed) throw new Error('Cannot use a destroyed OpenTUI renderer')
+    this.hover = new MouseHover(renderer, RGBA.fromHex(TUI_THEME.hoverBackground), RGBA.fromHex(TUI_THEME.highlightForeground))
     this.terminalTitle = terminalTitle ?? new TerminalTitleController(options.terminalTitle)
     this.programStatus = programStatus ?? new TerminalProgramStatus(options.programStatus, !options.oneShot)
     this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
@@ -499,6 +513,7 @@ export class OpenTuiIO implements ChatIO {
       })
       this.shell = new BoxRenderable(renderer, { id: 'vivi-root', width: '100%', height: '100%',
         flexDirection: 'column', backgroundColor: TUI_THEME.background, onMouse: (event) => {
+          if (event.type === 'scroll') this.hover.clear()
           if (event.type !== 'over') this.mouseActivation.clear()
           // Transcript scrolling must not steal the next keystroke from an input.
           if (event.type === 'down' && this.pending) event.preventDefault()
@@ -514,6 +529,11 @@ export class OpenTuiIO implements ChatIO {
       this.modelLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-model', height: 1, flexShrink: 0,
         width: '100%', fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'none', selectable: false,
         onMouse: event => this.handleFooterMouse(event) })
+      this.hover.bind(this.modelLine, () => this.pending?.kind === 'chat' && !this.cancelCallbacks.size &&
+        this.ready() && this.lastRenderedFrame > this.footerChangedFrame, point => {
+        const target = this.footerTargets.find(target => point.x >= target.start && point.x < target.end)
+        return target ? { x: target.start, y: 0, width: target.end - target.start, height: 1 } : undefined
+      })
       this.footer = new BoxRenderable(renderer, { id: 'vivi-footer', height: 1, flexShrink: 0,
         width: '100%', flexDirection: 'row' })
       this.workspaceLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-workspace', height: 1, flexShrink: 0,
@@ -567,11 +587,18 @@ export class OpenTuiIO implements ChatIO {
       this.composerBox.add(this.secretMask)
       this.completionBox = new BoxRenderable(renderer, { id: 'vivi-completions', visible: false,
         flexDirection: 'column', height: 6, flexShrink: 0, border: true, borderColor: TUI_THEME.lavender,
-        titleColor: TUI_THEME.lavender, title: 'Commands · ↑/↓ choose · Tab complete', paddingX: 1 })
+        titleColor: TUI_THEME.lavender, title: 'Commands · ↑/↓ choose · Enter run · Tab fill', paddingX: 1 })
       this.completionList = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-completion-list', width: '100%',
         height: '100%', fg: TUI_THEME.lavender, wrapMode: 'none' })
       this.completionList.selectable = false
       this.completionList.onMouse = (event) => this.handleCompletionMouse(event)
+      this.hover.bind(this.completionList, () => this.ready() && this.pending?.kind === 'chat' &&
+        this.lastRenderedFrame > this.completionChangedFrame, point => {
+        const rows = this.completionBox.height - 2
+        const first = Math.min(Math.max(0, this.completionIndex - rows + 1), this.completions.length - rows)
+        return this.completions[first + point.y]
+          ? { x: 0, y: point.y, width: this.completionList.width, height: 1 } : undefined
+      })
       this.completionBox.add(this.completionList)
       this.hintLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-hints', height: 1, flexShrink: 0,
         fg: TUI_THEME.muted, attributes: TextAttributes.DIM, content: HINTS, wrapMode: 'none' })
@@ -598,11 +625,23 @@ export class OpenTuiIO implements ChatIO {
         button.selectable = false
         button.onMouse = event => this.mouseActivation.handle(event, button, id, this.processGesture,
           !this.closed && !!this.processControls && this.processBar.visible, action)
+        this.hover.bind(button, () => !this.closed && !!this.processControls && this.processBar.visible)
         this.processBar.add(button)
       }
       this.footer.add(this.modelLine); this.footer.add(this.actionBar); this.footer.add(this.steeringActions)
       for (const child of [this.headerBox, this.workspaceLine, this.transcript, this.statusLine, this.pickerBox,
         this.completionBox, this.steeringQueueLine, this.shellNotice, this.composerBox, this.processBar, this.footer, this.hintLine]) this.shell.add(child)
+      this.loadingBox = new BoxRenderable(renderer, { id: 'vivi-loading', position: 'absolute', top: 0, left: 0,
+        width: '100%', height: '100%', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 1, visible: false })
+      this.loadingBox.add(new TextRenderable(renderer, { id: 'vivi-loading-title', content: 'vivi', height: 1,
+        width: '100%', textAlign: 'center', fg: TUI_THEME.lavender }))
+      this.loadingLine = new TextRenderable(renderer, { id: 'vivi-loading-stage', height: 1, width: '100%',
+        textAlign: 'center', fg: TUI_THEME.foreground, wrapMode: 'none' })
+      this.loadingBox.add(this.loadingLine)
+      this.loadingBox.add(new TextRenderable(renderer, { id: 'vivi-loading-hint', content: 'Ctrl+C to exit', height: 1,
+        width: '100%', textAlign: 'center', fg: TUI_THEME.muted, attributes: TextAttributes.DIM }))
+      renderer.root.add(this.loadingBox)
+      if (options.loading) this.setLoading('Starting vivi…')
       this.updateHeader(); this.updateActionBar()
       this.disableComposer()
       renderer.keyInput.on('keypress', this.keyHandler)
@@ -625,7 +664,7 @@ export class OpenTuiIO implements ChatIO {
       for (const widget of [this.composer, this.secretMask, this.completionList, this.header,
         this.transcript, this.statusLine, this.shellNotice, this.copyToast, this.composerBox, this.completionBox,
         this.pickerBox, this.hintLine, this.actionBar, this.tokenLine, this.headerBox,
-        this.modelLine, this.workspaceLine, this.steeringQueueLine, this.steeringActions, this.processBar, this.footer, this.shell]) {
+        this.modelLine, this.workspaceLine, this.steeringQueueLine, this.steeringActions, this.processBar, this.footer, this.shell, this.loadingBox]) {
         if (widget && !widget.parent && !widget.isDestroyed) {
           try { widget.destroyRecursively() } catch { /* Still release the renderer and hooks below. */ }
         }
@@ -636,11 +675,6 @@ export class OpenTuiIO implements ChatIO {
   }
 
   static async create(options: OpenTuiOptions = {}): Promise<OpenTuiIO> {
-    let historyUnavailable = false
-    if (options.promptHistoryStore && options.promptHistory === undefined) {
-      try { options = { ...options, promptHistory: await options.promptHistoryStore.load() } }
-      catch { historyUnavailable = true }
-    }
     let renderer: CliRenderer | undefined
     let terminalTitle: TerminalTitleController | undefined
     let programStatus: TerminalProgramStatus | undefined
@@ -665,10 +699,14 @@ export class OpenTuiIO implements ChatIO {
       terminalTitle = new TerminalTitleController(titleSink)
       programStatus = new TerminalProgramStatus(options.programStatus ?? createProgramStatusSink(process.stdout, options.statusEnvironment), !options.oneShot)
       clipboard = options.clipboard ?? createClipboard({ host: createHostClipboard(), terminal: createRendererClipboardAdapter(renderer) })
-      io = new OpenTuiIO(renderer, { ...options, clipboard }, terminalTitle, programStatus)
-      if (historyUnavailable) io.updateStatus('Saved prompt history unavailable; history works for this launch')
+      io = new OpenTuiIO(renderer, { ...options, loading: true, clipboard }, terminalTitle, programStatus)
       io.windowsInput = windowsInput
       windowsInput?.start()
+      if (options.promptHistoryStore && options.promptHistory === undefined) {
+        io.setLoading('Loading prompt history…')
+        try { io.promptHistory = new PromptHistory(await options.promptHistoryStore.load()) }
+        catch { io.updateStatus('Saved prompt history unavailable; history works for this launch') }
+      }
       return io
     } catch (error) {
       if (!io) void clipboard?.dispose().catch(() => undefined)
@@ -687,11 +725,35 @@ export class OpenTuiIO implements ChatIO {
   }
   get canAskQuestions(): boolean { return this.canAutoReview }
   readonly compactStartup = true
+  setLoading(message?: string): void {
+    if (this.closed) return
+    if (message === undefined && this.loadingMessage === undefined) return
+    this.loadingMessage = message === undefined ? undefined : this.safe(message, 256)
+    this.loadingBox.visible = message !== undefined
+    this.shell.visible = message === undefined
+    this.hover.clear(); this.mouseActivation.clear()
+    if (message === undefined) {
+      if (this.loadingTimer !== undefined) clearInterval(this.loadingTimer)
+      this.loadingTimer = undefined
+    } else {
+      this.composer.blur()
+      this.renderLoading()
+      this.loadingTimer ??= setInterval(() => { this.loadingFrame++; this.renderLoading() }, 100)
+      this.loadingTimer.unref?.()
+    }
+    this.updateTerminalTitle()
+  }
+  private renderLoading(): void {
+    if (this.closed || this.loadingMessage === undefined) return
+    const spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[this.loadingFrame % 10]
+    this.loadingLine.content = fitStatusColumns(`${spinner} ${this.loadingMessage}`, Math.max(1, this.renderer.terminalWidth), true)
+  }
   setApprovalMode(mode: ApprovalMode): void { this.approvalMode = mode; this.updateHeader() }
   setTaskMode(mode: TaskMode): void { this.taskMode = mode; this.updateHeader() }
 
   /** Explicit offline probe. No editable text, provider or session is opened. */
   async diagnoseInput(): Promise<InputDiagnosticReport> {
+    this.setLoading()
     if (this.closed || this.pending || this.diagnosticKey) throw new Error('Input diagnostic requires a fresh surface')
     const bridge = this.windowsInput
     const probes: InputProbe[] = []
@@ -729,6 +791,7 @@ export class OpenTuiIO implements ChatIO {
       errors: this.conversationErrors.errors.map(error => ({ ...error, message: this.safe(error.message) })) }
     this.reviewNotices = this.reviewNotices.map(redactEntry)
     this.sessionTitle = this.safe(this.sessionTitle, 4096)
+    this.sessionProvider = this.safe(this.sessionProvider, 4096)
     this.sessionModel = this.safe(this.sessionModel, 4096)
     this.sessionEffort = this.safe(this.sessionEffort, 256)
     this.updateHeader()
@@ -803,19 +866,27 @@ export class OpenTuiIO implements ChatIO {
     this.modelLine.width = width
     const mode = conversationModeLabel(this.taskMode, this.approvalMode)
     const modelWidth = width - statusTextColumns(` · ${mode}`)
-    const metadata = `${this.sessionModel}${this.sessionEffort ? ` · ${this.sessionEffort}` : ''}${this.sessionPlan ? ' · ChatGPT plan' : ''}`
+    const providerPrefix = `${this.sessionProvider} · `
+    const metadata = `${providerPrefix}${this.sessionModel}${this.sessionEffort ? ` · ${this.sessionEffort}` : ''}${this.sessionPlan ? ' · ChatGPT plan' : ''}`
     const displayed = modelWidth > 0 ? fitStatusColumns(metadata, modelWidth, true) : ''
     const content = modelWidth > 0 ? `${displayed} · ${mode}` : fitStatusColumns(mode, width, true)
     if (this.modelLine.plainText !== content) this.footerChangedFrame = this.renderer.frameId
     this.modelLine.content = content
-    // Only the visible model and effort cells act as shortcuts. Separators,
-    // permission mode and unused space do not open settings.
+    // Visible provider, model, effort and mode cells open their settings. Separators,
+    // truncation markers and unused space stay inactive.
     const visibleWidth = this.footerColumns(displayed.replace(/…$/, ''))
-    const modelEnd = this.footerColumns(this.sessionModel)
+    const providerEnd = this.footerColumns(this.sessionProvider)
+    const modelStart = this.footerColumns(providerPrefix)
+    const modelEnd = modelStart + this.footerColumns(this.sessionModel)
     const effortStart = modelEnd + this.footerColumns(' · ')
-    this.footerTargets = [{ start: 0, end: Math.min(modelEnd, visibleWidth), command: '/models' }]
+    this.footerTargets = [
+      { start: 0, end: Math.min(providerEnd, visibleWidth), command: '/provider' },
+      { start: modelStart, end: Math.min(modelEnd, visibleWidth), command: '/models' }
+    ]
     if (this.sessionEffort) this.footerTargets.push({ start: effortStart,
       end: Math.min(effortStart + this.footerColumns(this.sessionEffort), visibleWidth), command: '/effort' })
+    this.footerTargets.push({ start: modelWidth > 0 ? this.footerColumns(`${displayed} · `) : 0,
+      end: this.footerColumns(content.replace(/…$/, '')), command: '/mode' })
   }
   private footerColumns(text: string): number {
     if (/^[\x20-\x7e]*$/.test(text)) return text.length
@@ -888,6 +959,13 @@ export class OpenTuiIO implements ChatIO {
         (!this.cancelCallbacks.size || pending?.kind !== 'chat') &&
         (id !== 'vivi-approve' || performance.now() >= this.approvalMouseNotBefore), activate)
     }
+    this.hover.bind(button, () => {
+      const pending = this.pending
+      return this.ready(pending) && (!this.cancelCallbacks.size || pending?.kind !== 'chat') &&
+        (id !== 'vivi-approve' || performance.now() >= this.approvalMouseNotBefore) &&
+        (id !== 'vivi-confirm' || !['choice', 'search'].includes(pending?.kind ?? '') ||
+          !!this.picker?.options.length && this.picker.getSelectedOption()?.value !== -1)
+    })
     return button
   }
   private renderDialogActions(): void {
@@ -944,9 +1022,8 @@ export class OpenTuiIO implements ChatIO {
       this.mouseActivation.clear()
       event.preventDefault(); event.stopPropagation()
       if (this.ready() && event.scroll && ['up', 'down'].includes(event.scroll.direction)) {
-        const delta = Math.max(1, Math.min(20, event.scroll.delta))
-        if (event.scroll.direction === 'up') picker.moveUp(delta)
-        else picker.moveDown(delta)
+        if (event.scroll.direction === 'up') picker.moveUp()
+        else picker.moveDown()
       }
       return
     }
@@ -958,6 +1035,10 @@ export class OpenTuiIO implements ChatIO {
         if (pending.kind === 'search') pending.finish(option!.value)
         else pending.finish(index)
       })
+  }
+  private bindPickerHover(picker: SelectRenderable): void {
+    this.hover.bind(picker, () => this.ready() && this.lastRenderedFrame > this.pickerChangedFrame &&
+      (this.pending?.kind === 'choice' || this.pending?.kind === 'search'), point => pickerHoverRegion(picker, point))
   }
   private acceptCompletion(index = this.completionIndex): void {
     const item = this.completions[index]
@@ -996,7 +1077,7 @@ export class OpenTuiIO implements ChatIO {
     this.programStatus.setBlocked(input ? this.pending!.kind === 'approval' ? 'permission'
       : this.pending!.kind === 'secret' ? 'auth' : 'question' : undefined)
     this.terminalTitle.update(this.sessionTitle, input ? 'input'
-      : this.runStatus.running || this.cancelCallbacks.size ? 'working' : 'idle', this.secrets)
+      : this.loadingMessage !== undefined || this.runStatus.running || this.cancelCallbacks.size ? 'working' : 'idle', this.secrets)
   }
   private updateHeader(): void {
     if (this.closed || !this.headerBox) return
@@ -1347,6 +1428,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private consume(key: KeyEvent | PasteEvent): void { key.preventDefault(); key.stopPropagation() }
   private handlePaste(event: PasteEvent): void {
+    this.hover.clear()
     this.mouseActivation.clear()
     this.consume(event)
     if (this.diagnosticKey) return
@@ -1374,6 +1456,11 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) { this.consume(key); return }
     if (this.diagnosticKey) { this.consume(key); this.diagnosticKey(key); return }
     if (key.eventType === 'release') { this.consume(key); return }
+    if (this.loadingMessage !== undefined) {
+      this.consume(key)
+      if (key.ctrl && key.name === 'c' && !key.repeated) this.close()
+      return
+    }
     if ((key.name === 'f6' || key.name === 'f7') && !key.ctrl && !key.shift && !key.meta && !key.super && !key.hyper) {
       this.consume(key)
       if (!key.repeated && key.eventType !== 'repeat') this.stopProcess(key.name === 'f7')
@@ -1546,6 +1633,10 @@ export class OpenTuiIO implements ChatIO {
       pending.finish(value)
       return
     }
+    if (pending.kind === 'chat') {
+      this.updateCompletions()
+      this.acceptCompletion()
+    }
     const text = this.composer.plainText
     if (pending.kind === 'approval' || pending.kind === 'question') return
     if (pending.kind === 'chat') this.rememberPrompt(text)
@@ -1567,6 +1658,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.pending?.kind === 'question') return Promise.resolve(undefined)
     if (this.closed) return Promise.resolve(undefined)
     if (signal?.aborted) return kind === 'chat' ? Promise.reject(new Error('Input cancelled')) : Promise.resolve(undefined)
+    this.setLoading()
     if (kind !== 'chat' && !this.runStatus.running && this.runStatus.label !== undefined) {
       this.runStatus.reset()
       if (['Completed', 'Cancelled', 'Error'].includes(this.status)) this.status = 'Ready'
@@ -1681,11 +1773,13 @@ export class OpenTuiIO implements ChatIO {
       this.controls?.close(); this.controls = undefined; this.shell.opacity = 1
       return
     }
+    this.setLoading()
     if (this.controls) return
     this.controls = new ControlModal(this.renderer, { safe: (text, limit) => this.safe(text, limit),
+      hover: this.hover,
       ready: () => this.pending?.kind === 'control' && this.ready(), completedFrame: () => this.lastRenderedFrame,
       foreground: TUI_THEME.foreground, accent: TUI_THEME.lavender, selection: TUI_THEME.selectedBackground,
-      selectedForeground: TUI_THEME.highlightForeground })
+      selectedForeground: TUI_THEME.highlightForeground, rowBackground: TUI_THEME.rowBackground })
     this.controls.setTitle(title ?? 'Conversation actions')
     this.shell.opacity = 0.35
   }
@@ -1771,6 +1865,7 @@ export class OpenTuiIO implements ChatIO {
         selectedBackgroundColor: TUI_THEME.selectedBackground, selectedTextColor: TUI_THEME.pink,
         descriptionColor: TUI_THEME.muted, selectedDescriptionColor: TUI_THEME.lavender })
       this.picker.on(SelectRenderableEvents.ITEM_SELECTED, (index: number) => this.pending?.finish(index))
+      this.bindPickerHover(this.picker)
       this.picker.on(SelectRenderableEvents.SELECTION_CHANGED, () => {
         this.mouseActivation.clear(); this.pickerChangedFrame = this.renderer.frameId
       })
@@ -1811,6 +1906,7 @@ export class OpenTuiIO implements ChatIO {
       // This is a result view, not a second input target. Mouse autofocus must not
       // redirect later query typing into SelectRenderable's own key handler.
       this.picker.focusable = false
+      this.bindPickerHover(this.picker)
       this.picker.on(SelectRenderableEvents.SELECTION_CHANGED, () => {
         this.mouseActivation.clear(); this.pickerChangedFrame = this.renderer.frameId
       })
@@ -1836,8 +1932,6 @@ export class OpenTuiIO implements ChatIO {
   }
   private async showApproval(request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     if (this.closed || signal.aborted) return false
-    const enrollment = request.call.name === 'enroll_skip_permissions'
-    const enrollmentLabel = 'Enable Skip permissions?'
     const publicUrl = request.call.name === 'fetch_url'
     const skillSave = request.call.name === 'save_skill'
     if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
@@ -1848,14 +1942,13 @@ export class OpenTuiIO implements ChatIO {
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     const workspace = ['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
       ? workspaceDiffPresentation(request.description, request.workspaceDiff) : undefined
-    this.appendEntry({ category: 'activity', attention: true, label: workspace ? workspace.path : enrollment ? enrollmentLabel : `Approval required · ${scope}`,
+    this.appendEntry({ category: 'activity', attention: true, label: workspace ? workspace.path : `Approval required · ${scope}`,
       content: this.safe(workspace?.content ?? request.description), markdown: false, approval: approval.token,
       ...(workspace ? { workspaceDiff: workspace.content } : {}) })
-    const title = enrollment ? enrollmentLabel : publicUrl
+    const title = publicUrl
       ? 'Review this public URL request' : skillSave ? 'Save skill?' : 'Review this change'
-    this.updateStatus(enrollment ? enrollmentLabel : `Approval required${workspace ? '' : ` · ${scope}`}`)
-    const answer = this.openInput('approval', title, '', signal, enrollment ? { deny: 'Cancel', allow: 'Enable Skip' }
-      : skillSave ? { deny: 'Deny', allow: 'Save skill' } : undefined)
+    this.updateStatus(`Approval required${workspace ? '' : ` · ${scope}`}`)
+    const answer = this.openInput('approval', title, '', signal, skillSave ? { deny: 'Deny', allow: 'Save skill' } : undefined)
     this.pickerBox.title = title
     this.pickerBox.height = 4
     this.pickerBox.visible = true
@@ -1953,6 +2046,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateActionBar(); this.updateHeader(); this.updateSteeringQueue()
       try {
         this.questionDialog = new QuestionDialog(this.renderer, request, {
+          hover: this.hover,
           safe: (text, limit) => this.safe(text, limit), clean: stripControls, ready: () => this.pending === pending && this.ready(pending),
           mouseReady: () => performance.now() >= this.approvalMouseNotBefore,
           // Keep transcript context, status, and every visible shell footer.
@@ -1979,6 +2073,7 @@ export class OpenTuiIO implements ChatIO {
   private invalidateDialogs(): void { this.dialogOwner.abort(); this.dialogOwner = new AbortController() }
   runStarted(): void {
     if (this.closed) return
+    this.setLoading()
     this.invalidateDialogs()
     if (this.steering?.pending && this.pending === this.steering.pending) {
       this.steering.draft = this.composer.plainText
@@ -2150,6 +2245,7 @@ export class OpenTuiIO implements ChatIO {
         this.mouseActivation.handle(event, button, key, entry.tool, !this.closed && this.entries.includes(entry),
           () => this.toggleToolDetails(key))
       }
+      this.hover.bind(button, () => !this.closed && this.entries.includes(entry) && !this.controls?.overlay.visible)
       box.add(button)
       // Actionable custom warnings stay outside the detail budget, even when collapsed.
       for (const warning of collapsed ? card.warnings : []) box.add(new TextRenderable(this.renderer,
@@ -2393,7 +2489,8 @@ export class OpenTuiIO implements ChatIO {
     this.contextUsage = undefined
     this.canCompact = false
     this.sessionTitle = 'Untitled conversation'
-    this.sessionModel = `${provider} · choose a model with /models`
+    this.sessionProvider = provider
+    this.sessionModel = 'choose a model with /models'
     this.sessionEffort = ''; this.sessionPlan = false
     this.updateHeader()
     this.clearStream()
@@ -2448,7 +2545,8 @@ export class OpenTuiIO implements ChatIO {
     }
     this.sessionId = session.id
     this.sessionTitle = this.safe(sessionDisplayTitle(session), 4096)
-    this.sessionModel = this.safe(`${session.provider} / ${session.model}`, 4096)
+    this.sessionProvider = this.safe(session.provider, 4096)
+    this.sessionModel = this.safe(session.model, 4096)
     this.sessionEffort = this.safe(session.reasoning ?? 'default', 256)
     this.sessionPlan = session.provider === 'chatgpt'
     this.historyLength = session.history.length
@@ -2624,6 +2722,9 @@ export class OpenTuiIO implements ChatIO {
   }
   private dispose(destroyRenderer: boolean): void {
     if (this.closed) return
+    if (this.loadingTimer !== undefined) clearInterval(this.loadingTimer)
+    this.loadingTimer = undefined
+    this.hover.clear()
     if (this.steering) this.releaseSteering(this.steering)
     this.steeringQueue = []
     this.closed = true

@@ -181,7 +181,7 @@ test('terminal ChatGPT rejection revokes Skip and cleans owned fake background j
       executable: process.execPath, args: ['-e', 'offline-fixture'], background: true, yieldMs: 0 } }] }
       throw new ChatGPTInferenceError(new ProviderRequestError('OpenAI', 'http', 'fixture denial', 401, { bodyShape: 'error', code: 'subscription_sharing_invalid_user' })) } }) }), 0)
   assert.equal(rounds, 2); assert.equal(processes.length, 1); assert.equal(processes[0].stops, 1)
-  assert.equal(io.approvals.filter(request => request.call.name === 'enroll_skip_permissions').length, 1)
+  assert.equal(io.approvals.filter(request => request.call.name === 'enroll_skip_permissions').length, 0)
   assert(!io.approvals.some(request => request.call.name === 'command_start')); assert.match(io.output, /Unattended permissions revoked/)
   assert.match(io.output, /selected account changed/); assert.equal(auth.state.logouts.length, 0)
 })

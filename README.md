@@ -84,9 +84,9 @@ OAuth is never sent to the Decisions API. Manual and Skip need no reviewer.
 
 ### Skip permissions
 
-Use `/mode` → **Skip permissions**, `/mode skip`, or `--approval-mode skip` and
-confirm the warning in a live interactive terminal. Your choice is remembered across
-new conversations, resumes and launches, alongside the other modes. It skips ordinary
+Use `/mode` → **Skip permissions**, `/mode skip`, or `--approval-mode skip` in
+a live interactive terminal. Selection enables it directly, without a second confirmation.
+Your choice is remembered across new conversations, resumes and launches, alongside the other modes. It skips ordinary
 prompts without human **or AI** review for eligible, host-prepared local changes,
 public/paid web requests, trusted commands and already-connected MCP operations.
 
@@ -143,10 +143,12 @@ image path normally; the agent can inspect PNG/JPEG pixels with
 `workspace_read_image`, subject to workspace policy and verified model support.
 There is no `/attach` command or automatic image upload.
 
-Sessions get a readable name from the first accepted message, without an extra
-model call. Rename keeps that name through later turns and resumes. The resume
-picker shows names and local dates such as Today or Yesterday, with the model
-and session ID still available. Older unnamed sessions use a display-only
+Sessions are saved only after the first accepted user message, which also gives
+them a readable name without an extra model call. Rename keeps that name through
+later turns and resumes. The resume picker hides older empty sessions and uses
+alternating row shading, with relative times such as `1m ago` or `2d ago` to the
+left of each name. The precise local date, model and session ID remain in the
+selected session's details. Older unnamed sessions use a display-only
 first-message fallback; browsing them does not rewrite saved files.
 
 The full-screen welcome shows vivi, a shortened workspace path, and one muted
@@ -210,7 +212,7 @@ Repeated consecutive prompts occupy one entry. Down past the newest entry restor
 your unfinished draft and cursor; edits made while browsing are kept until you send
 or leave the composer. In multiline or wrapped text, arrows move within the text
 until the first/last row. Setup dialogs and masked inputs are excluded.
-Tab completes slash commands. Shift+Tab cycles
+Enter submits the highlighted slash command; Tab fills it in without submitting. Shift+Tab cycles
 Manual / Auto review / Skip permissions / Plan while the composer is idle and preserves an unfinished
 draft. Selecting Auto enables it immediately, without an extra confirmation. Entering Plan
 revokes Auto enrollment; leaving Plan returns to Manual. During a turn and inside
