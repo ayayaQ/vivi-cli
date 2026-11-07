@@ -259,3 +259,40 @@ test('ChatGPT bearer route remains fixed even when a JavaScript caller supplies 
   await provider.generate({ messages: seed, tools: [] }, signal())
   assert.deepEqual(targets, ['https://api.openai.com/v1/responses'])
 })
+
+test('published core accepts fragmented SSE with missing or incorrect MIME in both display modes', async () => {
+  for (const stream of [false, true]) for (const contentType of [undefined, 'application/json', 'text/plain']) {
+    const bytes = new TextEncoder().encode(frame({ type: 'response.output_text.delta', delta: 'Hello 🐈' }) + frame(completed([message('Hello 🐈')])))
+    let offset = 0
+    const reply = new Response(new ReadableStream({ pull(controller) {
+      if (offset === bytes.length) controller.close()
+      else controller.enqueue(bytes.slice(offset, ++offset))
+    } }), { headers: contentType ? { 'content-type': contentType } : {} })
+    const h = harness([reply], { stream }); const progress = []
+    const result = await h.provider.generate({ messages: seed, tools: [] }, signal(), { onProgress: event => progress.push(event.text) })
+    assert.equal(result.content, 'Hello 🐈'); assert.deepEqual(progress, stream ? ['Hello 🐈'] : [])
+    assert.equal(h.requests[0].headers.get('accept'), 'text/event-stream')
+    assert.equal(h.requests.length, 1); assert.equal(h.credentials(), 1)
+    noUnsupportedFields(h.requests[0].body)
+  }
+})
+
+test('published core rejects non-SSE and incomplete streams with safe diagnostics and no replay', async () => {
+  for (const [body, type, shape] of [
+    [JSON.stringify({ error: { code: 'subscription_sharing_usage_limit_exceeded', param: 'model', message: 'private-upstream fixture-token-1' } }), 'application/json; private=hidden', 'error'],
+    ['<html>private-upstream fixture-token-1</html>', 'text/html', 'unreadable']
+  ]) {
+    const h = harness([new Response(body, { headers: { 'content-type': type, 'x-request-id': 'req_mime' } })])
+    await assert.rejects(h.provider.generate({ messages: seed, tools: [] }, signal()), error => {
+      assert.equal(error.status, 200); assert.equal(error.details.bodyShape, shape)
+      assert.equal(error.details.contentType, type.split(';')[0]); assert.equal(error.details.requestId, 'req_mime')
+      assert(Object.isFrozen(error.details)); assert.doesNotMatch(error.message + JSON.stringify(error), /private-upstream|fixture-token|hidden/)
+      if (shape === 'error') assert.match(error.message, /usage limit reached/)
+      return true
+    })
+    assert.equal(h.requests.length, 1); assert.equal(h.credentials(), 1)
+  }
+  const h = harness([new Response(frame({ type: 'response.output_text.delta', delta: 'partial' }), { headers: { 'content-type': 'text/plain' } })])
+  await assert.rejects(h.provider.generate({ messages: seed, tools: [] }, signal()), /before completion/)
+  assert.equal(h.requests.length, 1)
+})
