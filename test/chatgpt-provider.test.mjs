@@ -91,7 +91,7 @@ test('ChatGPT catalog uses visible slugs and labels in server order without stat
   assert.throws(() => parseChatGPTModelCatalog({ data: [{ id: 'api-key-schema' }] }), /format/)
 })
 
-test('ChatGPT documents only exact SiwC text and streaming support without granting other capabilities or availability', () => {
+test('ChatGPT enriches only the reviewed exact slug without granting tools, vision, capacity or availability', () => {
   const ids = ['future-model', 'gpt-6.1-sol', 'gpt-6.1-sol-future', 'GPT-6.1-SOL', 'openai/gpt-6.1-sol', 'gpt-5']
   const models = parseChatGPTModelCatalog({ models: ids.map(slug => ({ slug, display_name: 'Account label', visibility: 'list',
     tools: true, vision: true, reasoning: { supported_efforts: ['high'] }, context_window: 123456 })) })
@@ -102,13 +102,19 @@ test('ChatGPT documents only exact SiwC text and streaming support without grant
     assert.equal(model.modelCapabilities.chat, expected); assert.equal(model.modelCapabilities.stream, expected)
     assert.equal(model.tools, 'unknown'); assert.equal(model.modelCapabilities.tools, 'unknown')
     assert.equal(model.vision, undefined); assert.equal(model.modelCapabilities.vision, 'unknown')
-    assert.equal(model.reasoning, 'unknown'); assert.deepEqual(model.efforts, [])
-    assert.equal(model.modelCapabilities.reasoning.support, 'unknown')
-    assert.equal(model.modelCapabilities.reasoning.requirement, 'unknown')
+    assert.equal(model.reasoning, expected)
+    assert.deepEqual(model.efforts, expected === 'supported' ? ['low', 'medium', 'high', 'xhigh', 'max'] : [])
+    assert.equal(model.modelCapabilities.reasoning.support, expected)
+    assert.equal(model.modelCapabilities.reasoning.requirement, expected === 'supported' ? 'required' : 'unknown')
+    assert.equal(model.modelCapabilities.reasoning.disable, expected === 'supported' ? 'unsupported' : 'unknown')
+    assert.equal(model.reasoningMandatory, expected === 'supported')
     assert.equal(model.contextWindow, undefined); assert.equal(model.modelCapabilities.contextWindow, undefined)
+    assert.equal(model.maxInputTokens, undefined); assert.equal(model.maxOutputTokens, undefined)
+    assert.equal(model.contextBudget?.tokens, expected === 'supported' ? 475000 : undefined)
     assert.equal(model.name, 'Account label')
     if (expected === 'supported') assert.deepEqual(model.modelCapabilities.sources, [{ kind: 'official-model-documentation',
-      url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-05' }])
+      url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-07' },
+      { kind: 'official-model-documentation', url: 'https://developers.openai.com/api/docs/models/gpt-6.1-sol', reviewedOn: '2026-11-07' }])
     else assert.deepEqual(model.modelCapabilities.sources, [])
   }
   const unlisted = parseChatGPTModelCatalog({ models: [{ slug: 'gpt-6.1-sol', visibility: 'hide' }, { slug: 'future-model', visibility: 'list' }] })

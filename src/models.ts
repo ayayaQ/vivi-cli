@@ -22,6 +22,8 @@ export interface ModelEntry {
   source: string
   /** Request capacity is separate from cumulative provider usage. Missing stays unknown. */
   contextWindow?: number
+  /** Local input + output working budget, not a provider/account capacity claim. */
+  contextBudget?: { tokens: number; source: CapabilitySource }
   maxInputTokens?: number
   maxOutputTokens?: number
   contextLimitsSource?: CapabilitySource
@@ -255,14 +257,18 @@ export class ModelCatalog implements Catalog {
   }
 }
 
-/** Trusted catalog/documentation facts only. Unknown values stay omitted. */
+/** Trusted limits and explicit host budgets only. A budget never becomes a model capability. */
 export function contextLimitsForModel(model?: ModelEntry, now = Date.now()): import('@ayayaq/vivi').ContextLimits | undefined {
-  if (!model || model.contextWindow === undefined && model.maxInputTokens === undefined && model.maxOutputTokens === undefined) return
+  if (!model || model.contextWindow === undefined && model.maxInputTokens === undefined && model.maxOutputTokens === undefined && !model.contextBudget) return
+  const budget = model.contextBudget && (model.contextWindow === undefined || model.contextBudget.tokens <= model.contextWindow)
+    ? model.contextBudget : undefined
+  const window = budget?.tokens ?? model.contextWindow
   return {
-    ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+    ...(window === undefined ? {} : { contextWindow: window }),
     ...(model.maxInputTokens === undefined ? {} : { maxInputTokens: model.maxInputTokens }),
     ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
-    ...(model.contextLimitsSource ? { source: { ...model.contextLimitsSource,
+    ...(budget ? { source: { kind: 'host' as const, url: budget.source.url, reviewedOn: budget.source.reviewedOn } }
+      : model.contextLimitsSource ? { source: { ...model.contextLimitsSource,
       ...(model.contextMetadata ? { fetchedAt: model.contextMetadata.fetchedAt, freshness: now - Date.parse(model.contextMetadata.fetchedAt) > 15 * 60 * 1000 ? 'stale' : model.contextMetadata.state } : {}) } } : {})
   }
 }
