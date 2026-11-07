@@ -225,7 +225,7 @@ test('account replacement revokes enrollment even when model selection cancels, 
   assert.equal(io.modes.at(-1), 'manual')
   assert.equal(io.sessions.length, 1)
   const store = new FileSessionStore(directory)
-  assert.equal((await store.load(io.sessions[0].id)).provider, 'openai')
+  await assert.rejects(store.load(io.sessions[0].id), { code: 'ENOENT' })
 })
 
 test('interactive /mode cycle bypasses the picker and visits Auto, Skip and Plan', async t => {
@@ -234,7 +234,7 @@ test('interactive /mode cycle bypasses the picker and visits Auto, Skip and Plan
   const io = fakeIO({ interactive: true, lines: ['/mode cycle', '/mode cycle', '/mode cycle', '/exit'], approvals: [true] })
   assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io,
     providerFactory: () => ({ generate: async () => { throw new Error('Mode controls must not send a chat turn') } }) }), 0)
-  assert.equal(io.requests.length, 1); assert.equal(io.requests[0].call.name, 'enroll_skip_permissions')
+  assert.equal(io.requests.length, 0)
   assert.equal(io.choices.length, 0)
   assert.equal(io.modes.at(-1), 'manual')
   assert.equal(io.taskModes.at(-1), 'plan')

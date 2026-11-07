@@ -29,6 +29,8 @@ async function fixture(width = 100) {
 
 test('native idle Shift+Tab cycles Manual -> Auto -> Skip -> Plan -> Manual and preserves an unfinished draft', async () => {
   const f = await fixture(), first = f.io.readLine('Message')
+  const transcript = f.setup.renderer.root.findDescendantById('vivi-transcript')!
+  const initial = transcript.getChildren().length
   await f.input.typeText('Unsent planning draft'); await f.frame()
   f.input.pressTab({ shift: true }); expect(await first).toBe('/mode cycle')
   await cycleApprovalMode(f.host, f.io)
@@ -36,10 +38,7 @@ test('native idle Shift+Tab cycles Manual -> Auto -> Skip -> Plan -> Manual and 
   const skipping = f.io.readLine('Message'); await f.frame()
   expect(f.composer.plainText).toBe('Unsent planning draft')
   f.input.pressTab({ shift: true }); expect(await skipping).toBe('/mode cycle')
-  const enablingSkip = cycleApprovalMode(f.host, f.io)
-  await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
-  await new Promise(resolve => setTimeout(resolve, 3)); await f.frame()
-  f.input.pressArrow('right'); f.input.pressEnter(); await enablingSkip
+  await cycleApprovalMode(f.host, f.io)
   expect(f.host.approvalMode).toBe('skip'); expect(await f.frame()).toContain('Skip permissions')
   for (const expected of ['plan', 'execute']) {
     const reading = f.io.readLine('Message'); await f.frame()
@@ -51,6 +50,7 @@ test('native idle Shift+Tab cycles Manual -> Auto -> Skip -> Plan -> Manual and 
   }
   const last = f.io.readLine('Message'); await f.frame()
   expect(f.composer.plainText).toBe('Unsent planning draft')
+  expect(transcript.getChildren().length).toBe(initial)
   f.input.pressEnter(); expect(await last).toBe('Unsent planning draft')
 })
 

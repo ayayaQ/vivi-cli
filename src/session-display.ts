@@ -48,6 +48,18 @@ export interface SessionDateOptions {
   timeZone?: string
 }
 
+/** Compact elapsed time for the resume list; future clock skew reads as current. */
+export function formatSessionRelativeTime(timestamp: string, now = new Date()): string {
+  const date = Date.parse(timestamp), current = now.getTime()
+  if (!Number.isFinite(date) || !Number.isFinite(current)) return 'Unknown'
+  const seconds = Math.max(0, Math.floor((current - date) / 1000))
+  if (seconds < 60) return 'now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
+  if (seconds < 31536000) return `${Math.floor(seconds / 86400)}d ago`
+  return `${Math.floor(seconds / 31536000)}y ago`
+}
+
 /** Local calendar dates, including DST boundaries; precise stored timestamps remain untouched. */
 export function formatSessionDate(timestamp: string, options: SessionDateOptions = {}): string {
   const date = new Date(timestamp), now = options.now ?? new Date()

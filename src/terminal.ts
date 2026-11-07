@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createInterface, emitKeypressEvents } from 'node:readline'
-import { randomUUID } from 'node:crypto'
 import type { Interface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import type { AgentEvent, AgentResult, ContextUsage } from '@ayayaq/vivi'
@@ -240,7 +239,7 @@ function selectManual(host: CliHost, io: ChatIO): void {
   io.setTaskMode?.('execute')
   io.setApprovalMode?.('manual')
 }
-function selectPlan(host: CliHost, io: ChatIO, announce = true): void {
+function selectPlan(host: CliHost, io: ChatIO, announce = !io.compactStartup): void {
   host.setTaskMode('plan')
   io.setTaskMode?.('plan')
   io.setApprovalMode?.('manual')
@@ -248,7 +247,7 @@ function selectPlan(host: CliHost, io: ChatIO, announce = true): void {
 }
 
 /** Explicit Auto selection enables review directly on a live interactive surface. */
-export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser, setupReviewer?: () => Promise<boolean>, announce = true): Promise<void> {
+export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: ModeChooser, setupReviewer?: () => Promise<boolean>, announce = !io.compactStartup): Promise<void> {
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   const current: ConversationMode = host.taskMode === 'plan' ? 'plan' : host.approvalMode
   const selected = choose ? await choose('Mode', [
@@ -259,7 +258,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
   ], ['manual', 'auto', 'skip', 'plan'].indexOf(current)) : 'auto'
   if (selected === undefined || (choose && io.isClosed)) return
   if (selected === 'plan') { selectPlan(host, io, announce); return }
-  if (selected === 'skip') { await enrollSkipPermissions(host, io, current === 'plan'); return }
+  if (selected === 'skip') { selectSkipPermissions(host, io, current === 'plan', announce); return }
   if (selected !== 'auto') { selectManual(host, io); if (announce) io.write('Approval mode: Manual\n'); return }
   const fromPlan = current === 'plan'
   if (fromPlan) host.setApprovalMode('manual')
@@ -293,7 +292,7 @@ export async function selectApprovalMode(host: CliHost, io: ChatIO, choose?: Mod
 
 /** Restore a saved user choice on the new live host; transcripts never supply it. */
 export async function restoreConversationMode(host: CliHost, io: ChatIO, mode: ConversationMode,
-  setupReviewer?: () => Promise<boolean>, announce = true): Promise<void> {
+  setupReviewer?: () => Promise<boolean>, announce = !io.compactStartup): Promise<void> {
   if ((mode === 'auto' || mode === 'skip') && (io.canAutoReview !== true || io.isClosed)) {
     io.write(mode === 'auto' ? `${AUTO_REVIEW_UNAVAILABLE}\n` : 'Skip permissions requires a live interactive terminal. Using Manual.\n')
     return
@@ -306,37 +305,23 @@ export async function restoreConversationMode(host: CliHost, io: ChatIO, mode: C
 
 export const SKIP_PERMISSIONS_DISCLOSURE = 'Skip permissions skips ordinary approval prompts for enabled host-prepared local note/memory and workspace changes, public URL requests and configured paid web requests, trusted commands, and calls or resource reads on already-connected MCP servers. There is no human or AI review of those actions. Remote requests disclose their arguments and can have effects or costs. Trusted commands are unsandboxed: they run with your OS account’s file and network access, can act outside the workspace, and can read credential files your account can access. Existing hard denials, workspace/path and known-credential protections, tool validation, cancellation and session isolation remain; this does not grant OS privileges or add a sandbox. Skill installation, MCP setup/connections/sign-in and credential/trust administration still require human action. This mode is remembered for future conversations and launches; live account, workspace and trust checks still apply. Enable only for a task and environment you trust.'
 
-async function enrollSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolean): Promise<void> {
+function selectSkipPermissions(host: CliHost, io: ChatIO, fromPlan: boolean, announce: boolean): void {
   if (fromPlan) host.setApprovalMode('manual')
   else selectManual(host, io)
   if (io.canAutoReview !== true || io.isClosed) {
-    io.write(`Skip permissions requires a live interactive terminal and fresh confirmation. ${fromPlan ? 'Plan remains active' : 'Using Manual'}; piped and headless launches cannot enroll.\n`)
+    io.write(`Skip permissions requires a live interactive terminal. ${fromPlan ? 'Plan remains active' : 'Using Manual'}; piped and headless launches cannot enroll.\n`)
     return
   }
-  const binding = host.approvalEnrollmentBinding
-  const controller = new AbortController(), dispose = io.onCancel(() => controller.abort())
   try {
-    const enrolled = await io.approve({ call: { id: randomUUID(), name: 'enroll_skip_permissions', arguments: {
-      mode: 'skip', sessionId: host.session.id, enrollmentBinding: binding
-    } }, currentRevision: 'fresh Skip permissions selection', description: SKIP_PERMISSIONS_DISCLOSURE }, controller.signal)
-    const changed = binding !== host.approvalEnrollmentBinding
-    if (enrolled && !changed && !controller.signal.aborted && !io.isClosed && io.canAutoReview === true) {
-      try {
-        if (fromPlan) host.setTaskMode('execute')
-        host.setApprovalMode('skip')
-      } catch (error) {
-        if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
-        io.setTaskMode?.(host.taskMode); io.setApprovalMode?.(host.approvalMode)
-        throw error
-      }
-      io.setTaskMode?.('execute'); io.setApprovalMode?.('skip')
-      io.write('Approval mode: Skip permissions · remembered; no human or AI review of ordinary actions\n')
-    } else {
-      if (!changed) host.setApprovalMode('manual')
-      io.setTaskMode?.(host.taskMode); io.setApprovalMode?.(host.approvalMode)
-      io.write(`Mode: ${conversationModeLabel(host.taskMode, host.approvalMode)}${changed ? '. Enrollment changed; open /mode for a fresh confirmation' : ''}\n`)
-    }
-  } finally { dispose() }
+    if (fromPlan) host.setTaskMode('execute')
+    host.setApprovalMode('skip')
+  } catch (error) {
+    if (fromPlan && host.taskMode === 'execute') host.setTaskMode('plan')
+    io.setTaskMode?.(host.taskMode); io.setApprovalMode?.(host.approvalMode)
+    throw error
+  }
+  io.setTaskMode?.('execute'); io.setApprovalMode?.('skip')
+  if (announce) io.write('Approval mode: Skip permissions · remembered; no human or AI review of ordinary actions\n')
 }
 
 /** Manual -> Auto -> Skip permissions -> Plan -> Manual. */
@@ -344,7 +329,7 @@ export async function cycleApprovalMode(host: CliHost, io: ChatIO, setupReviewer
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   if (host.taskMode === 'plan') {
     selectManual(host, io)
-    io.write('Approval mode: Manual\n')
+    if (!io.compactStartup) io.write('Approval mode: Manual\n')
     return
   }
   if (host.approvalMode === 'auto') {
@@ -362,7 +347,7 @@ export async function runModeControl(host: CliHost, io: ChatIO, line: string, ch
   if (host.running) throw new Error('Wait for the current turn before changing mode')
   switch (line.trim()) {
     case '/mode plan': selectPlan(host, io); return
-    case '/mode manual': selectManual(host, io); io.write('Approval mode: Manual\n'); return
+    case '/mode manual': selectManual(host, io); if (!io.compactStartup) io.write('Approval mode: Manual\n'); return
     case '/mode cycle': await cycleApprovalMode(host, io, setupReviewer); return
     case '/mode skip': await selectApprovalMode(host, io, async () => 'skip', setupReviewer); return
     case '/mode': await selectApprovalMode(host, io, choose, setupReviewer); return

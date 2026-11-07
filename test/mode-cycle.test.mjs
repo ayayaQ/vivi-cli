@@ -24,8 +24,7 @@ test('Manual -> Auto -> Skip -> Plan -> Manual visits every mode', async () => {
     assert.equal(f.host.approvalMode, mode)
     assert.equal(f.host.taskMode, task)
   }
-  assert.equal(f.requests.length, 1)
-  assert.equal(f.requests[0].call.name, 'enroll_skip_permissions')
+  assert.equal(f.requests.length, 0)
 })
 
 test('cycle enables Auto directly when interactive and stays Manual when unavailable', async () => {
@@ -40,8 +39,7 @@ test('cycle enables Auto directly when interactive and stays Manual when unavail
 test('line command cycle switches directly and revokes Auto while rejecting unsupported mode arguments', async () => {
   const f = fixture({ allow: true, lines: ['/mode auto', '/mode cycle', '/mode cycle', '/mode cycle', '/exit'] })
   await runChatLoop(f.host, f.io)
-  assert.equal(f.requests.length, 1)
-  assert.equal(f.requests[0].call.name, 'enroll_skip_permissions')
+  assert.equal(f.requests.length, 0)
   assert.equal(f.host.approvalMode, 'manual')
   assert.match(f.io.output, /Use \/mode by itself/)
 })

@@ -10,14 +10,50 @@ import { USER_SHELL_DISCLOSURE } from '../src/user-shell.js'
 
 const active: OpenTuiIO[] = []
 afterEach(() => { for (const io of active.splice(0)) io.close() })
-async function fixture(width = 100, height = 30) {
+async function fixture(width = 100, height = 30, loading = false) {
   const setup = await createTestRenderer({ width, height, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
-  const io = new OpenTuiIO(setup.renderer); active.push(io)
+  const io = new OpenTuiIO(setup.renderer, { loading }); active.push(io)
   const node = (id: string) => setup.renderer.root.findDescendantById(id)!
   const composer = node('vivi-composer') as TextareaRenderable
   const frame = async () => { await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
   return { io, setup, node, composer, frame }
 }
+
+test('startup animates while hiding provisional settings and ignores input until the real session is ready', async () => {
+  const f = await fixture(40, 12, true)
+  expect(await f.frame()).toContain('Starting vivi')
+  expect(f.node('vivi-root').visible).toBe(false)
+  expect(await f.frame()).not.toContain('Manual')
+  const first = (f.node('vivi-loading-stage') as TextRenderable).plainText
+  await new Promise(resolve => setTimeout(resolve, 120)); await f.frame()
+  expect((f.node('vivi-loading-stage') as TextRenderable).plainText).not.toBe(first)
+  f.io.setLoading('Loading model capabilities…')
+  f.setup.resize(32, 10)
+  expect(await f.frame()).toContain('Loading model capabilities')
+  await f.setup.mockInput.typeText('Too early')
+  f.setup.mockInput.pressEnter()
+  expect(f.composer.plainText).toBe('')
+  f.io.setSession(newSession({ provider: 'deepseek', model: 'deepseek-flash' }))
+  f.io.setTaskMode('plan')
+  expect(await f.frame()).not.toContain('deepseek')
+  const reading = f.io.readLine('Message')
+  expect(await f.frame()).toContain('Plan')
+  expect(f.node('vivi-loading').visible).toBe(false)
+  expect(f.node('vivi-root').visible).toBe(true)
+  expect(f.node('vivi-transcript').getChildren()).toHaveLength(0)
+  expect(f.composer.plainText).toBe('')
+  f.io.close(); expect(await reading).toBeUndefined()
+})
+
+test('Ctrl+C exits startup immediately and cancels outstanding setup', async () => {
+  const f = await fixture(40, 12, true)
+  let cancelled = 0
+  f.io.onCancel(() => { cancelled++ })
+  await f.frame(); f.setup.mockInput.pressCtrlC()
+  expect(f.io.isClosed).toBe(true)
+  expect(f.setup.renderer.isDestroyed).toBe(true)
+  expect(cancelled).toBe(1)
+})
 
 test('fresh welcome shows one model/mode row, a home-relative workspace and an empty transcript', async () => {
   const f = await fixture()

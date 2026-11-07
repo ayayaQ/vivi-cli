@@ -93,6 +93,26 @@ test('autocomplete renders above composer, arrows cycle and Tab accepts without 
   expect(await line).toBe('/menu')
 })
 
+test('Enter submits the highlighted slash completion and preserves newline shortcuts', async () => {
+  const { io, setup, input, frame } = await fixture()
+  let line = io.readLine('Message')
+  await input.typeText('/ex'); await frame(); input.pressEnter()
+  expect(await line).toBe('/exit')
+  line = io.readLine('Message')
+  await input.typeText('/m'); await frame(); input.pressArrow('down'); input.pressEnter()
+  expect(await line).toBe('/mode')
+  line = io.readLine('Message')
+  await frame()
+  setup.renderer.stdin.emit('data', Buffer.from('/ex\r'))
+  expect(await line).toBe('/exit')
+  for (const modifiers of [{ shift: true }, { meta: true }]) {
+    line = io.readLine('Message')
+    await input.typeText('/ex'); await frame(); input.pressEnter(modifiers)
+    expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('/ex\n')
+    input.pressEnter(); expect(await line).toBe('/ex\n')
+  }
+})
+
 test('autocomplete leaves ordinary text, arguments, unknown commands and askText alone', async () => {
   const { io, setup, input, frame } = await fixture()
   for (const text of ['ordinary /m', '/models argument', '/unknown']) {
@@ -419,7 +439,7 @@ test('renders session header, canonical roles, tools, usage and command hints', 
   session.usage = { inputTokens: 9, outputTokens: 8, totalTokens: 17 }
   io.setSession(session)
   const output = await frame()
-  expect(output).toContain('openai / mock-model')
+  expect(output).toContain('openai · mock-model')
   expect((setup.renderer.root.findDescendantById('vivi-header') as TextRenderable).plainText).not.toContain(session.id)
   const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
   const cards = transcript.getChildren().flatMap(entry => entry.getChildren())

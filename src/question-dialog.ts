@@ -2,7 +2,8 @@
 import { BoxRenderable, ScrollBoxRenderable, TextareaRenderable, TextRenderable, StyledText, TextAttributes, decodePasteBytes, parseColor } from '@opentui/core'
 import type { CliRenderer, KeyEvent, MouseEvent, PasteEvent } from '@opentui/core'
 import type { QuestionAnswer, QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/questions'
-import { MouseActivation } from './tui-mouse.js'
+import { ModalScrollBoxRenderable, MouseActivation } from './tui-mouse.js'
+import type { MouseHover } from './tui-mouse.js'
 
 const MAX_ANSWER = 4000
 type Focus = 'choices' | 'text' | 'actions'
@@ -13,6 +14,7 @@ interface DialogOptions {
   clean(text: string): string
   ready(): boolean
   mouseReady(): boolean
+  hover: MouseHover
   availableHeight(): number
   status(text: string): void
   finish(response: QuestionResponse, mouse?: boolean): void
@@ -54,7 +56,7 @@ export class QuestionDialog {
     try {
       this.progress = new TextRenderable(renderer, { id: 'vivi-question-progress', height: 1,
         flexShrink: 0, fg: options.foreground, attributes: TextAttributes.DIM, wrapMode: 'none' })
-      this.body = new ScrollBoxRenderable(renderer, { id: 'vivi-question-body', width: '100%',
+      this.body = new ModalScrollBoxRenderable(renderer, { id: 'vivi-question-body', width: '100%',
         height: 6, flexShrink: 0, scrollX: false, scrollY: true,
         contentOptions: { width: '100%', flexDirection: 'column' } })
       this.heading = new TextRenderable(renderer, { id: 'vivi-question-heading', width: Math.max(1, renderer.terminalWidth - 5),
@@ -105,6 +107,7 @@ export class QuestionDialog {
       if (wrap && event.type === 'scroll') { this.mouse.clear(); return }
       this.mouse.handle(event, node, id, this.context, this.live() && this.options.mouseReady(), action)
     }
+    this.options.hover.bind(node, () => this.live() && this.options.mouseReady())
     return node
   }
   private addChoice(node: TextRenderable): void {

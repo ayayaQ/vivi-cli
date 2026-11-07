@@ -159,10 +159,10 @@ test('mode picker offers Plan without enrollment, cancellation preserves Plan, a
   await cycleApprovalMode(subject, f.io); assert.equal(subject.approvalMode, 'skip')
   await cycleApprovalMode(subject, f.io); assert.equal(subject.taskMode, 'plan'); assert.equal(subject.approvalMode, 'manual')
   await runModeControl(subject, f.io, '/mode manual')
-  await cycleApprovalMode(subject, f.io); assert.equal(f.requests.length, 1)
+  await cycleApprovalMode(subject, f.io); assert.equal(f.requests.length, 0)
   f.io.canAutoReview = false
   await runModeControl(subject, f.io, '/mode plan'); assert.equal(subject.taskMode, 'plan')
-  assert.equal(f.requests.length, 1)
+  assert.equal(f.requests.length, 0)
   await subject.shutdown()
 })
 

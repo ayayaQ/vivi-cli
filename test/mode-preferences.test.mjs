@@ -141,7 +141,7 @@ for (const mode of ['auto', 'skip']) test(`noninteractive launches cannot restor
 
 test('resuming a transcript uses the current mode preference', async t => {
   const f = await fixture(t)
-  const first = await f.run({ lines: ['/mode plan', '/exit'] })
+  const first = await f.run({ lines: ['/mode plan', 'A real saved conversation', '/exit'] })
   const id = first.sessions[0].id
   await f.preferences.save({ ...await f.preferences.load(), mode: 'auto', reviewer: 'openai' })
   const resumed = await f.run({ args: ['--resume', id] })

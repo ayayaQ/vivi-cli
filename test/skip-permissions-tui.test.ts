@@ -18,27 +18,20 @@ async function fixture(width = 120) {
     provider: { async generate() { throw new Error('Mode selection never calls a model') } } })
   active.push({ io, host }); io.setSession(host.session)
   const frame = async () => { await setup.flush(); await setup.renderOnce(); return setup.captureCharFrame() }
-  const settle = async () => {
-    await new Promise(resolve => setTimeout(resolve, 0)); await frame()
-    // A newly drawn approval arms only after its input batch drains.
-    await new Promise(resolve => setTimeout(resolve, 0)); return frame()
-  }
-  return { setup, io, host, frame, settle, input: setup.mockInput }
+  return { setup, io, host, frame, input: setup.mockInput }
 }
 
-test('native Skip confirmation has honest label and approval selected first, then explicit allow enables remembered Skip', async () => {
+test('native Skip selection enables it directly without confirmation or transcript output', async () => {
   const f = await fixture()
-  const denied = runModeControl(f.host, f.io, '/mode skip')
-  const warning = await f.settle()
-  expect(warning).toContain('Enable Skip permissions?')
-  expect(warning).toContain('Cancel')
-  f.input.pressArrow('down'); f.input.pressEnter(); await denied
-  expect(f.host.approvalMode).toBe('manual')
-  const enrolled = runModeControl(f.host, f.io, '/mode skip')
-  await f.settle(); f.input.pressArrow('right'); f.input.pressEnter(); await enrolled
+  const transcript = f.setup.renderer.root.findDescendantById('vivi-transcript')!
+  const initial = transcript.getChildren().length
+  await runModeControl(f.host, f.io, '/mode skip')
   expect(f.host.approvalMode).toBe('skip')
   const result = await f.frame()
   expect(result).toContain('Skip permissions')
+  expect(result).not.toContain('Enable Skip permissions?')
+  expect(result).not.toContain('Approval mode:')
+  expect(transcript.getChildren().length).toBe(initial)
   expect(result).not.toContain('Auto review:')
   expect(result).not.toContain('model estimate')
 })
@@ -49,8 +42,7 @@ test('native picker selects Skip deliberately and cancelling from Plan preserves
   const reading = f.io.readLine('Message'); await f.input.typeText('Keep the unsent plan'); await f.frame()
   f.input.pressTab({ shift: true }); expect(await reading).toBe('/mode cycle')
   const choosing = selectApprovalMode(f.host, f.io, (title, choices, index) => f.io.choose(title, choices, index))
-  await f.frame(); f.input.pressArrow('up'); f.input.pressEnter()
-  await f.settle(); f.input.pressEscape(); await choosing
+  await f.frame(); f.input.pressArrow('up'); f.input.pressEscape(); await choosing
   expect(f.host.taskMode).toBe('plan'); expect(f.host.approvalMode).toBe('manual')
   const next = f.io.readLine('Message'); await f.frame()
   expect((f.setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('Keep the unsent plan')

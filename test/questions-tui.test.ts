@@ -265,7 +265,7 @@ test('long question and option text remains readable by paging a wrapped body at
   const beforeWheel = body.scrollTop
   const second = f.node('vivi-question-option-1')
   await f.mouse.scroll(second.x + 1, second.y, 'up'); await f.frame()
-  expect(body.scrollTop).toBeLessThan(beforeWheel)
+  expect(body.scrollTop).toBe(beforeWheel - 1)
   await pending(); f.input.pressEnter(); f.input.pressEnter()
   expect(await answer).toEqual({ requestId: 'long', status: 'answered', answers: [{ id: 'long', answer: { kind: 'option', optionId: 'second' } }] })
 })

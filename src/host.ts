@@ -27,7 +27,7 @@ import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 import { createBuiltinToolset } from './tools.js'
 import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
-import { FileSessionStore, newSession, redactSecrets, SessionCommitError, validateSession } from './session.js'
+import { FileSessionStore, newSession, redactSecrets, sessionHasUserMessage, SessionCommitError, validateSession } from './session.js'
 import type { CliSession, SessionPersistence } from './session.js'
 import { aggregateUsage } from './usage.js'
 import { CliConversationRecords, FileCliConversationStore } from './conversation-records.js'
@@ -498,7 +498,7 @@ export class CliHost {
     await host.initialize()
     return host
   }
-  /** Finish evidence recovery and the guarded startup checkpoint before display. */
+  /** Recover saved evidence before display; untouched sessions remain in memory. */
   async initialize(): Promise<void> {
     if (this.running) throw new Error('Wait for the current turn before initializing the session')
     await this.recoverMcpOutcomes()
@@ -506,8 +506,9 @@ export class CliHost {
     await this.checkpoint(this.current)
     await this.initializeRecords()
   }
-  private async initializeRecords(): Promise<void> {
-    await this.records.initialize(this.current, this.safeMcpRows(), this.safePublicUrlRows())
+  private async initializeRecords(snapshot = this.current): Promise<void> {
+    if (!sessionHasUserMessage(this.current)) return
+    await this.records.initialize(snapshot, this.safeMcpRows(), this.safePublicUrlRows())
     const eventId = this.records.anchorEventId
     if (eventId && !this.current.recordAnchor && this.records.view.durability === 'disk') {
       const next = validateSession({ ...this.current, schemaVersion: this.current.schemaVersion === 3 ? 3 : 2, recordAnchor: { version: 1, eventId } })
@@ -1707,6 +1708,10 @@ export class CliHost {
   }
   /** Repeat privacy checks at the durable store's last admission guard as well as queue entry. */
   private async checkpoint(snapshot: CliSession, options?: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<void> {
+    if (!sessionHasUserMessage(snapshot)) {
+      options?.signal?.throwIfAborted(); options?.assertCurrent?.()
+      return
+    }
     this.discardUnsafeContextCheckpoint(snapshot)
     if (!historyUsesMcp(snapshot.history) && !historyUsesPublicUrl(snapshot.history)) {
       if (snapshot.contextCheckpoint) await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
@@ -2301,6 +2306,9 @@ export class CliHost {
         this.steering.acknowledgeInitial(queuedId)
         if (!controller.signal.aborted) onSteeringAccepted?.(submittedShell ?? content, true)
       }
+      // Keep untouched conversations in memory. Once the first prompt is saved,
+      // anchor its pre-turn history before beginning the canonical run journal.
+      if (firstPrompt) await this.initializeRecords(previous)
       await this.records.begin(this.toolsetRevision, this.current)
       const result = await runAgent({
         provider: guardedProvider, messages: this.current.history, context, getContextPrefix: getInstructionPrefix,

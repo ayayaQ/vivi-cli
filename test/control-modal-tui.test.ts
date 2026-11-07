@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, test } from 'bun:test'
-import { SelectRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
+import { RGBA, SelectRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import { createTestRenderer } from '@opentui/core/testing'
-import { OpenTuiIO } from '../src/tui.js'
+import { OpenTuiIO, TUI_THEME } from '../src/tui.js'
+import { pickerIndexAt } from '../src/tui-mouse.js'
 const surfaces: OpenTuiIO[] = []
 afterEach(() => { for (const io of surfaces.splice(0)) io.close() })
 const choices = [{ name: 'Context details', description: 'Input usage and capacity', value: '/context' },
@@ -55,7 +56,9 @@ test('mouse wheel and full-row clicks retain search focus and cannot use stale f
   await f.arm()
   const picker = f.node('vivi-control-picker') as SelectRenderable
   await f.mouse.scroll(picker.x + 3, picker.y, 'down'); await f.frame()
-  expect(picker.getSelectedIndex()).toBeGreaterThan(0)
+  expect(picker.getSelectedIndex()).toBe(1)
+  for (const direction of ['down', 'down', 'up'] as const) await f.mouse.scroll(picker.x + 3, picker.y, direction)
+  await f.frame(); expect(picker.getSelectedIndex()).toBe(0)
   expect((f.node('vivi-control-query') as TextareaRenderable).focused).toBe(true)
   await f.mouse.pressDown(picker.x + 3, picker.y)
   await f.input.typeText('Action 49'); await f.frame()
@@ -63,6 +66,49 @@ test('mouse wheel and full-row clicks retain search focus and cannot use stale f
   let finished = false; void choosing.then(() => { finished = true }); await Promise.resolve(); expect(finished).toBe(false)
   await f.mouse.click(picker.x + picker.width - 3, picker.y)
   expect(await choosing).toBe(49)
+})
+
+test('resume rows alternate shading through scrolling and filtering, with distinct selection and hover', async () => {
+  const f = await fixture(); f.io.setControlMode(true)
+  const choosing = f.io.choose('Resume a local session', Array.from({ length: 40 }, (_, value) => ({ name: `Session ${value}`, leadingText: `${value}d ago`, value })))
+  const displayed = await f.arm()
+  expect(displayed).toContain('0d ago   Session 0')
+  expect(displayed).toContain('10d ago  Session 10')
+  const picker = f.node('vivi-control-picker') as SelectRenderable
+  const background = (x: number, y: number) => {
+    let column = 0
+    for (const span of f.setup.captureSpans().lines[y]!.spans) {
+      column += span.width
+      if (column > x) return span.bg.toInts().join(',')
+    }
+    throw new Error('Missing picker cell')
+  }
+  const bands = () => {
+    for (let row = 0; row < picker.height; row++) {
+      const index = pickerIndexAt(picker, picker.x, picker.y + row)
+      if (index === undefined || index === picker.getSelectedIndex()) continue
+      expect(background(picker.x + picker.width - 3, picker.y + row) === stripe)
+        .toBe(index % 2 === 0)
+    }
+  }
+  expect((f.node('vivi-control-query') as TextareaRenderable).plainText).toBe('')
+  const stripe = RGBA.fromHex(TUI_THEME.rowBackground).toInts().join(',')
+  expect(background(picker.x + 3, picker.y + 2)).toBe(stripe)
+  expect(background(picker.x + 3, picker.y)).not.toBe(stripe)
+  expect(background(picker.x + 3, picker.y + 1)).not.toBe(stripe)
+  bands()
+  await f.mouse.moveTo(picker.x + 3, picker.y + 2); await f.frame()
+  expect(background(picker.x + 3, picker.y + 2)).not.toBe(stripe)
+  for (let step = 0; step < 15; step++) f.input.pressArrow('down')
+  await f.frame()
+  bands()
+  f.setup.resize(70, 20); await f.frame(); bands()
+  await f.input.typeText('No session matches'); await f.frame()
+  expect(background(picker.x + 3, picker.y)).not.toBe(stripe)
+  f.input.pressKey('u', { ctrl: true }); await f.input.typeText('Session 14'); await f.frame()
+  expect(picker.options[0]!.name).toBe('14d ago  Session 14')
+  await f.mouse.click(picker.x + 3, picker.y)
+  expect(await choosing).toBe(14)
 })
 
 test('context detail view scrolls independently and returns to the same menu search', async () => {
@@ -74,6 +120,12 @@ test('context detail view scrolls independently and returns to the same menu sea
   expect(await f.arm()).toContain('25%')
   expect(f.node('vivi-transcript').getChildren()).toHaveLength(0)
   f.input.pressKey('pagedown'); await f.frame()
+  const body = f.node('vivi-control-body') as import('@opentui/core').ScrollBoxRenderable
+  for (const direction of ['down', 'down', 'down', 'up', 'up', 'up'] as const) {
+    const before = body.scrollTop
+    await f.mouse.scroll(body.viewport.x + 2, body.viewport.y + 1, direction); await f.frame()
+    expect(body.scrollTop).toBe(before + (direction === 'down' ? 1 : -1))
+  }
   f.input.pressEscape(); await details
   const back = f.io.choose('Conversation actions', choices); await f.arm()
   expect((f.node('vivi-control-query') as TextareaRenderable).plainText).toBe('context')
@@ -201,16 +253,20 @@ test('section navigation scrolls the selected action into view and wheel browsin
   const f = await fixture(), many = Array.from({ length: 30 }, (_, value) => ({ name: `Action ${value}`, value,
     section: ['Models', 'Conversation', 'Tools'][Math.floor(value / 10)]! }))
   f.io.setControlMode(true); const choosing = f.io.choose('Conversation actions', many); await f.arm()
+  const list = f.node('vivi-control-sections') as import('@opentui/core').ScrollBoxRenderable
+  for (const [direction, expected] of [['down', 1], ['down', 1], ['up', 0], ['up', 0]] as const) {
+    await f.mouse.scroll(list.viewport.x + 2, list.viewport.y, direction); await f.frame()
+    expect(list.scrollTop).toBe(expected)
+  }
   for (let index = 0; index < 10; index++) f.input.pressArrow('down')
   await f.frame()
-  const list = f.node('vivi-control-sections') as import('@opentui/core').ScrollBoxRenderable
   const selected = f.node('vivi-control-section-row-10')
   expect(list.scrollTop).toBeGreaterThan(0)
   expect(selected.y).toBeGreaterThanOrEqual(list.viewport.y)
   expect(selected.y + selected.height).toBeLessThanOrEqual(list.viewport.y + list.viewport.height)
   const before = list.scrollTop
   await f.mouse.scroll(list.x + 2, list.y + 2, 'down'); await f.frame()
-  expect(list.scrollTop).toBeGreaterThan(before)
+  expect(list.scrollTop).toBe(before + 1)
   expect((f.node('vivi-control-query') as TextareaRenderable).focused).toBe(true)
   const index = many.findIndex((_, value) => {
     const row = f.node(`vivi-control-section-row-${value}`)

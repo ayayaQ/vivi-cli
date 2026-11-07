@@ -697,8 +697,8 @@ test('actual CLI failed canonical MCP checkpoint retains stronger exact ledger e
     onSave(session) { if (failCheckpoint && toolResults(session.history).length) throw new Error('Owned canonical result checkpoint failed') },
     generate(_value, _signal, _options, round) { return round === 1 ? answer('', [mcp.call('failed-checkpoint-call')]) : answer('No second send expected') }
   })
-  const previous = subject.host.conversationRecords.committedSequence
   await assert.rejects(subject.host.send('Retain exact evidence if canonical storage fails'), /checkpoint failed|cleanup also failed|callback failed/)
+  const previous = subject.records.writes[0].records.at(-1).sequence
   assert.equal(mcp.invocations.length, 1)
   const retained = await outcomes.load(subject.host.session.id)
   assert.equal(retained.length, 1); assert.equal(retained[0].state, 'settled')

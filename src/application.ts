@@ -24,7 +24,7 @@ import { bindBackgroundProcessControls, runProcessControl } from './process-cont
 import { autoReviewDisclosure, compactChatContext, refreshChatContext, displayMemories, MEMORY_DISCLOSURE, reviewMemoryChange, sendChatTurn, runSteeringCommand, selectApprovalMode, runModeControl, restoreConversationMode, AUTO_REVIEW_UNAVAILABLE, runCommandControl, displaySkills, SKILLS_DISCLOSURE, skillCreationPrompt, runInstructionsCommand, isMcpCommand, runMcpCommand } from './terminal.js'
 import { formatContextDetails, formatContextSummaryUsage } from './context-status.js'
 import { conversationModeLabel } from './task-mode.js'
-import { formatSessionDate, sessionDisplayTitle } from './session-display.js'
+import { formatSessionDate, formatSessionRelativeTime, sessionDisplayTitle } from './session-display.js'
 import { PreferenceStore, listSessions, DEFAULT_PREFERENCES } from './preferences.js'
 import { chooseAutoReviewThreshold } from './auto-review-controls.js'
 import { formatAutoReviewThreshold, parseAutoReviewThresholdPercent, resolveAutoReviewThreshold } from './auto-review-settings.js'
@@ -50,7 +50,7 @@ import { bindChatGptAccount, chatGptPlanStatus, chooseChatGptAccount, confirmCha
 import type { ChatGptAuth } from './chatgpt-controls.js'
 
 export interface InteractiveIO extends ChatIO {
-  choose<T>(title: string, choices: readonly { name: string; description?: string; value: T }[], initialIndex?: number): Promise<T | undefined>
+  choose<T>(title: string, choices: readonly Choice<T>[], initialIndex?: number): Promise<T | undefined>
   chooseSearchable<T>(title: string, choices: readonly Choice<T>[], options?: SearchableOptions): Promise<SearchableSelection<T> | undefined>
   askText(title: string, initial?: string): Promise<string | undefined>
   askSecret?(title: string): Promise<string | undefined>
@@ -59,6 +59,7 @@ export interface InteractiveIO extends ChatIO {
   setComposerDraft?(content: string): void
   setSession(session: CliSession): void
   setWorkspace?(directory?: string): void
+  setLoading?(message?: string): void
   setControlMode?(active: boolean, title?: string): void
   showControlDetails?(details: ControlDetails): Promise<void>
   showControlOutput?(includeUnseen?: boolean): Promise<void>
@@ -130,6 +131,7 @@ interface ApplicationSecretRegistration {
   targets(values: readonly string[]): void
 }
 export async function runApplication(input: ApplicationOptions): Promise<number> {
+  input.io.setLoading?.('Starting vivi…')
   if (input.options.prompt !== undefined && /^\/auto-threshold(?:\s|$)/.test(input.options.prompt.trim())) {
     input.io.write('Auto threshold changes require an idle interactive conversation; no setting changed\n')
     return 0
@@ -165,6 +167,14 @@ export async function runApplication(input: ApplicationOptions): Promise<number>
 async function runManagedApplication(input: ApplicationOptions, mcp: McpManager, oauth: McpOAuthControls,
   registration: ApplicationSecretRegistration): Promise<number> {
   const { io, options, args, providerFactory } = input
+  let starting = true
+  const startupStage = (message: string): void => { if (starting) io.setLoading?.(message) }
+  const finishStartup = (): void => {
+    if (!starting) return
+    starting = false
+    io.setLoading?.()
+  }
+  startupStage('Loading workspace…')
   const mcpSetup = { service: new McpSetupService(mcp, oauth), io }
   const env = { ...input.env }
   const commandEnv = captureCommandEnvironment(input.env)
@@ -193,6 +203,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   let settings = structuredClone(DEFAULT_PREFERENCES)
   let savedSettings: TuiPreferences | undefined
   let thresholdPreferencesAvailable = true
+  startupStage('Loading saved settings…')
   try { savedSettings = await preferences.load(); settings = savedSettings ? structuredClone(savedSettings) : settings }
   catch (error) { thresholdPreferencesAvailable = false; io.write('Saved defaults could not be loaded; Auto enrollment is unavailable until /auto-threshold explicitly saves a valid setting. Use /provider or /resume\n'); report(error) }
   // App-wide consent belongs to the launch, not to a model's session settings.
@@ -282,11 +293,13 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   // Already-selected models in this launch need no second discovery request.
   const hydrateModel = async (): Promise<string | false | undefined> => {
     if (settings.provider === 'openai' || knownModels.has(modelKey(settings.provider, settings.model))) return
+    startupStage('Loading provider credentials…')
     const key = await loadKey(settings.provider)
     const controller = new AbortController()
     const dispose = io.onCancel(() => controller.abort())
     try {
-      io.write(`Loading ${settings.provider} model capabilities…\n`)
+      startupStage('Loading model capabilities…')
+      if (!io.compactStartup) io.write(`Loading ${settings.provider} model capabilities…\n`)
       const hydrated = await hydrateModelCapabilities(catalog, settings.provider, settings.model, key, controller.signal)
       if (io.isClosed || controller.signal.aborted) return false
       const result = hydrated.catalog!
@@ -658,8 +671,10 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   }
   const selectResume = async (): Promise<string | undefined> => {
     const sessions = await listSessions(store)
+    const now = new Date()
     const choices = sessions.filter(session => !session.locked).map(session => ({
-      name: session.title, description: `${formatSessionDate(session.updatedAt)} · ${session.model} · ${session.provider} · ${session.id}`, value: session.id
+      name: session.title, leadingText: formatSessionRelativeTime(session.updatedAt, now),
+      description: `${formatSessionDate(session.updatedAt)} · ${session.model} · ${session.provider} · ${session.id}`, value: session.id
     }))
     if (!choices.length) { io.write('No unlocked valid sessions found. Check the previous process before removing a session lock\n'); return }
     return io.choose('Resume a local session', choices)
@@ -767,6 +782,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     if (!selection.resume && !settings.model) return false
     const capabilityNotice = selection.resume ? undefined : await hydrateModel()
     if (capabilityNotice === false) return false
+    startupStage(selection.resume ? 'Restoring conversation…' : 'Preparing conversation…')
     await host?.drainMemory()
     await host?.drainSkills()
     const fresh = selection.resume ? undefined : newSession({ provider: settings.provider, model: settings.model, reasoning: settings.reasoning,
@@ -820,6 +836,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         enableTools, enableNotes: enableTools && settings.enableNotes,
         enableMemory: activeMemory, enableSkills: activeSkills,
         maxRounds: settings.maxRounds }
+      startupStage('Loading provider credentials…')
       await loadKey(session.provider)
       if (io.isClosed) { await discardCandidate(); return false }
       const reviewerPreference = settings.reviewer
@@ -873,6 +890,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         approve: (request, signal) => io.approve(request, signal), onEvent: event => io.event(event) })
       candidate.host = nextHost
       if (selection.preservePlan && previousHost?.taskMode === 'plan') nextHost.setTaskMode('plan')
+      startupStage('Initializing conversation…')
       await nextHost.initialize()
       if (workspace && !effective.enableTools) io.write('Workspace tools are unavailable for this model; choose a tool-capable model to read files\n')
       if (io.isClosed) { await discardCandidate(); return false }
@@ -897,6 +915,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     io.setTaskMode?.(host.taskMode)
     io.setApprovalMode?.('manual')
     if (!io.compactStartup) io.write(host.taskMode === 'plan' ? 'Mode: Plan · local-read task policy preserved; unattended enrollment revoked\n' : 'Approval mode: Manual\n')
+    startupStage('Restoring saved mode…')
     if (options.reviewer !== undefined && io.canAutoReview === true && !io.isClosed) await preferences.save(settings)
     if (!launchModePending && !(selection.preservePlan && previousHost?.taskMode === 'plan') && preferredMode !== 'manual') {
       try { await restoreConversationMode(host, io, preferredMode, setupReviewer, !io.compactStartup) }
@@ -926,6 +945,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     // Offer the existing minimal setup once per unconfigured interactive launch.
     // Cancellation returns to a clean composer; explicit commands can retry.
     if (!settings.model && !options.resume && options.prompt === undefined && !io.isClosed) {
+      finishStartup()
       io.setControlMode?.(true, 'Provider')
       try { await configureProviderModel() } catch (error) { report(error) }
       finally {
@@ -957,6 +977,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (workspace && !io.compactStartup) io.write(`${USER_SHELL_DISCLOSURE}\nWorkspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\nFiles read by tools are sent to the selected provider and saved in session history\n`)
       }
       if (options.prompt !== undefined) {
+        finishStartup()
         if (!host) { io.write('Choose a provider and model before running a prompt\n'); return 1 }
         if (options.prompt.trim() === '/compact') { return await compactChatContext(host, io) === 'cancelled' ? 130 : 0 }
         if (options.prompt.trim() === '/context') {
@@ -974,6 +995,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           return result.status === 'error' ? 1 : result.status === 'cancelled' ? 130 : 0
         } finally { dispose() }
       }
+      finishStartup()
       let line = reopenControls ? '/menu' : await io.readLine('Message')
       if (io.isClosed) continue
       if (line === undefined || line.trim() === '/exit') return 0
@@ -1115,9 +1137,18 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
             io.write('Approval mode: Manual. The selected account changed; use /new or /models before enrolling unattended permissions again\n')
             continue
           }
-          await runModeControl(host, io, command, (title, choices, initialIndex) => io.choose(title, choices, initialIndex), setupReviewer)
+          let selectedMode: string | undefined
+          await runModeControl(host, io, command, async (title, choices, initialIndex) => {
+            const mode = await io.choose(title, choices, initialIndex)
+            selectedMode = mode
+            return mode
+          }, setupReviewer)
           await rememberMode()
           io.setContext?.(undefined, host.canCompact)
+          if (selectedMode !== undefined && selectedMode === (host.taskMode === 'plan' ? 'plan' : host.approvalMode)) {
+            reopenControls = false
+            io.setControlMode?.(false)
+          }
           continue
         }
         if (command === '/compact') {

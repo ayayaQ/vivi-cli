@@ -87,7 +87,7 @@ test('Skip revokes on account/trust or surface changes and rejects stale in-flig
   assert.throws(() => unavailable.controller.setMode('skip'), /interactive/)
 })
 
-function enrollmentFixture({ plan = false, interactive = true, approve = true } = {}) {
+function enrollmentFixture({ plan = false, interactive = true } = {}) {
   let task = plan ? 'plan' : 'execute', mode = 'manual', revision = 0
   const host = { session: newSession({ provider: 'openai', model: 'offline-skip' }),
     get taskMode() { return task }, get approvalMode() { return mode }, get approvalEnrollmentBinding() { return `binding-${revision}` },
@@ -95,16 +95,15 @@ function enrollmentFixture({ plan = false, interactive = true, approve = true } 
     setApprovalMode(value) { mode = value; revision++ } }
   const io = { canAutoReview: interactive, isClosed: false, requests: [], output: '', write(value) { this.output += value },
     onCancel(callback) { this.cancel = callback; return () => {} }, setTaskMode() {}, setApprovalMode() {},
-    async approve(request) { this.requests.push(request); return typeof approve === 'function' ? approve(host, this) : approve } }
+    async approve(request) { this.requests.push(request); throw new Error('Mode selection must not ask for approval') } }
   return { host, io }
 }
 
-test('explicit Skip enrollment warns once, needs no reviewer and is accurately labeled', async () => {
+test('explicit Skip selection needs no confirmation or reviewer and is accurately labeled', async () => {
   const f = enrollmentFixture()
   await runModeControl(f.host, f.io, '/mode skip')
   assert.equal(f.host.approvalMode, 'skip')
-  assert.equal(f.io.requests.length, 1); assert.equal(f.io.requests[0].call.name, 'enroll_skip_permissions')
-  assert.equal(f.io.requests[0].description, SKIP_PERMISSIONS_DISCLOSURE)
+  assert.equal(f.io.requests.length, 0)
   for (const wording of ['no human or AI review', 'paid web', 'already-connected MCP', 'unsandboxed', 'credential files', 'does not grant OS privileges', 'remembered for future conversations and launches']) {
     assert(SKIP_PERMISSIONS_DISCLOSURE.toLowerCase().includes(wording.toLowerCase()), wording)
   }
@@ -113,16 +112,27 @@ test('explicit Skip enrollment warns once, needs no reviewer and is accurately l
   assert(!f.io.output.includes('Automatically approved'))
 })
 
-test('Skip cancellation/denial/headless or stale confirmation preserves Plan and cannot grant authority', async () => {
-  for (const input of [{ approve: false }, { interactive: false }, { approve: (_host, io) => { io.cancel(); return true } },
-    { approve: (_host, io) => { io.isClosed = true; return true } }, { approve: host => { host.setTaskMode('plan'); return true } }]) {
+test('cancelled, closed and headless Skip selection preserves Plan; live selection enables Skip directly', async () => {
+  for (const input of [{ cancelled: true }, { interactive: false }, { closed: true }]) {
     const f = enrollmentFixture({ plan: true, ...input })
-    await selectApprovalMode(f.host, f.io, async () => 'skip')
+    await selectApprovalMode(f.host, f.io, async () => {
+      f.io.isClosed = input.closed === true
+      return input.cancelled ? undefined : 'skip'
+    })
     assert.equal(f.host.taskMode, 'plan'); assert.equal(f.host.approvalMode, 'manual')
+    assert.equal(f.io.requests.length, 0)
   }
   const f = enrollmentFixture({ plan: true })
   await selectApprovalMode(f.host, f.io, async () => 'skip')
   assert.equal(f.host.taskMode, 'execute'); assert.equal(f.host.approvalMode, 'skip')
+  const failing = enrollmentFixture({ plan: true })
+  const setApprovalMode = failing.host.setApprovalMode
+  failing.host.setApprovalMode = mode => {
+    if (mode === 'skip') throw new Error('Skip unavailable')
+    setApprovalMode(mode)
+  }
+  await assert.rejects(selectApprovalMode(failing.host, failing.io, async () => 'skip'), /Skip unavailable/)
+  assert.equal(failing.host.taskMode, 'plan'); assert.equal(failing.host.approvalMode, 'manual')
 })
 
 async function commandFixture(t) {

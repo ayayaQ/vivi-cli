@@ -258,7 +258,7 @@ test('native surface runs saved-default chat, accepted Markdown, new session and
       }
     }) })
     await ready(state => state.kind === 'session')
-    await setup.waitForFrame(frame => frame.includes('openai / native-fake-model') && frame.includes('/ menu'))
+    await setup.waitForFrame(frame => frame.includes('openai · native-fake-model') && frame.includes('/ menu'))
     await setup.mockInput.typeText('first')
     setup.mockInput.pressEnter({ shift: true })
     await setup.mockInput.typeText('second')
@@ -350,6 +350,55 @@ for (const oneShot of [false, true]) {
     } finally { process.stderr.write = originalWrite; io.close(); setup.renderer.destroy(); await rm(directory, { recursive: true, force: true }) }
   })
 }
+
+test('startup shows loading stages until credentials, model metadata and the saved mode are ready', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-native-loading-'))
+  const setup = await createTestRenderer({ width: 80, height: 24, exitOnCtrlC: false, exitSignals: [], consoleMode: 'disabled' })
+  const io = new OpenTuiIO(setup.renderer, { loading: true })
+  const credentialsRequested = Promise.withResolvers<void>(), credentialsReady = Promise.withResolvers<void>()
+  const catalogRequested = Promise.withResolvers<void>(), catalogReady = Promise.withResolvers<void>()
+  const composerReady = Promise.withResolvers<void>()
+  const readLine = io.readLine.bind(io)
+  io.readLine = (prompt, signal) => { const reading = readLine(prompt, signal); composerReady.resolve(); return reading }
+  const frame = async () => { await setup.renderOnce(); await setup.renderOnce(); return setup.captureCharFrame() }
+  let running: Promise<number> | undefined
+  try {
+    await new PreferenceStore(directory).save({ schemaVersion: 1, provider: 'openrouter', model: 'vendor/loading-fixture',
+      reasoning: 'default', reasoningCapabilities: [], enableTools: false, enableNotes: false, enableMemory: false,
+      stream: false, maxRounds: 7, mode: 'plan' })
+    running = main(['--no-workspace', '--no-skills'], { VIVI_SESSION_DIR: directory }, { tuiIO: io,
+      credentials: { status: async () => ({ available: false, label: 'Offline vault' }),
+        load: async () => { credentialsRequested.resolve(); await credentialsReady.promise; return 'offline-loading-key' },
+        save: async () => { throw new Error('Startup must not save credentials') } },
+      catalog: { list: async () => {
+        catalogRequested.resolve(); await catalogReady.promise
+        return { state: 'fresh', models: [{ id: 'vendor/loading-fixture', name: 'Loading fixture', conversation: 'supported',
+          tools: 'unsupported', streaming: 'supported', reasoning: 'unsupported', efforts: [], source: 'Offline fixture' }] }
+      } }, providerFactory: () => ({ generate: async () => { throw new Error('Startup must not generate a response') } }) })
+    await credentialsRequested.promise
+    let displayed = await frame()
+    expect(displayed).toContain('Loading provider credentials')
+    expect(displayed).not.toContain('Manual')
+    expect(displayed).not.toContain('choose a model')
+    expect(setup.renderer.root.findDescendantById('vivi-root')!.visible).toBe(false)
+    credentialsReady.resolve(); await catalogRequested.promise
+    setup.resize(40, 12); displayed = await frame()
+    expect(displayed).toContain('Loading model capabilities')
+    expect(displayed).not.toContain('/ menu')
+    catalogReady.resolve(); await composerReady.promise
+    displayed = await frame()
+    expect(displayed).toContain('openrouter')
+    expect(displayed).toContain('Plan')
+    expect(displayed).not.toContain('Loading')
+    expect(displayed).not.toContain('Manual')
+    expect(setup.renderer.root.findDescendantById('vivi-loading')!.visible).toBe(false)
+    expect(setup.renderer.root.findDescendantById('vivi-transcript')!.getChildren()).toHaveLength(0)
+    setup.mockInput.pressCtrlC(); expect(await running).toBe(0)
+  } finally {
+    credentialsReady.resolve(); catalogReady.resolve(); io.close(); await running?.catch(() => undefined)
+    setup.renderer.destroy(); await rm(directory, { recursive: true, force: true })
+  }
+})
 
 test('closing native UI during startup cannot start a one-shot provider request', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-native-startup-cancel-'))
@@ -468,7 +517,7 @@ test('native fresh startup selects provider/model directly and skips broader set
     await modalInputReady(setup)
     setup.mockInput.pressEnter()
     await ready(state => state.kind === 'composer')
-    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('/ menu'))
+    await setup.waitForFrame(frame => frame.includes('openai · gpt-5.1') && frame.includes('/ menu'))
     expect((setup.renderer.root.findDescendantById('vivi-composer') as TextareaRenderable).plainText).toBe('')
     const afterSend = ready.nextComposer()
     await setup.mockInput.typeText('Hello'); setup.mockInput.pressEnter(); await afterSend
@@ -546,7 +595,7 @@ test('native automatic setup cancels cleanly and slash setup saves a masked key 
     const afterModel = ready.nextComposer()
     setup.mockInput.pressEnter()
     await afterModel
-    await setup.waitForFrame(frame => frame.includes('openai / gpt-5.1') && frame.includes('/ menu') && !frame.includes('Models ·'))
+    await setup.waitForFrame(frame => frame.includes('openai · gpt-5.1') && frame.includes('/ menu') && !frame.includes('Models ·'))
     expect(vault.get('openai')).toBe(key)
     await setup.mockInput.typeText('/effort')
     setup.mockInput.pressEnter()
@@ -652,7 +701,7 @@ async function nativeCatalogApplication(provider: CliProviderName, catalog: Cata
   }
   try {
     await ready(state => state.kind === 'composer', `${provider}: initial composer`)
-    await setup.waitForFrame(frame => frame.includes(`${provider} / saved-default-model`) && frame.includes('/ menu'))
+    await setup.waitForFrame(frame => frame.includes(`${provider} · saved-default-model`) && frame.includes('/ menu'))
   } catch (error) { await close(); throw error }
   return { directory, setup, io, ready, preferences, defaults, sessions, requests, running, composer, session, openModels, chat, close }
 }
@@ -701,7 +750,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
         const afterModel = app.ready.nextComposer(`${provider}: composer after model selection`)
         app.setup.mockInput.pressEnter()
         await afterModel
-        await app.setup.waitForFrame(frame => frame.includes(`${provider} / ${model.id}`) && !frame.includes('Models ·'))
+        await app.setup.waitForFrame(frame => frame.includes(`${provider} · ${model.id}`) && !frame.includes('Models ·'))
         expect(app.session().id).not.toBe(previousId)
         expect(app.session().model).toBe(model.id)
         expect(app.session().history).toEqual([])
@@ -772,7 +821,7 @@ for (const provider of ['openai', 'openrouter'] as const) {
       const afterModel = app.ready.nextComposer(`${provider}: composer after refreshed model selection`)
       app.setup.mockInput.pressEnter()
       await afterModel
-      await app.setup.waitForFrame(frame => frame.includes(`${provider} / ${refreshed.id}`) && !frame.includes('Models ·'))
+      await app.setup.waitForFrame(frame => frame.includes(`${provider} · ${refreshed.id}`) && !frame.includes('Models ·'))
       expect(app.session().id).not.toBe(originalSession.id)
       expect(app.session().model).toBe(refreshed.id)
       expect(await app.preferences.load()).toEqual({ ...app.defaults, model: refreshed.id })
