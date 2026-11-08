@@ -2,34 +2,55 @@
 import type { CatalogResult, ModelEntry } from './models.js'
 import { unknownModel } from './models.js'
 import { unknownChatGPTCapabilities } from './chatgpt-provider.js'
+import type { ReasoningEffort } from '@ayayaq/vivi/providers/openrouter'
 
 const MAX_BYTES = 4 * 1024 * 1024
 const MAX_MODELS = 5000
-const reviewedOn = '2026-11-07'
-const modelDocumentation = 'https://developers.openai.com/api/docs/models/gpt-6.1-sol'
+const reviewedOn = '2026-11-08'
 const signInDocumentation = 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference'
+const codexCatalog = 'https://github.com/openai/codex/blob/c9b4267c370a755da12ec1c8648c2451163212b7/codex-rs/models-manager/models.json'
+const ordinaryEfforts: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const standardWorkingBudget = 258_400
+const extendedWorkingBudget = 475_000
+// Exact intersection of reviewed Codex and pi subscription catalogs. This is
+// enrichment only: the selected account's response remains the availability gate.
+// See docs/CHATGPT_MODEL_METADATA.md for provenance, omissions and budget policy.
+const reviewedModels = new Map([
+  ['gpt-6-astra', { budget: standardWorkingBudget, reasoningRequired: true }],
+  ['gpt-6.1-sol', { budget: extendedWorkingBudget, reasoningRequired: true }],
+  ['gpt-6.1-terra', { budget: extendedWorkingBudget, reasoningRequired: false }],
+  ['gpt-6-sol', { budget: standardWorkingBudget, reasoningRequired: false }],
+  ['gpt-6-luna', { budget: standardWorkingBudget, reasoningRequired: false }],
+  ['gpt-5.6-sol', { budget: standardWorkingBudget, reasoningRequired: false }],
+  ['gpt-5.6-terra', { budget: standardWorkingBudget, reasoningRequired: false }],
+  ['gpt-5.6-luna', { budget: standardWorkingBudget, reasoningRequired: false }]
+])
 
 /** Reviewed exact-slug metadata is separate from account availability. Never
  * import the API-key registry's context window or infer aliases/future models. */
 function reviewedModel(id: string): ModelEntry {
   const model = unknownModel(id), capabilities = unknownChatGPTCapabilities(id)
   model.modelCapabilities = capabilities
-  if (id !== 'gpt-6.1-sol') return model
+  const reviewed = reviewedModels.get(id)
+  if (!reviewed) return model
+  const modelDocumentation = `https://developers.openai.com/api/docs/models/${id}`
   capabilities.chat = model.conversation = 'supported'
   capabilities.stream = model.streaming = 'supported'
-  model.efforts = ['low', 'medium', 'high', 'xhigh', 'max']
-  model.reasoning = 'supported'; model.reasoningMandatory = true
-  capabilities.reasoning = { support: 'supported', disable: 'unsupported', effortSelection: 'supported',
-    efforts: [...model.efforts], requirement: 'required' }
+  model.efforts = [...ordinaryEfforts]
+  model.reasoning = 'supported'; model.reasoningMandatory = reviewed.reasoningRequired
+  // The reviewed subscription catalog does not offer none. For models whose
+  // API docs allow it, leave disabling/requirement unknown on this route rather
+  // than turning a conservative omission into a claim that reasoning is required.
+  capabilities.reasoning = { support: 'supported', disable: reviewed.reasoningRequired ? 'unsupported' : 'unknown',
+    effortSelection: 'supported', efforts: [...model.efforts], requirement: reviewed.reasoningRequired ? 'required' : 'unknown' }
   capabilities.sources = [{ kind: 'official-model-documentation', url: signInDocumentation, reviewedOn },
-    { kind: 'official-model-documentation', url: modelDocumentation, reviewedOn }]
-  // Codex/Work documents a 500K default; Codex reserves 5% of its raw window.
-  // https://github.com/openai/codex/blob/5226f2fb4bcbc4aa3ec1863b6ba0bd2c4ddb0486/codex-rs/protocol/src/openai_models.rs#L568-L589
-  // Choose the resulting 475K as local working policy, not evidence of this
-  // subscription-sharing route's/account's actual limit. Vivi's own output
-  // reserve and compaction threshold still apply inside this budget.
-  model.contextBudget = { tokens: 475_000,
-    source: { kind: 'official-model-documentation', url: modelDocumentation, reviewedOn } }
+    { kind: 'official-model-documentation', url: modelDocumentation, reviewedOn },
+    { kind: 'official-model-documentation', url: codexCatalog, reviewedOn }]
+  // Intentionally conservative local input + output budgets, never advertised
+  // server limits. Apply the 95% choice once, then Vivi's own output reserve and
+  // compaction threshold inside it; do not copy pi's maxTokens/output reserve.
+  model.contextBudget = { tokens: reviewed.budget,
+    source: { kind: 'official-model-documentation', url: id === 'gpt-6.1-sol' ? modelDocumentation : codexCatalog, reviewedOn } }
   return model
 }
 class ChatGPTModelCatalogError extends Error {}
