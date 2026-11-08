@@ -60,29 +60,32 @@ vivi auth logout --chatgpt-account ACCOUNT_ID
 
 Use the exact registration ID from `auth list`; account/workspace registrations
 remain separate even with the same email. `/models` shows the signed-in account's
-catalog in server order. Text and streaming support for the exact `gpt-6.1-sol`
-slug is documented in the [Sign in with ChatGPT guide](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference),
-but it is offered only when listed for the selected account. Reviewed
-[model documentation](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
-adds `low`, `medium`, `high`, `xhigh` and `max` reasoning choices for that exact slug,
-without a `none`/disable choice. Provider default still sends no reasoning override.
-These documented choices have not all been tested against your account; account and
-workspace policy can reject them. Unknown models and aliases stay conservative and
-need an explicit `--reasoning-capabilities` declaration for nondefault reasoning in
-line mode. Tools and vision remain unverified for this route; `--tools` explicitly
+catalog in server order. A [reviewed exact-slug catalog](docs/CHATGPT_MODEL_METADATA.md)
+adds text/streaming support, `low`, `medium`, `high`, `xhigh` and `max` reasoning
+choices, and local context budgets for these models when the account lists them:
+
+- `gpt-6.1-sol` and `gpt-6.1-terra`: **475,000-token local working budget**
+- `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and
+  `gpt-5.6-luna`: **258,400-token local working budget**
+
+Provider default sends no reasoning override. `none`/disable and `ultra` are not
+offered by this conservative subscription metadata policy. These documented
+choices have not all been tested against your account; account and workspace
+policy can reject them. Unknown models and aliases stay conservative and need an
+explicit `--reasoning-capabilities` declaration for nondefault reasoning in line
+mode. Tools and vision remain unverified for this route; `--tools` explicitly
 declares function-tool support in line mode.
 
-For `gpt-6.1-sol`, Vivi chooses a **475,000-token local working budget**, including
-the separately displayed output reserve. This is not a confirmed subscription
-endpoint/account limit. It follows the documented 500K Codex/Work default and
-[Codex's 95% usable-window calculation](https://github.com/openai/codex/blob/5226f2fb4bcbc4aa3ec1863b6ba0bd2c4ddb0486/codex-rs/protocol/src/openai_models.rs#L568-L589).
-The API's 1,050,000-token window is not imported as a subscription limit. The
-account catalog does not advertise capacity, so `/context` keeps capacity unknown
-and labels the 475K value as a working budget. Codex's base compaction threshold is
-separately 90% of its raw window (450K for 500K), not 475K. Vivi keeps its own
-compaction policy: normally 85% of the available input budget after its output
-reserve (4096 tokens by default), rather than copying Codex's threshold. No
-`max_output_tokens` parameter is sent on this route.
+The working budgets are intentional local input-plus-output policy, **not confirmed
+subscription endpoint/account limits**. They use 95% of reviewed Codex/Work or pi
+defaults, applied once. The API's 1,050,000-token window and other clients' maximum
+output/override ceilings are not imported as subscription limits. `/context`
+keeps capacity unknown and labels the working budget and separate output reserve
+(4096 tokens by default). Vivi normally compacts above 85% of the available input
+budget after that reserve, rather than copying Codex's compaction threshold. No
+`max_output_tokens` parameter is sent on this route. See the
+[metadata policy and pinned sources](docs/CHATGPT_MODEL_METADATA.md) for exact
+model coverage, deliberate omissions, source discrepancies and calculations.
 
 Official dynamic registration uses Vivi's own issued client ID, PKCE and verified
 OIDC identity. No legacy Codex client IDs, shared `auth.json`, or ChatGPT private

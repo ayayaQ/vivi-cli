@@ -29,6 +29,7 @@
     "src",
     "scripts",
     "docs/PROJECT_INPUTS.md",
+    "docs/CHATGPT_MODEL_METADATA.md",
     "docs/TERMINAL_PROGRAM_STATUS.md",
     "tsconfig.json",
     "LICENSE",

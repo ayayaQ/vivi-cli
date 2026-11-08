@@ -91,7 +91,7 @@ test('ChatGPT catalog uses visible slugs and labels in server order without stat
   assert.throws(() => parseChatGPTModelCatalog({ data: [{ id: 'api-key-schema' }] }), /format/)
 })
 
-test('ChatGPT enriches only the reviewed exact slug without granting tools, vision, capacity or availability', () => {
+test('ChatGPT enriches only the reviewed exact slugs without granting tools, vision, capacity or availability', () => {
   const ids = ['future-model', 'gpt-6.1-sol', 'gpt-6.1-sol-future', 'GPT-6.1-SOL', 'openai/gpt-6.1-sol', 'gpt-5']
   const models = parseChatGPTModelCatalog({ models: ids.map(slug => ({ slug, display_name: 'Account label', visibility: 'list',
     tools: true, vision: true, reasoning: { supported_efforts: ['high'] }, context_window: 123456 })) })
@@ -113,8 +113,9 @@ test('ChatGPT enriches only the reviewed exact slug without granting tools, visi
     assert.equal(model.contextBudget?.tokens, expected === 'supported' ? 475000 : undefined)
     assert.equal(model.name, 'Account label')
     if (expected === 'supported') assert.deepEqual(model.modelCapabilities.sources, [{ kind: 'official-model-documentation',
-      url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-07' },
-      { kind: 'official-model-documentation', url: 'https://developers.openai.com/api/docs/models/gpt-6.1-sol', reviewedOn: '2026-11-07' }])
+      url: 'https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference', reviewedOn: '2026-11-08' },
+      { kind: 'official-model-documentation', url: 'https://developers.openai.com/api/docs/models/gpt-6.1-sol', reviewedOn: '2026-11-08' },
+      { kind: 'official-model-documentation', url: 'https://github.com/openai/codex/blob/c9b4267c370a755da12ec1c8648c2451163212b7/codex-rs/models-manager/models.json', reviewedOn: '2026-11-08' }])
     else assert.deepEqual(model.modelCapabilities.sources, [])
   }
   const unlisted = parseChatGPTModelCatalog({ models: [{ slug: 'gpt-6.1-sol', visibility: 'hide' }, { slug: 'future-model', visibility: 'list' }] })

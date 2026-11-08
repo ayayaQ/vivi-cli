@@ -103,19 +103,46 @@ test('line ChatGPT startup hydrates documented reasoning without a manual capabi
 test('ChatGPT effort selection and model switching hydrate reviewed metadata without leaking the budget into unknown models', async t => {
   const directory = await fixture(t), auth = authFixture(), uses = [], contexts = []
   await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, provider: 'chatgpt', chatgptAccountId: A, model: 'gpt-6.1-sol' })
-  const io = ioFixture(['/effort', 'First', '/context', '/models', 'Second', '/context', '/exit'], ['max', 'future-model', true, false])
+  const io = ioFixture(['/effort', 'First', '/context', '/models', 'Second', '/context', '/models', 'Third', '/context', '/exit'],
+    ['max', 'gpt-6-luna', false, 'future-model', true, false])
   io.setContext = usage => contexts.push(usage)
   const catalog = { async list(provider, id) {
     assert.equal(provider, 'chatgpt'); assert.equal(id, A)
-    return { state: 'fresh', models: parseChatGPTModelCatalog({ models: ['gpt-6.1-sol', 'future-model'].map(slug => ({ slug, visibility: 'list' })) }) }
+    return { state: 'fresh', models: parseChatGPTModelCatalog({ models: ['gpt-6.1-sol', 'gpt-6-luna', 'future-model'].map(slug => ({ slug, visibility: 'list' })) }) }
   } }
   assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io, chatgptAuth: auth, catalog,
     providerFactory: (session, options) => ({ async generate() { uses.push({ model: session.model, reasoning: session.reasoning, efforts: options.reasoningCapabilities }); return { content: 'Done', toolCalls: [] } } }) }), 0)
-  assert.deepEqual(uses.map(use => [use.model, use.reasoning]), [['gpt-6.1-sol', 'max'], ['future-model', 'default']])
-  assert.deepEqual(uses[0].efforts, ['low', 'medium', 'high', 'xhigh', 'max']); assert.deepEqual(uses[1].efforts, [])
-  assert(contexts.some(usage => usage?.contextWindow === 475000)); assert.equal(contexts.at(-1).contextWindow, undefined)
-  assert.match(io.output, /Working budget: 475000/); assert.match(io.output, /Context ~\d+\/?\?/)
+  assert.deepEqual(uses.map(use => [use.model, use.reasoning]), [['gpt-6.1-sol', 'max'], ['gpt-6-luna', 'default'], ['future-model', 'default']])
+  assert.deepEqual(uses[0].efforts, ['low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(uses[1].efforts, uses[0].efforts); assert.deepEqual(uses[2].efforts, [])
+  assert(contexts.some(usage => usage?.contextWindow === 475000)); assert(contexts.some(usage => usage?.contextWindow === 258400))
+  assert.equal(contexts.at(-1).contextWindow, undefined)
+  assert.match(io.output, /Working budget: 475000/); assert.match(io.output, /Working budget: 258400/); assert.match(io.output, /Context ~\d+\/?\?/)
   assert.deepEqual(auth.state.tokens, [])
+})
+
+test('every reviewed subscription model hydrates through line startup with its own host budget', async t => {
+  for (const model of ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+    const directory = await fixture(t), auth = authFixture(), contexts = [], io = ioFixture([], [], false)
+    io.setContext = usage => contexts.push(usage)
+    const catalog = { async list(provider, id) {
+      assert.equal(provider, 'chatgpt'); assert.equal(id, A)
+      return { state: 'fresh', models: parseChatGPTModelCatalog({ models: [{ slug: model, visibility: 'list' }] }) }
+    } }
+    let used
+    assert.equal(await main(['--no-workspace', '--no-tui', '--provider', 'chatgpt', '--chatgpt-account', A,
+      '--model', model, '--reasoning', 'max', '--session-dir', directory, '--prompt', '/context'], {}, {
+      io, chatgptAuth: auth, catalog, providerFactory: (session, options) => {
+        used = { session, options }; return { async generate() { assert.fail('context measurement must not call inference') } }
+      }
+    }), 0, model)
+    assert.equal(used.session.model, model); assert.equal(used.session.reasoning, 'max')
+    assert.deepEqual(used.options.reasoningCapabilities, ['low', 'medium', 'high', 'xhigh', 'max'])
+    const budget = ['gpt-6.1-sol', 'gpt-6.1-terra'].includes(model) ? 475000 : 258400
+    assert(contexts.some(usage => usage?.contextWindow === budget && usage.limitSource.kind === 'host'), model)
+    assert.match(io.output, /Capacity: unknown/); assert(io.output.includes(`Working budget: ${budget}`))
+    assert.deepEqual(auth.state.tokens, [])
+  }
 })
 
 test('ChatGPT explicit startup efforts are validated after account discovery in line and TUI flows', async t => {
