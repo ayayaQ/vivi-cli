@@ -343,6 +343,33 @@ triple-click line selections copy too. Vivi uses the local system clipboard,
 or the terminal's OSC 52 clipboard protocol for remote sessions and as a fallback.
 Terminal clipboard permissions and multiplexer settings can affect copying.
 
+In the full-screen composer, text pastes of at least 1,000 characters or 10 lines
+collapse to `[Pasted Content N chars]`. The complete text is sent. Backspace or
+Delete next to a collapsed block removes it in one step; undo restores it.
+Paste the same text again immediately beside its block to expand it for editing.
+Blocks also survive draft restoration and history navigation.
+
+Use Ctrl+V to paste a PNG or JPEG from the local system clipboard, or Alt+V if
+your terminal reserves Ctrl+V. Images appear as removable `[Image #N]` blocks
+with thumbnails above the text. Pasting a PNG/JPEG file path also attaches the
+image, including paths with spaces and paths wrapped in single or double quotes.
+Relative paths use the launch workspace. Unreadable or invalid image paths remain
+text. Click a thumbnail to inspect the attachment in your default image viewer.
+The viewer opens a temporary copy of the attached pixels, including clipboard
+images, so changes to the original file do not change what you inspect. Opening
+an image preserves the composer draft. Previews use the terminal's image protocol when
+available and colored character blocks otherwise. Image attachments require
+enabled workspace tools and a model with verified vision support. The agent
+reads attached pixels through `workspace_read_image`; accepted image observations
+are saved as immutable session snapshots. Images not yet read remain available
+for this launch. The existing limits of 5 MiB and 16 megapixels per image apply.
+
+Successful image reads also show clickable thumbnails directly beneath their
+tool result, including when the tool details are collapsed. These previews use
+the saved image snapshot and remain available after transcript refreshes or
+session resume. A missing snapshot displays “Unavailable”; vivi does not reopen
+the original workspace file to replace it.
+
 Mouse reporting varies by terminal and multiplexer. [Windows Terminal supports
 VT mouse input](https://learn.microsoft.com/en-us/windows/terminal/selection);
 this implementation still needs interactive validation on your actual terminal.

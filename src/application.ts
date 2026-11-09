@@ -105,6 +105,7 @@ export async function chooseEffort(io: InteractiveIO, base: TuiPreferences): Pro
   return selected === undefined ? undefined : { ...base, reasoning: selected }
 }
 const COMMAND_HELP = `${USER_SHELL_DISCLOSURE}\nEnter submits; Ctrl+J adds a line. Shift/Alt+Enter also adds a line when the terminal reports it. Up/Down browses the last 100 prompts across workspaces and launches, from the first/last composer row. Down restores your draft. Tab completes slash commands above the composer.
+Large text pastes collapse into removable blocks; paste the same text again beside its block to expand. Ctrl+V or Alt+V pastes clipboard images with thumbnails (vision model and workspace tools required).
 /provider sets up an OpenAI, OpenRouter or DeepSeek chat key; /web independently selects Direct, DeepSeek or Disabled; /reviewer changes the saved Auto reviewer; /models opens the model picker; /effort selects supported reasoning.
 /new starts fresh; /resume explicitly resumes a local session; /rename names the current session; /notes changes the session-note default for new conversations.
 /memories manages this launch’s app-wide saved context and its future-launch default; it is plaintext locally and sent to the selected provider when enabled.
@@ -917,6 +918,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     await refreshChatContext(host, io)
     io.setToolEvidence?.(host.toolPresentationEvidence)
     io.setConversationErrors?.(host.conversationErrors)
+    io.setImageSource?.(host.imageSource)
     io.setSession(host.session)
     io.setContext?.(host.contextUsage, host.canCompact)
     io.setTaskMode?.(host.taskMode)

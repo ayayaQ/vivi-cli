@@ -9,14 +9,14 @@ export const MAX_PROMPT_HISTORY = 100
 const MAX_PROMPT_LENGTH = 65536
 // JSON can expand a UTF-16 code unit to six bytes.
 const MAX_HISTORY_BYTES = MAX_PROMPT_HISTORY * (MAX_PROMPT_LENGTH * 6 + 4) + 64
-interface Draft { text: string; cursor: number }
+interface Draft<T> { text: string; cursor: number; view?: T }
 interface LeaseDatabase { exec(sql: string): unknown; close(): void }
 
 /** Oldest first. Browsing edits are temporary and never mutate submitted history. */
-export class PromptHistory {
+export class PromptHistory<T = never> {
   private entries: string[]
   private index: number
-  private drafts = new Map<number, Draft>()
+  private drafts = new Map<number, Draft<T>>()
 
   constructor(entries: readonly string[] = []) {
     this.entries = entries.filter(text => text.trim() && text.length <= MAX_PROMPT_LENGTH).slice(-MAX_PROMPT_HISTORY)
@@ -30,7 +30,7 @@ export class PromptHistory {
     }
     this.reset()
   }
-  move(direction: -1 | 1, current: Draft): Draft | undefined {
+  move(direction: -1 | 1, current: Draft<T>): Draft<T> | undefined {
     const next = Math.max(0, Math.min(this.entries.length, this.index + direction))
     if (next === this.index) return undefined
     this.drafts.set(this.index, { ...current })

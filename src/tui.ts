@@ -3,7 +3,7 @@ import { conversationHistoryDigest, matchingConversationErrors } from './convers
 import type { CliConversationError, CliConversationErrors } from './conversation-errors.js'
 import {
   BoxRenderable, CliRenderEvents, CodeRenderable, createCliRenderer, createClipboard, createHostClipboard,
-  createRendererClipboardAdapter, decodePasteBytes, MarkdownRenderable,
+  createRendererClipboardAdapter, decodePasteBytes, ImageRenderable, MarkdownRenderable,
   RGBA, SelectRenderable, SelectRenderableEvents, StyledText, SyntaxStyle, TextareaRenderable, TextAttributes, TextBufferRenderable, TextRenderable, TextTableRenderable,
   ScrollBoxRenderable, TreeSitterClient, resolveRenderLib
 } from '@opentui/core'
@@ -12,7 +12,7 @@ import { rm } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ClipboardService, CliRenderer, KeyEvent, MouseEvent, PasteEvent, Renderable, Selection } from '@opentui/core'
-import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, ContextUsage } from '@ayayaq/vivi'
+import type { AgentEvent, AgentResult, HistoryMessage, ToolCall, ToolImageReference, ContextUsage } from '@ayayaq/vivi'
 import type { ToolPresentation, ToolPresentationEffect, ToolPresentationStatus } from '@ayayaq/vivi/presentation'
 import type { CliProviderName, CliSession } from './session.js'
 import { redactSecrets } from './session.js'
@@ -46,6 +46,13 @@ import type { QuestionRequest, QuestionResponse } from '@ayayaq/vivi/extensions/
 import { TerminalProgramStatus, createProgramStatusSink } from './terminal-program-status.js'
 import type { ProgramStatusSink } from './terminal-program-status.js'
 import { InputQueue } from './input-queue.js'
+import { ComposerPastes } from './composer-paste.js'
+import type { ComposerDraft } from './composer-paste.js'
+import type { CliImageSource, PastedImage } from './image-assets.js'
+import { IMAGE_LIMITS } from './image-assets.js'
+import { pastedImagePath, readPastedImagePath } from './pasted-image-path.js'
+import { FileImagePreviewer } from './image-preview.js'
+import type { ImagePreviewService } from './image-preview.js'
 import { QuestionDialog } from './question-dialog.js'
 import { PromptHistory } from './prompt-history.js'
 import type { PromptHistoryStore } from './prompt-history.js'
@@ -57,7 +64,8 @@ export interface OpenTuiOptions { oneShot?: boolean; stream?: boolean; loading?:
   promptHistory?: readonly string[]; promptHistoryStore?: PromptHistoryStore;
   /** Trusted production wiring or an offline test sink; omitted on directly constructed test surfaces. */
   terminalTitle?: TerminalTitleSink; programStatus?: ProgramStatusSink; statusEnvironment?: NodeJS.ProcessEnv;
-  clipboard?: Pick<ClipboardService, 'writeText' | 'dispose'> }
+  clipboard?: Pick<ClipboardService, 'writeText' | 'dispose'> & Partial<Pick<ClipboardService, 'read'>>;
+  imagePreview?: ImagePreviewService }
 
 // Ordinary surfaces and text inherit the terminal palette. Dark localized
 // highlights need their own foreground, including native text selections.
@@ -202,12 +210,14 @@ interface DisplayEntry {
   historyStart?: number
   approval?: object
   workspaceDiff?: string
+  images?: readonly ToolImageReference[]
   tool?: { encoded: string; key: string; detailBytes?: number; retained?: boolean; localRead?: boolean; resultError?: boolean }
 }
 interface SteeringInput {
   readonly controls: SteeringControls
   pending?: PendingInput | undefined
   draft: string
+  pasteDraft?: ComposerDraft | undefined
   timer?: ReturnType<typeof setTimeout>
 }
 interface SearchPicker {
@@ -293,6 +303,12 @@ export class OpenTuiIO implements ChatIO {
   private readonly mouseActivation = new MouseActivation()
   private readonly hover: MouseHover
   private readonly clipboard: OpenTuiOptions['clipboard']
+  private readonly imagePreview: ImagePreviewService
+  private readonly openingImages = new Set<string>()
+  private imageSource: CliImageSource | undefined
+  private imageSourceController = new AbortController()
+  private readonly resultImageBytes = new Map<string, Promise<Uint8Array>>()
+  private resultImageByteCount = 0
   private pickerChangedFrame = 0
   private completionChangedFrame = 0
   private lastRenderedFrame = 0
@@ -309,7 +325,13 @@ export class OpenTuiIO implements ChatIO {
   private copyToast!: TextRenderable
   private copyToastTimer: ReturnType<typeof setTimeout> | undefined
   private composer!: TextareaRenderable
-  private promptHistory: PromptHistory
+  private pastes!: ComposerPastes
+  private imagePreviews!: BoxRenderable
+  private previewPaths = ''
+  private clipboardRead: AbortController | undefined
+  private imagePathRead: AbortController | undefined
+  private imagePathJobs: Promise<void> = Promise.resolve()
+  private promptHistory: PromptHistory<ComposerDraft>
   private readonly promptHistoryStore: PromptHistoryStore | undefined
   private secretMask!: TextRenderable
   // Secret characters never enter an editable/renderable buffer or its undo history.
@@ -346,7 +368,7 @@ export class OpenTuiIO implements ChatIO {
   private activeDialog: object | undefined
   private questionDialog: QuestionDialog | undefined
   private controls: ControlModal | undefined
-  private suspendedChat: { pending: PendingInput; text: string; cursor: number; title: string } | undefined
+  private suspendedChat: { pending: PendingInput; title: string; pasteDraft: ComposerDraft } | undefined
   private closed = false
   private failure: Error | undefined
   private changingInput = false
@@ -385,7 +407,7 @@ export class OpenTuiIO implements ChatIO {
     // Reconcile after a completed frame as well as at ordinary edit callbacks.
     this.updateChoiceLayout()
     this.controls?.sync()
-    if (this.pending?.kind === 'steering' && this.steeringHasDraft !== !!this.composer.plainText.trim()) this.updateFooter()
+    if (this.pending?.kind === 'steering' && this.steeringHasDraft !== !!this.composerText.trim()) this.updateFooter()
     this.updateComposerLayout()
   }
   private readonly focusHandler = (): void => {
@@ -499,9 +521,10 @@ export class OpenTuiIO implements ChatIO {
     this.runStatus = new RunStatus(() => this.updateStatus(), options.runClock)
     this.secrets = [...new Set(options.secrets ?? [])].filter(Boolean).sort((a, b) => b.length - a.length)
     this.stream = options.stream ?? true
-    this.promptHistory = new PromptHistory(options.promptHistory)
+    this.promptHistory = new PromptHistory<ComposerDraft>(options.promptHistory)
     this.promptHistoryStore = options.promptHistoryStore
     this.clipboard = options.clipboard
+    this.imagePreview = options.imagePreview ?? new FileImagePreviewer()
     renderer.once(CliRenderEvents.DESTROY, this.destroyHandler)
     try {
       this.style = SyntaxStyle.fromStyles({
@@ -543,7 +566,7 @@ export class OpenTuiIO implements ChatIO {
       {
         const menu = this.mouseButton('vivi-action-menu', '/ menu', () => {
           const pending = this.pending
-          if (pending?.kind === 'chat' && !this.composer.plainText) pending.finish('/menu')
+          if (pending?.kind === 'chat' && !this.composerText) pending.finish('/menu')
           else this.updateStatus('Finish or clear your draft before opening an action')
         })
         menu.fg = TUI_THEME.muted
@@ -581,6 +604,10 @@ export class OpenTuiIO implements ChatIO {
           (!this.cancelCallbacks.size || this.pending?.kind === 'steering') &&
           ['chat', 'steering', 'text', 'search'].includes(this.pending!.kind)) this.composer.focus()
       }
+      this.pastes = new ComposerPastes(this.composer)
+      this.imagePreviews = new BoxRenderable(renderer, { id: 'vivi-pasted-images', height: 4,
+        flexShrink: 0, flexDirection: 'row', visible: false })
+      this.composerBox.add(this.imagePreviews)
       this.composerBox.add(this.composer)
       this.secretMask = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-secret-mask', width: '100%', height: 2,
         visible: false, content: '', fg: TUI_THEME.lavender, wrapMode: 'none' })
@@ -704,7 +731,7 @@ export class OpenTuiIO implements ChatIO {
       windowsInput?.start()
       if (options.promptHistoryStore && options.promptHistory === undefined) {
         io.setLoading('Loading prompt history…')
-        try { io.promptHistory = new PromptHistory(await options.promptHistoryStore.load()) }
+        try { io.promptHistory = new PromptHistory<ComposerDraft>(await options.promptHistoryStore.load()) }
         catch { io.updateStatus('Saved prompt history unavailable; history works for this launch') }
       }
       return io
@@ -839,7 +866,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || !this.footer) return
     const columns = Math.max(1, this.renderer.terminalWidth)
     const steering = this.pending?.kind === 'steering' && this.steering !== undefined
-    const draft = this.composer.plainText.trim().length > 0
+    const draft = this.composerText.trim().length > 0
     this.steeringHasDraft = draft
     const queue = this.steeringQueue.length > 0
     this.steeringActions.visible = steering && columns >= 24
@@ -902,7 +929,7 @@ export class OpenTuiIO implements ChatIO {
     this.mouseActivation.handle(event, this.modelLine, `${target?.command}:${this.modelLine.plainText}`, pending,
       !!target && pending?.kind === 'chat' && !this.cancelCallbacks.size && this.ready(pending) &&
       this.lastRenderedFrame > this.footerChangedFrame, () => {
-        this.nextComposerDraft = this.composer.plainText
+        this.saveComposerDraft()
         pending!.finish(target!.command)
       })
   }
@@ -920,7 +947,7 @@ export class OpenTuiIO implements ChatIO {
     if (!this.composer || !this.composerBox || this.closed) return
     const kind = this.pending?.kind
     const multiline = kind === 'chat' || kind === 'steering' || kind === 'text'
-    const shell = (kind === 'chat' || kind === 'steering') && parseUserShellInput(this.composer.plainText) !== undefined
+    const shell = (kind === 'chat' || kind === 'steering') && parseUserShellInput(this.composerText) !== undefined
     if (this.shellNotice.visible !== shell) this.shellNotice.visible = shell
     if (shell) {
       const disclosure = this.renderer.terminalHeight < 20
@@ -938,16 +965,19 @@ export class OpenTuiIO implements ChatIO {
     // Its current viewport only counts visible lines, so measuring the complete
     // buffer is essential for both explicit newlines and long wrapped lines.
     const width = Math.max(1, this.renderer.terminalWidth - (simple ? 2 : 4))
-    const measured = simple && !this.composer.plainText ? 1
+    const measured = simple && !this.composerText ? 1
       : multiline || simple ? this.composer.editorView.measureForDimensions(width, 65536)?.lineCount : 2
     const otherRows = this.shell.getChildren().reduce((rows, child) => child.visible &&
       child !== this.transcript && child !== this.composerBox ? rows + Number(child.height) : rows, 0)
     // Keep a transcript viewport and leave bounded drafts scrollable. Tiny
     // terminals retain an editable row without reserving empty input lines.
-    const maximum = Math.max(1, Math.min(10, this.renderer.terminalHeight - otherRows - 4))
+    this.updateImagePreviews()
+    const previewRows = this.imagePreviews.visible ? Math.min(4, Math.max(0, this.renderer.terminalHeight - otherRows - 5)) : 0
+    this.imagePreviews.height = previewRows
+    const maximum = Math.max(1, Math.min(10, this.renderer.terminalHeight - otherRows - previewRows - 4))
     const height = multiline || simple ? Math.min(maximum, Math.max(simple || shell ? 1 : 2, measured ?? this.composer.lineCount)) : Math.min(2, maximum)
     if (this.composer.height !== height) this.composer.height = height
-    if (this.composerBox.height !== height + 2) this.composerBox.height = height + 2
+    if (this.composerBox.height !== height + previewRows + 2) this.composerBox.height = height + previewRows + 2
   }
   private mouseButton(id: string, label: string, activate: () => void): TextRenderable {
     const button = new TextRenderable(this.renderer, { ...TEXT_SELECTION, id, content: ` ${label} `, width: label.length + 2,
@@ -1017,7 +1047,7 @@ export class OpenTuiIO implements ChatIO {
     const picker = this.picker
     const pending = this.pending
     if (!picker || !pending) return
-    if (pending.kind === 'search' && this.searchPicker?.query !== this.composer.plainText) this.inputChanged()
+    if (pending.kind === 'search' && this.searchPicker?.query !== this.composerText) this.inputChanged()
     if (event.type === 'scroll') {
       this.mouseActivation.clear()
       event.preventDefault(); event.stopPropagation()
@@ -1054,7 +1084,7 @@ export class OpenTuiIO implements ChatIO {
     const first = Math.min(Math.max(0, this.completionIndex - rows + 1), this.completions.length - rows)
     const index = first + event.y - this.completionList.y
     const item = this.completions[index]
-    this.mouseActivation.handle(event, this.completionList, `${index}:${item?.command}:${this.composer.plainText}`,
+    this.mouseActivation.handle(event, this.completionList, `${index}:${item?.command}:${this.composerText}`,
       this.pending, this.ready() && this.lastRenderedFrame > this.completionChangedFrame && this.pending?.kind === 'chat' && !!item, () => this.acceptCompletion(index))
   }
   private updateStatus(status = this.status): void {
@@ -1121,7 +1151,8 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return () => undefined
     if (this.steering) this.releaseSteering(this.steering)
     if (this.pending?.kind === 'chat') this.pending.finish(undefined)
-    const steering: SteeringInput = { controls, draft: this.nextComposerDraft }
+    const steering: SteeringInput = { controls, draft: this.nextComposerDraft, pasteDraft: this.nextPasteDraft }
+    this.nextPasteDraft = undefined
     this.nextComposerDraft = ''
     this.steering = steering
     if (!this.pending) this.restoreSteering(steering)
@@ -1130,8 +1161,11 @@ export class OpenTuiIO implements ChatIO {
   private releaseSteering(steering: SteeringInput): void {
     if (this.steering !== steering) return
     const editing = this.pending === steering.pending && steering.pending !== undefined
-    const draft = editing ? this.composer.plainText : steering.draft
-    if (draft) this.nextComposerDraft = this.safe(draft, MAX_INPUT)
+    const draft = editing ? this.composerText : steering.draft
+    if (draft) {
+      this.nextComposerDraft = this.safe(draft, MAX_INPUT)
+      this.nextPasteDraft = editing ? this.pastes.snapshot() : steering.pasteDraft
+    }
     if (steering.timer !== undefined) clearTimeout(steering.timer)
     this.steering = undefined
     this.steeringMessage = undefined
@@ -1164,6 +1198,8 @@ export class OpenTuiIO implements ChatIO {
     this.composerBox.bottomTitle = undefined
     this.composer.placeholder = COMPOSER_PLACEHOLDER
     this.composer.setText(this.safe(steering.draft, MAX_INPUT))
+    if (steering.pasteDraft) this.pastes.restore(steering.pasteDraft)
+    this.inputChanged()
     this.composer.gotoBufferEnd()
     this.composer.traits = {}
     this.composer.showCursor = true
@@ -1220,7 +1256,7 @@ export class OpenTuiIO implements ChatIO {
   private editLatestSteering(): void {
     const steering = this.steering
     if (!steering || this.pending !== steering.pending || !this.ready()) return
-    if (this.composer.plainText) {
+    if (this.composerText) {
       this.steeringFeedback('Clear your draft before Undo latest')
       return
     }
@@ -1233,14 +1269,15 @@ export class OpenTuiIO implements ChatIO {
     this.composer.setText(this.safe(content, MAX_INPUT))
     this.composer.gotoBufferEnd()
     this.composer.focus()
-    steering.draft = this.composer.plainText
+    this.saveSteeringDraft(steering)
     this.updateComposerLayout()
   }
   private submitSteering(interrupt: boolean): void {
     const steering = this.steering
     if (!steering || this.pending !== steering.pending || !this.ready()) return
+    if (this.clipboardRead || this.imagePathRead) { this.steeringFeedback('Reading pasted image...'); return }
     this.inputChanged()
-    const content = this.composer.plainText
+    const content = this.composerText
     if (!content.trim()) { this.steeringFeedback('Write a message first'); return }
     if (!steering.controls.submit(content, interrupt)) {
       if (this.steering === steering) this.steeringFeedback('Message not queued · draft kept')
@@ -1251,6 +1288,7 @@ export class OpenTuiIO implements ChatIO {
     // is the sole place a steering message becomes a displayed user message.
     if (this.steering === steering && this.pending === steering.pending) {
       steering.draft = ''
+      steering.pasteDraft = undefined
       this.clearInput()
       this.composer.focus()
     }
@@ -1272,6 +1310,9 @@ export class OpenTuiIO implements ChatIO {
     }
   }
   private clearInput(): void {
+    this.clipboardRead?.abort(); this.clipboardRead = undefined
+    this.imagePathRead?.abort(); this.imagePathRead = undefined
+    this.imagePathJobs = Promise.resolve()
     this.promptHistory.reset()
     this.clearSecret()
     this.acceptedCompletion = undefined
@@ -1288,6 +1329,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus()
     }
     const raw = this.composer.plainText
+    const resolved = this.composerText
     if (this.pending?.kind === 'chat' || this.pending?.kind === 'steering') {
       this.composerBox.title = parseUserShellInput(raw) !== undefined
         ? this.pending.kind === 'steering' ? 'Shell · queued after turn · Send approves unsandboxed' : 'Shell · Send approves unsandboxed'
@@ -1295,15 +1337,15 @@ export class OpenTuiIO implements ChatIO {
     }
     const safe = this.pending?.kind === 'search'
       ? this.safe(raw, MAX_INPUT).replace(/[\t\n]+/g, ' ').slice(0, MAX_QUERY)
-      : this.safe(raw, MAX_INPUT).slice(0, MAX_INPUT)
-    if (raw !== safe) {
+      : this.safe(resolved, MAX_INPUT).slice(0, MAX_INPUT)
+    if ((this.pending?.kind === 'search' ? raw : resolved) !== safe) {
       this.changingInput = true
       try { this.composer.setText(safe); this.composer.gotoBufferEnd() }
       finally { this.changingInput = false }
       const limit = this.pending?.kind === 'search' ? MAX_QUERY : MAX_INPUT
-      this.updateStatus(raw.length > limit ? `Input limit: ${limit} characters` : 'Control text or known credential removed from input')
+      this.updateStatus(resolved.length > limit ? `Input limit: ${limit} characters` : 'Control text or known credential removed from input')
     }
-    if (this.searchPicker) this.renderSearchPicker(this.composer.plainText !== this.searchPicker.query)
+    if (this.searchPicker) this.renderSearchPicker(this.composerText !== this.searchPicker.query)
     else this.updateCompletions()
     this.updateComposerLayout()
   }
@@ -1311,7 +1353,7 @@ export class OpenTuiIO implements ChatIO {
     const search = this.searchPicker
     if (!search || !this.picker || this.closed) return
     const previous = search.matches[this.picker.getSelectedIndex()]
-    const query = this.composer.plainText
+    const query = this.composerText
     if (queryChanged || query !== search.query) {
       this.mouseActivation.clear()
       this.pickerChangedFrame = this.renderer.frameId
@@ -1335,7 +1377,7 @@ export class OpenTuiIO implements ChatIO {
     if (!search || !this.picker) return false
     // Native content-change notifications may be deferred until the next frame.
     // Navigation/refresh must use the query typed in this input batch immediately.
-    if (this.composer.plainText !== search.query) this.inputChanged()
+    if (this.composerText !== search.query) this.inputChanged()
     if (['return', 'kpenter', 'linefeed'].includes(key.name)) { this.consume(key); this.submit(); return true }
     if (key.ctrl && key.name === 'u') { this.consume(key); this.composer.setText(''); return true }
     if (key.ctrl && key.name === 'r' && search.refresh) { this.consume(key); this.pending?.finish(-1); return true }
@@ -1361,7 +1403,7 @@ export class OpenTuiIO implements ChatIO {
     this.updateActionBar()
   }
   private updateCompletions(): void {
-    const input = this.composer.plainText
+    const input = this.composerText
     if (input !== this.acceptedCompletion) this.acceptedCompletion = undefined
     if (this.pending?.kind !== 'chat' || !this.pending.armed || this.cancelCallbacks.size ||
       input === this.acceptedCompletion) { this.hideCompletions(); return }
@@ -1427,6 +1469,152 @@ export class OpenTuiIO implements ChatIO {
     this.renderSecret()
   }
   private consume(key: KeyEvent | PasteEvent): void { key.preventDefault(); key.stopPropagation() }
+  private get composerText(): string { return this.pastes?.text ?? this.composer.plainText }
+  pastedImages(content: string): readonly PastedImage[] {
+    return this.pastes.imagesFor(content).map(image => ({ path: image.path, bytes: Uint8Array.from(image.bytes) }))
+  }
+  private updateImagePreviews(): void {
+    if (!this.imagePreviews) return
+    const images = this.pending?.kind === 'chat' || this.pending?.kind === 'steering'
+      ? this.pastes.imagesFor().slice(-Math.max(1, Math.floor((this.renderer.terminalWidth - 4) / 12))) : []
+    const paths = images.map(image => image.path).join(',')
+    this.imagePreviews.visible = images.length > 0
+    if (paths === this.previewPaths) return
+    this.previewPaths = paths
+    for (const child of this.imagePreviews.getChildren()) child.destroyRecursively()
+    for (const [index, image] of images.entries()) {
+      const thumbnail = new ImageRenderable(this.renderer, { id: `vivi-pasted-image-${index}`,
+        width: 12, height: '100%', flexShrink: 0, source: image.bytes, fit: 'fit', protocol: 'auto' })
+      thumbnail.onMouse = event => {
+        const pending = this.pending
+        const enabled = !thumbnail.isDestroyed && this.imagePreviews.visible && this.ready(pending) &&
+          (pending?.kind === 'chat' || pending?.kind === 'steering') &&
+          this.pastes.imagesFor().some(attached => attached.path === image.path)
+        this.mouseActivation.handle(event, thumbnail, image.path, pending, enabled,
+          () => { void this.openImagePreview(image) })
+      }
+      this.imagePreviews.add(thumbnail)
+    }
+  }
+  private async openImagePreview(image: PastedImage): Promise<void> {
+    if (this.closed || this.openingImages.has(image.path)) return
+    this.openingImages.add(image.path)
+    try { await this.imagePreview.open(image) }
+    catch { if (!this.closed) this.updateStatus('Could not open the image in the system viewer') }
+    finally { this.openingImages.delete(image.path) }
+  }
+  setImageSource(source: CliImageSource | undefined): void {
+    if (this.closed || source === this.imageSource) return
+    this.imageSourceController.abort()
+    this.imageSourceController = new AbortController()
+    this.resultImageBytes.clear(); this.resultImageByteCount = 0
+    this.imageSource = source
+    this.mouseActivation.clear()
+    this.rebuild()
+  }
+  private privateImage(bytes: Uint8Array): boolean {
+    return this.secrets.some(secret => secret && Buffer.from(bytes).includes(Buffer.from(secret)))
+  }
+  private loadResultImage(reference: ToolImageReference): Promise<Uint8Array> {
+    const source = this.imageSource
+    if (!source || this.sessionId !== undefined && source.sessionId !== this.sessionId) return Promise.reject(new Error('Image source unavailable'))
+    const key = JSON.stringify(reference), existing = this.resultImageBytes.get(key)
+    if (existing) return existing
+    if (!Number.isSafeInteger(reference.byteLength) || reference.byteLength <= 0 || reference.byteLength > IMAGE_LIMITS.bytes ||
+      this.resultImageBytes.size >= IMAGE_LIMITS.sessionImages || this.resultImageByteCount + reference.byteLength > IMAGE_LIMITS.sessionBytes) {
+      return Promise.reject(new Error('Image preview limit reached'))
+    }
+    this.resultImageByteCount += reference.byteLength
+    const signal = this.imageSourceController.signal
+    const bytes = Promise.resolve().then(() => { signal.throwIfAborted(); return source.read(structuredClone(reference), signal) })
+    this.resultImageBytes.set(key, bytes)
+    return bytes
+  }
+  private addResultImages(box: BoxRenderable, entry: DisplayEntry): void {
+    if (!entry.images?.length) return
+    const columns = Math.max(1, Math.floor((this.renderer.width - 4) / 16))
+    const images = entry.images.slice(0, IMAGE_LIMITS.sessionImages)
+    const row = new BoxRenderable(this.renderer, { id: `vivi-tool-images-${entry.tool!.key}`, width: '100%',
+      height: Math.ceil(images.length / columns) * 5, flexShrink: 0, flexDirection: 'row', flexWrap: 'wrap' })
+    box.add(row)
+    for (const [index, reference] of images.entries()) {
+      const cell = new BoxRenderable(this.renderer, { width: Math.min(16, Math.max(1, this.renderer.width - 4)), height: 5, flexShrink: 0 })
+      const thumbnail = new ImageRenderable(this.renderer, { id: `vivi-tool-image-${entry.tool!.key}-${index}`,
+        width: '100%', height: 4, flexShrink: 0, fit: 'fit', protocol: 'auto' })
+      const caption = new TextRenderable(this.renderer, { content: 'Loading image...', height: 1, width: '100%',
+        fg: TUI_THEME.muted, wrapMode: 'none', selectable: false })
+      cell.add(thumbnail); cell.add(caption); row.add(cell)
+      const source = this.imageSource, controller = this.imageSourceController
+      const current = () => !this.closed && !controller.signal.aborted && source === this.imageSource &&
+        !!source && (this.sessionId === undefined || source.sessionId === this.sessionId) && !thumbnail.isDestroyed && this.entries.includes(entry)
+      let loaded: Uint8Array | undefined
+      void this.loadResultImage(reference).then(bytes => {
+        if (!current()) return
+        if (this.privateImage(bytes)) throw new Error('Private image')
+        loaded = bytes; thumbnail.source = bytes
+        caption.content = this.safe(`${reference.width} x ${reference.height} - open`, 128)
+      }).catch(() => { if (!thumbnail.isDestroyed && !this.closed) caption.content = 'Unavailable' })
+      thumbnail.onMouse = event => {
+        if (event.type === 'scroll') { this.mouseActivation.clear(); return }
+        this.mouseActivation.handle(event, thumbnail, reference.id, entry,
+          current() && !!loaded && !this.privateImage(loaded) && !this.controls?.overlay.visible &&
+          (!this.pending || this.pending.kind === 'chat' || this.pending.kind === 'steering'),
+          () => { if (loaded) void this.openImagePreview({ path: reference.id, bytes: loaded }) })
+      }
+    }
+  }
+  private async pasteClipboardImage(): Promise<void> {
+    const pending = this.pending
+    if (!this.clipboard?.read || this.clipboardRead || !pending) return
+    const controller = new AbortController()
+    this.clipboardRead = controller
+    try {
+      const result = await this.clipboard.read({ preferredTypes: ['image/png', 'image/jpeg', 'text/plain'], signal: controller.signal })
+      if (controller.signal.aborted || this.closed || this.pending !== pending) return
+      if (result.status !== 'read') { this.updateStatus('No clipboard image available; use your terminal’s text paste shortcut'); return }
+      if (result.representation.mimeType.startsWith('image/')) {
+        this.pastes.pasteImage(result.representation.bytes)
+      } else {
+        const text = this.safe(decodePasteBytes(result.representation.bytes).replace(/\r\n?/g, '\n'), MAX_INPUT + 1)
+        if (!await this.pasteImagePath(text, pending, controller.signal)) this.insertPastedText(text)
+      }
+      this.inputChanged()
+    } catch { if (!controller.signal.aborted) this.updateStatus('Clipboard image could not be pasted within the PNG/JPEG image limits') }
+    finally { if (this.clipboardRead === controller) this.clipboardRead = undefined }
+  }
+  private insertPastedText(text: string): void {
+    if (!this.pastes.fits(text, MAX_INPUT)) { this.updateStatus('Paste ignored: input limit is 65536 characters'); return }
+    if (this.pending?.kind === 'chat' || this.pending?.kind === 'steering') this.pastes.paste(text)
+    else this.composer.insertText(text)
+    this.inputChanged()
+  }
+  private async pasteImagePath(text: string, pending: PendingInput, signal: AbortSignal): Promise<boolean> {
+    const path = pastedImagePath(text)
+    if (path === undefined) return false
+    try {
+      const bytes = await readPastedImagePath(path, this.workspaceDirectory ?? process.cwd(), signal)
+      if (signal.aborted || this.closed || this.pending !== pending) return true
+      this.pastes.pasteImage(bytes)
+      this.inputChanged()
+    } catch {
+      if (!signal.aborted && !this.closed && this.pending === pending) {
+        this.insertPastedText(text)
+        this.updateStatus('Image path could not be attached; pasted as text. Check the file and PNG/JPEG image limits')
+      }
+    }
+    return true
+  }
+  private queueImagePathPaste(text: string): void {
+    const pending = this.pending
+    if (!pending) return
+    const controller = this.imagePathRead ??= new AbortController()
+    const job = this.imagePathJobs.then(async () => {
+      if (controller.signal.aborted || this.closed || this.pending !== pending) return
+      if (!await this.pasteImagePath(text, pending, controller.signal)) this.insertPastedText(text)
+    }).catch(error => { if (!controller.signal.aborted) this.errorHandler({ error }) })
+    this.imagePathJobs = job
+    void job.finally(() => { if (this.imagePathJobs === job && this.imagePathRead === controller) this.imagePathRead = undefined })
+  }
   private handlePaste(event: PasteEvent): void {
     this.hover.clear()
     this.mouseActivation.clear()
@@ -1446,10 +1634,10 @@ export class OpenTuiIO implements ChatIO {
       return
     }
     if (this.pending.kind === 'secret') { this.insertSecret(decodePasteBytes(event.bytes)); return }
-    const text = this.safe(decodePasteBytes(event.bytes).replace(/\r\n?/g, '\n'), MAX_INPUT)
-    const remaining = MAX_INPUT - this.composer.plainText.length
-    if (text.length > remaining) { this.updateStatus('Paste ignored: input limit is 65536 characters'); return }
-    this.composer.insertText(text)
+    const text = this.safe(decodePasteBytes(event.bytes).replace(/\r\n?/g, '\n'), MAX_INPUT + 1)
+    if ((this.pending.kind === 'chat' || this.pending.kind === 'steering') && (this.imagePathRead || pastedImagePath(text) !== undefined)) {
+      this.queueImagePathPaste(text)
+    } else this.insertPastedText(text)
   }
   private handleKey(key: KeyEvent): void {
     this.mouseActivation.clear()
@@ -1536,13 +1724,18 @@ export class OpenTuiIO implements ChatIO {
     }
     if (this.cancelCallbacks.size && pending.kind === 'chat') { this.consume(key); return }
     if (pending.kind === 'secret') { this.handleSecretKey(key); return }
+    if ((pending.kind === 'chat' || pending.kind === 'steering') && key.name === 'v' && (key.ctrl !== key.meta) && !key.shift && !key.super && !key.hyper && this.clipboard?.read) {
+      this.consume(key)
+      if (!key.repeated && key.eventType !== 'repeat') void this.pasteClipboardImage()
+      return
+    }
     // Modes change only between turns. Dialogs keep their own Tab navigation,
     // and the draft never becomes input to the enrollment approval.
     if (pending.kind === 'chat' && key.name === 'tab' && key.shift &&
       !key.ctrl && !key.meta && !key.super && !key.hyper) {
       this.consume(key)
       if (key.repeated || key.eventType === 'repeat' || this.runStatus.running) return
-      this.nextComposerDraft = this.safe(this.composer.plainText, MAX_INPUT)
+      this.saveComposerDraft()
       pending.finish('/mode cycle')
       return
     }
@@ -1576,15 +1769,16 @@ export class OpenTuiIO implements ChatIO {
       if (key.name === 'up' ? row === 0 : row === this.composer.virtualLineCount - 1) {
         this.consume(key)
         const draft = this.promptHistory.move(key.name === 'up' ? -1 : 1,
-          { text: this.composer.plainText, cursor: this.composer.cursorOffset })
+          { text: this.composerText, cursor: this.composer.cursorOffset, view: this.pastes.snapshot() })
         if (draft) {
           this.changingInput = true
           try {
             this.composer.setText(this.safe(draft.text, MAX_INPUT))
-            this.composer.cursorOffset = draft.cursor
+            if (draft.view) this.pastes.restore(draft.view)
+            else this.composer.cursorOffset = draft.cursor
           } finally { this.changingInput = false }
           // A recalled slash command is ready to edit/send; its menu must not trap history arrows.
-          this.acceptedCompletion = this.composer.plainText
+          this.acceptedCompletion = this.composerText
           this.inputChanged()
         }
         return
@@ -1592,7 +1786,7 @@ export class OpenTuiIO implements ChatIO {
     }
     if (pending.kind === 'chat' && key.ctrl && ['n', 'r', 'p'].includes(key.name)) {
       this.consume(key)
-      if (!this.cancelCallbacks.size && !this.composer.plainText) {
+      if (!this.cancelCallbacks.size && !this.composerText) {
         pending.finish(key.name === 'n' ? '/new' : key.name === 'r' ? '/resume' : '/menu')
       }
     }
@@ -1605,7 +1799,7 @@ export class OpenTuiIO implements ChatIO {
     if (this.pending && this.pending.kind !== 'chat') this.pending.finish(undefined)
     // Cancelling a run retains both its queued messages and unfinished steering draft.
     if (!this.steering) this.clearInput()
-    else if (this.pending === this.steering.pending) this.steering.draft = this.composer.plainText
+    else if (this.pending === this.steering.pending) this.saveSteeringDraft(this.steering)
     if (this.cancelCallbacks.size) {
       this.runStatus.setPhase('cancelling')
       this.updateStatus('Cancelling…')
@@ -1637,8 +1831,11 @@ export class OpenTuiIO implements ChatIO {
       this.updateCompletions()
       this.acceptCompletion()
     }
-    const text = this.composer.plainText
+    if (this.clipboardRead || this.imagePathRead) { this.updateStatus('Reading pasted image...'); return }
+    this.inputChanged()
+    const text = this.composerText
     if (pending.kind === 'approval' || pending.kind === 'question') return
+    if (pending.kind === 'chat') this.lastSubmittedDraft = { content: text, view: this.pastes.snapshot() }
     if (pending.kind === 'chat') this.rememberPrompt(text)
     if (pending.kind === 'chat' && !this.steeringQueue.length && text.trim() && !text.trim().startsWith('/') && parseUserShellInput(text) === undefined) {
       this.appendEntry({ category: 'user', label: 'You', content: this.safe(text), markdown: false })
@@ -1665,7 +1862,7 @@ export class OpenTuiIO implements ChatIO {
       this.updateStatus()
     }
     if (this.steering?.pending && this.pending === this.steering.pending) {
-      this.steering.draft = this.composer.plainText
+      this.saveSteeringDraft(this.steering)
       this.steering.pending = undefined
       if (this.steering.timer !== undefined) clearTimeout(this.steering.timer)
       this.pending = undefined
@@ -1767,6 +1964,16 @@ export class OpenTuiIO implements ChatIO {
     })
   }
   private nextComposerDraft = ''
+  private lastSubmittedDraft: { content: string; view: ComposerDraft } | undefined
+  private nextPasteDraft: ComposerDraft | undefined
+  private saveComposerDraft(): void {
+    this.nextComposerDraft = this.composerText
+    this.nextPasteDraft = this.pastes.snapshot()
+  }
+  private saveSteeringDraft(steering: SteeringInput): void {
+    steering.draft = this.composerText
+    steering.pasteDraft = this.pastes.snapshot()
+  }
   setControlMode(active: boolean, title?: string): void {
     if (this.closed) return
     if (!active) {
@@ -1817,11 +2024,15 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed) return
     if (content.length > 65536) throw new Error('Skill draft request exceeds composer limit')
     this.nextComposerDraft = this.safe(content)
+    this.nextPasteDraft = this.lastSubmittedDraft?.content === content ? this.lastSubmittedDraft.view : undefined
   }
   async readLine(prompt: string, signal?: AbortSignal): Promise<string | undefined> {
     const initial = this.nextComposerDraft
     this.nextComposerDraft = ''
-    const value = await this.openInput('chat', prompt, initial, signal)
+    const draft = this.nextPasteDraft; this.nextPasteDraft = undefined
+    const reading = this.openInput('chat', prompt, initial, signal)
+    if (draft && this.pending?.kind === 'chat') { this.pastes.restore(draft); this.inputChanged() }
+    const value = await reading
     return typeof value === 'string' ? value : undefined
   }
   async askText(title: string, initial = ''): Promise<string | undefined> {
@@ -1972,7 +2183,7 @@ export class OpenTuiIO implements ChatIO {
     return this.inputQueue.enqueue(bound, () => { if (this.failure) throw this.failure; return cancelled() }, async activeSignal => {
       const token = {}; this.activeDialog = token
       if (this.steering?.pending && this.pending === this.steering.pending) {
-        this.steering.draft = this.composer.plainText
+        this.saveSteeringDraft(this.steering)
         this.steering.pending = undefined
         if (this.steering.timer !== undefined) clearTimeout(this.steering.timer)
         this.pending = undefined
@@ -1980,8 +2191,8 @@ export class OpenTuiIO implements ChatIO {
         this.clearInput(); this.disableComposer()
       }
       if (this.pending?.kind === 'chat') {
-        this.suspendedChat = { pending: this.pending, text: this.composer.plainText,
-          cursor: this.composer.cursorOffset, title: this.composerBox.title ?? 'Message' }
+        this.suspendedChat = { pending: this.pending,
+          title: this.composerBox.title ?? 'Message', pasteDraft: this.pastes.snapshot() }
         this.pending = undefined
         this.hideCompletions(); this.disableComposer()
       }
@@ -1995,8 +2206,9 @@ export class OpenTuiIO implements ChatIO {
             this.composerBox.visible = true; this.composer.visible = true; this.secretMask.visible = false
             this.composerBox.title = chat.title
             this.changingInput = true
-            try { this.composer.setText(chat.text); this.composer.cursorOffset = chat.cursor }
+            try { this.pastes.restore(chat.pasteDraft) }
             finally { this.changingInput = false }
+            this.inputChanged()
             if (!this.cancelCallbacks.size) { this.composer.traits = {}; this.composer.showCursor = true; this.composer.focus() }
             this.hintLine.content = HINTS
             this.updateCompletions(); this.updateActionBar(); this.updateComposerLayout()
@@ -2076,7 +2288,7 @@ export class OpenTuiIO implements ChatIO {
     this.setLoading()
     this.invalidateDialogs()
     if (this.steering?.pending && this.pending === this.steering.pending) {
-      this.steering.draft = this.composer.plainText
+      this.saveSteeringDraft(this.steering)
       if (this.steering.timer !== undefined) clearTimeout(this.steering.timer)
       this.steering.pending = undefined
       this.pending = undefined
@@ -2261,6 +2473,7 @@ export class OpenTuiIO implements ChatIO {
       for (const section of view.details) details.add(new TextRenderable(this.renderer,
         { ...TEXT_SELECTION, content: this.safe(`${section.label}:\n${section.text}`), fg: bodyColor, attributes: bodyAttributes, width: '100%', wrapMode: 'word', flexShrink: 0 }))
       box.add(details)
+      this.addResultImages(box, entry)
       if (!collapsed && view.notice) details.add(new TextRenderable(this.renderer,
         { ...TEXT_SELECTION, content: view.notice, fg: TUI_THEME.muted, attributes: TextAttributes.DIM, width: '100%', wrapMode: 'word', flexShrink: 0 }))
     }
@@ -2384,6 +2597,7 @@ export class OpenTuiIO implements ChatIO {
         const detailBytes = Math.max(0, Math.min(8192, budget))
         const view = cliToolPresentationView(encoded, false, detailBytes, this.secrets)
         entries.unshift({ category: 'activity', label: safeLabel, content: '', markdown: false, historyIndex: index,
+          ...(!message.isError && message.images?.length ? { images: structuredClone(message.images) } : {}),
           attention: !!message.isError, tool: { encoded, key, detailBytes, retained: index >= latestTurn,
             localRead: requestIndex !== index && isCliLocalReadTool(message.name), resultError: !!message.isError } })
         // Whole-history retention may omit old complete cards, never slice their safety rows.
@@ -2533,6 +2747,7 @@ export class OpenTuiIO implements ChatIO {
       this.canCompact = false
     }
     if (this.sessionId !== undefined && this.sessionId !== session.id) {
+      this.pastes.resetImages()
       this.runStatus.reset()
       this.liveErrors = []
       this.resultNotices = []
@@ -2672,6 +2887,7 @@ export class OpenTuiIO implements ChatIO {
       catch { encoded = '' }
       const old = this.entries.find(entry => entry.tool?.key === live?.key)
       const entry: DisplayEntry = { category: 'activity', attention: !!event.message.isError,
+        ...(!event.message.isError && event.message.images?.length ? { images: structuredClone(event.message.images) } : {}),
         label: this.safe(`Tool ${event.message.name} · ${event.message.isError ? 'error result' : 'result'}`, 4096), content: '', markdown: false,
         ...(resultIndex === undefined ? {} : { historyIndex: resultIndex }),
         tool: { encoded, key: live?.key ?? `display-${this.displaySequence++}`, retained: true,
@@ -2750,7 +2966,11 @@ export class OpenTuiIO implements ChatIO {
     this.renderer.off(CliRenderEvents.BLUR, this.blurHandler)
     this.renderer.off(CliRenderEvents.FOCUS, this.focusHandler)
     this.renderer.off(CliRenderEvents.SELECTION, this.selectionHandler)
+    this.clipboardRead?.abort()
+    this.imagePathRead?.abort()
+    this.imageSourceController.abort(); this.resultImageBytes.clear()
     void this.clipboard?.dispose().catch(() => undefined)
+    void this.imagePreview.dispose().catch(() => undefined)
     this.renderer.off(CliRenderEvents.RENDER_ERROR, this.errorHandler)
     this.renderer.off(CliRenderEvents.HANDLER_ERROR, this.errorHandler)
     process.off('SIGINT', this.signalHandler)

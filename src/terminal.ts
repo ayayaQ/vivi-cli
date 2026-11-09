@@ -24,6 +24,7 @@ import type { CliToolEvidence } from './tool-presentation.js'
 import type { CliConversationErrors } from './conversation-errors.js'
 import { conversationModeLabel } from './task-mode.js'
 import type { ConversationMode, TaskMode } from './task-mode.js'
+import type { CliImageSource, PastedImage } from './image-assets.js'
 
 export interface ChatIO {
   /** Native surfaces render launch state in their chrome; /session exposes full details. */
@@ -37,6 +38,9 @@ export interface ChatIO {
   setSteeringQueue?(messages: readonly SteeringMessage[]): void
   steeringAccepted?(content: string, initial?: boolean): void
   setComposerDraft?(content: string): void
+  /** Bytes belong to explicit composer attachments, never to arbitrary mentioned paths. */
+  pastedImages?(content: string): readonly PastedImage[]
+  setImageSource?(source: CliImageSource | undefined): void
   /** Display-only host evidence, re-screened by the consumer before rendering. */
   setToolEvidence?(evidence: CliToolEvidence): void
   /** Persisted display-only host errors, not provider messages or tool outcomes. */
@@ -70,6 +74,12 @@ export interface ChatIO {
 /** Share explicit turn boundaries across interactive, one-shot and accessible line flows. */
 export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, signal?: AbortSignal,
   queuedId?: string): Promise<AgentResult> {
+  io.setImageSource?.(host.imageSource)
+  const images = io.pastedImages?.(content) ?? []
+  if (images.length) {
+    try { host.addPastedImages(images) }
+    catch (error) { io.setComposerDraft?.(content); throw error }
+  }
   const shell = queuedId === undefined && parseUserShellInput(content) !== undefined
   // Only live user submission is parsed. Stored continuation envelopes and raw
   // host.send() inputs are data, not executable instructions.
@@ -91,7 +101,11 @@ export async function sendChatTurn(host: CliHost, io: ChatIO, content: string, s
   const dispose = io.onSteering?.({
     submit: (message, force): boolean => {
       if (!active || io.isClosed || signal?.aborted) return false
-      try { if (parseUserShellInput(message) !== undefined) host.queueUserShell(message); else host.queueMessage(message) }
+      try {
+        const images = io.pastedImages?.(message) ?? []
+        if (images.length) host.addPastedImages(images)
+        if (parseUserShellInput(message) !== undefined) host.queueUserShell(message); else host.queueMessage(message)
+      }
       catch (error) {
         io.write(`${error instanceof Error ? error.message : 'Message was not queued'}\n`)
         return false

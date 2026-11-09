@@ -13,6 +13,7 @@ import { ReadOnlyWorkspace } from '../dist/workspace.js'
 import { FileSessionStore, newSession, validateSession } from '../dist/session.js'
 import { replayCliConversationDocument } from '../dist/conversation-records.js'
 import { parseModelCatalog } from '../dist/models.js'
+import { sendChatTurn } from '../dist/terminal.js'
 
 const pixels = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64')
 const call = (path = 'image.png', id = 'image-read') => ({ id, name: 'workspace_read_image', arguments: { path } })
@@ -46,6 +47,44 @@ test('mentioning an image path remains text and does not read or snapshot a file
   assert.equal((await host.send('Consider image.png later')).status, 'completed')
   assert.equal(resultMessages(host).length, 0)
   await assert.rejects(fs.stat(f.images.directory), { code: 'ENOENT' })
+})
+
+test('explicit pasted images supply immutable pixels through the existing image tool and survive resume', async t => {
+  const f = await setup(t), path = 'vivi-paste/01234567-89ab-4cde-8fab-0123456789ab.png'
+  let round = 0
+  const host = hostFor(f, providerFor(f.images, async input => {
+    if (++round === 1) { clipboardBytes.fill(0); return { content: '', toolCalls: [call(path)] } }
+    const observation = input.messages.find(message => message.kind === 'tool_result')
+    assert.equal(JSON.parse(observation.content).source, 'user_attachment')
+    assert.deepEqual(Buffer.from(f.images.resolve(observation.images[0])), pixels)
+    return { content: 'Observed pasted pixels.', toolCalls: [] }
+  }))
+  const clipboardBytes = Buffer.from(pixels)
+  const result = await sendChatTurn(host, { pastedImages: () => [{ path, bytes: clipboardBytes }] }, `Inspect the attached image: ${path}`)
+  clipboardBytes.fill(0)
+  assert.equal(result.status, 'completed')
+  const saved = await f.store.load(f.session.id)
+  assert(!JSON.stringify(saved).includes(pixels.toString('base64')))
+  const images = new FileImageAssets(join(f.directory, 'state', 'images'), f.session.id)
+  const resumed = hostFor({ ...f, images, session: saved }, providerFor(images, async input => {
+    const observation = input.messages.find(message => message.kind === 'tool_result')
+    assert.deepEqual(Buffer.from(images.resolve(observation.images[0])), pixels)
+    return { content: 'The original pasted pixels remain.', toolCalls: [] }
+  }))
+  assert.equal((await resumed.send('Describe the same image')).status, 'completed')
+})
+
+test('unregistered pasted identities never read workspace files and unsupported models reject attachments', async t => {
+  const f = await setup(t), path = 'vivi-paste/01234567-89ab-4cde-8fab-0123456789ab.png'
+  let round = 0
+  const host = hostFor(f, providerFor(f.images, async () => ++round === 1
+    ? { content: '', toolCalls: [call(path)] } : { content: 'No attachment.', toolCalls: [] }))
+  assert.equal((await host.send(path)).status, 'completed')
+  assert.equal(resultMessages(host)[0].isError, true)
+  assert.equal(resultMessages(host)[0].images, undefined)
+  const unknown = hostFor(f, {}, { imageCapability: 'unknown' })
+  assert.throws(() => unknown.addPastedImages([{ path, bytes: pixels }]), /verified image-input support/)
+  assert.throws(() => host.addPastedImages([{ path: '../outside.png', bytes: pixels }]), /identity/)
 })
 
 test('explicit workspace read delivers actual pixels on Responses wire and persists only snapshot references', async t => {
@@ -120,6 +159,39 @@ test('snapshot metadata verifies PNG and JPEG and resolver does not expose mutab
   const disk = new FileImageAssets(join(f.directory, 'state', 'images'), f.session.id)
   await disk.preload([{ kind: 'tool_result', images: [reference] }], signal())
   assert.deepEqual(Buffer.from(disk.resolve(reference)), pixels)
+})
+
+test('display snapshot reads work after turn cleanup and leave prepared provider images unchanged', async t => {
+  const f = await setup(t)
+  const jpeg = await fs.readFile(new URL('./fixtures/tool-image-1x1.jpg', import.meta.url))
+  const first = await f.images.snapshot(pixels, signal()), second = await f.images.snapshot(jpeg, signal())
+  f.images.accepted([first, second])
+  await f.images.preload([{ kind: 'tool_result', images: [first] }], signal())
+  assert.deepEqual(Buffer.from(await f.images.read(second, signal())), jpeg)
+  assert.deepEqual(Buffer.from(f.images.resolve(first)), pixels)
+  assert.throws(() => f.images.resolve(second), /not prepared/)
+  await f.images.finish()
+  assert.deepEqual(Buffer.from(await f.images.read(first, signal())), pixels)
+  assert.throws(() => f.images.resolve(first), /not prepared/)
+  await assert.rejects(f.images.read({ ...first, width: 2 }, signal()), /inconsistent/)
+})
+
+test('turn binding exposes verified image snapshots to the display and rechecks privacy on later reads', async t => {
+  const f = await setup(t), secrets = []
+  let round = 0, source, livePixels
+  const host = hostFor(f, providerFor(f.images, async () => ++round === 1
+    ? { content: '', toolCalls: [call()] } : { content: 'Observed.', toolCalls: [] }), {
+    secrets, onEvent: async event => {
+      if (event.type === 'tool_completed' && event.message.images?.length) livePixels = await source.read(event.message.images[0], signal())
+    }
+  })
+  const result = await sendChatTurn(host, { setImageSource: value => { source = value } }, 'Inspect image.png')
+  assert.equal(result.status, 'completed'); assert.equal(source.sessionId, f.session.id)
+  assert.deepEqual(Buffer.from(livePixels), pixels)
+  const reference = resultMessages(host)[0].images[0]
+  assert.deepEqual(Buffer.from(await source.read(reference, signal())), pixels)
+  secrets.push('IHDR')
+  await assert.rejects(source.read(reference, signal()), /unavailable/)
 })
 
 test('cancelled/unaccepted snapshots are cleaned while accepted snapshots remain for replay', async t => {
