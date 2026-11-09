@@ -524,7 +524,13 @@ export class OpenTuiIO implements ChatIO {
       this.header = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-header', height: 1, flexShrink: 0,
         content: 'vivi', fg: TUI_THEME.foreground, wrapMode: 'none' })
       this.tokenLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-tokens', height: 1, flexShrink: 0,
-        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, textAlign: 'right', wrapMode: 'none' })
+        fg: TUI_THEME.muted, attributes: TextAttributes.DIM, textAlign: 'right', wrapMode: 'none', selectable: false,
+        onMouse: event => this.handleContextMouse(event) })
+      this.hover.bind(this.tokenLine, () => this.pending?.kind === 'chat' && !this.cancelCallbacks.size && this.ready(), point => {
+        const width = Math.min(this.tokenLine.width, statusTextColumns(this.tokenLine.plainText))
+        const x = this.tokenLine.width - width
+        return point.x >= x ? { x, y: 0, width, height: 1 } : undefined
+      })
       this.headerBox.add(this.header); this.headerBox.add(this.tokenLine)
       this.modelLine = new TextRenderable(renderer, { ...TEXT_SELECTION, id: 'vivi-model', height: 1, flexShrink: 0,
         width: '100%', fg: TUI_THEME.muted, attributes: TextAttributes.DIM, wrapMode: 'none', selectable: false,
@@ -904,6 +910,16 @@ export class OpenTuiIO implements ChatIO {
       this.lastRenderedFrame > this.footerChangedFrame, () => {
         this.nextComposerDraft = this.composer.plainText
         pending!.finish(target!.command)
+      })
+  }
+  private handleContextMouse(event: MouseEvent): void {
+    const pending = this.pending
+    const start = this.tokenLine.width - statusTextColumns(this.tokenLine.plainText)
+    this.mouseActivation.handle(event, this.tokenLine, this.tokenLine.plainText, pending,
+      this.tokenLine.visible && event.x >= this.tokenLine.x + start &&
+      pending?.kind === 'chat' && !this.cancelCallbacks.size && this.ready(pending), () => {
+        this.nextComposerDraft = this.composer.plainText
+        pending!.finish('/context')
       })
   }
   private updateChoiceLayout(): void {

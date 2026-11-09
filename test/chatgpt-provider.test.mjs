@@ -81,17 +81,17 @@ test('ChatGPT context compaction uses the same wire projection without unsupport
   noUnsupportedFields(h.requests[0].body); assert(!('tools' in h.requests[0].body))
 })
 
-test('ChatGPT catalog uses visible slugs and labels in server order without static capability assumptions', () => {
+test('ChatGPT catalog uses visible slugs and labels in server order with assumed function-tool support', () => {
   const models = parseChatGPTModelCatalog({ models: [
     { slug: 'z-model', display_name: 'Zed', visibility: 'list' }, { slug: 'hidden', display_name: 'Hidden', visibility: 'hide' },
     { slug: 'gpt-5', display_name: 'Account choice', visibility: 'list' }, { slug: 'z-model', display_name: 'Duplicate', visibility: 'list' }
   ] })
   assert.deepEqual(models.map(model => [model.id, model.name]), [['z-model', 'Zed'], ['gpt-5', 'Account choice']])
-  for (const model of models) { assert.equal(model.tools, 'unknown'); assert.equal(model.vision, undefined); assert.deepEqual(model.efforts, []); assert.equal(model.modelCapabilities.vision, 'unknown') }
+  for (const model of models) { assert.equal(model.tools, 'supported'); assert.equal(model.modelCapabilities.tools, 'supported'); assert.equal(model.vision, undefined); assert.deepEqual(model.efforts, []); assert.equal(model.modelCapabilities.vision, 'unknown') }
   assert.throws(() => parseChatGPTModelCatalog({ data: [{ id: 'api-key-schema' }] }), /format/)
 })
 
-test('ChatGPT enriches only the reviewed exact slugs without granting tools, vision, capacity or availability', () => {
+test('ChatGPT enriches only the reviewed exact slugs beyond its subscription-wide tool policy', () => {
   const ids = ['future-model', 'gpt-6.1-sol', 'gpt-6.1-sol-future', 'GPT-6.1-SOL', 'openai/gpt-6.1-sol', 'gpt-5']
   const models = parseChatGPTModelCatalog({ models: ids.map(slug => ({ slug, display_name: 'Account label', visibility: 'list',
     tools: true, vision: true, reasoning: { supported_efforts: ['high'] }, context_window: 123456 })) })
@@ -100,7 +100,7 @@ test('ChatGPT enriches only the reviewed exact slugs without granting tools, vis
     const expected = model.id === 'gpt-6.1-sol' ? 'supported' : 'unknown'
     assert.equal(model.conversation, expected); assert.equal(model.streaming, expected)
     assert.equal(model.modelCapabilities.chat, expected); assert.equal(model.modelCapabilities.stream, expected)
-    assert.equal(model.tools, 'unknown'); assert.equal(model.modelCapabilities.tools, 'unknown')
+    assert.equal(model.tools, 'supported'); assert.equal(model.modelCapabilities.tools, 'supported')
     assert.equal(model.vision, undefined); assert.equal(model.modelCapabilities.vision, 'unknown')
     assert.equal(model.reasoning, expected)
     assert.deepEqual(model.efforts, expected === 'supported' ? ['low', 'medium', 'high', 'xhigh', 'max'] : [])

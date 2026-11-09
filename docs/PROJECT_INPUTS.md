@@ -54,8 +54,10 @@ Responses receives image-bearing function outputs. Chat gateway adapters preserv
 the whole real tool-result batch, then add a provider-only image observation
 labelled by source call ID—not a canonical user request or approval.
 
-Vision and tool support must be verified for the exact selected model/provider/
-protocol. Unknown or unsupported support is explicit; no adapter silently drops
+Vision and tool support are scoped to the exact selected model/provider/protocol.
+ChatGPT subscription catalogs assume function-tool support for all listed models;
+other routes require verified support or an explicit launch declaration. Unknown
+or unsupported support is explicit; no adapter silently drops
 pixels. Provider compatibility is fixture-tested, not a claim of live endpoint or
 account qualification.
 

@@ -43,11 +43,15 @@ model pages allow it, disabling reasoning remains unverified on this route and i
 not offered. Only Astra and 6.1 Sol's model documentation establishes required
 reasoning; the other six retain an unknown requirement. `ultra` in Codex entails
 automatic task delegation and is not implemented by Vivi's subscription adapter.
-Tools and vision remain unknown on this route, regardless of another client's
-capability flags. Account/workspace policy can still reject a documented effort.
+Vivi assumes function-tool support for every model returned by the selected
+ChatGPT subscription account's visible catalog, including new slugs. Selecting a
+model enables host tools without an additional capability confirmation. Explicit
+tools-off choices and host approval policies still apply. This is a local policy
+assumption, not a verified account entitlement. Vision remains unknown on this
+route. Account/workspace policy can still reject tools or a documented effort.
 
-Aliases, future models and other slugs keep unknown metadata. For example, the
-bundled Codex catalog includes `gpt-5.5`, while pi explicitly excludes it because
+Beyond function-tool support, aliases, future models and other slugs keep unknown
+metadata. For example, the bundled Codex catalog includes `gpt-5.5`, while pi explicitly excludes it because
 its ChatGPT backend rejected it. That is not proof that the public token-sharing
 route rejects it. If an account lists it, Vivi still shows it conservatively rather
 than claiming reviewed support or hiding it.
