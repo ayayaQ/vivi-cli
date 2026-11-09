@@ -56,7 +56,10 @@ test('composer measures wrapped Unicode cells and reflows height when the termin
 
 test('large multiline drafts stay bounded, keep the last line editable and fit compact resize', async () => {
   const f = await fixture(), reading = f.io.readLine('Message')
-  await f.frame(); await f.input.pasteBracketedText(Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n'))
+  const text = Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n')
+  await f.frame(); await f.input.pasteBracketedText(text)
+  expect(f.composer.plainText).toBe(`[Pasted Content ${text.length} chars]`)
+  await f.input.pasteBracketedText(text)
   await f.frame()
   expect(f.composer.height).toBe(10)
   expect(f.composer.scrollY).toBeGreaterThan(0)

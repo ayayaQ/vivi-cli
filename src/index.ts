@@ -64,7 +64,7 @@ export type { CliWebConfiguration, CliWebProviderName } from './web-tools.js'
 export { ProjectInstructions, INSTRUCTION_LIMIT_BYTES } from './instructions.js'
 export type { InstructionProfile, InstructionSnapshot } from './instructions.js'
 export { FileImageAssets, IMAGE_LIMITS, imageMetadata } from './image-assets.js'
-export type { CliImageAssets } from './image-assets.js'
+export type { CliImageAssets, CliImageSource, PastedImage } from './image-assets.js'
 
 export { AUTOMATION_PROTOCOL, AUTOMATION_VERSION, AUTOMATION_LIMITS } from './automation.js'
 export type { AutomationEvent, AutomationPayload, AutomationEnvelope, AutomationExitCode, AutomationUsage, AutomationJson } from './automation.js'

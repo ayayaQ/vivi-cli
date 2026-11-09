@@ -8,6 +8,12 @@ import { isSessionId } from './session.js'
 
 export const IMAGE_LIMITS = Object.freeze({ bytes: 5 * 1024 * 1024, pixels: 16_000_000,
   dimension: 8192, sessionBytes: 64 * 1024 * 1024, sessionImages: 32 })
+/** A composer-owned virtual path and copied image pixels; never an arbitrary filesystem path. */
+export interface PastedImage { path: string; bytes: Uint8Array }
+export interface CliImageSource {
+  readonly sessionId: string
+  read(reference: ToolImageReference, signal: AbortSignal): Promise<Uint8Array>
+}
 const hash = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
 function check(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message) }
 function crc32(bytes: Uint8Array): number {
@@ -74,6 +80,8 @@ export interface CliImageAssets {
   snapshot(bytes: Uint8Array, signal: AbortSignal): Promise<ToolImageReference>
   preload(history: readonly HistoryMessage[], signal: AbortSignal): Promise<void>
   resolve(reference: ToolImageReference): Uint8Array
+  /** Display-only snapshot reads must not replace or clear the provider's prepared image cache. */
+  read?(reference: ToolImageReference, signal: AbortSignal): Promise<Uint8Array>
   accepted(references: readonly ToolImageReference[]): void
   finish(): Promise<void>
 }
@@ -138,6 +146,11 @@ export class FileImageAssets implements CliImageAssets {
     }
   }
   private async load(reference: ToolImageReference, signal: AbortSignal): Promise<void> {
+    const bytes = await this.read(reference, signal)
+    signal.throwIfAborted()
+    this.admit(reference, Buffer.from(bytes))
+  }
+  async read(reference: ToolImageReference, signal: AbortSignal): Promise<Uint8Array> {
     signal.throwIfAborted(); await this.prepare(); signal.throwIfAborted()
     const handle = await open(this.path(reference.id), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     try {
@@ -155,7 +168,10 @@ export class FileImageAssets implements CliImageAssets {
       const after = await handle.stat()
       check(offset === before.size && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs,
         'Image snapshot changed while reading')
-      signal.throwIfAborted(); this.admit(reference, bytes.subarray(0, offset))
+      signal.throwIfAborted()
+      const image = bytes.subarray(0, offset)
+      this.verify(reference, image)
+      return image
     } finally { await handle.close() }
   }
   async snapshot(input: Uint8Array, signal: AbortSignal): Promise<ToolImageReference> {
