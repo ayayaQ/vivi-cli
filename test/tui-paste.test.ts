@@ -275,6 +275,19 @@ test('history navigation and mode changes restore collapsed drafts with their cu
   f.input.pressEnter(); expect(await next).toBe(text)
 })
 
+test('opening context details preserves the collapsed paste draft and hidden content', async () => {
+  const f = await fixture(), reading = f.io.readLine('Message')
+  await f.input.pasteBracketedText(text)
+  f.io.setContext({ inputTokens: 90000, estimated: true, contextWindow: 100000, outputReserveTokens: 4096 })
+  await f.frame()
+  const context = f.setup.renderer.root.findDescendantById('vivi-tokens')!
+  await f.setup.mockMouse.click(context.x + context.width - 1, context.y)
+  expect(await reading).toBe('/context')
+  const next = f.io.readLine('Message'); await f.frame()
+  expect(f.composer.plainText).toBe(`[Pasted Content ${text.length} chars]`)
+  f.input.pressEnter(); expect(await next).toBe(text)
+})
+
 test('late credentials in hidden blocks are removed before submission', async () => {
   const f = await fixture(), reading = f.io.readLine('Message')
   const secretText = text + ' newly-known-secret'

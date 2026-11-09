@@ -104,7 +104,7 @@ test('ChatGPT effort selection and model switching hydrate reviewed metadata wit
   const directory = await fixture(t), auth = authFixture(), uses = [], contexts = []
   await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, provider: 'chatgpt', chatgptAccountId: A, model: 'gpt-6.1-sol' })
   const io = ioFixture(['/effort', 'First', '/context', '/models', 'Second', '/context', '/models', 'Third', '/context', '/exit'],
-    ['max', 'gpt-6-luna', false, 'future-model', true, false])
+    ['max', 'gpt-6-luna', 'future-model', true])
   io.setContext = usage => contexts.push(usage)
   const catalog = { async list(provider, id) {
     assert.equal(provider, 'chatgpt'); assert.equal(id, A)
@@ -117,7 +117,7 @@ test('ChatGPT effort selection and model switching hydrate reviewed metadata wit
   assert.deepEqual(uses[1].efforts, uses[0].efforts); assert.deepEqual(uses[2].efforts, [])
   assert(contexts.some(usage => usage?.contextWindow === 475000)); assert(contexts.some(usage => usage?.contextWindow === 258400))
   assert.equal(contexts.at(-1).contextWindow, undefined)
-  assert.match(io.output, /Working budget: 475000/); assert.match(io.output, /Working budget: 258400/); assert.match(io.output, /Context ~\d+\/?\?/)
+  assert.match(io.output, /Working budget: 475000/); assert.match(io.output, /Working budget: 258400/); assert.match(io.output, /Context ~[\d.]+[km]?\/\?/)
   assert.deepEqual(auth.state.tokens, [])
 })
 
@@ -182,7 +182,7 @@ test('TUI account/workspace switch creates isolated history and current account 
   for (const cancel of [false, true]) {
     const directory = await fixture(t), auth = authFixture(), catalog = catalogFixture(), uses = []
     await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, provider: 'chatgpt', chatgptAccountId: A, model: 'model-a' })
-    const io = ioFixture(['First', '/account', 'Second', '/exit'], cancel ? ['choose', undefined] : ['choose', B, 'model-b', false])
+    const io = ioFixture(['First', '/account', 'Second', '/exit'], cancel ? ['choose', undefined] : ['choose', B, 'model-b'])
     const status = await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io, chatgptAuth: auth, catalog,
       providerFactory: session => ({ async generate(input) { uses.push({ id: session.id, account: session.chatgptAccountId, text: input.messages.filter(m => m.kind === 'message' && m.role === 'user' && ['First', 'Second'].includes(m.content)).map(m => m.content) }); return { content: 'Done', toolCalls: [] } } }) })
     assert.equal(status, 0); assert.deepEqual(uses.map(u => u.account), cancel ? [A, A] : [A, B])
@@ -193,21 +193,23 @@ test('TUI account/workspace switch creates isolated history and current account 
   }
 })
 
-test('ChatGPT picker skips the documented text warning but preserves unknown-model and tool choices', async t => {
-  for (const model of ['gpt-6.1-sol', 'future-model']) {
+test('ChatGPT picker enables tools without a follow-up prompt for reviewed and new models, respecting explicit opt-out', async t => {
+  for (const model of ['gpt-6.1-sol', 'future-model']) for (const disabled of [false, true]) {
     const directory = await fixture(t), auth = authFixture(), used = []
     await new PreferenceStore(directory).save({ ...DEFAULT_PREFERENCES, provider: 'chatgpt', chatgptAccountId: A, model })
     const catalog = { async list(provider, selected) {
       assert.equal(provider, 'chatgpt'); assert.equal(selected, A)
       return { state: 'fresh', models: parseChatGPTModelCatalog({ models: [{ slug: model, display_name: 'Selected account choice', visibility: 'list' }] }) }
     } }
-    const io = ioFixture(['/models', 'Hello', '/exit'], model === 'gpt-6.1-sol' ? [model, false] : [model, true, false])
-    assert.equal(await main(['--no-workspace', '--session-dir', directory], {}, { tuiIO: io, catalog, chatgptAuth: auth,
+    const io = ioFixture(['/models', 'Hello', '/exit'], model === 'gpt-6.1-sol' ? [model] : [model, true])
+    assert.equal(await main(['--no-workspace', '--session-dir', directory, ...(disabled ? ['--no-tools'] : [])], {}, { tuiIO: io, catalog, chatgptAuth: auth,
       providerFactory: (session, options) => ({ async generate(input) { used.push({ session, options, tools: input.tools }); return { content: 'Done', toolCalls: [] } } }) }), 0)
     assert.equal(io.choices.filter(choice => /Text conversation compatibility is unverified/.test(choice.title)).length, model === 'gpt-6.1-sol' ? 0 : 1)
-    assert.equal(io.choices.filter(choice => /Function-tool support is not advertised/.test(choice.title)).length, 1)
+    assert.equal(io.choices.filter(choice => /Function-tool support is not advertised/.test(choice.title)).length, 0)
     assert.equal(used.length, 1); assert.equal(used[0].session.model, model); assert.equal(used[0].session.chatgptAccountId, A)
-    assert.deepEqual(used[0].tools, []); assert.deepEqual(auth.state.tokens, [])
+    assert.equal(used[0].options.enableTools, !disabled)
+    assert.equal(used[0].tools.some(tool => tool.name === 'note_set'), !disabled)
+    assert.deepEqual(auth.state.tokens, [])
   }
 })
 

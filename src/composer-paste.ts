@@ -4,7 +4,7 @@ import type { TextareaRenderable } from '@opentui/core'
 import { imageMetadata, IMAGE_LIMITS } from './image-assets.js'
 import type { PastedImage } from './image-assets.js'
 
-interface PasteData { content: string; image?: PastedImage }
+interface PasteData { content: string; label: string; image?: PastedImage }
 export interface ComposerDraft {
   text: string
   cursor: number
@@ -20,9 +20,22 @@ export class ComposerPastes {
   private imageNumber = 0
   constructor(private readonly editor: TextareaRenderable) {
     this.type = editor.extmarks.registerType('vivi-paste')
+    // OpenTUI 0.5.14 keeps its extmark undo snapshots when setText resets the
+    // native text history. Never restore marks without a matching text edit:
+    // otherwise undo on a cleared/new prompt can resurrect invisible content.
+    const buffer = editor.editBuffer
+    const undo = buffer.undo.bind(buffer), redo = buffer.redo.bind(buffer)
+    buffer.undo = () => buffer.canUndo() ? undo() : null
+    buffer.redo = () => buffer.canRedo() ? redo() : null
   }
   // OpenTUI restores getAll() on undo; its secondary type index is not restored.
-  private marks() { return this.editor.extmarks.getAll().filter(mark => mark.typeId === this.type).sort((a, b) => a.start - b.start) }
+  private marks() {
+    return this.editor.extmarks.getAll().filter(mark => {
+      const data = mark.data as PasteData | undefined
+      return mark.typeId === this.type && typeof data?.label === 'string' && mark.start >= 0 && mark.end > mark.start &&
+        this.editor.editBuffer.getTextRange(mark.start, mark.end) === data.label
+    }).sort((a, b) => a.start - b.start)
+  }
   snapshot(): ComposerDraft {
     return { text: this.editor.plainText, cursor: this.editor.cursorOffset,
       marks: this.marks().map(mark => ({ start: mark.start, end: mark.end, data: mark.data as PasteData })) }
@@ -59,10 +72,10 @@ export class ComposerPastes {
     }
     return this.text.length - selected + text.length <= limit
   }
-  private insert(label: string, data: PasteData): void {
+  private insert(label: string, data: Omit<PasteData, 'label'>): void {
     this.editor.insertText(label)
     const end = this.editor.cursorOffset
-    this.editor.extmarks.create({ start: end - label.length, end, virtual: true, typeId: this.type, data })
+    this.editor.extmarks.create({ start: end - label.length, end, virtual: true, typeId: this.type, data: { ...data, label } })
   }
   paste(text: string): void {
     const adjacent = this.expandable(text)

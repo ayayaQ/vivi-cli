@@ -29,8 +29,8 @@ test('all eight reviewed exact slugs retain their account label and conservative
     assert.deepEqual(entry.modelCapabilities.reasoning, { support: 'supported', disable: required ? 'unsupported' : 'unknown',
       effortSelection: 'supported', efforts, requirement: required ? 'required' : 'unknown' })
     assert.equal(entry.reasoningMandatory, required)
-    assert.equal(entry.tools, 'unknown'); assert.equal(entry.vision, undefined)
-    assert.equal(entry.modelCapabilities.tools, 'unknown'); assert.equal(entry.modelCapabilities.vision, 'unknown')
+    assert.equal(entry.tools, 'supported'); assert.equal(entry.vision, undefined)
+    assert.equal(entry.modelCapabilities.tools, 'supported'); assert.equal(entry.modelCapabilities.vision, 'unknown')
     for (const field of ['contextWindow', 'maxInputTokens', 'maxOutputTokens', 'contextLimitsSource']) {
       assert.equal(entry[field], undefined); assert.equal(entry.modelCapabilities[field], undefined)
     }

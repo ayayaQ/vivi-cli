@@ -73,8 +73,9 @@ offered by this conservative subscription metadata policy. These documented
 choices have not all been tested against your account; account and workspace
 policy can reject them. Unknown models and aliases stay conservative and need an
 explicit `--reasoning-capabilities` declaration for nondefault reasoning in line
-mode. Tools and vision remain unverified for this route; `--tools` explicitly
-declares function-tool support in line mode.
+mode. Vivi assumes function-tool support for every model in the selected
+subscription account's catalog, so model selection enables tools without another
+prompt. `--no-tools` keeps tools disabled. Vision remains unverified for this route.
 
 The working budgets are intentional local input-plus-output policy, **not confirmed
 subscription endpoint/account limits**. They use 95% of reviewed Codex/Work or pi

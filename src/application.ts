@@ -197,7 +197,6 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   const workspace = options.workspace === undefined ? undefined : await ReadOnlyWorkspace.open(options.workspace, secrets, [options.sessionDirectory])
   io.setWorkspace?.(workspace?.directory)
   const knownModels = new Map<string, ModelEntry>()
-  const declaredToolModels = new Set<string>()
   const modelKey = (provider: CliProviderName, id: string, accountId = settings.chatgptAccountId): string =>
     provider === 'chatgpt' ? `${provider}:${accountId ?? 'unselected'}:${id}` : `${provider}:${id}`
   const report = (error: unknown): void => io.write(`${redactSecrets(error instanceof Error ? error.message : 'Application failed', secrets)}\n`)
@@ -412,7 +411,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     const controller = new AbortController()
     const dispose = io.onCancel(() => controller.abort())
     let result
-    try { io.write(`Loading ${base.provider} models…\n`); result = await catalog.list(base.provider, key, controller.signal) }
+    try { result = await catalog.list(base.provider, key, controller.signal) }
     catch (error) { if (!controller.signal.aborted) report(error); if (modelAccessDenied(error)) return }
     finally { dispose() }
     if (io.isClosed || controller.signal.aborted) return
@@ -433,7 +432,6 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     }
     remember()
     if (result.warning) io.write(`${result.warning}. Showing a stale cached catalog\n`)
-    else if (result.state === 'cached') io.write('Using the cached model catalog (up to 15 minutes old)\n')
     let search = ''
     for (;;) {
       const choices = result.models.map(model => ({ name: base.provider === 'chatgpt' ? model.name : model.id,
@@ -447,7 +445,6 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         const refreshController = new AbortController()
         const cleanup = io.onCancel(() => refreshController.abort())
         try {
-          io.write(`Refreshing ${base.provider} models…\n`)
           result = await catalog.list(base.provider, key, refreshController.signal, true)
           remember()
           if (result.warning) io.write(`${result.warning}. Showing stale cached models\n`)
@@ -465,19 +462,9 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         ])
         if (!use) continue
       }
-      let declaredTools = false
-      if (base.provider === 'chatgpt' && model.tools === 'unknown') {
-        const use = await io.choose(`Function-tool support is not advertised · ${model.name}`, [
-          { name: 'Use chat only', description: 'Default; do not assume tool support', value: false },
-          { name: 'Enable host function tools', description: 'I verified this model supports function tools. Requests may still be rejected by account/workspace policy', value: true }
-        ])
-        if (use === undefined || io.isClosed) return
-        declaredTools = use
-        if (use) declaredToolModels.add(modelKey(base.provider, model.id, base.chatgptAccountId))
-      }
-      if (model.tools === 'unknown' && !declaredTools) io.write('Tool capabilities are unknown; this model will use chat only\n')
+      if (model.tools === 'unknown') io.write('Tool capabilities are unknown; this model will use chat only\n')
       if (model.reasoning === 'unknown') io.write('Reasoning capabilities are unknown; using provider default\n')
-      return { ...settingsForModel(base, model), ...(declaredTools ? { enableTools: true } : {}) }
+      return settingsForModel(base, model)
     }
   }
   const save = async (next: TuiPreferences, changed: { notes?: boolean; memory?: boolean } = {}): Promise<void> => {
@@ -834,8 +821,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         capabilities = [session.reasoning as ReasoningEffort]
       }
       const declaredTools = args.includes('--tools') &&
-        (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model) ||
-        declaredToolModels.has(modelKey(session.provider, session.model, session.chatgptAccountId))
+        (explicitResume || session.provider === declaredToolTarget.provider && session.model === declaredToolTarget.model)
       const enableTools = modelToolsEnabled(metadata, { disabled: args.includes('--no-tools'),
         declared: declaredTools, enabled: !sameModel || settings.enableTools })
       const effective: CliOptions = { ...options, reasoningCapabilities: capabilities,

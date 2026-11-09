@@ -132,6 +132,15 @@ test('direct slash commands and footer shortcuts share modal settings, preserve 
       await cancel(); expect(transcript.getChildren().length).toBe(initial)
     }
     await setup.mockInput.typeText('Keep this unfinished draft'); await frame()
+    io.setContext({ inputTokens: 90000, estimated: true, contextWindow: 100000, outputReserveTokens: 4096 })
+    await frame()
+    const context = node('vivi-tokens') as TextRenderable
+    expect(context.visible).toBe(true)
+    await setup.mockMouse.click(context.x + context.width - 1, context.y); await modal('Context')
+    expect(setup.captureCharFrame()).toContain('Input tokens')
+    expect(transcript.getChildren().length).toBe(initial)
+    await cancel()
+    expect((node('vivi-composer') as TextareaRenderable).plainText).toBe('Keep this unfinished draft')
     const footer = node('vivi-model') as TextRenderable
     expect(footer.plainText).toContain('gpt-5.1 · default')
     const modelX = footer.x + footer.plainText.indexOf('gpt-5.1')

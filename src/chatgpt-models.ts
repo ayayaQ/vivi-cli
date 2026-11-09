@@ -31,6 +31,9 @@ const reviewedModels = new Map([
 function reviewedModel(id: string): ModelEntry {
   const model = unknownModel(id), capabilities = unknownChatGPTCapabilities(id)
   model.modelCapabilities = capabilities
+  // Subscription models listed for this account are assumed to support host
+  // function tools. This policy also applies to newly listed model slugs.
+  capabilities.tools = model.tools = 'supported'
   const reviewed = reviewedModels.get(id)
   if (!reviewed) return model
   const modelDocumentation = `https://developers.openai.com/api/docs/models/${id}`
@@ -79,8 +82,8 @@ export function parseChatGPTModelCatalog(input: unknown): ModelEntry[] {
     const model = reviewedModel(id)
     models.push({ ...model, name: label(field(entry, 'display_name'), id),
       source: model.conversation === 'supported'
-        ? 'Selected ChatGPT account model catalog; reviewed text, streaming and reasoning documentation; local context budget (account limits unverified)'
-        : 'Selected ChatGPT account model catalog; capabilities not advertised' })
+        ? 'Selected ChatGPT account model catalog; assumed function-tool support; reviewed text, streaming and reasoning documentation; local context budget (account limits unverified)'
+        : 'Selected ChatGPT account model catalog; assumed function-tool support; other capabilities not advertised' })
   }
   if (!models.length) throw new ChatGPTModelCatalogError('No selectable models were returned for this ChatGPT account')
   return models
