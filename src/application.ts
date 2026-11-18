@@ -861,7 +861,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) { await discardCandidate(); return false }
       nextHost = new CliHost({ provider, images, imageCapability: metadata?.vision ?? 'unknown', ...(metadata?.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)), mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        codeMode: options.codeMode === true, enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         permissionApproval: { accountRevision: () => accountGeneration, isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed },
         skillSaveApproval: { isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,

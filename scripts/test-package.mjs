@@ -86,6 +86,7 @@ try {
     'scripts/platform-acceptance.mjs', 'scripts/package-candidate.mjs', 'scripts/no-tui-loader.mjs',
     'src/main.ts', 'src/index.ts', 'src/host.ts', 'src/session.ts',
     'src/models.ts', 'src/picker.ts', 'src/credentials.ts', 'dist/models.js', 'dist/picker.js', 'dist/picker.d.ts', 'dist/credentials.js',
+    'dist/code-mode.js', 'dist/code-mode-guest.js', 'dist/code-mode-contract.js',
     'src/tools.ts', 'src/terminal.ts', 'src/tui.ts', 'src/preferences.ts', 'src/application.ts', 'src/launcher.ts',
     'dist/tui.js', 'dist/preferences.js', 'dist/application.js', 'dist/launcher.js', 'dist/main.js', 'dist/index.js', 'dist/index.d.ts',
     'dist/host.d.ts', 'dist/session.d.ts', 'dist/terminal.d.ts',
@@ -163,7 +164,8 @@ try {
   // Prepare runtime dependency metadata/bytes from the registry without running install scripts.
   runNpm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', cache, tarball], temporary)
   const consumerLock = JSON.parse(await readFile(join(temporary, 'package-lock.json'), 'utf8'))
-  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch', '@modelcontextprotocol/client', '@modelcontextprotocol/core', 'url-template']) {
+  for (const name of ['@opentui/core', 'web-tree-sitter', 'ignore', 'picomatch', '@modelcontextprotocol/client', '@modelcontextprotocol/core', 'url-template',
+    'quickjs-emscripten-core', '@jitl/quickjs-singlefile-cjs-release-sync', '@jitl/quickjs-ffi-types']) {
     const path = `node_modules/${name}`
     for (const field of ['version', 'resolved', 'integrity']) {
       assert.equal(consumerLock.packages[path][field], lock.packages[path][field], `Consumer ${name} ${field} must match the reviewed lock`)

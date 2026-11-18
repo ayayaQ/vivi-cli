@@ -9,7 +9,8 @@ const directory = await mkdtemp(join(tmpdir(), 'vivi-compiled-consumer-'))
 try {
   const executable = join(directory, process.platform === 'win32' ? 'probe.exe' : 'probe')
   const result = await Bun.build({
-    entrypoints: [fileURLToPath(new URL('./standalone-probe.ts', import.meta.url))],
+    entrypoints: ['./standalone-probe.ts', '../src/code-mode-guest.ts'].map(file => fileURLToPath(new URL(file, import.meta.url))),
+    naming: { entry: '[name].[ext]' },
     compile: { outfile: executable },
     ...(process.platform === 'linux' ? { define: { 'process.env.OPENTUI_LIBC': JSON.stringify(process.env.OPENTUI_LIBC === 'musl' ? 'musl' : 'glibc') } } : {})
   })

@@ -643,6 +643,10 @@ progress and settled outcomes without exposing model reasoning or credentials.
 
 ## Workspace tools
 
+Pass `--code-mode` to let the model combine workspace searches and text reads in one tool call. This launch option works in Plan and Execute when a workspace and model tools are enabled. Embedders can set `codeMode: true` on `CliHost`.
+
+A script can await `tools.workspace_search(args)` and `tools.workspace_read(args)`, filter their JSON results, and return a value. Each call gets a fresh QuickJS worker with an 8 MiB guest heap, a 10-second deadline, up to eight reads and four in flight. Source and returned JSON are each limited to 8 KiB. The parent result records child tool names, IDs, argument digests and outcomes. Intermediate file contents stay out of the provider transcript unless the script returns them.
+
 The CLI uses the current working directory where you launch vivi as its selected
 workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
 disable workspace access for that launch. These flags cannot be combined. Relative

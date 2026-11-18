@@ -24,6 +24,7 @@ import type { CliQuestionHost } from './questions.js'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
+import { codeModeTool, type ChildDispatch } from './code-mode.js'
 import { createBuiltinToolset } from './tools.js'
 import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
 import type { ApprovalRequest, NoteSnapshot } from './tools.js'
@@ -68,7 +69,7 @@ import type { CliImageAssets, CliImageSource, PastedImage } from './image-assets
 import { imageMetadata, IMAGE_LIMITS } from './image-assets.js'
 
 const memoryToolNames = new Set(['list_memories', 'create_memory', 'edit_memory', 'delete_memory'])
-const workspaceToolNames = new Set<string>([...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
+const workspaceToolNames = new Set<string>(['code_mode', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES])
 const commandToolNames = new Set<string>(COMMAND_TOOL_NAMES)
 const isMcpTool = (name: string): boolean => name.startsWith('mcp_') || ['list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template'].includes(name)
 const isPublicUrlTool = (name: string): boolean => name === 'fetch_url' || name === 'web_search' || name.startsWith('public_url_withheld_')
@@ -279,6 +280,7 @@ export interface CliHostOptions {
   provider: ModelProvider
   store: SessionPersistence
   session: CliSession
+  codeMode?: boolean
   enableNotes?: boolean
   /** Opt-in, app-wide state, independent of session-only notes. */
   enableMemory?: boolean
@@ -2090,7 +2092,29 @@ export class CliHost {
           return response
         }
       }) : undefined
-      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspace, skills, commands, mcp, publicUrl, taskMode, questions, mcpSetup)
+      const selectedWorkspace = this.options.workspace
+      const codeRuns = new Set<Promise<ToolResult>>()
+      const interruptedPrograms = new Map<string, ToolResult>()
+      const trackProgram = (parent: ToolCall, work: Promise<ToolResult>): void => {
+        const tracked = work.then(result => {
+          if (controller.signal.aborted) interruptedPrograms.set(reviewDigest(parent), result)
+          return result
+        })
+        codeRuns.add(tracked)
+        void tracked.then(() => codeRuns.delete(tracked), () => codeRuns.delete(tracked))
+      }
+      const dispatchChild: ChildDispatch = (call, signal) => {
+        signal.throwIfAborted()
+        if (!allowedTools.has(call.name) || !this.options.codeMode || this.options.enableTools === false ||
+            this.options.workspace !== selectedWorkspace || this.controller !== controller || owner.state !== 'open') {
+          throw new Error('Workspace read is unavailable')
+        }
+        return executeGuarded(call, { signal })
+      }
+      const workspaceTools = workspace && this.options.codeMode ? { ...workspace,
+        tools: [...workspace.tools, codeModeTool(dispatchChild, () => this.options.secrets ?? [], trackProgram)] } : workspace
+      owner.defer(async () => { await Promise.allSettled(codeRuns) })
+      const toolset = createBuiltinToolset(enableNotes, this.options.extensions, memory, workspaceTools, skills, commands, mcp, publicUrl, taskMode, questions, mcpSetup)
       if (questions) prefix.push({ kind: 'message', role: 'system', content: QUESTION_GUIDANCE })
       const allowedTools = new Set(enableTools ? toolset.tools.map(tool => tool.name) : [])
       if (publicUrl) prefix.push({ kind: 'message', role: 'system', content: this.selectedWeb.provider === 'deepseek' ? DEEPSEEK_WEB_GUIDANCE : PUBLIC_URL_GUIDANCE })
@@ -2240,6 +2264,9 @@ export class CliHost {
             }
             output = await generate(input, signal, options)
           }
+          if (output.toolCalls.some(call => call.name === 'code_mode' && mcpContainsSecret(call, this.options.secrets ?? []))) {
+            throw new Error('Code mode request contains a known credential')
+          }
           if ((historyUsesMcp(input.messages) || output.toolCalls.some(call => isMcpTool(call.name))) && mcpContainsSecret([
             output.toolCalls.filter(call => isMcpTool(call.name)), output.content, output.providerState ?? null
           ], this.options.secrets ?? [])) {
@@ -2361,6 +2388,88 @@ export class CliHost {
         }
       }
       await this.records.begin(this.toolsetRevision, this.current)
+      const executeGuarded = async (call: ToolCall, context: { signal: AbortSignal }): Promise<ToolResult> => {
+        enteredToolCalls.add(reviewDigest(call))
+        context.signal.throwIfAborted()
+        const guarded = async (result: ToolResult, status: 'denied' | 'failed' | 'cancelled' = 'denied'): Promise<ToolResult> => {
+          const row = this.acceptedMcpRow(call)
+          if (row) {
+            this.mcpRows.set(row.id, { ...row, state: 'settled', result: structuredClone(result) })
+            try { await this.persistMcpOutcomes() } catch { /* No remote send was admitted. */ }
+          }
+          return this.observeToolReceipt(call, result, { status, effect: 'not_attempted' }, 'dispatcher')
+        }
+        if (taskMode === 'plan' && !allowedTools.has(call.name)) return guarded(planModeRefusal())
+        if (outcomeMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
+        if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
+          return guarded({ content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
+            error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true })
+        }
+        if (call.name === QUESTION_TOOL_NAME && mcpContainsSecret(call.arguments, this.options.secrets ?? [])) {
+          return guarded({ content: JSON.stringify({ success: false, error: { code: 'question_credentials_blocked',
+            message: 'Question contains a known credential; no prompt was displayed' } }), isError: true })
+        }
+        if (skillsToolNames.has(call.name)) {
+          this.options.skills?.addSecrets(this.options.secrets ?? [])
+          if (memoryContextContainsSecret([skillContents, call.arguments], this.options.secrets ?? [])) {
+            return guarded({ content: JSON.stringify({ success: false, error: 'Skill operation contains a known credential; it was blocked' }), isError: true })
+          }
+        }
+        if (WORKSPACE_TOOL_NAMES.includes(call.name as typeof WORKSPACE_TOOL_NAMES[number]) && typeof call.arguments.path === 'string') {
+          try { this.projectInstructions.activate(call.arguments.path, call.name === 'workspace_read' || call.name === 'workspace_read_image') } catch { /* Mutation preflight reports bounded scope errors. */ }
+        }
+        let result = await toolset.executeTool(call, context.signal, {
+          enableNotes,
+          readSessionStatus: () => ({ provider: this.current.provider, model: this.current.model,
+            ...(this.current.reasoning === undefined ? {} : { reasoning: this.current.reasoning }),
+            taskMode: this.taskMode, approvalMode: this.approvalMode, context: this.contextUsage ?? null }),
+          readNotes: () => this.notes(),
+          commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
+          reviewNote: (call, before, key, value, signal) => this.reviewNote(call, before, key, value, signal, controller.signal),
+          approve: (request, signal) => this.approveWithPresentation(request, signal)
+        })
+        if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
+          result = { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }
+        }
+        const accepted = ownedMcpNames.has(call.name) ? this.acceptedMcpRow(call) : undefined
+        if (accepted?.state === 'accepted') {
+          let body: unknown
+          try { body = JSON.parse(result.content) } catch { /* Local diagnostics may be plain text. */ }
+          const safe = withholdMcpResult({ ...result, content: JSON.stringify({
+            ...(body && typeof body === 'object' && !Array.isArray(body) ? body : { success: false, error: { code: 'mcp_unavailable', message: 'The captured MCP request was unavailable' } }), requestSent: false
+          }) }, this.options.secrets ?? [])
+          this.mcpRows.set(accepted.id, { ...accepted, state: 'settled', result: safe })
+          try { await this.persistMcpOutcomes() } catch { /* Accepted evidence still proves no send. */ }
+          return this.observeToolReceipt(call, safe, cliMcpRecordOutcome(this.mcpRows.get(accepted.id)!), 'mcp')
+        }
+        const safeResult = isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
+        const policy = toolset.outcomePolicies.get(call.name)
+        let outcome: Pick<CliToolReceipt, 'status' | 'effect'> | undefined
+        let sourceKind: CliToolReceipt['sourceKind'] = policy === 'local-read' ? 'builtin-read' : policy ?? 'dispatcher'
+        if (policy === 'local-read') {
+          const question = call.name === QUESTION_TOOL_NAME ? questionResponses.get(call.id) : undefined
+          const cancelledQuestion = question?.status === 'cancelled' && safeResult.content === JSON.stringify({ requestId: question.requestId, status: 'cancelled' })
+          outcome = { status: safeResult.isError ? 'failed' : cancelledQuestion ? 'cancelled' : 'succeeded', effect: 'confirmed' }
+        }
+        else if (policy === 'local-mutation' && !this.toolReceipts.has(reviewDigest(call))) {
+          // Reserved mutation validation failed before its owned executor/commit callback.
+          outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
+        } else if (policy === 'command' && !this.toolReceipts.has(reviewDigest(call))) {
+          outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
+        } else if (policy === 'public-url') {
+          const row = this.safePublicUrlRows().find(item => publicUrlOutcomeMatchesCall(item, call))
+          if (row) outcome = cliPublicUrlRecordOutcome(row)
+          else if (!this.toolReceipts.has(reviewDigest(call))) outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
+        } else if (policy === 'mcp') {
+          const row = this.safeMcpRows().find(item => mcpOutcomeMatchesCall(item, call))
+          if (row) outcome = cliMcpRecordOutcome(row)
+        } else if (policy === 'extension') {
+          // A return confirms only executor completion, never claims inside its untrusted body.
+          outcome = { status: safeResult.isError ? 'failed' : 'succeeded', effect: 'unknown' }
+        }
+        if (outcome) this.observeToolReceipt(call, safeResult, outcome, sourceKind)
+        return safeResult
+      }
       const result = await runAgent({
         provider: guardedProvider, messages: this.current.history, context, getContextPrefix: getInstructionPrefix,
         tools: enableTools ? toolset.tools : [], signal: controller.signal,
@@ -2379,88 +2488,7 @@ export class CliHost {
           return queued
         },
         ...(this.options.maxRounds === undefined ? {} : { maxRounds: this.options.maxRounds }),
-        executeTool: async (call, context) => {
-          enteredToolCalls.add(reviewDigest(call))
-          context.signal.throwIfAborted()
-          const guarded = async (result: ToolResult, status: 'denied' | 'failed' | 'cancelled' = 'denied'): Promise<ToolResult> => {
-            const row = this.acceptedMcpRow(call)
-            if (row) {
-              this.mcpRows.set(row.id, { ...row, state: 'settled', result: structuredClone(result) })
-              try { await this.persistMcpOutcomes() } catch { /* No remote send was admitted. */ }
-            }
-            return this.observeToolReceipt(call, result, { status, effect: 'not_attempted' }, 'dispatcher')
-          }
-          if (taskMode === 'plan' && !allowedTools.has(call.name)) return guarded(planModeRefusal())
-          if (outcomeMcpNames.has(call.name)) enteredMcpCalls.add(mcpDigest(call))
-          if (isMcpTool(call.name) && mcpContainsSecret(call, this.options.secrets ?? [])) {
-            return guarded({ content: JSON.stringify({ success: false, source: 'mcp', untrusted: true, requestSent: false,
-              error: { code: 'mcp_credentials_blocked', message: 'MCP request contains a known credential; no remote request was sent' } }), isError: true })
-          }
-          if (call.name === QUESTION_TOOL_NAME && mcpContainsSecret(call.arguments, this.options.secrets ?? [])) {
-            return guarded({ content: JSON.stringify({ success: false, error: { code: 'question_credentials_blocked',
-              message: 'Question contains a known credential; no prompt was displayed' } }), isError: true })
-          }
-          if (skillsToolNames.has(call.name)) {
-            this.options.skills?.addSecrets(this.options.secrets ?? [])
-            if (memoryContextContainsSecret([skillContents, call.arguments], this.options.secrets ?? [])) {
-              return guarded({ content: JSON.stringify({ success: false, error: 'Skill operation contains a known credential; it was blocked' }), isError: true })
-            }
-          }
-          if (WORKSPACE_TOOL_NAMES.includes(call.name as typeof WORKSPACE_TOOL_NAMES[number]) && typeof call.arguments.path === 'string') {
-            try { this.projectInstructions.activate(call.arguments.path, call.name === 'workspace_read' || call.name === 'workspace_read_image') } catch { /* Mutation preflight reports bounded scope errors. */ }
-          }
-          let result = await toolset.executeTool(call, context.signal, {
-          enableNotes,
-          readSessionStatus: () => ({ provider: this.current.provider, model: this.current.model,
-            ...(this.current.reasoning === undefined ? {} : { reasoning: this.current.reasoning }),
-            taskMode: this.taskMode, approvalMode: this.approvalMode, context: this.contextUsage ?? null }),
-          readNotes: () => this.notes(),
-          commitNote: (key, value, revision) => this.commitNote(key, value, revision, context.signal),
-          reviewNote: (call, before, key, value, signal) => this.reviewNote(call, before, key, value, signal, controller.signal),
-          approve: (request, signal) => this.approveWithPresentation(request, signal)
-          })
-          if (skillsToolNames.has(call.name) && result.content.length > 64 * 1024) {
-            result = { content: JSON.stringify({ success: false, error: 'Skill response exceeds the CLI transcript limit; inspect the exact document with /skills or use a smaller text resource' }), isError: true }
-          }
-          const accepted = ownedMcpNames.has(call.name) ? this.acceptedMcpRow(call) : undefined
-          if (accepted?.state === 'accepted') {
-            let body: unknown
-            try { body = JSON.parse(result.content) } catch { /* Local diagnostics may be plain text. */ }
-            const safe = withholdMcpResult({ ...result, content: JSON.stringify({
-              ...(body && typeof body === 'object' && !Array.isArray(body) ? body : { success: false, error: { code: 'mcp_unavailable', message: 'The captured MCP request was unavailable' } }), requestSent: false
-            }) }, this.options.secrets ?? [])
-            this.mcpRows.set(accepted.id, { ...accepted, state: 'settled', result: safe })
-            try { await this.persistMcpOutcomes() } catch { /* Accepted evidence still proves no send. */ }
-            return this.observeToolReceipt(call, safe, cliMcpRecordOutcome(this.mcpRows.get(accepted.id)!), 'mcp')
-          }
-          const safeResult = isMcpTool(call.name) ? withholdMcpResult(result, this.options.secrets ?? []) : result
-          const policy = toolset.outcomePolicies.get(call.name)
-          let outcome: Pick<CliToolReceipt, 'status' | 'effect'> | undefined
-          let sourceKind: CliToolReceipt['sourceKind'] = policy === 'local-read' ? 'builtin-read' : policy ?? 'dispatcher'
-          if (policy === 'local-read') {
-            const question = call.name === QUESTION_TOOL_NAME ? questionResponses.get(call.id) : undefined
-            const cancelledQuestion = question?.status === 'cancelled' && safeResult.content === JSON.stringify({ requestId: question.requestId, status: 'cancelled' })
-            outcome = { status: safeResult.isError ? 'failed' : cancelledQuestion ? 'cancelled' : 'succeeded', effect: 'confirmed' }
-          }
-          else if (policy === 'local-mutation' && !this.toolReceipts.has(reviewDigest(call))) {
-            // Reserved mutation validation failed before its owned executor/commit callback.
-            outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
-          } else if (policy === 'command' && !this.toolReceipts.has(reviewDigest(call))) {
-            outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
-          } else if (policy === 'public-url') {
-            const row = this.safePublicUrlRows().find(item => publicUrlOutcomeMatchesCall(item, call))
-            if (row) outcome = cliPublicUrlRecordOutcome(row)
-            else if (!this.toolReceipts.has(reviewDigest(call))) outcome = { status: safeResult.isError ? 'failed' : 'unknown', effect: safeResult.isError ? 'not_attempted' : 'unknown' }
-          } else if (policy === 'mcp') {
-            const row = this.safeMcpRows().find(item => mcpOutcomeMatchesCall(item, call))
-            if (row) outcome = cliMcpRecordOutcome(row)
-          } else if (policy === 'extension') {
-            // A return confirms only executor completion, never claims inside its untrusted body.
-            outcome = { status: safeResult.isError ? 'failed' : 'succeeded', effect: 'unknown' }
-          }
-          if (outcome) this.observeToolReceipt(call, safeResult, outcome, sourceKind)
-          return safeResult
-        },
+        executeTool: executeGuarded,
         onAccepted: (update: AgentAcceptedUpdate) => {
           if (owner.state !== 'open' || this.activeTurn?.scope !== owner) return
           if (update.message.kind === 'tool_result' && update.message.images?.length) {
@@ -2571,6 +2599,7 @@ export class CliHost {
           return work
         }
       })
+      await Promise.allSettled(codeRuns)
       coreFailure = result.error
       acknowledgedEventError = result.error?.code === 'event_error' && eventFailures.length > 0
       // Await any in-flight atomic write, including a committed note whose result raced abort.
@@ -2587,6 +2616,22 @@ export class CliHost {
       const rawHistory = structuredClone(result.history)
       if (result.contextUsage) this.measuredContext = { ...result.contextUsage }
       let terminalHistory = this.reconcileMcpHistory(rawHistory)
+      // Core closes interrupted calls before the worker drain. Preserve only the
+      // matching current request's host-built read receipts in its closing result.
+      if (interruptedPrograms.size) {
+        let requests: readonly ToolCall[] = []
+        for (let index = this.presentationTurnStart; index < terminalHistory.length; index++) {
+          const message = terminalHistory[index]!
+          if (message.kind === 'assistant') requests = message.toolCalls
+          if (message.kind !== 'tool_result' || message.name !== 'code_mode') continue
+          const program = requests.find(call => call.id === message.callId && call.name === message.name)
+          const closed = program && interruptedPrograms.get(reviewDigest(program))
+          if (program && closed && !mcpContainsSecret(closed, this.options.secrets ?? [])) {
+            terminalHistory[index] = { kind: 'tool_result', name: program.name, callId: program.id, ...closed }
+            this.observeToolReceipt(program, closed, { status: 'cancelled', effect: 'confirmed' }, 'builtin-read')
+          }
+        }
+      }
       for (const call of acceptedToolCalls.values()) {
         const digest = reviewDigest(call)
         if (this.toolReceipts.has(digest) || enteredToolCalls.has(digest)) continue

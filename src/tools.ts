@@ -21,7 +21,7 @@ export function isBuiltinReadTool(name: string): boolean {
 export type CliToolOutcomePolicy = 'local-read' | 'local-mutation' | 'command' | 'public-url' | 'mcp' | 'extension'
 /** Closed inventory. Adding an advertised owned tool requires an explicit evidence policy. */
 export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
-  calculate: 'local-read', current_time: 'local-read', session_status: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
+  code_mode: 'local-read', calculate: 'local-read', current_time: 'local-read', session_status: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
   list_memories: 'local-read', create_memory: 'local-mutation', edit_memory: 'local-mutation', delete_memory: 'local-mutation',
   workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
   workspace_read_image: 'local-read',
@@ -94,7 +94,7 @@ export function createBuiltinToolset(enableNotes = false, extensions: readonly T
 } {
   if (taskMode !== 'execute' && taskMode !== 'plan') throw new Error('Unknown task mode')
   const scope = createExtensionScope({
-    reservedNames: ['session_status', 'current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
+    reservedNames: ['code_mode', 'session_status', 'current_time', 'note_read', 'note_set', 'list_memories', 'create_memory', 'edit_memory', 'delete_memory', ...WORKSPACE_TOOL_NAMES, ...WORKSPACE_MUTATION_TOOL_NAMES, 'list_skills', 'read_skill', 'save_skill', ...COMMAND_TOOL_NAMES,
       PUBLIC_URL_TOOL_NAME, 'web_search', QUESTION_TOOL_NAME, ...MCP_SETUP_TOOL_NAMES, 'list_mcp_resources', 'read_mcp_resource', 'read_mcp_resource_template', ...(mcp?.tools.map(tool => tool.definition.name) ?? [])]
   })
   // The trusted built-in memory pack is separate from caller extensions. Custom

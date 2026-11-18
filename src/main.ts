@@ -71,6 +71,7 @@ export interface CliOptions {
   workspace?: string
   stream: boolean
   tui: boolean
+  codeMode?: boolean
   enableNotes: boolean
   enableMemory: boolean
   /** Launch-only command proposal availability, never process execution authority. */
@@ -111,6 +112,7 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
+  --code-mode                 Enable JavaScript composition of workspace search and text reads
   --workspace PATH            Folder for reads and reviewed text edits (default: launch directory)
   --no-workspace              Disable workspace files for this launch
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state
@@ -212,6 +214,7 @@ export function parseArguments(args: readonly string[], env: NodeJS.ProcessEnv =
       }
       case '--resume': options.resume = value(); break
       case '--session-dir': options.sessionDirectory = value(); break
+      case '--code-mode': options.codeMode = true; break
       case '--workspace': explicitWorkspace = true; options.workspace = value(); break
       case '--no-workspace': noWorkspace = true; delete options.workspace; break
       case '--enable-commands': options.enableCommands = true; break
@@ -598,7 +601,7 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     } } : { provider: options.webProvider ?? 'direct' }
     if (web.provider === 'deepseek') io.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, images, imageCapability: metadata.vision ?? 'unknown', ...(metadata.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes,
+    host = new CliHost({ provider, images, imageCapability: metadata.vision ?? 'unknown', ...(metadata.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes, codeMode: options.codeMode === true,
       permissionApproval: { accountRevision: () => accountRevision, isAvailable: () => accountCurrent && io?.canAutoReview === true && !io.isClosed },
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       skillSaveApproval: { isAvailable: () => accountCurrent && options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
