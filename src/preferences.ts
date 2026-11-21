@@ -19,7 +19,7 @@ const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as 
 const preferenceKeys = ['schemaVersion', 'provider', 'model', 'reasoning',
   'reasoningCapabilities', 'stream', 'enableTools', 'enableNotes', 'enableMemory', 'maxRounds'] as const
 const optionalPreferenceKeys = ['enableMemory', 'webProvider', 'autoReviewThresholds', 'chatgptAccountId', 'mode', 'reviewer'] as const
-const allowedPreferenceKeys = [...preferenceKeys, 'webProvider', 'autoReviewThresholds', 'chatgptAccountId', 'mode', 'reviewer'] as const
+const allowedPreferenceKeys = [...preferenceKeys, 'codeMode', 'webProvider', 'autoReviewThresholds', 'chatgptAccountId', 'mode', 'reviewer'] as const
 
 /** Host preferences only. Credentials, transcripts, prompts and paths are never settings. */
 export interface TuiPreferences {
@@ -32,6 +32,8 @@ export interface TuiPreferences {
   reasoningCapabilities: ReasoningEffort[]
   stream: boolean
   enableTools: boolean
+  /** Interactive preference. Older settings leave Code Mode off. */
+  codeMode?: boolean
   /** Session-note launch intent; availability is separately gated by model tool support. */
   enableNotes: boolean
   /** Future launch default; persistent context is independent of model tool support. */
@@ -123,6 +125,11 @@ export function validatePreferences(value: unknown, secrets: readonly string[] =
     reasoningCapabilities: supported, stream: fields.stream, enableTools: fields.enableTools,
     enableNotes: fields.enableNotes, enableMemory: fields.enableMemory,
     maxRounds: fields.maxRounds as number
+  }
+  if (keys.includes('codeMode')) {
+    const descriptor = descriptors.codeMode
+    check(descriptor && descriptor.enumerable && 'value' in descriptor && typeof descriptor.value === 'boolean', 'invalid Code Mode toggle')
+    preferences.codeMode = descriptor.value
   }
   if (keys.includes('chatgptAccountId')) {
     const descriptor = descriptors.chatgptAccountId

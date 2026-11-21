@@ -18,6 +18,7 @@ export interface PublicUrlOutcomeRecord {
   readonly callId: string
   readonly toolName: string
   readonly callDigest: string
+  readonly codeModeParentDigest?: string
   /** Original exact-call hash bridges interrupted privacy-only identity rewrites. */
   readonly recoveryCallDigest?: string
   readonly webProvider?: 'deepseek'
@@ -48,7 +49,8 @@ export function validatePublicUrlOutcomes(sessionId: string, value: unknown): Pu
   const ids = new Set<string>(), calls = new Set<string>(), digests = new Map<string, string>()
   for (const record of value as PublicUrlOutcomeRecord[]) {
     check(record && !Array.isArray(record) && typeof record === 'object')
-    check(Object.keys(record).every(key => ['id', 'sessionId', 'runId', 'callId', 'toolName', 'callDigest', 'recoveryCallDigest', 'webProvider', 'bindingDigest', 'state', 'result'].includes(key)))
+    check(Object.keys(record).every(key => ['id', 'sessionId', 'runId', 'callId', 'toolName', 'callDigest', 'codeModeParentDigest', 'recoveryCallDigest', 'webProvider', 'bindingDigest', 'state', 'result'].includes(key)))
+    if (Object.hasOwn(record, 'codeModeParentDigest')) check(digest(record.codeModeParentDigest))
     check(uuid(record.id) && record.sessionId === sessionId && uuid(record.runId))
     check(typeof record.callId === 'string' && record.callId.length > 0 && record.callId.length <= 200)
     check(typeof record.toolName === 'string' && (record.toolName === 'fetch_url' || record.toolName === 'web_search' || /^public_url_withheld_[a-z0-9]+$/.test(record.toolName)))
@@ -73,8 +75,8 @@ export function validatePublicUrlOutcomes(sessionId: string, value: unknown): Pu
 }
 export function publicUrlOutcomeMatchesCall(record: PublicUrlOutcomeRecord, call: ToolCall): boolean {
   const exact = mcpDigest(call)
-  return record.callId === call.id && record.toolName === call.name && record.callDigest === exact ||
-    record.recoveryCallDigest === exact
+  return !record.codeModeParentDigest && (record.callId === call.id && record.toolName === call.name && record.callDigest === exact ||
+    record.recoveryCallDigest === exact)
 }
 export function publicUrlOutcomeResult(record: PublicUrlOutcomeRecord): ToolResult {
   if (record.result) return record.result

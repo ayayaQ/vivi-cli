@@ -595,6 +595,36 @@ test('memory can be enabled or disabled before model setup without reading or cr
   assert.match(io.output, /Choose a model.*before listing or changing/)
 })
 
+test('Code Mode menu changes the live tool catalog and saves the choice across conversations and launches', async t => {
+  const directory = await fixture(t), services = fakeServices(), store = new PreferenceStore(directory)
+  await store.save(base)
+  const seen = []
+  const factory = () => ({ async generate({ tools }) {
+    seen.push(tools.some(tool => tool.name === 'code_mode'))
+    return answer('Done')
+  } })
+  const first = fakeIO(['/code-mode', true], [], ['Before', '/menu', 'After', '/new', 'New conversation', '/exit'])
+  assert.equal(await run(directory, first, services, factory, ['--tools']), 0)
+  assert.deepEqual(seen.splice(0), [false, true, true])
+  assert.equal(first.choices[0].values.find(choice => choice.value === '/code-mode').description, 'Off')
+  assert.deepEqual(await store.load(), { ...base, codeMode: true })
+
+  const chatOnly = fakeIO([], [], ['/session', 'Hello', '/exit'])
+  assert.equal(await run(directory, chatOnly, services, factory, ['--no-tools']), 0)
+  assert.deepEqual(seen.splice(0), [false])
+  assert.match(chatOnly.output, /Code Mode: On · tools unavailable for this model/)
+
+  const second = fakeIO(['/code-mode', undefined, '/code-mode', false], [], ['/menu', 'After cancel', '/menu', 'After disable', '/exit'])
+  assert.equal(await run(directory, second, services, factory, ['--tools']), 0)
+  assert.deepEqual(seen.splice(0), [true, false])
+  assert.equal(second.choices[0].values.find(choice => choice.value === '/code-mode').description, 'On')
+  assert.deepEqual(await store.load(), { ...base, codeMode: false })
+
+  const flagged = fakeIO([false], [], ['Flag override', '/code-mode', 'After disable', '/exit'])
+  assert.equal(await run(directory, flagged, services, factory, ['--tools', '--code-mode']), 0)
+  assert.deepEqual(seen, [true, false])
+})
+
 test('unknown saved and resumed models omit tools without a current declaration while memory context stays enabled', async t => {
   const directory = await fixture(t), services = fakeServices()
   await new PreferenceStore(directory).save({ ...base, enableTools: true, enableMemory: true })

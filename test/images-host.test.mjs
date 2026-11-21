@@ -38,6 +38,22 @@ function hostFor(f, provider, options = {}) {
   return new CliHost({ ...f, provider, imageCapability: 'supported', approve: async () => false, ...options })
 }
 
+test('Code Mode attaches a child image to its parent observation and preserves the snapshot', async t => {
+  const f = await setup(t)
+  let round = 0
+  const host = hostFor(f, providerFor(f.images, async input => {
+    if (++round === 1) return { content: '', toolCalls: [{ id:'parent', name:'code_mode',
+      arguments:{ code:'return (await tools.workspace_read_image({path:"image.png"})).width' } }] }
+    const result = input.messages.find(message => message.kind === 'tool_result')
+    assert.equal(JSON.parse(result.content).value, 1)
+    assert.deepEqual(Buffer.from(f.images.resolve(result.images[0])), pixels)
+    return { content:'Done', toolCalls:[] }
+  }), { codeMode:true })
+  t.after(() => host.shutdown())
+  assert.equal((await host.send('Inspect image.png')).status, 'completed')
+  assert.equal((await f.store.load(host.session.id)).history.find(message => message.kind === 'tool_result').images.length, 1)
+})
+
 test('mentioning an image path remains text and does not read or snapshot a file', async t => {
   const f = await setup(t)
   const host = hostFor(f, providerFor(f.images, async input => {

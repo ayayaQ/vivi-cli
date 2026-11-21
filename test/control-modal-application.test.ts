@@ -61,6 +61,9 @@ test('Ctrl+P opens real settings subviews, returns to filtered commands and leav
     expect(transcript.getChildren().length).toBe(initial)
     setup.mockInput.pressEscape(); await waitFor('Commands')
     expect((node('vivi-control-query') as TextareaRenderable).plainText).toBe('context')
+    await search('code mode'); await waitFor('Settings / Code Mode · saved for future launches')
+    expect(setup.captureCharFrame()).toContain('On')
+    setup.mockInput.pressEscape(); await waitFor('Commands')
     await search('session'); await waitFor('Settings / Session')
     expect(setup.captureCharFrame()).toContain('Workspace')
     setup.mockInput.pressEscape(); await waitFor('Commands')
@@ -118,7 +121,7 @@ test('direct slash commands and footer shortcuts share modal settings, preserve 
     await idle()
     const transcript = node('vivi-transcript'), initial = transcript.getChildren().length
     for (const [slash, heading] of [['/provider', 'Provider'], ['/models', 'Models ·'], ['/effort', 'Reasoning effort'],
-      ['/notes', 'Session notes'], ['/web', 'Web provider'], ['/account', 'ChatGPT account controls']]) {
+      ['/notes', 'Session notes'], ['/code-mode', 'Code Mode'], ['/web', 'Web provider'], ['/account', 'ChatGPT account controls']]) {
       await command(slash!); await modal(heading!); await cancel()
       expect(transcript.getChildren().length).toBe(initial)
     }

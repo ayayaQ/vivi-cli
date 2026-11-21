@@ -114,6 +114,7 @@ Shift+Tab cycles Manual / Auto review / Skip permissions / Plan in the idle comp
 /processes lists background jobs; logs ID, stop ID, restart ID and stop-all manage them. F6 stops the selected job; F7 stops all, even while working or in a dialog.
 /commands proposes workspace commands by default; every exact unsandboxed command needs fresh human approval in Manual/Auto; explicitly enrolled Skip permissions skips ordinary prompts. /commands off disables proposals; /commands on restores them.
 /skills lists and inspects standard skills and prepares creator drafts for human-reviewed saving.
+/code-mode lets you turn JavaScript tool queries on or off and saves your choice for future interactive launches.
 /instructions status|reload|disable manages launch-local AGENTS.md guidance.
 /mcp manages trusted installed server connections; each launch starts disabled. Remote tool calls/resources need human approval in Manual/Auto; enrolled Skip applies only to already-connected servers.
 MCP sign-in can be saved securely and refreshed before an approved Connect. Disconnect retains it; Sign out forgets saved tokens locally. Session-only sign-in is an explicit choice.
@@ -210,6 +211,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   // App-wide consent belongs to the launch, not to a model's session settings.
   let activeMemory = args.includes('--enable-memory') || args.includes('--disable-memory')
     ? options.enableMemory : settings.enableMemory
+  let activeCodeMode = options.codeMode ?? settings.codeMode ?? false
   if ((options.provider !== undefined && options.provider !== settings.provider) ||
     (options.model !== undefined && options.model !== settings.model)) {
     settings = { ...settings, reasoning: 'default', reasoningCapabilities: [], enableTools: false }
@@ -254,6 +256,11 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
   let launchModePending = args.includes('--approval-mode')
   let preferredMode = args.includes('--approval-mode') ? options.approvalMode : settings.mode ?? 'manual'
   let activeSettings: TuiPreferences | undefined
+  const codeModeStatus = (): string => {
+    if (!activeCodeMode) return 'Off'
+    if (!host) return 'On · choose a tool-capable model'
+    return activeSettings?.enableTools ? 'On' : 'On · tools unavailable for this model'
+  }
   let release: (() => Promise<void>) | undefined
   let candidate: { host?: CliHost; release: () => Promise<void>; shutdownConfirmed?: boolean; releaseFailed?: boolean } | undefined
   let sessionCleanupFailed = false
@@ -472,6 +479,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
     const defaults = { ...next, ...(settings.webProvider ? { webProvider: settings.webProvider } : {}), enableNotes: changed.notes ? next.enableNotes : settings.enableNotes,
       enableMemory: changed.memory ? next.enableMemory : settings.enableMemory }
     if (settings.autoReviewThresholds) defaults.autoReviewThresholds = settings.autoReviewThresholds
+    if (settings.codeMode !== undefined) defaults.codeMode = settings.codeMode
     if (settings.mode) defaults.mode = settings.mode
     if (settings.reviewer) defaults.reviewer = settings.reviewer
     await preferences.save(defaults); settings = defaults
@@ -861,7 +869,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
       if (io.isClosed) { await discardCandidate(); return false }
       nextHost = new CliHost({ provider, images, imageCapability: metadata?.vision ?? 'unknown', ...(metadata?.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(knownModels.get(modelKey(session.provider, session.model, session.chatgptAccountId)) ??
         (session.provider === 'openai' ? documentedOpenAIModel(session.model) : undefined)), mcp, mcpSetup, onMcpNotice: message => io.write(`${message}\n`), onConversationNotice: message => io.write(`${message}\n`), enableTools: effective.enableTools,
-        enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
+        codeMode: activeCodeMode, enableNotes: effective.enableNotes, enableCommands: activeCommands, enableMemory: activeMemory, memory, enableSkills: activeSkills, skills,
         permissionApproval: { accountRevision: () => accountGeneration, isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed },
         skillSaveApproval: { isAvailable: () => accountAvailable() && io.canAutoReview === true && !io.isClosed, accountRevision: () => accountGeneration },
         onSkillsNotice: message => io.write(`${message}\n`), ...(workspace ? { workspace } : {}), maxRounds: effective.maxRounds,
@@ -1013,6 +1021,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
           ...(host?.canCompact ? [{ name: 'Compact context', description: 'Summarize older provider context; retain the full transcript', value: '/compact' }] : []),
           { name: 'Mode', description: 'Manual / Auto review / Skip permissions / Plan', value: '/mode' },
           { name: 'Trusted commands', value: '/commands' },
+          { name: 'Code Mode', description: codeModeStatus(), value: '/code-mode' },
           { name: 'Background processes', value: '/processes' },
           { name: 'Session notes', description: 'Default for new conversations', value: '/notes' },
           { name: 'Persistent memories', description: 'This launch and future-launch default', value: '/memories' },
@@ -1024,7 +1033,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         const sections = [
           { name: 'Models & providers', commands: ['/models', '/effort', '/provider', '/account', '/usage', '/web'] },
           { name: 'Conversation', commands: ['/new', '/resume', '/rename', '/session', '/context', '/compact'] },
-          { name: 'Tools & context', commands: ['/instructions', '/skills', '/memories', '/notes', '/mcp', '/processes'] },
+          { name: 'Tools & context', commands: ['/code-mode', '/instructions', '/skills', '/memories', '/notes', '/mcp', '/processes'] },
           { name: 'Permissions', commands: ['/mode', '/reviewer', '/auto-threshold', '/commands'] },
           { name: 'Application', commands: ['/help', '/exit'] }
         ]
@@ -1088,6 +1097,21 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
         if (command === '/models') { const model = await chooseModel(hostAccountGeneration === accountGeneration ? activeSettings ?? settings : settings); if (model) { await save(model); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/effort') { const effort = await chooseEffort(io, hostAccountGeneration === accountGeneration ? activeSettings ?? settings : settings); if (effort) { await save(effort); selected = { fresh: true, preservePlan: true } }; continue }
         if (command === '/notes') { await configureNotes(); continue }
+        if (command === '/code-mode') {
+          const enabled = await io.choose('Code Mode · saved for future launches', [
+            { name: 'Off', description: 'Remove code_mode from the model’s tools', value: false },
+            { name: 'On', description: 'Let JavaScript queries call the tools available on this turn', value: true }
+          ], activeCodeMode ? 1 : 0)
+          if (enabled === undefined || io.isClosed) continue
+          host?.setCodeModeEnabled(enabled)
+          activeCodeMode = enabled
+          io.setContext?.(undefined, false)
+          io.write(`Code Mode: ${codeModeStatus()}\n`)
+          const stored = await preferences.load() ?? DEFAULT_PREFERENCES
+          await preferences.save({ ...stored, codeMode: enabled })
+          settings = { ...settings, codeMode: enabled }
+          continue
+        }
         if (/^\/instructions(?:\s|$)/.test(command)) {
           if (!host) { io.write('Choose a model before inspecting project instructions\n'); continue }
           try { await runInstructionsCommand(host, io, command) } finally { host.invalidateContext(); io.setContext?.(undefined, false) }
@@ -1180,6 +1204,7 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
             : 'Fresh conversation has no saved session until a model is selected\n')
           write(workspace ? `Workspace: ${JSON.stringify(workspace.directory)} · reads and reviewed text edits for this launch\n` : 'Workspace: disabled\n')
           if (session) write(`Provider: ${session.provider}\nModel: ${session.model}\nReasoning: ${session.reasoning ?? 'default'}\n`)
+          write(`Code Mode: ${codeModeStatus()}\n`)
           if (session?.provider === 'chatgpt') {
             const account = (await chatgptAuth.listAccounts()).find(account => account.id === session.chatgptAccountId)
             if (account) write(chatGptPlanStatus(account))

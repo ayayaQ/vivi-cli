@@ -82,6 +82,42 @@ async function fixture(t, input = {}) {
 
 function resultOf(result, name = alias) { return result.history.find(message => message.kind === 'tool_result' && message.name === name) }
 
+test('cold recovery binds interrupted remote effects to the exact Code Mode script', async t => {
+  const session = newSession({provider:'openai', model:'fixture'})
+  const parent = call('code_mode', {code:'return await tools.remote({})'})
+  session.history.push({kind:'message', role:'user', content:'Run the query'},
+    {kind:'assistant', content:'', toolCalls:[parent]})
+  const child = call(alias, {query:'ordinary'})
+  const row = {id:randomUUID(), sessionId:session.id, runId:randomUUID(), callId:child.id, toolName:child.name,
+    bindingDigest:mcpDigest(child), callDigest:mcpDigest(child), codeModeParentDigest:mcpDigest(parent), state:'intent'}
+  const unrelated = {...row, id:randomUUID(), callId:'different', callDigest:mcpDigest({...child,id:'different'}),
+    codeModeParentDigest:mcpDigest({...parent,arguments:{code:'return 1'}})}
+  const host = await CliHost.resume({id:session.id, store:{async load(){return session},async save(){}},
+    mcpOutcomes:{async load(){return [row,unrelated]},async save(){}},provider:{async generate(){assert.fail('Never replay a child')}}})
+  t.after(() => host.shutdown())
+  const result = JSON.parse(host.session.history.at(-1).content)
+  assert.deepEqual(result.calls.map(item => [item.id,item.status,item.effect]), [[child.id,'unknown','unknown']])
+})
+
+for (const allow of [true, false]) test('Code Mode routes a connected MCP tool through its exact review: ' + allow, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-code-mcp-'))
+  t.after(() => rm(directory, {recursive:true, force:true}))
+  const store = new FileSessionStore(directory)
+  const code = 'return await tools[' + JSON.stringify(alias) + ']({query:"nested"})'
+  const approvals = []
+  const f = await fixture(t, { options: { codeMode:true, store, approve: async request => { approvals.push(request); return allow } },
+    generate(_input, subject) { return subject.state.generations === 1 ? answer('', [call('code_mode', {code})]) : answer() } })
+  const result = await f.host.send('Query the connected fixture')
+  const data = JSON.parse(resultOf(result, 'code_mode').content)
+  assert.equal(approvals.length, 1)
+  assert(approvals[0].description.includes(code))
+  assert.equal(f.invocations().length, allow ? 1 : 0)
+  assert.equal(data.success, allow)
+  assert.equal(data.calls[0].name, alias)
+  assert.equal(data.calls[0].status, allow ? 'succeeded' : 'denied')
+  assert.deepEqual(await f.options.mcpOutcomes.load(f.host.session.id), [])
+})
+
 test('local captured MCP resource metadata has exact live, final and cold-resume read receipts without a remote operation', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-local-read-receipt-')), store = new FileSessionStore(directory)
   t.after(() => rm(directory, { recursive: true, force: true }))

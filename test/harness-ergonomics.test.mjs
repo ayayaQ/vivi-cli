@@ -49,7 +49,7 @@ for (const mode of ['manual', 'auto', 'skip', 'plan']) {
   test(`session_status reads actual host state in ${mode} without approvals, notes or extra provider requests`, async t => {
     let rounds = 0
     const session = newSession({ provider: 'openai', model: 'fixture', reasoning: 'high' })
-    const host = new CliHost({ session, store: { async save() {} }, enableNotes: false,
+    const host = new CliHost({ session, store: { async save() {} }, enableNotes: false, codeMode: mode === 'plan',
       permissionApproval: { isAvailable: () => true, accountRevision: () => 'account' },
       decisionReview: { canAutoReview: true, accountRevision: () => 'account', isAvailable: () => true,
         provider: { id: 'openai', model: 'reviewer', evaluate: async () => assert.fail('Status must never use a reviewer') }, ledger: { async upsert() {} } },
@@ -68,7 +68,8 @@ for (const mode of ['manual', 'auto', 'skip', 'plan']) {
     assert.equal(data.taskMode, mode === 'plan' ? 'plan' : 'execute')
     assert.equal(data.approvalMode, mode === 'plan' ? 'manual' : mode)
     assert(data.context === null || typeof data.context.inputTokens === 'number')
-    assert.equal(rounds, 2); assert.deepEqual(Object.keys(data).sort(), ['approvalMode', 'context', 'model', 'provider', 'reasoning', 'taskMode'])
+    assert.equal(data.codeMode, mode === 'plan')
+    assert.equal(rounds, 2); assert.deepEqual(Object.keys(data).sort(), ['approvalMode', 'codeMode', 'context', 'model', 'provider', 'reasoning', 'taskMode'])
   })
 }
 

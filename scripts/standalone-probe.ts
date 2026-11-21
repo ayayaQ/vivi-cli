@@ -18,6 +18,7 @@ import { FileMemoryStore } from '../src/memory.js'
 import { FileSessionStore } from '../src/session.js'
 import { FileCliConversationStore, replayCliConversationDocument } from '../src/conversation-records.js'
 import { CliHost } from '../src/host.js'
+import { codeModeTool } from '../src/code-mode.js'
 import type { CliHostOptions } from '../src/host.js'
 import type { CliQuestionHost } from '../src/questions.js'
 import { createQuestionExtension, QUESTION_LIMITS } from '@ayayaq/vivi/extensions/questions'
@@ -71,6 +72,13 @@ const mcp = new McpManager({ store: new McpConfigStore(directory), env: {}, tran
   return transport
 } })
 try {
+  {
+    const tool = codeModeTool(async () => ({ content: '{"content":"compiled worker"}' }), () => [], () => {})
+    const result = await tool.execute({ name: 'code_mode', id: 'compiled-code', arguments: {
+      code: 'return (await tools.workspace_read({path:"fixture"})).content'
+    } }, { signal: new AbortController().signal })
+    assert.equal(JSON.parse(result.content).value, 'compiled worker', result.content)
+  }
   {
     // Real compiled consumer of the published renderer-neutral question API.
     const option: QuestionOption = { id: 'short', label: 'Short', description: 'Concise' }

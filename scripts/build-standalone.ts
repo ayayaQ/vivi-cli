@@ -6,7 +6,7 @@ import { join } from 'node:path'
 // Build only the current platform. Cross-target claims require testing on each target.
 await mkdir(new URL('../build/', import.meta.url), { recursive: true })
 const result = await Bun.build({
-  entrypoints: [fileURLToPath(new URL('../dist/launcher.js', import.meta.url))],
+  entrypoints: ['launcher.js', 'code-mode-guest.js'].map(file => fileURLToPath(new URL('../dist/' + file, import.meta.url))),
   compile: { outfile: fileURLToPath(new URL(`../build/vivi${process.platform === 'win32' ? '.exe' : ''}`, import.meta.url)) },
   ...(process.platform === 'linux' ? { define: { 'process.env.OPENTUI_LIBC': JSON.stringify(process.env.OPENTUI_LIBC === 'musl' ? 'musl' : 'glibc') } } : {})
 })
