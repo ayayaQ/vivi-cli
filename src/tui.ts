@@ -120,6 +120,7 @@ export const SLASH_COMMANDS = [
   { command: '/compact', description: 'Compact the provider context; retain the full transcript' },
   { command: '/context', description: 'Show context capacity and output reserve' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
+  { command: '/code-mode', description: 'Turn JavaScript tool queries on or off' },
   { command: '/processes', description: 'List, inspect or stop background jobs' },
   { command: '/instructions', description: 'Inspect, reload or disable project guidance' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
@@ -134,7 +135,7 @@ export type SlashCommand = typeof SLASH_COMMANDS[number]
 
 /** Complete only the whole, first slash token. Ordinary text and arguments are untouched. */
 export function getSlashCommandCompletions(input: string, canCompact = true): readonly SlashCommand[] {
-  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact))
+  return /^\/[a-z-]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact))
     .sort((a, b) => Number(b.command === input) - Number(a.command === input)) : []
 }
 

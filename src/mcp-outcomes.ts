@@ -18,6 +18,7 @@ export interface McpOutcomeRecord {
   readonly callId: string
   readonly toolName: string
   readonly callDigest: string
+  readonly codeModeParentDigest?: string
   /** Original exact-call hash bridges interrupted privacy-only identity rewrites. */
   readonly recoveryCallDigest?: string
   readonly bindingDigest: string
@@ -47,7 +48,8 @@ export function validateMcpOutcomes(sessionId: string, value: unknown): McpOutco
   const ids = new Set<string>(), calls = new Set<string>(), digests = new Map<string, string>()
   for (const record of value as McpOutcomeRecord[]) {
     check(record && !Array.isArray(record) && typeof record === 'object')
-    check(Object.keys(record).every(key => ['id', 'sessionId', 'runId', 'callId', 'toolName', 'callDigest', 'recoveryCallDigest', 'bindingDigest', 'state', 'result'].includes(key)))
+    check(Object.keys(record).every(key => ['id', 'sessionId', 'runId', 'callId', 'toolName', 'callDigest', 'codeModeParentDigest', 'recoveryCallDigest', 'bindingDigest', 'state', 'result'].includes(key)))
+    if (Object.hasOwn(record, 'codeModeParentDigest')) check(digest(record.codeModeParentDigest))
     check(uuid(record.id) && record.sessionId === sessionId && uuid(record.runId))
     check(typeof record.callId === 'string' && record.callId.length > 0 && record.callId.length <= 200)
     check(typeof record.toolName === 'string' && record.toolName.length > 0 && record.toolName.length <= 200)
@@ -70,8 +72,8 @@ export function validateMcpOutcomes(sessionId: string, value: unknown): McpOutco
 }
 export function mcpOutcomeMatchesCall(record: McpOutcomeRecord, call: ToolCall): boolean {
   const exact = mcpDigest(call)
-  return record.callId === call.id && record.toolName === call.name && record.callDigest === exact ||
-    record.recoveryCallDigest === exact
+  return !record.codeModeParentDigest && (record.callId === call.id && record.toolName === call.name && record.callDigest === exact ||
+    record.recoveryCallDigest === exact)
 }
 export function mcpOutcomeResult(record: McpOutcomeRecord): ToolResult {
   if (!record.result && record.toolName === 'mcp_setup') return record.state === 'accepted'

@@ -30,6 +30,20 @@ async function fixture(t, input = {}) {
   t.after(async () => { await host.shutdown(); await rm(root, { recursive: true, force: true }) })
   return { root, host, options, commandWorkspace, state, approvals }
 }
+test('Code Mode submits a command with argv through its normal human approval', async t => {
+  const code = 'return await tools.command_start(' + JSON.stringify({ executable: process.execPath,
+    args: ['-e', 'console.log("code-mode-command")'], yieldMs: 2000 }) + ')'
+  const subject = await fixture(t, { options: { codeMode: true }, generate({state}) {
+    return { content: '', toolCalls: state.rounds === 1 ? [{id:'parent', name:'code_mode', arguments:{code}}] : [] }
+  } })
+  const result = await subject.host.send('Run the fixture')
+  const body = JSON.parse(result.history.find(message => message.kind === 'tool_result').content)
+  assert.equal(subject.approvals.length, 1)
+  assert(subject.approvals[0].description.includes(code))
+  assert.equal(subject.approvals[0].call.name, 'command_start')
+  assert.equal(body.calls[0].status, 'succeeded')
+  assert.match(JSON.stringify(body.value), /code-mode-command/)
+})
 test('host advertises command proposals from startup but a model cannot grant execution authority', async t => {
   const subject = await fixture(t, { generate({ tools, state }) {
     assert(tools.some(tool => COMMAND_TOOL_NAMES.includes(tool.name)))

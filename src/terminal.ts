@@ -242,7 +242,7 @@ export async function runCommandControl(host: CliHost, io: ChatIO, line: string)
 
 /** Brief host-authored explanation for the active reviewer. */
 export function autoReviewDisclosure(provider: 'openai' | 'openrouter', deepSeekWeb = false): string {
-  return `${provider === 'openai' ? 'OpenAI reviews' : 'OpenRouter and TypeSafe review'} eligible actions automatically; extra API charges may apply.${deepSeekWeb ? ' DeepSeek web requests are billed separately.' : ''}`
+  return `${provider === 'openai' ? 'OpenAI reviews' : 'OpenRouter and TypeSafe review'} eligible actions automatically; extra API charges may apply. Code Mode shares scripts and diffs.${deepSeekWeb ? ' DeepSeek web requests are billed separately.' : ''}`
 }
 
 type ModeChooser = (title: string, choices: readonly { name: string; description: string; value: ConversationMode }[], initialIndex: number) => Promise<ConversationMode | undefined>

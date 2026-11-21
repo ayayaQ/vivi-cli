@@ -112,7 +112,7 @@ Usage: vivi --provider openai|openrouter|deepseek|chatgpt --model MODEL [options
   --new                       Start a new session (the default)
   --resume UUID               Resume a local session with its original provider/model
   --session-dir PATH          Private session directory (default ~/.vivi/sessions)
-  --code-mode                 Enable JavaScript composition of workspace search and text reads
+  --code-mode                 Let JavaScript queries call this turn's enabled tools
   --workspace PATH            Folder for reads and reviewed text edits (default: launch directory)
   --no-workspace              Disable workspace files for this launch
   --diagnose-input            Offline full-screen Enter modifier probe; no provider or saved state

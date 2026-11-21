@@ -21,7 +21,7 @@ export function isBuiltinReadTool(name: string): boolean {
 export type CliToolOutcomePolicy = 'local-read' | 'local-mutation' | 'command' | 'public-url' | 'mcp' | 'extension'
 /** Closed inventory. Adding an advertised owned tool requires an explicit evidence policy. */
 export const BUILTIN_TOOL_OUTCOME_POLICIES = Object.freeze({
-  code_mode: 'local-read', calculate: 'local-read', current_time: 'local-read', session_status: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
+  code_mode: 'local-mutation', calculate: 'local-read', current_time: 'local-read', session_status: 'local-read', note_read: 'local-read', note_set: 'local-mutation',
   list_memories: 'local-read', create_memory: 'local-mutation', edit_memory: 'local-mutation', delete_memory: 'local-mutation',
   workspace_list: 'local-read', workspace_read: 'local-read', workspace_search: 'local-read', workspace_glob: 'local-read',
   workspace_read_image: 'local-read',
@@ -44,6 +44,7 @@ export interface SessionStatusSnapshot {
   reasoning?: string
   taskMode: TaskMode
   approvalMode: 'manual' | 'auto' | 'skip'
+  codeMode: boolean
   context: ContextUsage | null
 }
 export interface ApprovalRequest {
@@ -68,7 +69,7 @@ const objectSchema = (properties: Record<string, unknown>, required: string[]): 
 
 function hostTools(enableNotes = false): ToolDefinition[] {
   const tools: ToolDefinition[] = [
-    { name: 'session_status', description: 'Read current host-owned provider, model, reasoning, task mode, approval mode and effective request context usage. Null context means not measured; estimated usage is labelled. A context window with limitSource.kind host is a local working budget, not confirmed provider capacity. Read only; does not grant permission or change settings.',
+    { name: 'session_status', description: 'Read current host-owned provider, model, reasoning, task mode, approval mode, Code Mode availability and effective request context usage. codeMode is true when this turn includes the code_mode JavaScript tool. Null context means not measured; estimated usage is labelled. A context window with limitSource.kind host is a local working budget, not confirmed provider capacity. Read only; does not grant permission or change settings.',
       parameters: objectSchema({}, []) },
     { name: 'current_time', description: 'Return the current time in a requested IANA timezone, default UTC.',
       parameters: objectSchema({ timezone: { type: 'string', maxLength: 100 } }, []) }

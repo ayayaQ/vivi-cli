@@ -36,7 +36,7 @@ async function fixture(t, config = {}) {
       await config.onOutcomeSave?.({ host, options: hostOptions, rows, guard: options?.assertCurrent, fileOutcomes })
       await fileOutcomes.save(id, rows, options)
     } }
-  const hostOptions = { store, session: newSession({ provider: 'openai', model: 'fixture-model' }), secrets,
+  const hostOptions = { store, session: newSession({ provider: 'openai', model: 'fixture-model' }), secrets, codeMode: config.codeMode,
     publicUrlOutcomes: config.noOutcome ? undefined : outcomeStore,
     publicUrlTransport: { async resolve(hostname, signal, guard) {
       guard(); resolves.push(hostname); events.push('resolve')
@@ -70,6 +70,19 @@ async function fixture(t, config = {}) {
   return { root, host, options: hostOptions, secrets, reviews, humans, records, sends, resolves, saves, events, store, fileOutcomes }
 }
 const resultBody = result => JSON.parse(result.history.find(message => message.kind === 'tool_result').content)
+
+test('a nested fetch gets one review of the script and exact request and retires its durable intent', async t => {
+  const code = 'return (await tools.fetch_url({url:' + JSON.stringify(url) + '})).success'
+  const f = await fixture(t, {codeMode:true, auto:true, generate(_input, round) {
+    return {content:'', toolCalls: round === 1 ? [{id:'parent', name:'code_mode', arguments:{code}}] : []}
+  }})
+  const result = resultBody(await f.host.send('Fetch ' + url))
+  assert.equal(f.reviews.length, 1)
+  assert.equal(f.reviews[0].snapshot.inputData.codeModeScript, code)
+  assert.equal(result.value, true)
+  assert.equal(f.sends.length, 1)
+  assert.deepEqual(await f.fileOutcomes.load(f.host.session.id), [])
+})
 
 test('actual host advertises one fixed URL-only tool and reserves it from caller extensions', async t => {
   const subject = await fixture(t, { inspectTools(tools) {

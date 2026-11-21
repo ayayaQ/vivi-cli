@@ -641,11 +641,19 @@ Uncertain, malformed, failed, stale or over-budget reviews use the ordinary
 human approval path; cancelled reviews cannot commit. The UI reports review
 progress and settled outcomes without exposing model reasoning or credentials.
 
+## Code Mode
+
+Open **/menu → Tools & context → Code Mode** or type `/code-mode` to turn JavaScript tool queries on or off. The choice applies to the next message and is saved for future interactive launches. Code Mode starts off on a fresh install. The `--code-mode` flag enables it for one launch. The model can check availability with `session_status`.
+
+`Object.keys(tools)` lists the other tools advertised for the current turn. Execute can include connected MCP tools, trusted commands, and installed extensions. Plan has its usual local tools. The runner also works without a selected workspace. Embedders can set `codeMode: true` on `CliHost`.
+
+A script calls `await tools[name](args)` with the same arguments as a direct call. Results are parsed JSON or plain text. Tool errors reject the call. Image observations are attached to a successful parent result. Each query gets a fresh QuickJS worker with an 8 MiB heap, 10 seconds of active script time, eight calls, and four in flight. Source and returned JSON are each limited to 8 KiB. Host tool waits pause the script clock. Each tool retains its own timeout and approval rules.
+
+Workspace text creates and edits return `{staged:true}`. Stage one change per file in each batch. Workspace list, glob, search, and text reads see the on-disk contents. Vivi reviews pending changes together before another kind of tool runs or the script returns successfully. For example, a command that runs tests after a staged edit sees the approved file contents. The command still goes through its own permission check.
+
+The result records workspace reads in `reads`, staged edits in `writes`, and other tool calls in `calls`. Each has a child ID and an outcome. Earlier effects can persist if a later call fails or the script is cancelled. Inspect those receipts before retrying.
+
 ## Workspace tools
-
-Pass `--code-mode` to let the model combine workspace searches and text reads in one tool call. This launch option works in Plan and Execute when a workspace and model tools are enabled. Embedders can set `codeMode: true` on `CliHost`.
-
-A script can await `tools.workspace_search(args)` and `tools.workspace_read(args)`, filter their JSON results, and return a value. Each call gets a fresh QuickJS worker with an 8 MiB guest heap, a 10-second deadline, up to eight reads and four in flight. Source and returned JSON are each limited to 8 KiB. The parent result records child tool names, IDs, argument digests and outcomes. Intermediate file contents stay out of the provider transcript unless the script returns them.
 
 The CLI uses the current working directory where you launch vivi as its selected
 workspace. Use `--workspace PATH` to choose another folder, or `--no-workspace` to
