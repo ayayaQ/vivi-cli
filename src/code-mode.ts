@@ -18,6 +18,36 @@ type ReadReceipt = { id: string; name: string; argumentsDigest: string; path?: s
 export function codeModeContainsSecret(value: unknown, secrets: readonly string[]): boolean {
   return mcpContainsSecret(value, secrets) || publicUrlContainsSecret(value, secrets)
 }
+/** The guest owns value only. Privacy withholding never treats it as host evidence. */
+export function withholdCodeModeResult(result: ToolResult, secrets: readonly string[], valueWithheld = false): ToolResult {
+  if (!valueWithheld && !codeModeContainsSecret(result, secrets)) return result
+  let body: Record<string, unknown> = {}
+  try {
+    const parsed = JSON.parse(result.content)
+    if (parsed?.untrusted === true && typeof parsed.success === 'boolean') body = parsed
+  } catch { /* An interrupted or legacy result may have no structured receipts. */ }
+  const isDigest = (value: unknown): boolean => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+  const projection = (kind: 'calls' | 'writes' | 'reads', fields: readonly string[]): unknown[] => {
+    const rows = body[kind]
+    if (!Array.isArray(rows)) return []
+    return rows.slice(0, CODE_LIMITS.calls).flatMap(row => {
+      if (!row || typeof row.id !== 'string' || !row.id || typeof row.name !== 'string' || !row.name ||
+          !['succeeded', 'failed', 'denied', 'cancelled', 'unknown', 'not_attempted'].includes(row.status) ||
+          (kind === 'calls' ? !isDigest(row.callDigest) || !['not_attempted', 'confirmed', 'unknown', 'unreported'].includes(row.effect)
+            : !isDigest(row.argumentsDigest))) return []
+      const safe = Object.fromEntries(fields.filter(key => typeof row[key] === 'string' || typeof row[key] === 'boolean')
+        .map(key => [key, row[key]]))
+      return !codeModeContainsSecret(safe, secrets) ? [safe] : []
+    })
+  }
+  const calls = projection('calls', ['id', 'name', 'argumentsDigest', 'callDigest', 'status', 'effect'])
+  const writes = projection('writes', ['id', 'name', 'path', 'argumentsDigest', 'status', 'revision', 'reviewSource', 'durabilityUnconfirmed'])
+  const reads = projection('reads', ['id', 'name', 'path', 'argumentsDigest', 'status', 'truncated'])
+  const content = JSON.stringify({ success: false, untrusted: true, contentWithheld: true, doNotRetry: true, reads,
+    ...(calls.length ? { calls } : {}), ...(writes.length ? { writes } : {}),
+    error: 'Code Mode result withheld because it contains a known credential. Inspect recorded effects before retrying.' })
+  return { content: codeModeContainsSecret(content, secrets) ? 'Code mode result withheld' : content, isError: true }
+}
 function validate(args: Readonly<JsonObject>): void {
   if (Object.keys(args).length !== 1 || typeof args.code !== 'string' || !args.code.trim() ||
       Buffer.byteLength(args.code) > CODE_LIMITS.sourceBytes) throw new Error('Expected code with at most 8192 UTF-8 bytes')
@@ -148,16 +178,16 @@ async function run(call: ToolCall, signal: AbortSignal, dispatch: ChildDispatch,
     Atomics.store(interrupt, 0, 1)
     await Promise.allSettled([...active, ...(worker ? [worker.terminate()] : [])])
   }
-  if (codeModeContainsSecret(value, secrets())) error = 'Result contains a known credential'
+  const valueWithheld = codeModeContainsSecret(value, secrets())
+  if (valueWithheld) error = 'Result contains a known credential'
   if (!error && nextWrite < writes.length) {
     try { await takeBatch()(signal) } catch (failure) { error = failure instanceof Error ? failure.message : 'Workspace changes failed' }
   }
   const body = { success: !error, untrusted: true, reads: receipts,
     ...(calls.length ? { calls } : {}),
     ...(writes.length ? { writes: writes.map(item => item.receipt) } : {}), ...(error ? { error } : { value }) }
-  if (codeModeContainsSecret(body, secrets())) return { content: 'Code mode result withheld', isError: true }
-  return { content: JSON.stringify(body), ...(error ? { isError: true } : {}),
-    ...(!error && images.size && !codeModeContainsSecret([...images.values()], secrets()) ? { images: [...images.values()] } : {}) }
+  return withholdCodeModeResult({ content: JSON.stringify(body), ...(error ? { isError: true } : {}),
+    ...(!error && images.size && !codeModeContainsSecret([...images.values()], secrets()) ? { images: [...images.values()] } : {}) }, secrets(), valueWithheld)
 }
 
 export function codeModeTool(dispatch: ChildDispatch, secrets: () => readonly string[], track: (call: ToolCall, work: Promise<ToolResult>) => void,

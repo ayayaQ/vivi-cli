@@ -24,7 +24,7 @@ import type { CliQuestionHost } from './questions.js'
 import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ayayaq/vivi/extensions/memory'
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
-import { codeModeContainsSecret, codeModeTool, type ChildDispatch } from './code-mode.js'
+import { codeModeContainsSecret, codeModeTool, withholdCodeModeResult, type ChildDispatch } from './code-mode.js'
 import { CodeModeParentRedactions, recoverCodeModeChildren, settledCodeModeChild } from './code-mode-outcomes.js'
 import { applyCodeWrites, type ApplyCodeWrites } from './code-mode-writes.js'
 import { createBuiltinToolset } from './tools.js'
@@ -240,9 +240,8 @@ function withholdRemoteHistory(history: HistoryMessage[], secrets: readonly stri
     }
     if (message.kind === 'tool_result' && canCallWeb(message.name)) {
       seen = true
-      const result = message.name !== 'code_mode' ? withholdPublicUrlResult(message, secrets)
-        : codeModeContainsSecret(message, secrets)
-        ? { kind: message.kind, callId: message.callId, name: message.name, content: 'Code mode result withheld', isError: true } : message
+      const withheld = message.name === 'code_mode' ? withholdCodeModeResult(message, secrets) : withholdPublicUrlResult(message, secrets)
+      const result = withheld === message ? message : { kind: message.kind, callId: message.callId, name: message.name, ...withheld }
       const callId = withholdPublicUrlIdentity(message.callId, secrets, replacements.callIds)
       const name = withholdPublicUrlIdentity(message.name, secrets, replacements.toolNames, 'public_url_withheld_')
       if (result !== message || callId !== message.callId || name !== message.name) changed = true
@@ -2717,6 +2716,7 @@ export class CliHost {
           { status: result.status === 'cancelled' ? 'cancelled' : 'denied', effect: 'not_attempted' }, 'dispatcher')
       }
       let currentRequests: readonly ToolCall[] = []
+      let restoredCodeModeReceipt = false
       terminalHistory = terminalHistory.map((message, index) => {
         if (message.kind === 'assistant') currentRequests = message.toolCalls
         if (message.kind !== 'tool_result') return message
@@ -2725,16 +2725,18 @@ export class CliHost {
         const receipt = receipts[0]!
         if (receipt.call.name === 'code_mode') {
           if (index < this.presentationTurnStart || !currentRequests.some(call => reviewDigest(call) === reviewDigest(receipt.call))) return message
-          if (codeModeContainsSecret(receipt.result, this.options.secrets ?? [])) {
-            return { kind: 'tool_result', callId: message.callId, name: message.name, content: 'Code mode result withheld', isError: true }
-          }
+          const result = withholdCodeModeResult(receipt.result, this.options.secrets ?? [])
           // Core owns image validation, acceptance and snapshot retention.
-          if (receipt.result.images?.length && !message.images?.length) return message
+          if (result.images?.length && !message.images?.length) return message
+          if (result.content !== message.content) restoredCodeModeReceipt = true
+          return { kind: 'tool_result', callId: message.callId, name: message.name, ...result }
         }
         // Reads/imported code have no durable domain commit to preserve after core cancellation.
-        if (receipt.call.name !== 'code_mode' && !['local-mutation', 'command', 'public-url'].includes(receipt.sourceKind)) return message
+        if (!['local-mutation', 'command', 'public-url'].includes(receipt.sourceKind)) return message
         return { kind: 'tool_result', callId: message.callId, name: message.name, ...receipt.result }
       })
+      // Restoring a live result must not erase an exact receipt recovered from a ledger.
+      if (restoredCodeModeReceipt) terminalHistory = this.reconcileMcpHistory(terminalHistory)
       const canonicalCalls = new Map(terminalHistory.flatMap(message => message.kind === 'assistant'
         ? message.toolCalls.map(call => [call.id, call] as const) : []))
       // Capacity or a cancelled admission callback can prevent creating a row.
