@@ -219,6 +219,29 @@ test('cancellation after publication keeps the completed receipt and stops later
   await assert.rejects(readFile(join(f.root, 'a.txt')), { code: 'ENOENT' })
 })
 
+test('cold Code Mode redaction omits a private workspace path but keeps the completed write', async t => {
+  const credential = 'later-known-workspace-path-credential'
+  const path = credential + '.txt'
+  const f = await fixture(t, 'await tools.workspace_create_text({path:' + JSON.stringify(path) + ',content:"new text"}); return null',
+    { approve: async () => true })
+  const initial = body(await f.host.send('Create a file in the workspace'))
+  assert.equal(initial.success, true, JSON.stringify(initial))
+  assert.deepEqual(initial.writes.map(row => [row.status, row.path, row.reviewSource]), [['succeeded', path, 'human']])
+  assert.equal(await readFile(join(f.root, path), 'utf8'), 'new text')
+  const id = f.host.session.id
+  await f.host.shutdown()
+  const provider = { async generate() { assert.fail('Recovery must not replay the completed write') } }
+  for (let resume = 0; resume < 2; resume++) {
+    const host = await CliHost.resume({ id, provider, store: f.store, secrets: [credential] })
+    const { path: _private, ...safeReceipt } = initial.writes[0]
+    const sanitized = body(host.session)
+    assert.equal(sanitized.doNotRetry, true)
+    assert.deepEqual(sanitized.writes, [safeReceipt])
+    assert(!(await readFile(join(f.store.directory, id + '.json'), 'utf8')).includes(credential))
+    await host.shutdown()
+  }
+})
+
 test('an invalid later proposal stops preparation before prompting or saving', async t => {
   let prompts = 0
   const f = await fixture(t, `await tools.workspace_create_text({path:"first.txt",content:"first"});

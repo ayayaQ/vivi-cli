@@ -26,23 +26,40 @@ export function withholdCodeModeResult(result: ToolResult, secrets: readonly str
     const parsed = JSON.parse(result.content)
     if (parsed?.untrusted === true && typeof parsed.success === 'boolean') body = parsed
   } catch { /* An interrupted or legacy result may have no structured receipts. */ }
-  const isDigest = (value: unknown): boolean => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+  const isDigest = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+  const safeIdentity = (value: string, digest: string): string | undefined => {
+    if (!codeModeContainsSecret(value, secrets)) return value
+    if (digest && !codeModeContainsSecret(digest, secrets)) {
+      const alias = 'withheld-' + digest.slice(0, 16)
+      if (!codeModeContainsSecret(alias, secrets)) return alias
+    }
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const alias = randomUUID()
+      if (!codeModeContainsSecret(alias, secrets)) return alias
+    }
+    return undefined
+  }
   const projection = (kind: 'calls' | 'writes' | 'reads', fields: readonly string[]): unknown[] => {
     const rows = body[kind]
     if (!Array.isArray(rows)) return []
     return rows.slice(0, CODE_LIMITS.calls).flatMap(row => {
       if (!row || typeof row.id !== 'string' || !row.id || typeof row.name !== 'string' || !row.name ||
           !['succeeded', 'failed', 'denied', 'cancelled', 'unknown', 'not_attempted'].includes(row.status) ||
-          (kind === 'calls' ? !isDigest(row.callDigest) || !['not_attempted', 'confirmed', 'unknown', 'unreported'].includes(row.effect)
-            : !isDigest(row.argumentsDigest))) return []
-      const safe = Object.fromEntries(fields.filter(key => typeof row[key] === 'string' || typeof row[key] === 'boolean')
-        .map(key => [key, row[key]]))
+          (kind === 'calls' && !['not_attempted', 'confirmed', 'unknown', 'unreported'].includes(row.effect))) return []
+      const exactDigest = kind === 'calls' ? row.callDigest : row.argumentsDigest
+      if (!isDigest(exactDigest) && !(body.contentWithheld === true && exactDigest === undefined)) return []
+      const identityDigest = isDigest(exactDigest) ? exactDigest : ''
+      const id = safeIdentity(row.id, identityDigest), name = safeIdentity(row.name, identityDigest)
+      if (id === undefined || name === undefined) return []
+      const safe = { id, name, ...Object.fromEntries(fields.filter(key =>
+        (typeof row[key] === 'string' || typeof row[key] === 'boolean') && !codeModeContainsSecret(row[key], secrets))
+        .map(key => [key, row[key]])) }
       return !codeModeContainsSecret(safe, secrets) ? [safe] : []
     })
   }
-  const calls = projection('calls', ['id', 'name', 'argumentsDigest', 'callDigest', 'status', 'effect'])
-  const writes = projection('writes', ['id', 'name', 'path', 'argumentsDigest', 'status', 'revision', 'reviewSource', 'durabilityUnconfirmed'])
-  const reads = projection('reads', ['id', 'name', 'path', 'argumentsDigest', 'status', 'truncated'])
+  const calls = projection('calls', ['argumentsDigest', 'callDigest', 'status', 'effect'])
+  const writes = projection('writes', ['path', 'argumentsDigest', 'status', 'revision', 'reviewSource', 'durabilityUnconfirmed'])
+  const reads = projection('reads', ['path', 'argumentsDigest', 'status', 'truncated'])
   const content = JSON.stringify({ success: false, untrusted: true, contentWithheld: true, doNotRetry: true, reads,
     ...(calls.length ? { calls } : {}), ...(writes.length ? { writes } : {}),
     error: 'Code Mode result withheld because it contains a known credential. Inspect recorded effects before retrying.' })

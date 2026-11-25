@@ -57,10 +57,10 @@ async function fixture(t, input = {}) {
     }
     return transport
   } })
-  const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: process.versions.bun ? ['--no-install', fileURLToPath(import.meta.url)] : [], cwd: directory, protocol: input.protocol ?? 'legacy', environment: [] }
+  const server = { id: input.serverId ?? 'docs', label: 'Fixture', executable: process.execPath, args: process.versions.bun ? ['--no-install', fileURLToPath(import.meta.url)] : [], cwd: directory, protocol: input.protocol ?? 'legacy', environment: [] }
   await manager.configure(server)
-  if (input.connect !== false) assert.equal(await manager.connect('docs', async () => true, signal()), true)
-  if (input.resources) await manager.refresh('docs', ['resources', 'resourceTemplates'], signal())
+  if (input.connect !== false) assert.equal(await manager.connect(server.id, async () => true, signal()), true)
+  if (input.resources) await manager.refresh(server.id, ['resources', 'resourceTemplates'], signal())
   const capture = manager.captureCatalogs.bind(manager)
   manager.captureCatalogs = async signal => { state.captures++; return capture(signal) }
   const options = { mcp: manager, mcpOutcomes: new FileMcpOutcomeStore(directory, secrets), secrets, session: input.session ?? newSession({ provider: 'openai', model: 'fixture' }),
@@ -207,6 +207,50 @@ test('a later credential in a Code Mode return value cannot erase retired remote
   }
   await check()
   await check()
+})
+
+test('late credentials redact nested remote receipt identity fields without erasing an effect', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-redact-code-call-label-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new FileSessionStore(directory)
+  const credential = 'fxtokencbc8c759e'
+  const name = mcpAlias(credential, 'tools', remoteName)
+  assert.equal(mcpContainsSecret(name, [credential]), true)
+  const code = 'await tools[' + JSON.stringify(name) + ']({query:"nested"}); return null'
+  const f = await fixture(t, { serverId: credential, options: { codeMode: true, store, approve: async () => true },
+    generate(_input, subject) {
+      return subject.state.generations === 1 ? answer('', [call('code_mode', { code })]) : answer()
+    } })
+  const sent = await f.host.send('Invoke the connected fixture')
+  assert.equal(f.invocations().length, 1)
+  assert.deepEqual(await f.options.mcpOutcomes.load(f.host.session.id), [])
+  const [original] = JSON.parse(resultOf(sent, 'code_mode').content).calls
+  assert.equal(original.name, name)
+  assert.equal(original.status, 'succeeded')
+  assert.equal(original.effect, 'unknown')
+  await f.host.shutdown()
+
+  const provider = { async generate() { assert.fail('Recovery must not replay the completed query') } }
+  const sessionId = f.host.session.id
+  const check = async secrets => {
+    const resumed = await CliHost.resume({ id: sessionId, store, secrets, provider })
+    const result = JSON.parse(resultOf(resumed.session, 'code_mode').content)
+    assert.equal(result.doNotRetry, true)
+    assert.equal(result.calls.length, 1)
+    const [receipt] = result.calls
+    assert.deepEqual({ ...receipt, id: original.id, name }, original)
+    assert.match(receipt.name, /^withheld-/)
+    assert.notEqual(receipt.name, name)
+    assert.equal(mcpContainsSecret(await readFile(join(directory, sessionId + '.json'), 'utf8'), secrets), false)
+    await resumed.shutdown()
+    return receipt
+  }
+  const first = await check([credential])
+  assert.equal(first.id, original.id, 'a safe exact identity is retained')
+  const second = await check([credential, original.id])
+  assert.match(second.id, /^withheld-/)
+  assert.notEqual(second.id, original.id)
+  assert.deepEqual(await check([credential, original.id]), second)
 })
 
 test('local captured MCP resource metadata has exact live, final and cold-resume read receipts without a remote operation', async t => {
