@@ -1103,13 +1103,20 @@ async function runManagedApplication(input: ApplicationOptions, mcp: McpManager,
             { name: 'On', description: 'Let JavaScript queries call the tools available on this turn', value: true }
           ], activeCodeMode ? 1 : 0)
           if (enabled === undefined || io.isClosed) continue
+          try {
+            const stored = await preferences.load() ?? DEFAULT_PREFERENCES
+            await preferences.save({ ...stored, codeMode: enabled })
+          } catch (error) {
+            io.write('Could not confirm saving Code Mode. The setting is unchanged for this launch.\n')
+            report(error)
+            continue
+          }
+          settings = { ...settings, codeMode: enabled }
+          if (io.isClosed) continue
           host?.setCodeModeEnabled(enabled)
           activeCodeMode = enabled
           io.setContext?.(undefined, false)
           io.write(`Code Mode: ${codeModeStatus()}\n`)
-          const stored = await preferences.load() ?? DEFAULT_PREFERENCES
-          await preferences.save({ ...stored, codeMode: enabled })
-          settings = { ...settings, codeMode: enabled }
           continue
         }
         if (/^\/instructions(?:\s|$)/.test(command)) {

@@ -15,6 +15,7 @@ import { McpConfigStore } from '../dist/mcp-config.js'
 import { mcpAlias } from '../dist/mcp-catalog.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
 import { FileMcpOutcomeStore } from '../dist/mcp-outcomes.js'
+import { FilePublicUrlOutcomeStore } from '../dist/public-url-outcomes.js'
 import { mcpContainsSecret } from '../dist/mcp-content.js'
 import { cliHistoryToolPresentation } from '../dist/tool-presentation.js'
 
@@ -97,6 +98,58 @@ test('cold recovery binds interrupted remote effects to the exact Code Mode scri
   t.after(() => host.shutdown())
   const result = JSON.parse(host.session.history.at(-1).content)
   assert.deepEqual(result.calls.map(item => [item.id,item.status,item.effect]), [[child.id,'unknown','unknown']])
+})
+
+test('cold recovery retains exact nested remote receipts across a durable Code Mode parent redaction', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-redacted-code-mcp-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new FileSessionStore(directory), mcpOutcomes = new FileMcpOutcomeStore(directory)
+  const publicUrlOutcomes = new FilePublicUrlOutcomeStore(directory)
+  const session = newSession({ provider: 'openai', model: 'fixture' })
+  const credential = 'later-registered-test-credential'
+  const parent = { id: 'real-parent', name: 'code_mode', arguments: { code: `// ${credential}\nreturn 1` } }
+  const parentDigest = mcpDigest(parent)
+  const untrusted = { id: 'model-placeholder', name: 'code_mode', arguments: {
+    publicUrlRequestWithheld: true, reason: 'known_credential', codeModeParentDigest: parentDigest
+  } }
+  session.history.push({ kind: 'message', role: 'user', content: 'Run the query' },
+    { kind: 'assistant', content: '', toolCalls: [parent, untrusted] })
+  await store.save(session)
+  const provider = { async generate() { assert.fail('Recovery must not replay a child') } }
+  const resume = async () => CliHost.resume({ id: session.id, store, mcpOutcomes, publicUrlOutcomes, provider, secrets: [credential] })
+
+  // Commit the sanitized transcript before the outcome store exposes the child rows.
+  const first = await resume()
+  await first.shutdown()
+  const disk = await readFile(join(directory, session.id + '.json'), 'utf8')
+  assert(!disk.includes(credential))
+  const sanitized = JSON.parse(disk)
+  const rewritten = sanitized.history.find(message => message.kind === 'assistant').toolCalls[0]
+  assert.deepEqual(rewritten.arguments, { publicUrlRequestWithheld: true, reason: 'known_credential' })
+  assert.deepEqual(sanitized.codeModeParentRedactions, { [mcpDigest(rewritten)]: parentDigest })
+
+  const row = (child, codeModeParentDigest = parentDigest) => ({ id: randomUUID(), sessionId: session.id, runId: randomUUID(),
+    callId: child.id, toolName: child.name, bindingDigest: mcpDigest(child), callDigest: mcpDigest(child),
+    codeModeParentDigest, state: 'intent' })
+  const mcpChild = { ...call(alias, { query: 'redacted parent' }), id: 'mcp-child' }
+  const webChild = { ...call('fetch_url', { url: 'https://example.com/' }), id: 'web-child' }
+  const unrelated = { ...mcpChild, id: 'unrelated-child' }
+  await mcpOutcomes.save(session.id, [row(mcpChild), row(unrelated, mcpDigest({ ...parent, arguments: { code: 'return 2' } }))])
+  await publicUrlOutcomes.save(session.id, [row(webChild)])
+
+  const checkRecovery = async () => {
+    const recovered = await resume()
+    const result = found => recovered.session.history.find(message => message.kind === 'tool_result' && message.callId === found.id)
+    const real = JSON.parse(result(parent).content)
+    assert.equal(real.doNotRetry, true)
+    assert.deepEqual(real.calls.map(call => [call.id, call.status, call.effect]),
+      [[mcpChild.id, 'unknown', 'unknown'], [webChild.id, 'unknown', 'unknown']])
+    assert.equal(result(untrusted).content, sanitized.history.find(message => message.callId === untrusted.id).content)
+    await recovered.shutdown()
+  }
+  await checkRecovery()
+  await checkRecovery()
+  assert(!(await readFile(join(directory, session.id + '.json'), 'utf8')).includes(credential))
 })
 
 for (const allow of [true, false]) test('Code Mode routes a connected MCP tool through its exact review: ' + allow, async t => {

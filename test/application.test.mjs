@@ -625,6 +625,27 @@ test('Code Mode menu changes the live tool catalog and saves the choice across c
   assert.deepEqual(seen, [true, false])
 })
 
+test('Code Mode does not change the live catalog or claim success when saving the preference fails', async t => {
+  const directory = await fixture(t), store = new PreferenceStore(directory)
+  await store.save({ ...base, codeMode: false })
+  const originalSave = PreferenceStore.prototype.save
+  t.mock.method(PreferenceStore.prototype, 'save', async function (value) {
+    if (value.codeMode === true) throw new Error('Fixture preference write failed')
+    return originalSave.call(this, value)
+  })
+  const seen = []
+  const factory = () => ({ async generate({ tools }) {
+    seen.push(tools.some(tool => tool.name === 'code_mode'))
+    return answer('Done')
+  } })
+  const io = fakeIO([true], [], ['Before', '/code-mode', 'After', '/exit'])
+  assert.equal(await run(directory, io, fakeServices(), factory, ['--tools']), 0)
+  assert.deepEqual(seen, [false, false])
+  assert.match(io.output, /Could not confirm saving Code Mode. The setting is unchanged for this launch/)
+  assert.doesNotMatch(io.output, /Code Mode: On/)
+  assert.equal((await store.load()).codeMode, false)
+})
+
 test('unknown saved and resumed models omit tools without a current declaration while memory context stays enabled', async t => {
   const directory = await fixture(t), services = fakeServices()
   await new PreferenceStore(directory).save({ ...base, enableTools: true, enableMemory: true })

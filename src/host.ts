@@ -25,7 +25,7 @@ import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ay
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 import { codeModeContainsSecret, codeModeTool, type ChildDispatch } from './code-mode.js'
-import { recoverCodeModeChildren, settledCodeModeChild } from './code-mode-outcomes.js'
+import { CodeModeParentRedactions, recoverCodeModeChildren, settledCodeModeChild } from './code-mode-outcomes.js'
 import { applyCodeWrites, type ApplyCodeWrites } from './code-mode-writes.js'
 import { createBuiltinToolset } from './tools.js'
 import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
@@ -229,7 +229,7 @@ function withholdPublicUrlCall(call: ToolCall, secrets: readonly string[], repla
   return id === call.id && name === call.name && !withheld ? call : { ...call, id, name,
     arguments: withheld ? { publicUrlRequestWithheld: true, reason: 'known_credential' } : call.arguments }
 }
-function withholdRemoteHistory(history: HistoryMessage[], secrets: readonly string[], replacements: McpIdentityReplacements): HistoryMessage[] {
+function withholdRemoteHistory(history: HistoryMessage[], secrets: readonly string[], replacements: McpIdentityReplacements, parentsRedacted: CodeModeParentRedactions): HistoryMessage[] {
   const safeMcp = withholdMcpHistory(history, secrets, replacements)
   let changed = false, seen = false
   const urlContext = historyUsesPublicUrl(safeMcp)
@@ -251,7 +251,12 @@ function withholdRemoteHistory(history: HistoryMessage[], secrets: readonly stri
     if (message.kind !== 'assistant') return message
     if (message.toolCalls.some(call => canCallWeb(call.name))) seen = true
     if (!seen) return message
-    const toolCalls = message.toolCalls.map(call => canCallWeb(call.name) ? withholdPublicUrlCall(call, secrets, replacements) : call)
+    const toolCalls = message.toolCalls.map(call => {
+      if (!canCallWeb(call.name)) return call
+      const safe = withholdPublicUrlCall(call, secrets, replacements)
+      parentsRedacted.remember(call, safe)
+      return safe
+    })
     const contentWithheld = publicUrlContainsSecret(message.content, secrets)
     const stateWithheld = publicUrlContainsSecret(message.providerState ?? null, secrets)
     if (!contentWithheld && !stateWithheld && toolCalls.every((call, index) => call === message.toolCalls[index])) return message
@@ -431,6 +436,7 @@ export class CliHost {
   private mcpOutcomeLoading: Promise<void> | undefined
   private readonly mcpJobs = new Set<Promise<ToolResult>>()
   private readonly eventJobs = new Set<Promise<void>>()
+  private readonly codeModeParentRedactions: CodeModeParentRedactions
   private readonly mcpIdentityReplacements: McpIdentityReplacements = { callIds: new Map(), toolNames: new Map() }
   private readonly questionAccount: string | undefined
   private readonly commandAccount: string | undefined
@@ -462,6 +468,7 @@ export class CliHost {
     if (this.enabledMemory && !options.memory) throw new Error('Persistent memory requires a host-owned memory store')
     this.reportMemoryCapability()
     this.current = validateSession(options.session)
+    this.codeModeParentRedactions = new CodeModeParentRedactions(this.current.codeModeParentRedactions)
     this.discardUnsafeContextCheckpoint(this.current)
     this.records = new CliConversationRecords(this.current.id, options.conversationStore ??
       (options.store instanceof FileSessionStore ? new FileCliConversationStore(options.store.directory) : undefined),
@@ -474,7 +481,7 @@ export class CliHost {
       options.decisionReview.provider.id !== this.current.provider && options.decisionReview.explicitReviewer !== true)) {
       throw new Error('Decision review must use this session’s selected provider; cross-provider review is unavailable')
     }
-    this.current.history = withholdRemoteHistory(closeInterruptedHistory(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
+    this.current.history = this.withholdRemoteHistory(closeInterruptedHistory(this.current.history))
     validateSession(this.current)
   }
   get instructionsEnabled(): boolean { return this.projectInstructions.isEnabled }
@@ -1304,8 +1311,17 @@ export class CliHost {
     try { await loading }
     catch (error) { if (this.mcpOutcomeLoading === loading) this.mcpOutcomeLoading = undefined; throw error }
   }
+  private withholdRemoteHistory(history: HistoryMessage[]): HistoryMessage[] {
+    return withholdRemoteHistory(history, this.options.secrets ?? [], this.mcpIdentityReplacements, this.codeModeParentRedactions)
+  }
+  /** Persist exact aliases and the privacy-scrubbed history in the same replacement. */
+  private captureCodeModeParentRedactions(snapshot: CliSession): void {
+    const evidence = this.codeModeParentRedactions.forHistory(snapshot.history)
+    if (evidence) snapshot.codeModeParentRedactions = evidence
+    else delete snapshot.codeModeParentRedactions
+  }
   private reconcileMcpHistory(history: readonly HistoryMessage[]): HistoryMessage[] {
-    const safe = withholdRemoteHistory(structuredClone(history) as HistoryMessage[], this.options.secrets ?? [], this.mcpIdentityReplacements)
+    const safe = this.withholdRemoteHistory(structuredClone(history) as HistoryMessage[])
     const rows = this.safeMcpRows()
     const reconciled = rows.length ? reconcileMcpOutcomes(safe, this.current.id, rows) : safe
     const urlRows = this.safePublicUrlRows()
@@ -1313,7 +1329,7 @@ export class CliHost {
     return recoverCodeModeChildren(direct, [
       ...rows.filter(row => row.codeModeParentDigest).map(row => ({ row, outcome: cliMcpRecordOutcome(row) })),
       ...urlRows.filter(row => row.codeModeParentDigest).map(row => ({ row, outcome: cliPublicUrlRecordOutcome(row) }))
-    ])
+    ], this.codeModeParentRedactions)
   }
   private async retireMcpOutcomes(history: readonly HistoryMessage[]): Promise<void> {
     const view = this.conversationRecords
@@ -1322,7 +1338,7 @@ export class CliHost {
     const matched = new Set<string>()
     const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
     for (const row of this.safeMcpRows()) {
-      if (settledCodeModeChild(row, history, view.projection?.outcomes ?? [])) matched.add(row.id)
+      if (settledCodeModeChild(row, history, view.projection?.outcomes ?? [], this.codeModeParentRedactions)) matched.add(row.id)
       if (calls.some(call => mcpOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
           outcome.callId === call.id && outcome.name === call.name && outcome.argumentsDigest === agentArgumentsDigest(call.arguments))) &&
         history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
@@ -1472,7 +1488,7 @@ export class CliHost {
     if (JSON.stringify(this.safePublicUrlRows()) !== JSON.stringify([...this.publicUrlRows.values()])) await this.persistPublicUrlOutcomes()
     if (view.state !== 'shadow' || view.durability !== 'disk' || view.committedSequence !== view.observedSequence) return
     const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
-    const matched = new Set(this.safePublicUrlRows().filter(row => settledCodeModeChild(row, history, view.projection?.outcomes ?? []) || calls.some(call => publicUrlOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
+    const matched = new Set(this.safePublicUrlRows().filter(row => settledCodeModeChild(row, history, view.projection?.outcomes ?? [], this.codeModeParentRedactions) || calls.some(call => publicUrlOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
       outcome.callId === call.id && outcome.name === call.name && outcome.argumentsDigest === agentArgumentsDigest(call.arguments))) &&
       history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
         message.content === publicUrlOutcomeResult(row).content)).map(row => row.id))
@@ -1746,6 +1762,7 @@ export class CliHost {
     }
     this.discardUnsafeContextCheckpoint(snapshot)
     if (!historyUsesMcp(snapshot.history) && !historyUsesPublicUrl(snapshot.history)) {
+      this.captureCodeModeParentRedactions(snapshot)
       if (snapshot.contextCheckpoint) await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
         options?.assertCurrent?.()
         if (mcpContainsSecret(snapshot.contextCheckpoint, this.options.secrets ?? [])) throw new Error('Context summary contains a known credential; session checkpoint was blocked')
@@ -1754,7 +1771,7 @@ export class CliHost {
       else await this.options.store.save(snapshot)
       return
     }
-    snapshot.history = withholdRemoteHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    snapshot.history = this.withholdRemoteHistory(snapshot.history)
     this.withholdPublicUrlTitle(snapshot)
     const assertIdentitiesSafe = (): void => {
       for (const replacements of Object.values(this.mcpIdentityReplacements)) for (const replacement of replacements.values()) {
@@ -1763,6 +1780,7 @@ export class CliHost {
     }
     let committed = false
     for (;;) {
+      this.captureCodeModeParentRedactions(snapshot)
       try {
         assertIdentitiesSafe()
         await this.options.store.save(snapshot, { ...options, assertCurrent: () => {
@@ -1772,7 +1790,7 @@ export class CliHost {
           if (historyUsesPublicUrl(snapshot.history) && snapshot.title && publicUrlContainsSecret(snapshot.title, this.options.secrets ?? [])) {
             throw new Error('Public URL title contains a newly known credential; checkpoint was blocked')
           }
-          const safe = withholdRemoteHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          const safe = this.withholdRemoteHistory(snapshot.history)
           if (safe !== snapshot.history && JSON.stringify(safe) !== JSON.stringify(snapshot.history)) {
             throw new Error('MCP transcript contains a newly known credential; checkpoint was blocked')
           }
@@ -1788,7 +1806,7 @@ export class CliHost {
       // withholding monotonically until the successful checkpoint returns stable.
       const previousTitle = snapshot.title
       this.withholdPublicUrlTitle(snapshot)
-      const safe = withholdRemoteHistory(snapshot.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+      const safe = this.withholdRemoteHistory(snapshot.history)
       if (previousTitle === snapshot.title && (safe === snapshot.history || JSON.stringify(safe) === JSON.stringify(snapshot.history))) return
       snapshot.history = safe
     }
@@ -1796,13 +1814,13 @@ export class CliHost {
   private async save(): Promise<void> {
     this.discardUnsafeContextCheckpoint(this.current)
     this.current.updatedAt = new Date().toISOString()
-    this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+    this.current.history = this.withholdRemoteHistory(this.current.history)
     this.withholdPublicUrlTitle(this.current)
     const snapshot = structuredClone(this.current)
     const operation = this.persistence.then(() => this.checkpoint(snapshot))
     this.persistence = operation.catch(() => undefined)
     try { await operation }
-    finally { this.current.history = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements); this.withholdPublicUrlTitle(this.current); this.discardUnsafeContextCheckpoint(this.current) }
+    finally { this.current.history = this.withholdRemoteHistory(this.current.history); this.withholdPublicUrlTitle(this.current); this.discardUnsafeContextCheckpoint(this.current) }
   }
   private notes(): NoteSnapshot {
     return { revision: this.current.noteRevision, notes: structuredClone(this.current.notes) }
@@ -2640,7 +2658,7 @@ export class CliHost {
           if (!controller.signal.aborted && owner.state === 'open' && this.activeTurn?.scope === owner) {
             // A persistence hook may register credentials after the event's first scan.
             if (admittedEvent.type === 'assistant' || admittedEvent.type === 'tool_completed') {
-              const safe = withholdRemoteHistory([...this.current.history, admittedEvent.message], this.options.secrets ?? [], this.mcpIdentityReplacements).at(-1)!
+              const safe = this.withholdRemoteHistory([...this.current.history, admittedEvent.message]).at(-1)!
               admittedEvent = { ...admittedEvent, message: safe } as AgentEvent
             }
             if (admittedEvent.type === 'tool_completed') for (const [id, original] of pendingMcpDisplay) {
@@ -2655,7 +2673,7 @@ export class CliHost {
           // Already-entered delivery is drained, but its obsolete continuation
           // cannot admit another effect. Terminal reconciliation below owns recovery.
           if (controller.signal.aborted || owner.state !== 'open' || this.activeTurn?.scope !== owner) return
-          const safeHistory = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+          const safeHistory = this.withholdRemoteHistory(this.current.history)
           if (safeHistory !== this.current.history) { this.current.history = safeHistory; await this.save() }
           if (admittedEvent.type === 'tool_completed') {
             captureRecordRows(); await this.retireMcpOutcomes(this.current.history)
@@ -2738,7 +2756,7 @@ export class CliHost {
       // A cancelled/unaccepted response contributes no round and preserves prior metrics.
       this.current.usage = aggregateUsage([...priorUsage, ...(result.rounds > 0 ? [result.usage] : [])])
       await this.save()
-      canonicalResult.history = withholdRemoteHistory(structuredClone(this.current.history), this.options.secrets ?? [], this.mcpIdentityReplacements)
+      canonicalResult.history = this.withholdRemoteHistory(structuredClone(this.current.history))
       // Cancellation suppresses core tool_completed events. Display only the exact
       // corrected, checkpointed results so a generic cancellation cannot hide effects.
       for (let index = 0; index < canonicalResult.history.length; index++) {
@@ -2764,7 +2782,7 @@ export class CliHost {
       await this.records.settle(this.toolsetRevision, canonicalResult, this.current, [...recordRows.values()], [...this.toolReceipts.values()])
       await this.retireMcpOutcomes(canonicalResult.history)
       await this.retirePublicUrlOutcomes(canonicalResult.history)
-      const safeFinal = withholdRemoteHistory(this.current.history, this.options.secrets ?? [], this.mcpIdentityReplacements)
+      const safeFinal = this.withholdRemoteHistory(this.current.history)
       if (safeFinal !== this.current.history) { this.current.history = safeFinal; await this.save() }
       canonicalResult.history = structuredClone(this.current.history)
       if (historyUsesMcp(canonicalResult.history) && mcpContainsSecret(canonicalResult.content, this.options.secrets ?? []) ||

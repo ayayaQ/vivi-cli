@@ -28,6 +28,8 @@ export interface CliSession {
   title?: string
   titleRevision?: number
   history: HistoryMessage[]
+  /** Private host evidence mapping sanitized Code Mode calls to exact pre-redaction hashes. */
+  codeModeParentRedactions?: Record<string, string>
   /** Durable derived provider view, bound to retained raw history; grants no authority. */
   contextCheckpoint?: import('@ayayaq/vivi').ContextCheckpoint
   /** Reported summary charges are separate from accepted response-round usage. */
@@ -93,7 +95,7 @@ export function validateSession(value: unknown): CliSession {
   json(value)
   check(object(value), 'expected object')
   keys(value, ['schemaVersion', 'id', 'provider', 'model', 'reasoning', 'createdAt', 'updatedAt',
-    'chatgptAccountId', 'history', 'contextCheckpoint', 'contextSummaryUsage', 'contextSummaryUnreported', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
+    'chatgptAccountId', 'history', 'codeModeParentRedactions', 'contextCheckpoint', 'contextSummaryUsage', 'contextSummaryUnreported', 'usage', 'noteRevision', 'notes', 'title', 'titleRevision', 'recordAnchor'])
   check(value.schemaVersion === 1 || value.schemaVersion === 2 || value.schemaVersion === 3, 'unsupported schema version')
   if (value.schemaVersion === 1) check(!('recordAnchor' in value), 'schema-1 must not contain a record anchor')
   else if (value.schemaVersion === 2 || 'recordAnchor' in value) {
@@ -134,6 +136,12 @@ export function validateSession(value: unknown): CliSession {
       text(note, 4096), 'invalid note')
   }
   check(Array.isArray(value.history) && value.history.length <= MAX_HISTORY_MESSAGES, 'history is too large')
+  if ('codeModeParentRedactions' in value) {
+    const aliases = value.codeModeParentRedactions
+    check(object(aliases) && Object.keys(aliases).length <= MAX_HISTORY_MESSAGES && Object.entries(aliases).every(([key, digest]) =>
+      /^[a-f0-9]{64}$/.test(key) && typeof digest === 'string' && /^[a-f0-9]{64}$/.test(digest) && key !== digest),
+    'invalid Code Mode parent redactions')
+  }
   const ids = new Set<string>()
   let pending: { id: string; name: string }[] = []
   for (const message of value.history) {
