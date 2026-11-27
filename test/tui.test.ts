@@ -1740,6 +1740,25 @@ test('review state, pending approvals and result errors remain prominent while s
   colors('Error', true)
 })
 
+test('a large Code Mode batch stays fully visible through approval', async () => {
+  const { io, setup, input, frame } = await fixture()
+  io.write('Earlier transcript content')
+  const description = 'Code Mode script\nreturn null\n\nProposed changes\n' +
+    'First diff\n' + 'x'.repeat(34000) + '\nSecond diff\n' + 'y'.repeat(34000) + '\nLast changed line'
+  const pending = io.approve({ call: { id: 'batch', name: 'code_mode', arguments: { code: 'return null' } },
+    currentRevision: 'fixture', description }, new AbortController().signal)
+  await tick(); await frame()
+  const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
+  expect(renderedText(transcript)).toContain(description)
+  expect(renderedText(transcript)).toContain('Earlier transcript content')
+  io.addSecrets(['unrelated-fixture-credential'])
+  expect(renderedText(transcript)).toContain(description)
+  input.pressArrow('up'); input.pressEnter()
+  expect(await pending).toBe(true)
+  expect(renderedText(transcript)).toContain('Earlier transcript content')
+  expect(renderedText(transcript)).not.toContain('Last changed line')
+})
+
 test('title-only header and responsive metadata keep native controls separate from the workspace', async () => {
   const { io, setup, input, frame } = await fixture({ width: 160, height: 30 })
   const session = newSession({ provider: 'openrouter', model: 'fixture-model', reasoning: 'high' })

@@ -14,6 +14,7 @@ import { McpManager } from '../dist/mcp-manager.js'
 import { McpConfigStore } from '../dist/mcp-config.js'
 import { mcpAlias } from '../dist/mcp-catalog.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
+import { CliConversationRecords, FileCliConversationStore } from '../dist/conversation-records.js'
 import { FileMcpOutcomeStore } from '../dist/mcp-outcomes.js'
 import { FilePublicUrlOutcomeStore } from '../dist/public-url-outcomes.js'
 import { mcpContainsSecret } from '../dist/mcp-content.js'
@@ -83,21 +84,56 @@ async function fixture(t, input = {}) {
 
 function resultOf(result, name = alias) { return result.history.find(message => message.kind === 'tool_result' && message.name === name) }
 
-test('cold recovery binds interrupted remote effects to the exact Code Mode script', async t => {
+test('cold recovery retires remote rows after their exact Code Mode receipts are durable', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-code-recovery-'))
+  t.after(() => rm(directory, {recursive:true, force:true}))
+  const store = new FileSessionStore(directory)
+  const mcpOutcomes = new FileMcpOutcomeStore(directory)
+  const publicUrlOutcomes = new FilePublicUrlOutcomeStore(directory)
   const session = newSession({provider:'openai', model:'fixture'})
   const parent = call('code_mode', {code:'return await tools.remote({})'})
-  session.history.push({kind:'message', role:'user', content:'Run the query'},
-    {kind:'assistant', content:'', toolCalls:[parent]})
+  const runId = randomUUID()
+  const records = new CliConversationRecords(session.id, new FileCliConversationStore(directory))
+  await records.initialize(session, [])
+  session.schemaVersion = 2
+  session.recordAnchor = {version:1, eventId:records.anchorEventId}
+  session.history.push({kind:'message', role:'user', content:'Run the query'})
+  await records.begin(runId, session)
+  const assistant = {kind:'assistant', content:'', toolCalls:[parent]}
+  await records.accept(runId, {type:'assistant_accepted', message:assistant, round:1,
+    usage:session.usage, aggregateUsage:session.usage})
+  assert.deepEqual(records.view.runs[0].history.at(-1).message, assistant)
+  const read = {id:'read', name:'workspace_read', path:'existing.txt', argumentsDigest:'a'.repeat(64), status:'succeeded'}
+  const write = {id:'write', name:'workspace_create_text', path:'created.txt', argumentsDigest:'b'.repeat(64), status:'succeeded'}
+  const partial = {success:false, untrusted:true, contentWithheld:true, reads:[read], writes:[write]}
+  session.history.push(assistant, {kind:'tool_result', name:parent.name, callId:parent.id, isError:true,
+    content:JSON.stringify(partial)})
   const child = call(alias, {query:'ordinary'})
-  const row = {id:randomUUID(), sessionId:session.id, runId:randomUUID(), callId:child.id, toolName:child.name,
+  const row = {id:randomUUID(), sessionId:session.id, runId, callId:child.id, toolName:child.name,
     bindingDigest:mcpDigest(child), callDigest:mcpDigest(child), codeModeParentDigest:mcpDigest(parent), state:'intent'}
   const unrelated = {...row, id:randomUUID(), callId:'different', callDigest:mcpDigest({...child,id:'different'}),
     codeModeParentDigest:mcpDigest({...parent,arguments:{code:'return 1'}})}
-  const host = await CliHost.resume({id:session.id, store:{async load(){return session},async save(){}},
-    mcpOutcomes:{async load(){return [row,unrelated]},async save(){}},provider:{async generate(){assert.fail('Never replay a child')}}})
-  t.after(() => host.shutdown())
-  const result = JSON.parse(host.session.history.at(-1).content)
-  assert.deepEqual(result.calls.map(item => [item.id,item.status,item.effect]), [[child.id,'unknown','unknown']])
+  const fetch = call('fetch_url', {url:'https://example.com'})
+  const urlRow = {...row, id:randomUUID(), callId:fetch.id, toolName:fetch.name,
+    callDigest:mcpDigest(fetch), bindingDigest:mcpDigest(fetch)}
+  await store.save(session)
+  await mcpOutcomes.save(session.id, [row, unrelated])
+  await publicUrlOutcomes.save(session.id, [urlRow])
+  for (let launch = 0; launch < 2; launch++) {
+    const host = await CliHost.resume({id:session.id, store, mcpOutcomes, publicUrlOutcomes,
+      provider:{async generate(){assert.fail('Never replay a child')}}})
+    try {
+      const result = JSON.parse(host.session.history.at(-1).content)
+      assert.equal(host.conversationRecords.state, 'shadow')
+      assert.equal(result.contentWithheld, true)
+      assert.deepEqual(result.reads, [read])
+      assert.deepEqual(result.writes, [write])
+      assert.deepEqual(result.calls.map(item => [item.id,item.status,item.effect]),
+        [[child.id,'unknown','unknown'], [fetch.id,'unknown','unknown']])
+      assert.deepEqual(await mcpOutcomes.load(session.id), [unrelated])
+      assert.deepEqual(await publicUrlOutcomes.load(session.id), [])
+    } finally { await host.shutdown() }
+  }
 })
 
 test('cold recovery retains exact nested remote receipts across a durable Code Mode parent redaction', async t => {

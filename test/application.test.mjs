@@ -740,6 +740,26 @@ test('accessible one-shot context details use documented model capacity without 
   assert.equal(code, 0); assert.equal(calls, 0); assert.match(io.output, /Capacity: 1047576/)
 })
 
+test('accessible Code Mode commands stay local and the saved choice restores on launch', async t => {
+  const directory = await fixture(t), seen = []
+  const prefs = new PreferenceStore(directory)
+  const launch = (lines, args = []) => main(
+    ['--no-tui', '--no-workspace', '--no-skills', '--model', 'gpt-4.1', ...args], { VIVI_SESSION_DIR: directory },
+    { ...fakeServices(), io: fakeIO([], [], lines), providerFactory: () => ({ async generate(input) {
+      seen.push([input.messages.at(-1).content, input.tools.some(tool => tool.name === 'code_mode')])
+      return answer('Done')
+    } }) })
+  assert.equal(await launch(['/code-mode', 'Enabled', '/exit']), 0)
+  assert.equal((await prefs.load()).codeMode, true)
+  assert.equal(await launch(['Restored', '/code-mode off', 'Disabled', '/exit']), 0)
+  assert.equal((await prefs.load()).codeMode, false)
+  assert.equal(await launch([], ['--prompt', '/code-mode on']), 0)
+  assert.equal((await prefs.load()).codeMode, false)
+  assert.equal(await launch(['Flag override', '/exit'], ['--code-mode']), 0)
+  assert.equal((await prefs.load()).codeMode, false)
+  assert.deepEqual(seen, [['Enabled', true], ['Restored', true], ['Disabled', false], ['Flag override', true]])
+})
+
 test('accessible small-model limits block an oversized current prompt before generation', async t => {
   const directory = await fixture(t), io = fakeIO(); let calls = 0
   const catalog = { async list() { return { state: 'fresh', models: parseModelCatalog('openrouter', { data: [{ id: 'vendor/small', context_length: 100 }] }) } } }

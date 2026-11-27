@@ -643,7 +643,7 @@ progress and settled outcomes without exposing model reasoning or credentials.
 
 ## Code Mode
 
-Open **/menu → Tools & context → Code Mode** or type `/code-mode` to turn JavaScript tool queries on or off. The choice applies to the next message and is saved for future interactive launches. Code Mode starts off on a fresh install. The `--code-mode` flag enables it for one launch. The model can check availability with `session_status`.
+Open **/menu → Tools & context → Code Mode** or type `/code-mode` to turn JavaScript tool queries on or off. In accessible line mode, `/code-mode` toggles the setting and `/code-mode on` or `/code-mode off` sets it directly. The choice applies to the next message and is saved for future interactive launches. Code Mode starts off on a fresh install. The `--code-mode` flag enables it for one launch. The model can check availability with `session_status`.
 
 `Object.keys(tools)` lists the other tools advertised for the current turn. Execute can include connected MCP tools, trusted commands, and installed extensions. Plan has its usual local tools. The runner also works without a selected workspace. Embedders can set `codeMode: true` on `CliHost`.
 

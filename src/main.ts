@@ -601,7 +601,8 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
     } } : { provider: options.webProvider ?? 'direct' }
     if (web.provider === 'deepseek') io.write(`${DEEPSEEK_WEB_DISCLOSURE}\n`)
     const commandEnv = captureCommandEnvironment(env)
-    host = new CliHost({ provider, images, imageCapability: metadata.vision ?? 'unknown', ...(metadata.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes, codeMode: options.codeMode === true,
+    let activeCodeMode = options.codeMode ?? (options.prompt === undefined && savedPreferences.codeMode === true)
+    host = new CliHost({ provider, images, imageCapability: metadata.vision ?? 'unknown', ...(metadata.modelCapabilities ? { imageModelCapabilities: metadata.modelCapabilities } : {}), web, store, session, secrets, getContextLimits: () => contextLimitsForModel(metadata), mcp, onMcpNotice: message => io!.write(`${message}\n`), onConversationNotice: message => io!.write(`${message}\n`), enableNotes: effective.enableNotes, codeMode: activeCodeMode,
       permissionApproval: { accountRevision: () => accountRevision, isAvailable: () => accountCurrent && io?.canAutoReview === true && !io.isClosed },
       enableTools, enableCommands: options.enableCommands, enableMemory: options.enableMemory, memory, enableSkills: options.enableSkills, skills,
       skillSaveApproval: { isAvailable: () => accountCurrent && options.prompt === undefined && io?.canAutoReview === true && !io.isClosed, accountRevision: () => accountRevision },
@@ -719,9 +720,25 @@ async function mainInternal(args: readonly string[], env: NodeJS.ProcessEnv,
       savedPreferences = { ...savedPreferences, autoReviewThresholds: next }; thresholdPreferencesAvailable = true
       io!.write(`Auto threshold: ${provider} ${formatAutoReviewThreshold(resolveAutoReviewThreshold(provider, next).allowPermille)} saved. Lower thresholds allow more uncertain proposals; hard blocks and human-only actions do not change. Auto disabled; select Auto again with /mode.\n`)
     }
+    const configureCodeMode = async (line: string): Promise<void> => {
+      const action = line.trim().slice('/code-mode'.length).trim()
+      if (options.prompt !== undefined || (action && action !== 'on' && action !== 'off')) {
+        io!.write('Use /code-mode, /code-mode on, or /code-mode off in interactive line mode\n')
+        return
+      }
+      const enabled = action ? action === 'on' : !activeCodeMode
+      const stored = await preferences.load() ?? DEFAULT_PREFERENCES
+      const next = { ...stored, codeMode: enabled }
+      await preferences.save(next)
+      savedPreferences = next
+      host!.setCodeModeEnabled(enabled)
+      activeCodeMode = enabled
+      io!.setContext?.(undefined, false)
+      io!.write(`Code Mode: ${!enabled ? 'Off' : enableTools ? 'On' : 'On · tools unavailable for this model'}\n`)
+    }
     const result = await runChatLoop(host, io, options.prompt, {
       web: configureWeb, reviewer: async line => { await configureReviewer(line) },
-      autoThreshold: configureAutoThreshold, modeChanged: rememberMode,
+      autoThreshold: configureAutoThreshold, modeChanged: rememberMode, codeMode: configureCodeMode,
       mcp: () => manageMcp(mcp!, io!, options.workspace, oauth)
     })
     return result?.status === 'error' ? 1 : result?.status === 'cancelled' ? 130 : 0

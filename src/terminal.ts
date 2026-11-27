@@ -760,7 +760,7 @@ export class TerminalIO implements ChatIO {
 }
 
 /** These controls are supplied by the launch owner, never exposed as model tools. */
-interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void>; autoThreshold?(line: string): Promise<void>; modeChanged?(): Promise<void> }
+interface UserChatControls { mcp?(): Promise<void>; web?(line: string): Promise<void>; reviewer?(line: string): Promise<void>; autoThreshold?(line: string): Promise<void>; modeChanged?(): Promise<void>; codeMode?(line: string): Promise<void> }
 
 export function isMcpCommand(line: string): boolean { return /^\/mcp(?:\s|$)/.test(line.trim()) }
 
@@ -775,11 +775,16 @@ export async function runMcpCommand(io: ChatIO, line: string, controls: UserChat
 export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
   controls: UserChatControls = {}): Promise<AgentResult | undefined> {
   const releaseProcesses = bindBackgroundProcessControls(host, io)
+  const codeModeCommand = async (line: string): Promise<void> => {
+    if (controls.codeMode) await controls.codeMode(line)
+    else io.write('Code Mode settings unavailable in this surface\n')
+  }
   try {
   if (host.skillsEnabled) io.write(`${SKILLS_DISCLOSURE}\n`)
   if (host.memoryEnabled) io.write(`Memory enabled for this launch\n${MEMORY_DISCLOSURE}\n`)
   if (host.commandsEnabled) io.write(`${USER_SHELL_DISCLOSURE}\n`)
   if (prompt !== undefined) {
+    if (/^\/code-mode(?:\s|$)/.test(prompt.trim())) { await codeModeCommand(prompt); return }
     if (/^\/web(?:\s|$)/.test(prompt.trim())) { if (controls.web) await controls.web(prompt); return }
     if (/^\/reviewer(?:\s|$)/.test(prompt.trim())) { if (controls.reviewer) await controls.reviewer(prompt); return }
     if (/^\/auto-threshold(?:\s|$)/.test(prompt.trim())) { if (controls.autoThreshold) await controls.autoThreshold(prompt); return }
@@ -820,6 +825,11 @@ export async function runChatLoop(host: CliHost, io: ChatIO, prompt?: string,
       continue
     }
     if (!line.trim()) continue
+    if (/^\/code-mode(?:\s|$)/.test(line.trim())) {
+      try { await codeModeCommand(line) }
+      catch (error) { io.write(`${error instanceof Error ? error.message : 'Code Mode setting failed'}\n`) }
+      continue
+    }
     if (/^\/web(?:\s|$)/.test(line.trim())) { if (controls.web) await controls.web(line); else io.write('Web settings unavailable in this surface\n'); continue }
     if (/^\/reviewer(?:\s|$)/.test(line.trim())) { if (controls.reviewer) await controls.reviewer(line); else io.write('Reviewer settings unavailable in this surface\n'); continue }
     if (/^\/auto-threshold(?:\s|$)/.test(line.trim())) {

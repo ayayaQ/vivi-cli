@@ -179,6 +179,20 @@ test('script failure discards staged writes before review', async t => {
   await assert.rejects(readFile(join(f.root, 'a.txt')), { code: 'ENOENT' })
 })
 
+test('invalid child arguments reject the awaited call and allow script recovery', async t => {
+  const f = await fixture(t, `const errors = [];
+    for (const args of [null, {path:"invalid.txt"}]) {
+      try { await tools.workspace_create_text(args) } catch (error) { errors.push(error) }
+    }
+    await tools.workspace_create_text({path:"valid.txt",content:"recovered"})
+    return errors`, { approve: async () => true })
+  const data = body(await f.host.send('Create valid.txt'))
+  assert.deepEqual(data.value, ['Invalid tool arguments', 'Invalid workspace change arguments'])
+  assert.deepEqual(data.writes.map(({ path, status }) => [path, status]), [['valid.txt', 'succeeded']])
+  assert.equal(await readFile(join(f.root, 'valid.txt'), 'utf8'), 'recovered')
+  await assert.rejects(readFile(join(f.root, 'invalid.txt')), { code: 'ENOENT' })
+})
+
 test('cancellation releases a pending review and late approval cannot publish', { timeout: 8000 }, async t => {
   const pending = Promise.withResolvers(), reviewing = Promise.withResolvers()
   const f = await fixture(t, 'return await tools.workspace_create_text({path:"late.txt",content:"late"})',

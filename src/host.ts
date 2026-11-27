@@ -25,7 +25,7 @@ import { createMemoryExtension, formatMemoryContext, MEMORY_GUIDANCE } from '@ay
 import type { MemoryActor, MemoryListResult, MemoryMutation, MemoryToolCall } from '@ayayaq/vivi/extensions/memory'
 import type { CliMemoryStore, MemoryCommitResult } from './memory.js'
 import { codeModeContainsSecret, codeModeTool, withholdCodeModeResult, type ChildDispatch } from './code-mode.js'
-import { CodeModeParentRedactions, recoverCodeModeChildren, settledCodeModeChild } from './code-mode-outcomes.js'
+import { CodeModeParentRedactions, recordedCodeModeChild, recoverCodeModeChildren, settledCodeModeChild } from './code-mode-outcomes.js'
 import { applyCodeWrites, type ApplyCodeWrites } from './code-mode-writes.js'
 import { createBuiltinToolset } from './tools.js'
 import { createExtensionScope, type ExtensionScope, type ToolExtension } from '@ayayaq/vivi/extensions'
@@ -520,6 +520,8 @@ export class CliHost {
     await this.recoverPublicUrlOutcomes()
     await this.checkpoint(this.current)
     await this.initializeRecords()
+    await this.retireMcpOutcomes(this.current.history)
+    await this.retirePublicUrlOutcomes(this.current.history)
   }
   private async initializeRecords(snapshot = this.current): Promise<void> {
     if (!sessionHasUserMessage(this.current)) return
@@ -1334,10 +1336,12 @@ export class CliHost {
     const view = this.conversationRecords
     if (JSON.stringify(this.safeMcpRows()) !== JSON.stringify([...this.mcpRows.values()])) await this.persistMcpOutcomes()
     if (view.state !== 'shadow' || view.durability !== 'disk' || view.committedSequence !== view.observedSequence) return
+    const recordedHistory = view.projection?.history.map(entry => entry.message) ?? []
     const matched = new Set<string>()
     const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
     for (const row of this.safeMcpRows()) {
-      if (settledCodeModeChild(row, history, view.projection?.outcomes ?? [], this.codeModeParentRedactions)) matched.add(row.id)
+      if (settledCodeModeChild(row, history, view.projection?.outcomes ?? [], this.codeModeParentRedactions) ||
+          recordedCodeModeChild(row, cliMcpRecordOutcome(row), recordedHistory, this.codeModeParentRedactions)) matched.add(row.id)
       if (calls.some(call => mcpOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
           outcome.callId === call.id && outcome.name === call.name && outcome.argumentsDigest === agentArgumentsDigest(call.arguments))) &&
         history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
@@ -1486,8 +1490,12 @@ export class CliHost {
     const view = this.conversationRecords
     if (JSON.stringify(this.safePublicUrlRows()) !== JSON.stringify([...this.publicUrlRows.values()])) await this.persistPublicUrlOutcomes()
     if (view.state !== 'shadow' || view.durability !== 'disk' || view.committedSequence !== view.observedSequence) return
+    const recordedHistory = view.projection?.history.map(entry => entry.message) ?? []
     const calls = history.flatMap(message => message.kind === 'assistant' ? message.toolCalls : [])
-    const matched = new Set(this.safePublicUrlRows().filter(row => settledCodeModeChild(row, history, view.projection?.outcomes ?? [], this.codeModeParentRedactions) || calls.some(call => publicUrlOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
+    const matched = new Set(this.safePublicUrlRows().filter(row =>
+      settledCodeModeChild(row, history, view.projection?.outcomes ?? [], this.codeModeParentRedactions) ||
+      recordedCodeModeChild(row, cliPublicUrlRecordOutcome(row), recordedHistory, this.codeModeParentRedactions) ||
+      calls.some(call => publicUrlOutcomeMatchesCall(row, call) && view.projection?.outcomes.some(outcome =>
       outcome.callId === call.id && outcome.name === call.name && outcome.argumentsDigest === agentArgumentsDigest(call.arguments))) &&
       history.some(message => message.kind === 'tool_result' && message.callId === row.callId && message.name === row.toolName &&
         message.content === publicUrlOutcomeResult(row).content)).map(row => row.id))

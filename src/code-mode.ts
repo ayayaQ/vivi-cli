@@ -140,11 +140,17 @@ async function run(call: ToolCall, signal: AbortSignal, dispatch: ChildDispatch,
           assertMcpJson(args, CODE_LIMITS.argumentBytes)
           if (!args || typeof args !== 'object' || Array.isArray(args) ||
               codeModeContainsSecret(args, secrets())) throw new Error()
-        } catch { reject(new Error('Invalid tool arguments')); return }
+        } catch {
+          guest.postMessage({ id: message.id, content: 'Invalid tool arguments', failed: true })
+          return
+        }
         const child: ToolCall = { id: randomUUID(), name: message.name, arguments: args }
         if (applyWrites && isCodeWrite(child.name)) {
           try { validateWorkspaceMutation(child.name, args) }
-          catch { reject(new Error('Invalid workspace change arguments')); return }
+          catch {
+            guest.postMessage({ id: message.id, content: 'Invalid workspace change arguments', failed: true })
+            return
+          }
           writes.push(stageCodeWrite(child))
           guest.postMessage({ id: message.id, content: '{"staged":true}', failed: false })
           return
