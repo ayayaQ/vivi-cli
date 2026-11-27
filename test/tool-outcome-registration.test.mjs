@@ -6,6 +6,7 @@ import { createSkillCatalog, createSkillsExtension } from '@ayayaq/vivi/extensio
 import { createQuestionExtension } from '@ayayaq/vivi/extensions/questions'
 import { createBuiltinToolset, BUILTIN_TOOL_OUTCOME_POLICIES } from '../dist/tools.js'
 import { createWorkspaceExtension } from '../dist/workspace.js'
+import { codeModeTool } from '../dist/code-mode.js'
 import { createCommandExtension } from '../dist/commands.js'
 import { createMcpExtension } from '../dist/mcp-tools.js'
 import { createMcpSetupExtension } from '../dist/mcp-setup-tools.js'
@@ -21,9 +22,10 @@ async function packs(save = false) {
   ].map(async ([kind, body]) => [kind, await collectMcpCategory('fixture', kind, async () => body, signal())])))
   const snapshot = { serverId: 'fixture', configRevision: 'a'.repeat(64), connectionGeneration: 'owned-generation',
     protocolVersion: '2025-11-25', catalogGeneration: 1, categories }
+  const workspace = createWorkspaceExtension({}, [], inert, inert)
   return {
     memory: createMemoryExtension({ listMemories: inert, executeMutation: inert }),
-    workspace: createWorkspaceExtension({}, [], inert, inert),
+    workspace: { ...workspace, tools: [...workspace.tools, codeModeTool(inert, () => [], inert)] },
     skills: createSkillsExtension({ catalog: createSkillCatalog([]), authorizeRead: inert, ...(save ? { save: { authorize: inert, commit: inert } } : {}) }),
     commands: createCommandExtension(inert, inert),
     mcp: createMcpExtension({ captureCatalogs: inert, prepareOperation: inert }, [snapshot], inert),

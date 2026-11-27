@@ -14,7 +14,9 @@ import { McpManager } from '../dist/mcp-manager.js'
 import { McpConfigStore } from '../dist/mcp-config.js'
 import { mcpAlias } from '../dist/mcp-catalog.js'
 import { FileSessionStore, newSession } from '../dist/session.js'
+import { CliConversationRecords, FileCliConversationStore } from '../dist/conversation-records.js'
 import { FileMcpOutcomeStore } from '../dist/mcp-outcomes.js'
+import { FilePublicUrlOutcomeStore } from '../dist/public-url-outcomes.js'
 import { mcpContainsSecret } from '../dist/mcp-content.js'
 import { cliHistoryToolPresentation } from '../dist/tool-presentation.js'
 
@@ -56,10 +58,10 @@ async function fixture(t, input = {}) {
     }
     return transport
   } })
-  const server = { id: 'docs', label: 'Fixture', executable: process.execPath, args: process.versions.bun ? ['--no-install', fileURLToPath(import.meta.url)] : [], cwd: directory, protocol: input.protocol ?? 'legacy', environment: [] }
+  const server = { id: input.serverId ?? 'docs', label: 'Fixture', executable: process.execPath, args: process.versions.bun ? ['--no-install', fileURLToPath(import.meta.url)] : [], cwd: directory, protocol: input.protocol ?? 'legacy', environment: [] }
   await manager.configure(server)
-  if (input.connect !== false) assert.equal(await manager.connect('docs', async () => true, signal()), true)
-  if (input.resources) await manager.refresh('docs', ['resources', 'resourceTemplates'], signal())
+  if (input.connect !== false) assert.equal(await manager.connect(server.id, async () => true, signal()), true)
+  if (input.resources) await manager.refresh(server.id, ['resources', 'resourceTemplates'], signal())
   const capture = manager.captureCatalogs.bind(manager)
   manager.captureCatalogs = async signal => { state.captures++; return capture(signal) }
   const options = { mcp: manager, mcpOutcomes: new FileMcpOutcomeStore(directory, secrets), secrets, session: input.session ?? newSession({ provider: 'openai', model: 'fixture' }),
@@ -81,6 +83,211 @@ async function fixture(t, input = {}) {
 }
 
 function resultOf(result, name = alias) { return result.history.find(message => message.kind === 'tool_result' && message.name === name) }
+
+test('cold recovery retires remote rows after their exact Code Mode receipts are durable', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-code-recovery-'))
+  t.after(() => rm(directory, {recursive:true, force:true}))
+  const store = new FileSessionStore(directory)
+  const mcpOutcomes = new FileMcpOutcomeStore(directory)
+  const publicUrlOutcomes = new FilePublicUrlOutcomeStore(directory)
+  const session = newSession({provider:'openai', model:'fixture'})
+  const parent = call('code_mode', {code:'return await tools.remote({})'})
+  const runId = randomUUID()
+  const records = new CliConversationRecords(session.id, new FileCliConversationStore(directory))
+  await records.initialize(session, [])
+  session.schemaVersion = 2
+  session.recordAnchor = {version:1, eventId:records.anchorEventId}
+  session.history.push({kind:'message', role:'user', content:'Run the query'})
+  await records.begin(runId, session)
+  const assistant = {kind:'assistant', content:'', toolCalls:[parent]}
+  await records.accept(runId, {type:'assistant_accepted', message:assistant, round:1,
+    usage:session.usage, aggregateUsage:session.usage})
+  assert.deepEqual(records.view.runs[0].history.at(-1).message, assistant)
+  const read = {id:'read', name:'workspace_read', path:'existing.txt', argumentsDigest:'a'.repeat(64), status:'succeeded'}
+  const write = {id:'write', name:'workspace_create_text', path:'created.txt', argumentsDigest:'b'.repeat(64), status:'succeeded'}
+  const partial = {success:false, untrusted:true, contentWithheld:true, reads:[read], writes:[write]}
+  session.history.push(assistant, {kind:'tool_result', name:parent.name, callId:parent.id, isError:true,
+    content:JSON.stringify(partial)})
+  const child = call(alias, {query:'ordinary'})
+  const row = {id:randomUUID(), sessionId:session.id, runId, callId:child.id, toolName:child.name,
+    bindingDigest:mcpDigest(child), callDigest:mcpDigest(child), codeModeParentDigest:mcpDigest(parent), state:'intent'}
+  const unrelated = {...row, id:randomUUID(), callId:'different', callDigest:mcpDigest({...child,id:'different'}),
+    codeModeParentDigest:mcpDigest({...parent,arguments:{code:'return 1'}})}
+  const fetch = call('fetch_url', {url:'https://example.com'})
+  const urlRow = {...row, id:randomUUID(), callId:fetch.id, toolName:fetch.name,
+    callDigest:mcpDigest(fetch), bindingDigest:mcpDigest(fetch)}
+  await store.save(session)
+  await mcpOutcomes.save(session.id, [row, unrelated])
+  await publicUrlOutcomes.save(session.id, [urlRow])
+  for (let launch = 0; launch < 2; launch++) {
+    const host = await CliHost.resume({id:session.id, store, mcpOutcomes, publicUrlOutcomes,
+      provider:{async generate(){assert.fail('Never replay a child')}}})
+    try {
+      const result = JSON.parse(host.session.history.at(-1).content)
+      assert.equal(host.conversationRecords.state, 'shadow')
+      assert.equal(result.contentWithheld, true)
+      assert.deepEqual(result.reads, [read])
+      assert.deepEqual(result.writes, [write])
+      assert.deepEqual(result.calls.map(item => [item.id,item.status,item.effect]),
+        [[child.id,'unknown','unknown'], [fetch.id,'unknown','unknown']])
+      assert.deepEqual(await mcpOutcomes.load(session.id), [unrelated])
+      assert.deepEqual(await publicUrlOutcomes.load(session.id), [])
+    } finally { await host.shutdown() }
+  }
+})
+
+test('cold recovery retains exact nested remote receipts across a durable Code Mode parent redaction', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-redacted-code-mcp-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new FileSessionStore(directory), mcpOutcomes = new FileMcpOutcomeStore(directory)
+  const publicUrlOutcomes = new FilePublicUrlOutcomeStore(directory)
+  const session = newSession({ provider: 'openai', model: 'fixture' })
+  const credential = 'later-registered-test-credential'
+  const parent = { id: 'real-parent', name: 'code_mode', arguments: { code: `// ${credential}\nreturn 1` } }
+  const parentDigest = mcpDigest(parent)
+  const untrusted = { id: 'model-placeholder', name: 'code_mode', arguments: {
+    publicUrlRequestWithheld: true, reason: 'known_credential', codeModeParentDigest: parentDigest
+  } }
+  session.history.push({ kind: 'message', role: 'user', content: 'Run the query' },
+    { kind: 'assistant', content: '', toolCalls: [parent, untrusted] })
+  await store.save(session)
+  const provider = { async generate() { assert.fail('Recovery must not replay a child') } }
+  const resume = async () => CliHost.resume({ id: session.id, store, mcpOutcomes, publicUrlOutcomes, provider, secrets: [credential] })
+
+  // Commit the sanitized transcript before the outcome store exposes the child rows.
+  const first = await resume()
+  await first.shutdown()
+  const disk = await readFile(join(directory, session.id + '.json'), 'utf8')
+  assert(!disk.includes(credential))
+  const sanitized = JSON.parse(disk)
+  const rewritten = sanitized.history.find(message => message.kind === 'assistant').toolCalls[0]
+  assert.deepEqual(rewritten.arguments, { publicUrlRequestWithheld: true, reason: 'known_credential' })
+  assert.deepEqual(sanitized.codeModeParentRedactions, { [mcpDigest(rewritten)]: parentDigest })
+
+  const row = (child, codeModeParentDigest = parentDigest) => ({ id: randomUUID(), sessionId: session.id, runId: randomUUID(),
+    callId: child.id, toolName: child.name, bindingDigest: mcpDigest(child), callDigest: mcpDigest(child),
+    codeModeParentDigest, state: 'intent' })
+  const mcpChild = { ...call(alias, { query: 'redacted parent' }), id: 'mcp-child' }
+  const webChild = { ...call('fetch_url', { url: 'https://example.com/' }), id: 'web-child' }
+  const unrelated = { ...mcpChild, id: 'unrelated-child' }
+  await mcpOutcomes.save(session.id, [row(mcpChild), row(unrelated, mcpDigest({ ...parent, arguments: { code: 'return 2' } }))])
+  await publicUrlOutcomes.save(session.id, [row(webChild)])
+
+  const checkRecovery = async () => {
+    const recovered = await resume()
+    const result = found => recovered.session.history.find(message => message.kind === 'tool_result' && message.callId === found.id)
+    const real = JSON.parse(result(parent).content)
+    assert.equal(real.doNotRetry, true)
+    assert.deepEqual(real.calls.map(call => [call.id, call.status, call.effect]),
+      [[mcpChild.id, 'unknown', 'unknown'], [webChild.id, 'unknown', 'unknown']])
+    assert.equal(result(untrusted).content, sanitized.history.find(message => message.callId === untrusted.id).content)
+    await recovered.shutdown()
+  }
+  await checkRecovery()
+  await checkRecovery()
+  assert(!(await readFile(join(directory, session.id + '.json'), 'utf8')).includes(credential))
+})
+
+for (const allow of [true, false]) test('Code Mode routes a connected MCP tool through its exact review: ' + allow, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-code-mcp-'))
+  t.after(() => rm(directory, {recursive:true, force:true}))
+  const store = new FileSessionStore(directory)
+  const code = 'return await tools[' + JSON.stringify(alias) + ']({query:"nested"})'
+  const approvals = []
+  const f = await fixture(t, { options: { codeMode:true, store, approve: async request => { approvals.push(request); return allow } },
+    generate(_input, subject) { return subject.state.generations === 1 ? answer('', [call('code_mode', {code})]) : answer() } })
+  const result = await f.host.send('Query the connected fixture')
+  const data = JSON.parse(resultOf(result, 'code_mode').content)
+  assert.equal(approvals.length, 1)
+  assert(approvals[0].description.includes(code))
+  assert.equal(f.invocations().length, allow ? 1 : 0)
+  assert.equal(data.success, allow)
+  assert.equal(data.calls[0].name, alias)
+  assert.equal(data.calls[0].status, allow ? 'succeeded' : 'denied')
+  assert.deepEqual(await f.options.mcpOutcomes.load(f.host.session.id), [])
+})
+
+test('a later credential in a Code Mode return value cannot erase retired remote receipts', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-redacted-code-result-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new FileSessionStore(directory)
+  const credential = 'fixture-later-registered-code-result-credential'
+  const fake = { id: 'guest-fabricated-receipt', name: alias, status: 'succeeded', effect: 'confirmed', callDigest: '0'.repeat(64) }
+  const code = 'const response = await tools[' + JSON.stringify(alias) + ']({query:"nested"}); return { ...response, calls: [' + JSON.stringify(fake) + '] }'
+  const f = await fixture(t, { toolResult: { content: [{ type: 'text', text: credential }] },
+    options: { codeMode: true, store, approve: async () => true },
+    generate(_input, subject) {
+      return subject.state.generations === 1 ? answer('', [call('code_mode', { code })]) : answer()
+    } })
+  const sent = await f.host.send('Query the connected fixture')
+  const completed = JSON.parse(resultOf(sent, 'code_mode').content)
+  assert.equal(completed.success, true)
+  assert(JSON.stringify(completed.value).includes(credential))
+  assert.deepEqual(completed.value.calls, [fake])
+  assert.equal(f.invocations().length, 1)
+  assert.deepEqual(await f.options.mcpOutcomes.load(f.host.session.id), [], 'child receipts are only available from the saved result')
+  await f.host.shutdown()
+
+  const provider = { async generate() { assert.fail('Recovery must not replay the completed query') } }
+  const check = async () => {
+    const recovered = await CliHost.resume({ id: f.host.session.id, store, provider, secrets: [credential] })
+    const result = resultOf(recovered.session, 'code_mode')
+    assert.equal(result.isError, true)
+    const sanitized = JSON.parse(result.content)
+    assert.equal(sanitized.doNotRetry, true)
+    assert.deepEqual(sanitized.calls, completed.calls)
+    assert(!Object.hasOwn(sanitized, 'value'))
+    assert(!JSON.stringify(recovered.session).includes(credential))
+    assert(!JSON.stringify(sanitized).includes(fake.id))
+    await recovered.shutdown()
+  }
+  await check()
+  await check()
+})
+
+test('late credentials redact nested remote receipt identity fields without erasing an effect', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vivi-redact-code-call-label-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new FileSessionStore(directory)
+  const credential = 'fxtokencbc8c759e'
+  const name = mcpAlias(credential, 'tools', remoteName)
+  assert.equal(mcpContainsSecret(name, [credential]), true)
+  const code = 'await tools[' + JSON.stringify(name) + ']({query:"nested"}); return null'
+  const f = await fixture(t, { serverId: credential, options: { codeMode: true, store, approve: async () => true },
+    generate(_input, subject) {
+      return subject.state.generations === 1 ? answer('', [call('code_mode', { code })]) : answer()
+    } })
+  const sent = await f.host.send('Invoke the connected fixture')
+  assert.equal(f.invocations().length, 1)
+  assert.deepEqual(await f.options.mcpOutcomes.load(f.host.session.id), [])
+  const [original] = JSON.parse(resultOf(sent, 'code_mode').content).calls
+  assert.equal(original.name, name)
+  assert.equal(original.status, 'succeeded')
+  assert.equal(original.effect, 'unknown')
+  await f.host.shutdown()
+
+  const provider = { async generate() { assert.fail('Recovery must not replay the completed query') } }
+  const sessionId = f.host.session.id
+  const check = async secrets => {
+    const resumed = await CliHost.resume({ id: sessionId, store, secrets, provider })
+    const result = JSON.parse(resultOf(resumed.session, 'code_mode').content)
+    assert.equal(result.doNotRetry, true)
+    assert.equal(result.calls.length, 1)
+    const [receipt] = result.calls
+    assert.deepEqual({ ...receipt, id: original.id, name }, original)
+    assert.match(receipt.name, /^withheld-/)
+    assert.notEqual(receipt.name, name)
+    assert.equal(mcpContainsSecret(await readFile(join(directory, sessionId + '.json'), 'utf8'), secrets), false)
+    await resumed.shutdown()
+    return receipt
+  }
+  const first = await check([credential])
+  assert.equal(first.id, original.id, 'a safe exact identity is retained')
+  const second = await check([credential, original.id])
+  assert.match(second.id, /^withheld-/)
+  assert.notEqual(second.id, original.id)
+  assert.deepEqual(await check([credential, original.id]), second)
+})
 
 test('local captured MCP resource metadata has exact live, final and cold-resume read receipts without a remote operation', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'vivi-mcp-local-read-receipt-')), store = new FileSessionStore(directory)

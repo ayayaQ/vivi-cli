@@ -595,6 +595,57 @@ test('memory can be enabled or disabled before model setup without reading or cr
   assert.match(io.output, /Choose a model.*before listing or changing/)
 })
 
+test('Code Mode menu changes the live tool catalog and saves the choice across conversations and launches', async t => {
+  const directory = await fixture(t), services = fakeServices(), store = new PreferenceStore(directory)
+  await store.save(base)
+  const seen = []
+  const factory = () => ({ async generate({ tools }) {
+    seen.push(tools.some(tool => tool.name === 'code_mode'))
+    return answer('Done')
+  } })
+  const first = fakeIO(['/code-mode', true], [], ['Before', '/menu', 'After', '/new', 'New conversation', '/exit'])
+  assert.equal(await run(directory, first, services, factory, ['--tools']), 0)
+  assert.deepEqual(seen.splice(0), [false, true, true])
+  assert.equal(first.choices[0].values.find(choice => choice.value === '/code-mode').description, 'Off')
+  assert.deepEqual(await store.load(), { ...base, codeMode: true })
+
+  const chatOnly = fakeIO([], [], ['/session', 'Hello', '/exit'])
+  assert.equal(await run(directory, chatOnly, services, factory, ['--no-tools']), 0)
+  assert.deepEqual(seen.splice(0), [false])
+  assert.match(chatOnly.output, /Code Mode: On · tools unavailable for this model/)
+
+  const second = fakeIO(['/code-mode', undefined, '/code-mode', false], [], ['/menu', 'After cancel', '/menu', 'After disable', '/exit'])
+  assert.equal(await run(directory, second, services, factory, ['--tools']), 0)
+  assert.deepEqual(seen.splice(0), [true, false])
+  assert.equal(second.choices[0].values.find(choice => choice.value === '/code-mode').description, 'On')
+  assert.deepEqual(await store.load(), { ...base, codeMode: false })
+
+  const flagged = fakeIO([false], [], ['Flag override', '/code-mode', 'After disable', '/exit'])
+  assert.equal(await run(directory, flagged, services, factory, ['--tools', '--code-mode']), 0)
+  assert.deepEqual(seen, [true, false])
+})
+
+test('Code Mode does not change the live catalog or claim success when saving the preference fails', async t => {
+  const directory = await fixture(t), store = new PreferenceStore(directory)
+  await store.save({ ...base, codeMode: false })
+  const originalSave = PreferenceStore.prototype.save
+  t.mock.method(PreferenceStore.prototype, 'save', async function (value) {
+    if (value.codeMode === true) throw new Error('Fixture preference write failed')
+    return originalSave.call(this, value)
+  })
+  const seen = []
+  const factory = () => ({ async generate({ tools }) {
+    seen.push(tools.some(tool => tool.name === 'code_mode'))
+    return answer('Done')
+  } })
+  const io = fakeIO([true], [], ['Before', '/code-mode', 'After', '/exit'])
+  assert.equal(await run(directory, io, fakeServices(), factory, ['--tools']), 0)
+  assert.deepEqual(seen, [false, false])
+  assert.match(io.output, /Could not confirm saving Code Mode. The setting is unchanged for this launch/)
+  assert.doesNotMatch(io.output, /Code Mode: On/)
+  assert.equal((await store.load()).codeMode, false)
+})
+
 test('unknown saved and resumed models omit tools without a current declaration while memory context stays enabled', async t => {
   const directory = await fixture(t), services = fakeServices()
   await new PreferenceStore(directory).save({ ...base, enableTools: true, enableMemory: true })
@@ -687,6 +738,26 @@ test('accessible one-shot context details use documented model capacity without 
   const code = await main(['--no-tui', '--no-workspace', '--no-skills', '--model', 'gpt-4.1', '--prompt', '/context'],
     { VIVI_SESSION_DIR: directory }, { io, providerFactory: () => ({ async generate() { calls++; throw new Error('Unexpected') } }) })
   assert.equal(code, 0); assert.equal(calls, 0); assert.match(io.output, /Capacity: 1047576/)
+})
+
+test('accessible Code Mode commands stay local and the saved choice restores on launch', async t => {
+  const directory = await fixture(t), seen = []
+  const prefs = new PreferenceStore(directory)
+  const launch = (lines, args = []) => main(
+    ['--no-tui', '--no-workspace', '--no-skills', '--model', 'gpt-4.1', ...args], { VIVI_SESSION_DIR: directory },
+    { ...fakeServices(), io: fakeIO([], [], lines), providerFactory: () => ({ async generate(input) {
+      seen.push([input.messages.at(-1).content, input.tools.some(tool => tool.name === 'code_mode')])
+      return answer('Done')
+    } }) })
+  assert.equal(await launch(['/code-mode', 'Enabled', '/exit']), 0)
+  assert.equal((await prefs.load()).codeMode, true)
+  assert.equal(await launch(['Restored', '/code-mode off', 'Disabled', '/exit']), 0)
+  assert.equal((await prefs.load()).codeMode, false)
+  assert.equal(await launch([], ['--prompt', '/code-mode on']), 0)
+  assert.equal((await prefs.load()).codeMode, false)
+  assert.equal(await launch(['Flag override', '/exit'], ['--code-mode']), 0)
+  assert.equal((await prefs.load()).codeMode, false)
+  assert.deepEqual(seen, [['Enabled', true], ['Restored', true], ['Disabled', false], ['Flag override', true]])
 })
 
 test('accessible small-model limits block an oversized current prompt before generation', async t => {

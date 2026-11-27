@@ -224,7 +224,7 @@ test('Auto sharing scope retains versioned workspace evidence and named recipien
   for (const provider of ['openai', 'openrouter']) {
     const sharing = autoReviewSharingScope(provider)
     assert.equal(sharing.revision, AUTO_REVIEW_SHARING_REVISION)
-    assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v6')
+    assert.equal(AUTO_REVIEW_POLICY_REVISION, 'vivi-cli-auto-v7')
     assert.deepEqual(sharing.recipients, provider === 'openai' ? ['OpenAI'] : ['OpenRouter', 'TypeSafe'])
     assert(sharing.data.some(item => item.includes('workspace-relative')))
   }

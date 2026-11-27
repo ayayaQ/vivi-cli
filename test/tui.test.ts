@@ -48,13 +48,14 @@ const renderedText = (node: Renderable): string => [
 
 test('slash command helpers match only the sole starting token', () => {
   expect(SLASH_COMMANDS.map(({ command }) => command)).toEqual([
-    '/provider', '/account', '/usage', '/web', '/reviewer', '/auto-threshold', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/processes', '/instructions', '/skills', '/mcp', '/menu', '/help', '/queue', '/session', '/exit'
+    '/provider', '/account', '/usage', '/web', '/reviewer', '/auto-threshold', '/models', '/effort', '/mode', '/new', '/resume', '/rename', '/notes', '/settings', '/memories', '/compact', '/context', '/commands', '/code-mode', '/processes', '/instructions', '/skills', '/mcp', '/menu', '/help', '/queue', '/session', '/exit'
   ])
   expect(getSlashCommandCompletions('/')).toEqual(SLASH_COMMANDS)
   expect(getSlashCommandCompletions('/m').map(({ command }) => command)).toEqual(['/models', '/mode', '/memories', '/mcp', '/menu'])
   expect(getSlashCommandCompletions('/mode').map(({ command }) => command)).toEqual(['/mode', '/models'])
   expect(getSlashCommandCompletions('/provider').map(({ command }) => command)).toEqual(['/provider'])
   expect(getSlashCommandCompletions('/commands').map(({ command }) => command)).toEqual(['/commands'])
+  expect(getSlashCommandCompletions('/code-m').map(({ command }) => command)).toEqual(['/code-mode'])
   expect(getSlashCommandCompletions('/processes').map(({ command }) => command)).toEqual(['/processes'])
   expect(getSlashCommandCompletions('/auto').map(({ command }) => command)).toEqual(['/auto-threshold'])
   expect(getSlashCommandCompletions('/auto-threshold 90')).toEqual([])
@@ -1737,6 +1738,25 @@ test('review state, pending approvals and result errors remain prominent while s
   input.pressArrow('down'); input.pressEnter(); expect(await pending).toBe(false)
   io.result({ ...result('Failed', 'error'), error: new Error('Visible result error') }); await frame()
   colors('Error', true)
+})
+
+test('a large Code Mode batch stays fully visible through approval', async () => {
+  const { io, setup, input, frame } = await fixture()
+  io.write('Earlier transcript content')
+  const description = 'Code Mode script\nreturn null\n\nProposed changes\n' +
+    'First diff\n' + 'x'.repeat(34000) + '\nSecond diff\n' + 'y'.repeat(34000) + '\nLast changed line'
+  const pending = io.approve({ call: { id: 'batch', name: 'code_mode', arguments: { code: 'return null' } },
+    currentRevision: 'fixture', description }, new AbortController().signal)
+  await tick(); await frame()
+  const transcript = setup.renderer.root.findDescendantById('vivi-transcript')!
+  expect(renderedText(transcript)).toContain(description)
+  expect(renderedText(transcript)).toContain('Earlier transcript content')
+  io.addSecrets(['unrelated-fixture-credential'])
+  expect(renderedText(transcript)).toContain(description)
+  input.pressArrow('up'); input.pressEnter()
+  expect(await pending).toBe(true)
+  expect(renderedText(transcript)).toContain('Earlier transcript content')
+  expect(renderedText(transcript)).not.toContain('Last changed line')
 })
 
 test('title-only header and responsive metadata keep native controls separate from the workspace', async () => {

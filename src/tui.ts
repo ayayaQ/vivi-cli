@@ -21,6 +21,8 @@ import type { ChatIO } from './terminal.js'
 import type { BackgroundProcessControls } from './process-controls.js'
 import type { SteeringControls, SteeringMessage } from './steering.js'
 import type { ApprovalRequest } from './tools.js'
+import { CODE_LIMITS } from './code-mode-contract.js'
+import { WORKSPACE_MUTATION_LIMITS } from './workspace-edit.js'
 import { matchingChoiceIndices } from './picker.js'
 import { createWindowsInputBridge } from './windows-input.js'
 import type { WindowsInputBridge } from './windows-input.js'
@@ -120,6 +122,7 @@ export const SLASH_COMMANDS = [
   { command: '/compact', description: 'Compact the provider context; retain the full transcript' },
   { command: '/context', description: 'Show context capacity and output reserve' },
   { command: '/commands', description: 'Manage trusted workspace commands' },
+  { command: '/code-mode', description: 'Turn JavaScript tool queries on or off' },
   { command: '/processes', description: 'List, inspect or stop background jobs' },
   { command: '/instructions', description: 'Inspect, reload or disable project guidance' },
   { command: '/skills', description: 'List, inspect and draft standard skills' },
@@ -134,13 +137,16 @@ export type SlashCommand = typeof SLASH_COMMANDS[number]
 
 /** Complete only the whole, first slash token. Ordinary text and arguments are untouched. */
 export function getSlashCommandCompletions(input: string, canCompact = true): readonly SlashCommand[] {
-  return /^\/[a-z]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact))
+  return /^\/[a-z-]*$/.test(input) ? SLASH_COMMANDS.filter(({ command }) => command.startsWith(input) && (command !== '/compact' || canCompact))
     .sort((a, b) => Number(b.command === input) - Number(a.command === input)) : []
 }
 
 const MAX_INPUT = 65536
 const MAX_SECRET = 4096
 const MAX_DISPLAY = 65536
+const MAX_APPROVAL_BODY = 60 * 1024
+const MAX_CODE_MODE_APPROVAL_BODY = MAX_INPUT + CODE_LIMITS.sourceBytes +
+  CODE_LIMITS.calls * (WORKSPACE_MUTATION_LIMITS.maximumDiffBytes + 512)
 const MAX_ENTRIES = 256
 const MAX_QUERY = 200
 const statusSegments = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
@@ -354,7 +360,7 @@ export class OpenTuiIO implements ChatIO {
   private readonly expandedTools = new Set<string>()
   private liveToolCalls = new Map<string, { call: ToolCall; index: number; resultIndex?: number; key: string; source: ToolPresentation['source']; status?: ToolPresentationStatus; effect?: ToolPresentationEffect }>()
   private liveHistoryIndex = 0
-  private activeApproval: { token: object; toolKey: string | undefined } | undefined
+  private activeApproval: { token: object; toolKey: string | undefined; oversized: boolean } | undefined
   private displaySequence = 0
   private resultNotices: DisplayEntry[] = []
   private conversationErrors: CliConversationErrors | undefined
@@ -816,7 +822,7 @@ export class OpenTuiIO implements ChatIO {
     this.secrets = [...new Set([...this.secrets, ...secrets])].filter(Boolean).sort((a, b) => b.length - a.length)
     if (this.closed) return
     const redactEntry = (entry: DisplayEntry): DisplayEntry => ({ ...entry,
-      label: this.safe(entry.label, 4096), content: this.safe(entry.content) })
+      label: this.safe(entry.label, 4096), content: this.safeEntryContent(entry) })
     this.entries = this.entries.map(redactEntry)
     this.resultNotices = this.resultNotices.map(redactEntry)
     this.liveErrors = this.liveErrors.map(error => ({ ...error, message: this.safe(error.message) }))
@@ -850,6 +856,11 @@ export class OpenTuiIO implements ChatIO {
     // that can evict an otherwise admitted final answer during aggregate trim.
     return safe.length > limit ? limit >= notice.length
       ? `${safe.slice(0, limit - notice.length)}${notice}` : safe.slice(0, Math.max(0, limit)) : safe
+  }
+
+  private safeEntryContent(entry: DisplayEntry): string {
+    return this.safe(entry.content, this.activeApproval?.oversized && entry.approval === this.activeApproval.token
+      ? MAX_CODE_MODE_APPROVAL_BODY : MAX_DISPLAY)
   }
   private ready(pending = this.pending): boolean {
     return !!pending?.armed && !this.closed &&
@@ -2161,16 +2172,17 @@ export class OpenTuiIO implements ChatIO {
     if (this.closed || signal.aborted) return false
     const publicUrl = request.call.name === 'fetch_url'
     const skillSave = request.call.name === 'save_skill'
-    if (request.description.length > 60 * 1024) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
+    const limit = request.call.name === 'code_mode' ? MAX_CODE_MODE_APPROVAL_BODY : MAX_APPROVAL_BODY
+    if (request.description.length > limit) { this.write('Approval denied: exact review exceeds the display limit\n'); return false }
     const restoreControls = this.suspendControls()
     this.showTool(request.call.id, 'approval_required', 'not_attempted', 'Exact action needs human review')
-    const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key }
+    const approval = { token: {}, toolKey: this.liveToolCalls.get(request.call.id)?.key, oversized: request.description.length > MAX_DISPLAY }
     this.activeApproval = approval
     const scope = request.currentRevision === 'new memory' ? 'new memory' : `current revision ${request.currentRevision}`
     const workspace = ['workspace_create_text', 'workspace_edit_text'].includes(request.call.name) && request.workspaceDiff
       ? workspaceDiffPresentation(request.description, request.workspaceDiff) : undefined
     this.appendEntry({ category: 'activity', attention: true, label: workspace ? workspace.path : `Approval required · ${scope}`,
-      content: this.safe(workspace?.content ?? request.description), markdown: false, approval: approval.token,
+      content: workspace?.content ?? request.description, markdown: false, approval: approval.token,
       ...(workspace ? { workspaceDiff: workspace.content } : {}) })
     const title = publicUrl
       ? 'Review this public URL request' : skillSave ? 'Save skill?' : 'Review this change'
@@ -2186,7 +2198,13 @@ export class OpenTuiIO implements ChatIO {
         reply === 'allow' && !signal.aborted && !this.closed && !publicUrl ? 'unreported' : 'not_attempted')
       return reply === 'allow' && !signal.aborted && !this.closed
     } finally {
-      if (this.activeApproval === approval) this.activeApproval = undefined
+      if (this.activeApproval === approval) {
+        this.activeApproval = undefined
+        if (approval.oversized) {
+          this.entries = this.entries.filter(entry => entry.approval !== approval.token)
+          this.rebuild()
+        }
+      }
       this.runStatus.setPhase(signal.aborted ? 'cancelling' : 'working')
       if (!this.closed && !this.runStatus.running) this.updateStatus('Ready')
       restoreControls()
@@ -2541,6 +2559,8 @@ export class OpenTuiIO implements ChatIO {
     // The generic transcript budget bounds bodies, not required semantic/source rows.
     // The separate entry cap bounds whole-card retention across long conversations.
     const size = (entry: DisplayEntry): number => {
+      // A pending large batch has its own bounded body budget.
+      if (this.activeApproval?.oversized && entry.approval === this.activeApproval.token) return 0
       if (!entry.tool) return entry.content.length
       const view = cliToolPresentationView(entry.tool.encoded, false, entry.tool.detailBytes ?? 8192, this.secrets)
       return view.details.reduce((sum, section) => sum + section.text.length, 0)
@@ -2579,7 +2599,7 @@ export class OpenTuiIO implements ChatIO {
   }
   private appendEntry(entry: DisplayEntry): void {
     if (this.closed) return
-    this.entries.push({ ...entry, label: this.safe(entry.label, 4096), content: this.safe(entry.content) })
+    this.entries.push({ ...entry, label: this.safe(entry.label, 4096), content: this.safeEntryContent(entry) })
     this.rebuild()
   }
   private historyEntries(history: readonly HistoryMessage[]): DisplayEntry[] {
